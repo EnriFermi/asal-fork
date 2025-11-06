@@ -16,7 +16,7 @@ The Lenia substrate.
 The implementation of Lenia is from https://github.com/maxencefaldor/Leniabreeder/tree/main/lenia.
 """
 class Lenia():
-    def __init__(self, grid_size=128, center_phenotype=True, phenotype_size=48, start_pattern="5N7KKM", clip1=jnp.inf, clip2=jnp.inf):
+    def __init__(self, grid_size=128, center_phenotype=True, phenotype_size=100, start_pattern="VT049W", clip1=jnp.inf, clip2=jnp.inf):
         self.grid_size = grid_size
         self.center_phenotype = center_phenotype
         self.phenotype_size = phenotype_size

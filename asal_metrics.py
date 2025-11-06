@@ -63,6 +63,11 @@ def calc_open_endedness_score(z):
     kernel = jnp.tril(kernel, k=-1)
     return kernel.max(axis=-1).mean()
 
+
+def calc_gradient_score(z):
+    accel = z[2:, :] - 2*z[1:-1, :] + z[:-2, :]
+    return (accel**2).mean()
+
 def calc_illumination_score(zs):
     """
     Calculates the illumination score from ASAL.
