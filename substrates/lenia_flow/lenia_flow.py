@@ -40,6 +40,9 @@ class FlowLenia:
         mix_rule: str = "stoch",
         seed_patch_size: int = 40,
         seed_n_patches: int = 1,
+        seed_mode: str = "notebook_centers",  # 'center' | 'random_patches' | 'notebook_centers'
+        p_constant_per_patch: bool = True,
+        render_mode: str = "Pcolor",  # 'A' | 'Pcolor'
         clip1: float = float("inf"),
         clip2: float = float("inf"),
         # mutation controls (optional)
@@ -58,6 +61,9 @@ class FlowLenia:
         self.mix_rule = mix_rule
         self.seed_patch_size = seed_patch_size
         self.seed_n_patches = seed_n_patches
+        self.seed_mode = seed_mode
+        self.p_constant_per_patch = bool(p_constant_per_patch)
+        self.render_mode = render_mode
         self.clip1 = clip1
         self.clip2 = clip2
         # mutation
@@ -177,22 +183,57 @@ class FlowLenia:
         A = jnp.zeros((self.cfg.X, self.cfg.Y, self.cfg.C))
         P = jnp.zeros((self.cfg.X, self.cfg.Y, self.cfg.k))
 
-        # Seed patch(es): either one central patch or multiple random, non-overlapping patches
+        # Seed patch(es): notebook-style or random
         kA, kP = split(rng)
         sz = int(self.seed_patch_size)
         sz = max(1, min(sz, self.grid_size))
-        P_vec = jr.uniform(kP, (1, 1, self.k))
-
-        if self.seed_n_patches <= 1:
-            # Single central patch (backward-compatible behavior)
+        mode = self.seed_mode
+        if mode == "center":
             i0 = self.grid_size // 2 - sz // 2
             j0 = self.grid_size // 2 - sz // 2
             A_patch = jr.uniform(kA, (sz, sz, self.C))
-            A = A.at[i0:i0+sz, j0:j0+sz, :].set(A_patch)
-            P_patch = jnp.ones((sz, sz, self.k)) * P_vec
-            P = P.at[i0:i0+sz, j0:j0+sz, :].set(P_patch)
+            if self.p_constant_per_patch:
+                P_vec = jr.uniform(kP, (1, 1, self.k))
+                P_patch = jnp.ones((sz, sz, self.k)) * P_vec
+            else:
+                P_patch = jr.uniform(kP, (sz, sz, self.k))
+            A = jax.lax.dynamic_update_slice(A, A_patch, (i0, j0, 0))
+            P = jax.lax.dynamic_update_slice(P, P_patch, (i0, j0, 0))
+        elif mode == "notebook_centers":
+            # Five patches: four near corners and one center, scaled to grid
+            g = self.grid_size
+            max_i = g - sz
+            max_j = g - sz
+            # Use ratios similar to the notebook (~0.27, 0.73, 0.5)
+            r1, r2, rC = 0.27, 0.73, 0.5
+            centers = [
+                (int(round(g * r1)), int(round(g * r1))),
+                (int(round(g * r1)), int(round(g * r2))),
+                (int(round(g * r2)), int(round(g * r1))),
+                (int(round(g * r2)), int(round(g * r2))),
+                (int(round(g * rC)), int(round(g * rC))),
+            ]
+            i0s = jnp.array([max(0, min(ci - sz // 2, max_i)) for ci, _ in centers], dtype=jnp.int32)
+            j0s = jnp.array([max(0, min(cj - sz // 2, max_j)) for _, cj in centers], dtype=jnp.int32)
+
+            def body(t, carry):
+                A_cur, P_cur, key_cur = carry
+                key_next, kA_t, kP_t = jr.split(key_cur, 3)
+                i0 = i0s[t]
+                j0 = j0s[t]
+                A_patch = jr.uniform(kA_t, (sz, sz, self.C))
+                if self.p_constant_per_patch:
+                    P_vec = jr.uniform(kP_t, (1, 1, self.k))
+                    P_patch = jnp.ones((sz, sz, self.k)) * P_vec
+                else:
+                    P_patch = jr.uniform(kP_t, (sz, sz, self.k))
+                A_cur = jax.lax.dynamic_update_slice(A_cur, A_patch, (i0, j0, 0))
+                P_cur = jax.lax.dynamic_update_slice(P_cur, P_patch, (i0, j0, 0))
+                return (A_cur, P_cur, key_next)
+
+            A, P, _ = jax.lax.fori_loop(0, 5, body, (A, P, kA))
         else:
-            # Multiple random patches (overlap allowed). JAX-safe dynamic placement.
+            # 'random_patches': place N random patches, overlaps allowed
             n_target = max(1, int(self.seed_n_patches))
             max_i = self.grid_size - sz
             max_j = self.grid_size - sz
@@ -201,11 +242,15 @@ class FlowLenia:
             def body(t, carry):
                 A_cur, P_cur, key_cur = carry
                 # Split keys for position and patch
-                key_next, kA_t, ki, kj = jr.split(key_cur, 4)
+                key_next, kA_t, kP_t, ki, kj = jr.split(key_cur, 5)
                 i0 = jr.randint(ki, (), 0, max_i + 1)
                 j0 = jr.randint(kj, (), 0, max_j + 1)
                 A_patch = jr.uniform(kA_t, (sz, sz, self.C))
-                P_patch = jnp.ones((sz, sz, self.k)) * P_vec
+                if self.p_constant_per_patch:
+                    P_vec = jr.uniform(kP_t, (1, 1, self.k))
+                    P_patch = jnp.ones((sz, sz, self.k)) * P_vec
+                else:
+                    P_patch = jr.uniform(kP_t, (sz, sz, self.k))
                 A_cur = jax.lax.dynamic_update_slice(A_cur, A_patch, (i0, j0, 0))
                 P_cur = jax.lax.dynamic_update_slice(P_cur, P_patch, (i0, j0, 0))
                 return (A_cur, P_cur, key_next)
@@ -256,15 +301,23 @@ class FlowLenia:
         return {"A": nA, "P": nP, "fK": fK, "m": m, "s": s}
 
     def render_state(self, state, params, img_size=None):
-        # Render activations A directly (matches reference example usage)
+        mode = getattr(self, 'render_mode', 'A')
         A = state["A"]
-        C = A.shape[-1]
-        if C == 1:
-            img = jnp.dstack([A[..., 0], A[..., 0], A[..., 0]])
-        elif C == 2:
-            img = jnp.dstack([A[..., 0], A[..., 0], A[..., 1]])
+        if mode == 'Pcolor':
+            # Notebook-style: intensity = sum(A) times first 3 channels of P
+            P = state["P"]
+            inten = A.sum(axis=-1, keepdims=True)
+            # Use first three P channels for RGB; clip to [0,1]
+            img = jnp.clip(inten * P[..., :3], 0.0, 1.0)
         else:
-            img = A[..., :3]
+            # Render activations A directly
+            C = A.shape[-1]
+            if C == 1:
+                img = jnp.dstack([A[..., 0], A[..., 0], A[..., 0]])
+            elif C == 2:
+                img = jnp.dstack([A[..., 0], A[..., 0], A[..., 1]])
+            else:
+                img = A[..., :3]
 
         if img_size is not None:
             img = jax.image.resize(img, (img_size, img_size, 3), method="nearest")
