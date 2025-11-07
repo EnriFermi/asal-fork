@@ -192,35 +192,35 @@ class FlowLenia:
             P_patch = jnp.ones((sz, sz, self.k)) * P_vec
             P = P.at[i0:i0+sz, j0:j0+sz, :].set(P_patch)
         else:
-            # Multiple random patches, ensure no overlap
-            # Rejection sampling of top-left corners
-            max_i = self.grid_size - sz
-            max_j = self.grid_size - sz
-            placed = []  # list of (i0, j0)
-            key_pos = kA
+            # Multiple random patches, non-overlapping by placing on a stride grid of size sz
+            # Choose random grid cells without replacement
+            n_i = (self.grid_size - sz) // sz + 1
+            n_j = (self.grid_size - sz) // sz + 1
+            n_cells = n_i * n_j
+            n_target = max(1, min(int(self.seed_n_patches), n_cells))
 
-            def overlaps(i, j, placed_list):
-                for (pi, pj) in placed_list:
-                    if (i < pi + sz) and (pi < i + sz) and (j < pj + sz) and (pj < j + sz):
-                        return True
-                return False
+            key_pos, kA_p = split(kA)
+            perm = jr.permutation(key_pos, n_cells)  # shape (n_cells,)
+            sel = perm[:n_target]
+            i_idx = sel // n_j
+            j_idx = sel % n_j
+            i0s = i_idx * sz
+            j0s = j_idx * sz
 
-            n_target = int(self.seed_n_patches)
-            n_target = max(1, n_target)
-            attempts = 0
-            max_attempts = 10000
-            while (len(placed) < n_target) and (attempts < max_attempts):
-                attempts += 1
-                key_pos, ki, kj, kpatch = jr.split(key_pos, 4)
-                i0 = int(jr.randint(ki, (), 0, max_i + 1))
-                j0 = int(jr.randint(kj, (), 0, max_j + 1))
-                if overlaps(i0, j0, placed):
-                    continue
-                placed.append((i0, j0))
-                A_patch = jr.uniform(kpatch, (sz, sz, self.C))
-                A = A.at[i0:i0+sz, j0:j0+sz, :].set(A_patch)
+            # Prepare random keys for patches
+            k_list = jr.split(kA_p, n_target)
+
+            def body(t, carry):
+                A_cur, P_cur = carry
+                A_patch = jr.uniform(k_list[t], (sz, sz, self.C))
+                i0 = i0s[t]
+                j0 = j0s[t]
+                A_cur = A_cur.at[i0:i0+sz, j0:j0+sz, :].set(A_patch)
                 P_patch = jnp.ones((sz, sz, self.k)) * P_vec
-                P = P.at[i0:i0+sz, j0:j0+sz, :].set(P_patch)
+                P_cur = P_cur.at[i0:i0+sz, j0:j0+sz, :].set(P_patch)
+                return (A_cur, P_cur)
+
+            A, P = jax.lax.fori_loop(0, n_target, body, (A, P))
 
         state = {"A": A, "P": P, "fK": fK, "m": m, "s": s}
         # Step once to avoid trivial zero image, like Lenia
