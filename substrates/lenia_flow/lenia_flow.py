@@ -39,6 +39,7 @@ class FlowLenia:
         border: str = "wall",
         mix_rule: str = "stoch",
         seed_patch_size: int = 40,
+        seed_n_patches: int = 1,
         clip1: float = float("inf"),
         clip2: float = float("inf"),
     ):
@@ -52,6 +53,7 @@ class FlowLenia:
         self.border = border
         self.mix_rule = mix_rule
         self.seed_patch_size = seed_patch_size
+        self.seed_n_patches = seed_n_patches
         self.clip1 = clip1
         self.clip2 = clip2
 
@@ -167,17 +169,50 @@ class FlowLenia:
         A = jnp.zeros((self.cfg.X, self.cfg.Y, self.cfg.C))
         P = jnp.zeros((self.cfg.X, self.cfg.Y, self.cfg.k))
 
-        # Seed a central patch for A with uniform noise and P with a constant vector
+        # Seed patch(es): either one central patch or multiple random, non-overlapping patches
         kA, kP = split(rng)
         sz = int(self.seed_patch_size)
         sz = max(1, min(sz, self.grid_size))
-        i0 = self.grid_size // 2 - sz // 2
-        j0 = self.grid_size // 2 - sz // 2
-        A_patch = jr.uniform(kA, (sz, sz, self.C))
-        A = A.at[i0:i0+sz, j0:j0+sz, :].set(A_patch)
         P_vec = jr.uniform(kP, (1, 1, self.k))
-        P_patch = jnp.ones((sz, sz, self.k)) * P_vec
-        P = P.at[i0:i0+sz, j0:j0+sz, :].set(P_patch)
+
+        if self.seed_n_patches <= 1:
+            # Single central patch (backward-compatible behavior)
+            i0 = self.grid_size // 2 - sz // 2
+            j0 = self.grid_size // 2 - sz // 2
+            A_patch = jr.uniform(kA, (sz, sz, self.C))
+            A = A.at[i0:i0+sz, j0:j0+sz, :].set(A_patch)
+            P_patch = jnp.ones((sz, sz, self.k)) * P_vec
+            P = P.at[i0:i0+sz, j0:j0+sz, :].set(P_patch)
+        else:
+            # Multiple random patches, ensure no overlap
+            # Rejection sampling of top-left corners
+            max_i = self.grid_size - sz
+            max_j = self.grid_size - sz
+            placed = []  # list of (i0, j0)
+            key_pos = kA
+
+            def overlaps(i, j, placed_list):
+                for (pi, pj) in placed_list:
+                    if (i < pi + sz) and (pi < i + sz) and (j < pj + sz) and (pj < j + sz):
+                        return True
+                return False
+
+            n_target = int(self.seed_n_patches)
+            n_target = max(1, n_target)
+            attempts = 0
+            max_attempts = 10000
+            while (len(placed) < n_target) and (attempts < max_attempts):
+                attempts += 1
+                key_pos, ki, kj, kpatch = jr.split(key_pos, 4)
+                i0 = int(jr.randint(ki, (), 0, max_i + 1))
+                j0 = int(jr.randint(kj, (), 0, max_j + 1))
+                if overlaps(i0, j0, placed):
+                    continue
+                placed.append((i0, j0))
+                A_patch = jr.uniform(kpatch, (sz, sz, self.C))
+                A = A.at[i0:i0+sz, j0:j0+sz, :].set(A_patch)
+                P_patch = jnp.ones((sz, sz, self.k)) * P_vec
+                P = P.at[i0:i0+sz, j0:j0+sz, :].set(P_patch)
 
         state = {"A": A, "P": P, "fK": fK, "m": m, "s": s}
         # Step once to avoid trivial zero image, like Lenia

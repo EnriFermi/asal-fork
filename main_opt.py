@@ -27,6 +27,7 @@ group.add_argument("--save_dir", type=str, default=None, help="path to save resu
 group = parser.add_argument_group("substrate")
 group.add_argument("--substrate", type=str, default='lenia', help="name of the substrate")
 group.add_argument("--rollout_steps", type=int, default=None, help="number of rollout timesteps, leave None for the default of the substrate")
+group.add_argument("--seed_n_patches", type=int, default=1, help="for lenia_flow: number of random non-overlapping seed patches")
 
 group = parser.add_argument_group("evaluation")
 group.add_argument("--foundation_model", type=str, default="clip", help="the foundation model to use (don't touch this)")
@@ -79,6 +80,12 @@ def main(args):
         
         fm = foundation_models.create_foundation_model(args.foundation_model)
         substrate = substrates.create_substrate(args.substrate)
+        # Optional: control initial seeding for FlowLenia
+        if hasattr(substrate, 'seed_n_patches'):
+            try:
+                substrate.seed_n_patches = int(args.seed_n_patches)
+            except Exception:
+                pass
         substrate = substrates.FlattenSubstrateParameters(substrate)
         if args.rollout_steps is None:
             args.rollout_steps = substrate.rollout_steps
