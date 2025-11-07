@@ -73,8 +73,9 @@ def rollout_simulation(rng, params, s0=None,
             img = substrate.render_state(state, params=params, img_size=img_size)
             z = embed_img_fn(img)
             return next_state, dict(rgb=img, z=z, state=(state if return_state else None))
-        _, data = jax.lax.scan(step_fn, s0, split(rng, rollout_steps))
-        return data
+        state_final, data = jax.lax.scan(step_fn, s0, split(rng, rollout_steps))
+        # Include final state for chaining batches when requested
+        return dict(**data, state_final=(state_final if return_state else None))
     elif isinstance(time_sampling, int) or isinstance(time_sampling, tuple): # return the rollout at K sampled intervals
         # Memory-efficient: do not store all T states; process in K chunks
         K, chunk_ends = time_sampling if isinstance(time_sampling, tuple) else (time_sampling, False)

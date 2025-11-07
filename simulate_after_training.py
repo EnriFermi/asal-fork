@@ -6,6 +6,7 @@ import jax.numpy as jnp
 from jax.random import split
 import numpy as np
 import imageio.v3 as iio
+import imageio  # for streaming writer
 
 import substrates
 from rollout import rollout_simulation
@@ -36,7 +37,12 @@ def main():
     parser.add_argument('--mutations', action='store_true', help='For FlowLenia: enable parameter patch mutations during rollout')
     parser.add_argument('--mutation_sz', type=int, default=20, help='For FlowLenia: size of mutation patch')
     parser.add_argument('--mutation_p', type=float, default=0.1, help='For FlowLenia: probability of mutation each step')
-    parser.add_argument('--output', type=str, default='tmp.gif', help='Output GIF path')
+    parser.add_argument('--output', type=str, default='out.mp4', help='Output MP4 path')
+    parser.add_argument('--fps', type=int, default=250, help='Output video FPS')
+    parser.add_argument('--codec', type=str, default='libx264', help='Video codec (e.g., libx264)')
+    parser.add_argument('--macro_block_size', type=int, default=None, help='Macro block size for encoder (set None to disable)')
+    parser.add_argument('--batch_steps', type=int, default=256, help='Number of steps per batch when streaming')
+    parser.add_argument('--max_steps', type=int, default=None, help='Total number of steps to run; None for until interrupted')
     args = parser.parse_args()
 
     best_path = os.path.join(args.save_dir, 'best.pkl')
@@ -77,23 +83,51 @@ def main():
     substrate = substrates.FlattenSubstrateParameters(substrate)
     rollout_steps = substrate.rollout_steps if args.rollout_steps is None else args.rollout_steps
 
-    ts = parse_time_sampling(args.time_sampling)
-
     rng = jax.random.PRNGKey(args.seed)
-    rollout_fn = rollout_simulation
 
-    data = rollout_fn(rng, best_member, s0=None, substrate=substrate, fm=None,
-                      rollout_steps=rollout_steps, time_sampling=ts, img_size=args.img_size, return_state=False)
+    # If time_sampling is 'video' and max_steps is provided, we can write at once via iio.imwrite; otherwise stream in batches
+    if args.max_steps is not None and args.max_steps <= rollout_steps and args.time_sampling == 'video':
+        data = rollout_simulation(rng, best_member, s0=None, substrate=substrate, fm=None,
+                                  rollout_steps=args.max_steps, time_sampling='video', img_size=args.img_size, return_state=False)
+        vid = np.asarray(data['rgb'])
+        vid_u8 = (np.clip(vid, 0.0, 1.0) * 255).astype(np.uint8)
+        iio.imwrite(
+            args.output,
+            vid_u8,
+            fps=args.fps,
+            codec=args.codec,
+            macro_block_size=args.macro_block_size,
+        )
+        print(f"Saved simulation to {args.output} (best fitness: {np.array(best_fitness).item():.4f})")
+        return
 
-    rgb = data['rgb']
-    if isinstance(ts, int) or ts == 'video':
-        vid = np.asarray(rgb)
-    else:  # final image -> make a 1-frame GIF
-        vid = np.asarray(rgb)[None]
-
-    vid_u8 = (np.clip(vid, 0.0, 1.0) * 255).astype(np.uint8)
-    iio.imwrite(args.output, vid_u8, duration=1/8)  # default 8 fps
-    print(f"Saved simulation to {args.output} (best fitness: {np.array(best_fitness).item():.4f})")
+    # Streaming writer: run indefinitely (or up to max_steps) in batches
+    writer = imageio.get_writer(
+        args.output,
+        fps=args.fps,
+        codec=args.codec,
+        macro_block_size=args.macro_block_size,
+    )
+    try:
+        # Initialize state once
+        s0 = substrate.init_state(rng, best_member)
+        steps_done = 0
+        while args.max_steps is None or steps_done < args.max_steps:
+            b = args.batch_steps if args.max_steps is None else min(args.batch_steps, args.max_steps - steps_done)
+            data = rollout_simulation(rng, best_member, s0=s0, substrate=substrate, fm=None,
+                                      rollout_steps=b, time_sampling='video', img_size=args.img_size, return_state=True)
+            rgb = np.asarray(data['rgb'])  # (b, H, W, 3)
+            s0 = data.get('state_final', s0)
+            # write frames
+            vid_u8 = (np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8)
+            for frame in vid_u8:
+                writer.append_data(frame)
+            steps_done += b
+    except KeyboardInterrupt:
+        print("Interrupted by user; finalizing video...")
+    finally:
+        writer.close()
+        print(f"Saved simulation to {args.output} (best fitness: {np.array(best_fitness).item():.4f})")
 
 
 if __name__ == '__main__':
