@@ -28,6 +28,9 @@ group = parser.add_argument_group("substrate")
 group.add_argument("--substrate", type=str, default='lenia', help="name of the substrate")
 group.add_argument("--rollout_steps", type=int, default=None, help="number of rollout timesteps, leave None for the default of the substrate")
 group.add_argument("--seed_n_patches", type=int, default=1, help="for lenia_flow: number of random non-overlapping seed patches")
+group.add_argument("--mutations", action='store_true', help="for lenia_flow: enable parameter patch mutations during rollout")
+group.add_argument("--mutation_sz", type=int, default=20, help="for lenia_flow: size of mutation patch")
+group.add_argument("--mutation_p", type=float, default=0.1, help="for lenia_flow: probability of mutation each step")
 
 group = parser.add_argument_group("evaluation")
 group.add_argument("--foundation_model", type=str, default="clip", help="the foundation model to use (don't touch this)")
@@ -84,6 +87,14 @@ def main(args):
         if hasattr(substrate, 'seed_n_patches'):
             try:
                 substrate.seed_n_patches = int(args.seed_n_patches)
+            except Exception:
+                pass
+        # Optional: control mutation behavior for FlowLenia
+        if hasattr(substrate, 'mutation_enabled'):
+            try:
+                substrate.mutation_enabled = bool(args.mutations)
+                substrate.mutation_sz = int(args.mutation_sz)
+                substrate.mutation_p = float(args.mutation_p)
             except Exception:
                 pass
         substrate = substrates.FlattenSubstrateParameters(substrate)

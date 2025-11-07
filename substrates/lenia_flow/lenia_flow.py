@@ -42,6 +42,10 @@ class FlowLenia:
         seed_n_patches: int = 1,
         clip1: float = float("inf"),
         clip2: float = float("inf"),
+        # mutation controls (optional)
+        mutation: bool = False,
+        mutation_patch_size: int = 20,
+        mutation_prob: float = 0.1,
     ):
         self.grid_size = grid_size
         self.C = C
@@ -56,6 +60,10 @@ class FlowLenia:
         self.seed_n_patches = seed_n_patches
         self.clip1 = clip1
         self.clip2 = clip2
+        # mutation
+        self.mutation_enabled = bool(mutation)
+        self.mutation_sz = int(mutation_patch_size)
+        self.mutation_p = float(mutation_prob)
 
         # Connectivity: by default, all k kernels read from channel 0 and
         # contribute to channel 0 (for C=1). For C>1, still route all to ch 0.
@@ -238,6 +246,23 @@ class FlowLenia:
         F = jnp.clip(F * (1 - alpha) - C_grad * alpha, -mag, mag)
 
         nA, nP = self.RT(A, P, F)
+
+        # Optional mutation: inject a random parameter patch into P
+        if self.mutation_enabled:
+            kmut, kpos, kprob = jr.split(rng, 3)
+            sz = max(1, min(self.mutation_sz, nP.shape[0], nP.shape[1]))
+            kdim = nP.shape[-1]
+            # mutation tensor and location
+            mut = jnp.ones((sz, sz, kdim)) * jr.normal(kmut, (1, 1, kdim))
+            max_i = nP.shape[0] - sz
+            max_j = nP.shape[1] - sz
+            ki, kj = jr.split(kpos)
+            i0 = jr.randint(ki, (), 0, max_i + 1)
+            j0 = jr.randint(kj, (), 0, max_j + 1)
+            dP = jax.lax.dynamic_update_slice(jnp.zeros_like(nP), mut, (i0, j0, 0))
+            msk = (jr.uniform(kprob, ()) < self.mutation_p).astype(nP.dtype)
+            nP = nP + dP * msk
+
         return {"A": nA, "P": nP, "fK": fK, "m": m, "s": s}
 
     def render_state(self, state, params, img_size=None):

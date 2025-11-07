@@ -30,6 +30,9 @@ def main():
     parser.add_argument('--img_size', type=int, default=224, help='Render size')
     parser.add_argument('--seed', type=int, default=0, help='Random seed for rollout')
     parser.add_argument('--n_seeds', type=int, default=1, help='For FlowLenia: number of random non-overlapping seed patches')
+    parser.add_argument('--mutations', action='store_true', help='For FlowLenia: enable parameter patch mutations during rollout')
+    parser.add_argument('--mutation_sz', type=int, default=20, help='For FlowLenia: size of mutation patch')
+    parser.add_argument('--mutation_p', type=float, default=0.1, help='For FlowLenia: probability of mutation each step')
     parser.add_argument('--output', type=str, default='tmp.gif', help='Output GIF path')
     args = parser.parse_args()
 
@@ -44,6 +47,13 @@ def main():
     if hasattr(substrate, 'seed_n_patches') and args.n_seeds is not None:
         try:
             substrate.seed_n_patches = int(args.n_seeds)
+        except Exception:
+            pass
+    if hasattr(substrate, 'mutation_enabled'):
+        try:
+            substrate.mutation_enabled = bool(args.mutations)
+            substrate.mutation_sz = int(args.mutation_sz)
+            substrate.mutation_p = float(args.mutation_p)
         except Exception:
             pass
     substrate = substrates.FlattenSubstrateParameters(substrate)
