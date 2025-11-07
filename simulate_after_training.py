@@ -30,6 +30,9 @@ def main():
     parser.add_argument('--img_size', type=int, default=224, help='Render size')
     parser.add_argument('--seed', type=int, default=0, help='Random seed for rollout')
     parser.add_argument('--n_seeds', type=int, default=1, help='For FlowLenia: number of random non-overlapping seed patches')
+    parser.add_argument('--seed_mode', type=str, default='notebook_centers', choices=['center','random_patches','notebook_centers'], help='For FlowLenia: seeding mode')
+    parser.add_argument('--p_constant_per_patch', type=int, default=1, help='For FlowLenia: 1 per-patch constant P, 0 per-pixel random P')
+    parser.add_argument('--render_mode', type=str, default='Pcolor', choices=['A','Pcolor'], help='For FlowLenia: rendering mode')
     parser.add_argument('--mutations', action='store_true', help='For FlowLenia: enable parameter patch mutations during rollout')
     parser.add_argument('--mutation_sz', type=int, default=20, help='For FlowLenia: size of mutation patch')
     parser.add_argument('--mutation_p', type=float, default=0.1, help='For FlowLenia: probability of mutation each step')
@@ -47,6 +50,21 @@ def main():
     if hasattr(substrate, 'seed_n_patches') and args.n_seeds is not None:
         try:
             substrate.seed_n_patches = int(args.n_seeds)
+        except Exception:
+            pass
+    if hasattr(substrate, 'seed_mode'):
+        try:
+            substrate.seed_mode = str(args.seed_mode)
+        except Exception:
+            pass
+    if hasattr(substrate, 'p_constant_per_patch'):
+        try:
+            substrate.p_constant_per_patch = bool(int(args.p_constant_per_patch))
+        except Exception:
+            pass
+    if hasattr(substrate, 'render_mode'):
+        try:
+            substrate.render_mode = str(args.render_mode)
         except Exception:
             pass
     if hasattr(substrate, 'mutation_enabled'):

@@ -76,38 +76,20 @@ def rollout_simulation(rng, params, s0=None,
         _, data = jax.lax.scan(step_fn, s0, split(rng, rollout_steps))
         return data
     elif isinstance(time_sampling, int) or isinstance(time_sampling, tuple): # return the rollout at K sampled intervals
+        # Memory-efficient: do not store all T states; process in K chunks
         K, chunk_ends = time_sampling if isinstance(time_sampling, tuple) else (time_sampling, False)
+        assert rollout_steps % K == 0, "For memory-efficient sampling, require rollout_steps % K == 0"
         chunk_steps = rollout_steps // K
         def step_fn(state, _rng):
             next_state = substrate.step_state(_rng, state, params)
-            return next_state, state
-        _, state_vid = jax.lax.scan(step_fn, s0, split(rng, rollout_steps))
-        if chunk_ends:
-            idx_sample = jnp.arange(chunk_steps-1, rollout_steps, chunk_steps)
-        else:
-            idx_sample = jnp.arange(0, rollout_steps, chunk_steps)
-        state_vid = jax.tree.map(lambda x: x[idx_sample], state_vid)
-        def render_state(_, state):
-            img = substrate.render_state(state, params=params, img_size=img_size)
+            return next_state, None
+        def chunk_fn(state, _rng):
+            next_state, _ = jax.lax.scan(step_fn, state, split(_rng, chunk_steps))
+            state_to_use = next_state if chunk_ends else state
+            img = substrate.render_state(state_to_use, params=params, img_size=img_size)
             z = embed_img_fn(img)
-            return _, dict(state=state, rgb=img, z=z)
-        _, data = jax.lax.scan(render_state, None, state_vid)
+            return next_state, dict(rgb=img, z=z, state=(state_to_use if return_state else None))
+        _, data = jax.lax.scan(chunk_fn, s0, split(rng, K))
         return data
-    # elif isinstance(time_sampling, int) or isinstance(time_sampling, tuple): # return the rollout at K sampled intervals
-    #     K, chunk_ends = time_sampling if isinstance(time_sampling, tuple) else (time_sampling, False)
-    #     assert rollout_steps % K == 0
-    #     chunk_steps = rollout_steps // K
-    #     print(rollout_steps, K, chunk_steps)
-    #     def step_fn(state, _rng):
-    #         next_state = substrate.step_state(_rng, state, params)
-    #         return next_state, None
-    #     def chunk_fn(state, _rng):
-    #         next_state, _ = jax.lax.scan(step_fn, state, split(_rng, chunk_steps))
-    #         state_to_use = next_state if chunk_ends else state
-    #         img = substrate.render_state(state_to_use, params=params, img_size=img_size)
-    #         z = embed_img_fn(img)
-    #         return next_state, dict(rgb=img, z=z, state=(state_to_use if return_state else None))
-    #     state_final, data = jax.lax.scan(chunk_fn, s0, split(rng, K))
-    #     return data
     else:
         raise ValueError(f"time_sampling {time_sampling} not recognized")

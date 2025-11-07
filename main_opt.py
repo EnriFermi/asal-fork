@@ -31,6 +31,9 @@ group.add_argument("--seed_n_patches", type=int, default=1, help="for lenia_flow
 group.add_argument("--mutations", action='store_true', help="for lenia_flow: enable parameter patch mutations during rollout")
 group.add_argument("--mutation_sz", type=int, default=20, help="for lenia_flow: size of mutation patch")
 group.add_argument("--mutation_p", type=float, default=0.1, help="for lenia_flow: probability of mutation each step")
+group.add_argument("--seed_mode", type=str, default='notebook_centers', choices=['center','random_patches','notebook_centers'], help="for lenia_flow: seeding mode")
+group.add_argument("--p_constant_per_patch", type=int, default=1, help="for lenia_flow: 1 for per-patch constant P, 0 for per-pixel random P")
+group.add_argument("--render_mode", type=str, default='Pcolor', choices=['A','Pcolor'], help="for lenia_flow: rendering mode")
 
 group = parser.add_argument_group("evaluation")
 group.add_argument("--foundation_model", type=str, default="clip", help="the foundation model to use (don't touch this)")
@@ -87,6 +90,21 @@ def main(args):
         if hasattr(substrate, 'seed_n_patches'):
             try:
                 substrate.seed_n_patches = int(args.seed_n_patches)
+            except Exception:
+                pass
+        if hasattr(substrate, 'seed_mode'):
+            try:
+                substrate.seed_mode = str(args.seed_mode)
+            except Exception:
+                pass
+        if hasattr(substrate, 'p_constant_per_patch'):
+            try:
+                substrate.p_constant_per_patch = bool(int(args.p_constant_per_patch))
+            except Exception:
+                pass
+        if hasattr(substrate, 'render_mode'):
+            try:
+                substrate.render_mode = str(args.render_mode)
             except Exception:
                 pass
         # Optional: control mutation behavior for FlowLenia
@@ -149,6 +167,17 @@ def main(args):
 
             show_video(rgb)
             run.log({'train_sample': wandb.Video((np.asarray(rgb) * 255).astype(np.uint8).transpose(0, 3, 1, 2), fps=4, format="gif")})
+
+            # After step: run a full rollout (all frames) for W&B logging using best-so-far params
+            try:
+                rng, _rng_vid = split(rng)
+                best_params = es_state.best_member
+                vid_data = rollout_simulation(_rng_vid, best_params, s0=None, substrate=substrate, fm=None,
+                                              rollout_steps=args.rollout_steps, time_sampling='video', img_size=224, return_state=False)
+                vid = (np.asarray(vid_data['rgb']) * 255).astype(np.uint8).transpose(0, 3, 1, 2)
+                run.log({'train_video': wandb.Video(vid, fps=8, format='gif')})
+            except Exception as e:
+                print(f"Full video logging failed: {e}")
 
             data.append(di)
             pbar.set_postfix(best_loss=es_state.best_fitness.item())
