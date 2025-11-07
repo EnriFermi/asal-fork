@@ -213,11 +213,11 @@ class FlowLenia:
             def body(t, carry):
                 A_cur, P_cur = carry
                 A_patch = jr.uniform(k_list[t], (sz, sz, self.C))
+                P_patch = jnp.ones((sz, sz, self.k)) * P_vec
                 i0 = i0s[t]
                 j0 = j0s[t]
-                A_cur = A_cur.at[i0:i0+sz, j0:j0+sz, :].set(A_patch)
-                P_patch = jnp.ones((sz, sz, self.k)) * P_vec
-                P_cur = P_cur.at[i0:i0+sz, j0:j0+sz, :].set(P_patch)
+                A_cur = jax.lax.dynamic_update_slice(A_cur, A_patch, (i0, j0, 0))
+                P_cur = jax.lax.dynamic_update_slice(P_cur, P_patch, (i0, j0, 0))
                 return (A_cur, P_cur)
 
             A, P = jax.lax.fori_loop(0, n_target, body, (A, P))
