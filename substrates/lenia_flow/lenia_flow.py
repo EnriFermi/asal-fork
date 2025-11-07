@@ -192,35 +192,25 @@ class FlowLenia:
             P_patch = jnp.ones((sz, sz, self.k)) * P_vec
             P = P.at[i0:i0+sz, j0:j0+sz, :].set(P_patch)
         else:
-            # Multiple random patches, non-overlapping by placing on a stride grid of size sz
-            # Choose random grid cells without replacement
-            n_i = (self.grid_size - sz) // sz + 1
-            n_j = (self.grid_size - sz) // sz + 1
-            n_cells = n_i * n_j
-            n_target = max(1, min(int(self.seed_n_patches), n_cells))
-
-            key_pos, kA_p = split(kA)
-            perm = jr.permutation(key_pos, n_cells)  # shape (n_cells,)
-            sel = perm[:n_target]
-            i_idx = sel // n_j
-            j_idx = sel % n_j
-            i0s = i_idx * sz
-            j0s = j_idx * sz
-
-            # Prepare random keys for patches
-            k_list = jr.split(kA_p, n_target)
+            # Multiple random patches (overlap allowed). JAX-safe dynamic placement.
+            n_target = max(1, int(self.seed_n_patches))
+            max_i = self.grid_size - sz
+            max_j = self.grid_size - sz
+            key_loop = kA
 
             def body(t, carry):
-                A_cur, P_cur = carry
-                A_patch = jr.uniform(k_list[t], (sz, sz, self.C))
+                A_cur, P_cur, key_cur = carry
+                # Split keys for position and patch
+                key_next, kA_t, ki, kj = jr.split(key_cur, 4)
+                i0 = jr.randint(ki, (), 0, max_i + 1)
+                j0 = jr.randint(kj, (), 0, max_j + 1)
+                A_patch = jr.uniform(kA_t, (sz, sz, self.C))
                 P_patch = jnp.ones((sz, sz, self.k)) * P_vec
-                i0 = i0s[t]
-                j0 = j0s[t]
                 A_cur = jax.lax.dynamic_update_slice(A_cur, A_patch, (i0, j0, 0))
                 P_cur = jax.lax.dynamic_update_slice(P_cur, P_patch, (i0, j0, 0))
-                return (A_cur, P_cur)
+                return (A_cur, P_cur, key_next)
 
-            A, P = jax.lax.fori_loop(0, n_target, body, (A, P))
+            A, P, _ = jax.lax.fori_loop(0, n_target, body, (A, P, key_loop))
 
         state = {"A": A, "P": P, "fK": fK, "m": m, "s": s}
         # Step once to avoid trivial zero image, like Lenia
