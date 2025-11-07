@@ -1,6 +1,6 @@
 import os
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-os.environ["JAX_PLATFORM_NAME"] = "cpu"
+# os.environ["JAX_PLATFORM_NAME"] = "cpu"
 
 import argparse
 from functools import partial
@@ -12,12 +12,19 @@ import numpy as np
 import evosax
 from tqdm.auto import tqdm
 
+from torch.profiler import profile, record_function, ProfilerActivity
+import jax.profiler
+# jax.profiler.start_server(6969)
+
 import substrates
 import foundation_models
 from rollout import rollout_simulation
 import asal_metrics
 import wandb
 import util
+
+print(jax.devices())
+print(jax.default_backend())
 
 parser = argparse.ArgumentParser()
 group = parser.add_argument_group("meta")
@@ -125,7 +132,10 @@ def main(args):
 
         data = []
         pbar = tqdm(range(args.n_iters))
+        # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True, profile_memory=True) as prof:
+        # with jax.profiler.trace("prof_dir", create_perfetto_link=True):
         for i_iter in pbar:
+            # with record_function('opt_iter'):
             rng, _rng = split(rng)
             es_state, di, rgb = do_iter(es_state, _rng)
 
@@ -141,7 +151,9 @@ def main(args):
                 util.save_pkl(args.save_dir, "best", best)
     finally:
         run.finish()
-    
+
+    # print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=50))
+
 
 if __name__ == '__main__':
     main(parse_args())
