@@ -39,8 +39,13 @@ class FlowLenia:
         border: str = "wall",
         mix_rule: str = "stoch",
         seed_patch_size: int = 40,
+        seed_n_patches: int = 1,
         clip1: float = float("inf"),
         clip2: float = float("inf"),
+        # mutation controls (optional)
+        mutation: bool = False,
+        mutation_patch_size: int = 20,
+        mutation_prob: float = 0.1,
     ):
         self.grid_size = grid_size
         self.C = C
@@ -52,8 +57,13 @@ class FlowLenia:
         self.border = border
         self.mix_rule = mix_rule
         self.seed_patch_size = seed_patch_size
+        self.seed_n_patches = seed_n_patches
         self.clip1 = clip1
         self.clip2 = clip2
+        # mutation
+        self.mutation_enabled = bool(mutation)
+        self.mutation_sz = int(mutation_patch_size)
+        self.mutation_p = float(mutation_prob)
 
         # Connectivity: by default, all k kernels read from channel 0 and
         # contribute to channel 0 (for C=1). For C>1, still route all to ch 0.
@@ -167,17 +177,50 @@ class FlowLenia:
         A = jnp.zeros((self.cfg.X, self.cfg.Y, self.cfg.C))
         P = jnp.zeros((self.cfg.X, self.cfg.Y, self.cfg.k))
 
-        # Seed a central patch for A with uniform noise and P with a constant vector
+        # Seed patch(es): either one central patch or multiple random, non-overlapping patches
         kA, kP = split(rng)
         sz = int(self.seed_patch_size)
         sz = max(1, min(sz, self.grid_size))
-        i0 = self.grid_size // 2 - sz // 2
-        j0 = self.grid_size // 2 - sz // 2
-        A_patch = jr.uniform(kA, (sz, sz, self.C))
-        A = A.at[i0:i0+sz, j0:j0+sz, :].set(A_patch)
         P_vec = jr.uniform(kP, (1, 1, self.k))
-        P_patch = jnp.ones((sz, sz, self.k)) * P_vec
-        P = P.at[i0:i0+sz, j0:j0+sz, :].set(P_patch)
+
+        if self.seed_n_patches <= 1:
+            # Single central patch (backward-compatible behavior)
+            i0 = self.grid_size // 2 - sz // 2
+            j0 = self.grid_size // 2 - sz // 2
+            A_patch = jr.uniform(kA, (sz, sz, self.C))
+            A = A.at[i0:i0+sz, j0:j0+sz, :].set(A_patch)
+            P_patch = jnp.ones((sz, sz, self.k)) * P_vec
+            P = P.at[i0:i0+sz, j0:j0+sz, :].set(P_patch)
+        else:
+            # Multiple random patches, ensure no overlap
+            # Rejection sampling of top-left corners
+            max_i = self.grid_size - sz
+            max_j = self.grid_size - sz
+            placed = []  # list of (i0, j0)
+            key_pos = kA
+
+            def overlaps(i, j, placed_list):
+                for (pi, pj) in placed_list:
+                    if (i < pi + sz) and (pi < i + sz) and (j < pj + sz) and (pj < j + sz):
+                        return True
+                return False
+
+            n_target = int(self.seed_n_patches)
+            n_target = max(1, n_target)
+            attempts = 0
+            max_attempts = 10000
+            while (len(placed) < n_target) and (attempts < max_attempts):
+                attempts += 1
+                key_pos, ki, kj, kpatch = jr.split(key_pos, 4)
+                i0 = int(jr.randint(ki, (), 0, max_i + 1))
+                j0 = int(jr.randint(kj, (), 0, max_j + 1))
+                if overlaps(i0, j0, placed):
+                    continue
+                placed.append((i0, j0))
+                A_patch = jr.uniform(kpatch, (sz, sz, self.C))
+                A = A.at[i0:i0+sz, j0:j0+sz, :].set(A_patch)
+                P_patch = jnp.ones((sz, sz, self.k)) * P_vec
+                P = P.at[i0:i0+sz, j0:j0+sz, :].set(P_patch)
 
         state = {"A": A, "P": P, "fK": fK, "m": m, "s": s}
         # Step once to avoid trivial zero image, like Lenia
@@ -203,6 +246,23 @@ class FlowLenia:
         F = jnp.clip(F * (1 - alpha) - C_grad * alpha, -mag, mag)
 
         nA, nP = self.RT(A, P, F)
+
+        # Optional mutation: inject a random parameter patch into P
+        if self.mutation_enabled:
+            kmut, kpos, kprob = jr.split(rng, 3)
+            sz = max(1, min(self.mutation_sz, nP.shape[0], nP.shape[1]))
+            kdim = nP.shape[-1]
+            # mutation tensor and location
+            mut = jnp.ones((sz, sz, kdim)) * jr.normal(kmut, (1, 1, kdim))
+            max_i = nP.shape[0] - sz
+            max_j = nP.shape[1] - sz
+            ki, kj = jr.split(kpos)
+            i0 = jr.randint(ki, (), 0, max_i + 1)
+            j0 = jr.randint(kj, (), 0, max_j + 1)
+            dP = jax.lax.dynamic_update_slice(jnp.zeros_like(nP), mut, (i0, j0, 0))
+            msk = (jr.uniform(kprob, ()) < self.mutation_p).astype(nP.dtype)
+            nP = nP + dP * msk
+
         return {"A": nA, "P": nP, "fK": fK, "m": m, "s": s}
 
     def render_state(self, state, params, img_size=None):
