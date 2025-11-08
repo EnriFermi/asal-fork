@@ -85,43 +85,31 @@ def main():
 
     rng = jax.random.PRNGKey(args.seed)
 
-    # If time_sampling is 'video' and max_steps is provided, we can write at once via iio.imwrite; otherwise stream in batches
-    if args.max_steps is not None and args.max_steps <= rollout_steps and args.time_sampling == 'video':
+    if args.time_sampling != 'video':
+        # Non-video modes can be done in one shot safely
+        ts = parse_time_sampling(args.time_sampling)
         data = rollout_simulation(rng, best_member, s0=None, substrate=substrate, fm=None,
-                                  rollout_steps=args.max_steps, time_sampling='video', img_size=args.img_size, return_state=False)
-        vid = np.asarray(data['rgb'])
+                                  rollout_steps=rollout_steps, time_sampling=ts, img_size=args.img_size, return_state=False)
+        rgb = np.asarray(data['rgb'])
+        vid = rgb if isinstance(ts, int) else rgb[None]
         vid_u8 = (np.clip(vid, 0.0, 1.0) * 255).astype(np.uint8)
-        iio.imwrite(
-            args.output,
-            vid_u8,
-            fps=args.fps,
-            codec=args.codec,
-            macro_block_size=args.macro_block_size,
-        )
+        iio.imwrite(args.output, vid_u8, fps=args.fps, codec=args.codec, macro_block_size=args.macro_block_size)
         print(f"Saved simulation to {args.output} (best fitness: {np.array(best_fitness).item():.4f})")
         return
 
-    # Streaming writer: run indefinitely (or up to max_steps) in batches
-    writer = imageio.get_writer(
-        args.output,
-        fps=args.fps,
-        codec=args.codec,
-        macro_block_size=args.macro_block_size,
-    )
+    # Streaming writer for 'video': step and render without stacking in memory
+    writer = imageio.get_writer(args.output, fps=args.fps, codec=args.codec, macro_block_size=args.macro_block_size)
     try:
-        # Initialize state once
-        s0 = substrate.init_state(rng, best_member)
+        s = substrate.init_state(rng, best_member)
         steps_done = 0
         while args.max_steps is None or steps_done < args.max_steps:
             b = args.batch_steps if args.max_steps is None else min(args.batch_steps, args.max_steps - steps_done)
-            data = rollout_simulation(rng, best_member, s0=s0, substrate=substrate, fm=None,
-                                      rollout_steps=b, time_sampling='video', img_size=args.img_size, return_state=True)
-            rgb = np.asarray(data['rgb'])  # (b, H, W, 3)
-            s0 = data.get('state_final', s0)
-            # write frames
-            vid_u8 = (np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8)
-            for frame in vid_u8:
-                writer.append_data(frame)
+            for _ in range(b):
+                rng, _rng = split(rng)
+                s = substrate.step_state(_rng, s, best_member)
+                frame = substrate.render_state(s, best_member, img_size=args.img_size)
+                frame_u8 = (np.clip(np.asarray(frame), 0.0, 1.0) * 255).astype(np.uint8)
+                writer.append_data(frame_u8)
             steps_done += b
     except KeyboardInterrupt:
         print("Interrupted by user; finalizing video...")
