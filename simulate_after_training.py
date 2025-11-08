@@ -7,6 +7,7 @@ from jax.random import split
 import numpy as np
 import imageio.v3 as iio
 import imageio  # for streaming writer
+import matplotlib.pyplot as plt
 
 import substrates
 from rollout import rollout_simulation
@@ -37,12 +38,27 @@ def main():
     parser.add_argument('--mutations', action='store_true', help='For FlowLenia: enable parameter patch mutations during rollout')
     parser.add_argument('--mutation_sz', type=int, default=20, help='For FlowLenia: size of mutation patch')
     parser.add_argument('--mutation_p', type=float, default=0.1, help='For FlowLenia: probability of mutation each step')
+    # food mechanics
+    parser.add_argument('--food', action='store_true', help='For FlowLenia: enable food mechanics (decay + spawn + consumption)')
+    parser.add_argument('--food_interval', type=int, default=128, help='For FlowLenia: steps between food spawns')
+    parser.add_argument('--food_n', type=int, default=3, help='For FlowLenia: number of food patches per spawn')
+    parser.add_argument('--food_sz', type=int, default=16, help='For FlowLenia: food patch size')
+    parser.add_argument('--food_amount', type=float, default=1.0, help='For FlowLenia: amount of food per cell in patch')
+    parser.add_argument('--food_consume_rate', type=float, default=0.05, help='For FlowLenia: rate of consumption per step per pixel relative to green mass')
+    parser.add_argument('--food_bonus', type=float, default=1.0, help='For FlowLenia: multiplier converting food to mass')
+    parser.add_argument('--mass_decay', type=float, default=0.0, help='For FlowLenia: uniform mass decay per step')
+    parser.add_argument('--food_channel', type=int, default=1, help='For FlowLenia: which channel consumes food (0=R,1=G,2=B)')
+    parser.add_argument('--food_auto_size', action='store_true', help='For FlowLenia: auto-set food patch size to compensate decay per spawn')
+    parser.add_argument('--food_conv_mode', type=str, default='scalar', choices=['scalar','conv'], help='For FlowLenia: consumption mode')
     parser.add_argument('--output', type=str, default='out.mp4', help='Output MP4 path')
     parser.add_argument('--fps', type=int, default=250, help='Output video FPS')
     parser.add_argument('--codec', type=str, default='libx264', help='Video codec (e.g., libx264)')
     parser.add_argument('--macro_block_size', type=int, default=None, help='Macro block size for encoder (set None to disable)')
-    parser.add_argument('--batch_steps', type=int, default=256, help='Number of steps per batch when streaming')
+    parser.add_argument('--batch_steps', type=int, default=256, help='Number of steps per batch when streaming (frames written per outer loop)')
+    parser.add_argument('--jit_microbatch', type=int, default=64, help='Frames computed per JIT call inside each batch (smaller avoids OOM)')
     parser.add_argument('--max_steps', type=int, default=None, help='Total number of steps to run; None for until interrupted')
+    parser.add_argument('--mass_plot', type=str, default='mass.png', help='Path to save mass traces plot (total and per-channel)')
+    parser.add_argument('--log_mass_every', type=int, default=1000, help='Print total mass every N frames')
     args = parser.parse_args()
 
     best_path = os.path.join(args.save_dir, 'best.pkl')
@@ -80,6 +96,24 @@ def main():
             substrate.mutation_p = float(args.mutation_p)
         except Exception:
             pass
+    # Food mechanics
+    if hasattr(substrate, 'food_enabled'):
+        try:
+            substrate.food_enabled = bool(args.food)
+            substrate.food_spawn_interval = int(args.food_interval)
+            substrate.food_n_patches = int(args.food_n)
+            substrate.food_patch_size = int(args.food_sz)
+            substrate.food_amount = float(args.food_amount)
+            substrate.food_consume_rate = float(args.food_consume_rate)
+            substrate.food_bonus = float(args.food_bonus)
+            substrate.mass_decay = float(args.mass_decay)
+            substrate.food_green_channel = int(args.food_channel)
+            if hasattr(substrate, 'food_auto_size'):
+                substrate.food_auto_size = bool(args.food_auto_size)
+            if hasattr(substrate, 'food_conv_mode'):
+                substrate.food_conv_mode = str(args.food_conv_mode)
+        except Exception:
+            pass
     substrate = substrates.FlattenSubstrateParameters(substrate)
     rollout_steps = substrate.rollout_steps if args.rollout_steps is None else args.rollout_steps
 
@@ -97,25 +131,85 @@ def main():
         print(f"Saved simulation to {args.output} (best fitness: {np.array(best_fitness).item():.4f})")
         return
 
-    # Streaming writer for 'video': step and render without stacking in memory
+    # Build JIT-compiled microbatch stepper that returns (state_next, frames[mb, H, W, 3])
+    def build_batch_stepper(mb: int):
+        def run_batch(state, rng):
+            rngs = jax.random.split(rng, mb)
+            frames0 = jnp.zeros((mb, args.img_size, args.img_size, 3), dtype=jnp.float32)
+            # infer channel count from current state at trace time
+            # we create a dummy mass buffer matching channels in A
+            A0 = state["A"]
+            C = A0.shape[-1]
+            masses0 = jnp.zeros((mb, C), dtype=jnp.float32)
+
+            def body(i, carry):
+                s, frames, masses = carry
+                s = substrate.step_state(rngs[i], s, best_member)
+                frame = substrate.render_state(s, best_member, img_size=args.img_size)
+                frames = frames.at[i].set(frame)
+                mch = jnp.sum(s["A"], axis=(0, 1))  # per-channel mass
+                masses = masses.at[i].set(mch)
+                return (s, frames, masses)
+
+            state_next, frames, masses = jax.lax.fori_loop(0, mb, body, (state, frames0, masses0))
+            return state_next, frames, masses
+
+        return jax.jit(run_batch)
+
+    step_micro = build_batch_stepper(int(args.jit_microbatch))
+
+    # Streaming writer for 'video': compute frames in jitted microbatches and append
     writer = imageio.get_writer(args.output, fps=args.fps, codec=args.codec, macro_block_size=args.macro_block_size)
     try:
         s = substrate.init_state(rng, best_member)
+        # setup mass traces
+        C = int(np.asarray(s["A"]).shape[-1])
+        mass_total = []
+        mass_channels = [ [] for _ in range(C) ]
         steps_done = 0
         while args.max_steps is None or steps_done < args.max_steps:
-            b = args.batch_steps if args.max_steps is None else min(args.batch_steps, args.max_steps - steps_done)
-            for _ in range(b):
+            outer_b = args.batch_steps if args.max_steps is None else min(args.batch_steps, args.max_steps - steps_done)
+            remaining = outer_b
+            while remaining > 0:
+                mb = int(args.jit_microbatch)
+                mb = remaining if remaining < mb else mb
                 rng, _rng = split(rng)
-                s = substrate.step_state(_rng, s, best_member)
-                frame = substrate.render_state(s, best_member, img_size=args.img_size)
-                frame_u8 = (np.clip(np.asarray(frame), 0.0, 1.0) * 255).astype(np.uint8)
-                writer.append_data(frame_u8)
-            steps_done += b
+                s, batch_frames, batch_masses = step_micro(s, _rng)
+                batch_frames = np.asarray(batch_frames[:mb])  # (mb, H, W, 3)
+                batch_masses = np.asarray(batch_masses[:mb])  # (mb, C)
+                batch_u8 = (np.clip(batch_frames, 0.0, 1.0) * 255).astype(np.uint8)
+                for frame in batch_u8:
+                    writer.append_data(frame)
+                # record masses
+                for i in range(batch_masses.shape[0]):
+                    mchs = batch_masses[i]
+                    for c in range(C):
+                        mass_channels[c].append(float(mchs[c]))
+                    mass_total.append(float(np.sum(mchs)))
+                # periodic log
+                if args.log_mass_every > 0 and (steps_done // args.log_mass_every) != ((steps_done + mb) // args.log_mass_every):
+                    print(f"Step {steps_done+mb}: total mass {mass_total[-1]:.6f}")
+                remaining -= mb
+                steps_done += mb
     except KeyboardInterrupt:
         print("Interrupted by user; finalizing video...")
     finally:
         writer.close()
         print(f"Saved simulation to {args.output} (best fitness: {np.array(best_fitness).item():.4f})")
+        # save mass plot
+        try:
+            plt.figure(figsize=(8,4))
+            for c in range(C):
+                plt.plot(mass_channels[c], label=f'ch{c}')
+            plt.plot(mass_total, label='total', linewidth=2, color='k', alpha=0.7)
+            plt.xlabel('frame')
+            plt.ylabel('mass (sum over grid)')
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(args.mass_plot, dpi=150)
+            print(f"Saved mass traces to {args.mass_plot}")
+        except Exception as e:
+            print(f"Failed to save mass plot: {e}")
 
 
 if __name__ == '__main__':

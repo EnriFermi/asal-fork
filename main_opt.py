@@ -34,6 +34,17 @@ group.add_argument("--mutation_p", type=float, default=0.1, help="for lenia_flow
 group.add_argument("--seed_mode", type=str, default='notebook_centers', choices=['center','random_patches','notebook_centers'], help="for lenia_flow: seeding mode")
 group.add_argument("--p_constant_per_patch", type=int, default=1, help="for lenia_flow: 1 for per-patch constant P, 0 for per-pixel random P")
 group.add_argument("--render_mode", type=str, default='Pcolor', choices=['A','Pcolor'], help="for lenia_flow: rendering mode")
+group.add_argument("--food", action='store_true', help="for lenia_flow: enable food mechanics (decay + spawn + consumption)")
+group.add_argument("--food_interval", type=int, default=128, help="for lenia_flow: steps between food spawns")
+group.add_argument("--food_n", type=int, default=3, help="for lenia_flow: number of food patches per spawn")
+group.add_argument("--food_sz", type=int, default=16, help="for lenia_flow: food patch size")
+group.add_argument("--food_amount", type=float, default=1.0, help="for lenia_flow: amount of food per cell in patch")
+group.add_argument("--food_consume_rate", type=float, default=0.05, help="for lenia_flow: rate of consumption per step per pixel relative to green mass")
+group.add_argument("--food_bonus", type=float, default=1.0, help="for lenia_flow: multiplier converting food to mass")
+group.add_argument("--mass_decay", type=float, default=0.0, help="for lenia_flow: uniform mass decay per step")
+group.add_argument("--food_channel", type=int, default=1, help="for lenia_flow: which channel consumes food (0=R,1=G,2=B)")
+group.add_argument("--food_auto_size", action='store_true', help="for lenia_flow: auto-set food patch size to compensate decay per spawn")
+group.add_argument("--food_conv_mode", type=str, default='scalar', choices=['scalar','conv'], help="for lenia_flow: consumption mode")
 
 group = parser.add_argument_group("evaluation")
 group.add_argument("--foundation_model", type=str, default="clip", help="the foundation model to use (don't touch this)")
@@ -105,6 +116,24 @@ def main(args):
         if hasattr(substrate, 'render_mode'):
             try:
                 substrate.render_mode = str(args.render_mode)
+            except Exception:
+                pass
+        # Optional: food mechanics
+        if hasattr(substrate, 'food_enabled'):
+            try:
+                substrate.food_enabled = bool(args.food)
+                substrate.food_spawn_interval = int(args.food_interval)
+                substrate.food_n_patches = int(args.food_n)
+                substrate.food_patch_size = int(args.food_sz)
+                substrate.food_amount = float(args.food_amount)
+                substrate.food_consume_rate = float(args.food_consume_rate)
+                substrate.food_bonus = float(args.food_bonus)
+                substrate.mass_decay = float(args.mass_decay)
+                substrate.food_green_channel = int(args.food_channel)
+                if hasattr(substrate, 'food_auto_size'):
+                    substrate.food_auto_size = bool(args.food_auto_size)
+                if hasattr(substrate, 'food_conv_mode'):
+                    substrate.food_conv_mode = str(args.food_conv_mode)
             except Exception:
                 pass
         # Optional: control mutation behavior for FlowLenia
