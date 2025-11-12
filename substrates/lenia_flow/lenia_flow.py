@@ -49,6 +49,19 @@ class FlowLenia:
         mutation: bool = False,
         mutation_patch_size: int = 20,
         mutation_prob: float = 0.1,
+        # food/resource mechanics (optional)
+        food_enabled: bool = False,
+        food_spawn_interval: int = 128,
+        food_n_patches: int = 3,
+        food_patch_size: int = 16,
+        food_amount: float = 1.0,
+        food_consume_rate: float = 0.05,
+        food_bonus: float = 1.0,
+        mass_decay: float = 0.0,
+        food_green_channel: int = 1,
+        food_auto_size: bool = False,
+        food_conv_mode: str = "scalar",  # 'scalar' | 'conv'
+        food_vis_scale: float = 1.0,
     ):
         self.grid_size = grid_size
         self.C = C
@@ -70,6 +83,19 @@ class FlowLenia:
         self.mutation_enabled = bool(mutation)
         self.mutation_sz = int(mutation_patch_size)
         self.mutation_p = float(mutation_prob)
+        # food
+        self.food_enabled = bool(food_enabled)
+        self.food_spawn_interval = int(food_spawn_interval)
+        self.food_n_patches = int(food_n_patches)
+        self.food_patch_size = int(food_patch_size)
+        self.food_amount = float(food_amount)
+        self.food_consume_rate = float(food_consume_rate)
+        self.food_bonus = float(food_bonus)
+        self.mass_decay = float(mass_decay)
+        self.food_green_channel = int(food_green_channel)
+        self.food_auto_size = bool(food_auto_size)
+        self.food_conv_mode = food_conv_mode
+        self.food_vis_scale = float(food_vis_scale)
 
         # Connectivity: by default, all k kernels read from channel 0 and
         # contribute to channel 0 (for C=1). For C>1, still route all to ch 0.
@@ -98,6 +124,7 @@ class FlowLenia:
             "a": (0.0, 1.0),
             "b": (0.001, 1.0),
             "w": (0.01, 0.5),
+            "fcr": (0.0, 0.5),
         }
 
         # Sample a deterministic base set of parameters following the same ranges
@@ -123,8 +150,11 @@ class FlowLenia:
         raw_a = to_raw(base_a, "a").reshape((-1,))
         raw_b = to_raw(base_b, "b").reshape((-1,))
         raw_w = to_raw(base_w, "w").reshape((-1,))
+        # Base food consume rate uses current hyper as center
+        base_fcr = jnp.clip(jnp.array(self.food_consume_rate), self.bounds["fcr"][0], self.bounds["fcr"][1])
+        raw_fcr = inv_sigmoid(jnp.clip((base_fcr - self.bounds["fcr"][0])/(self.bounds["fcr"][1]-self.bounds["fcr"][0]), 1e-6, 1-1e-6)).reshape((-1,))
 
-        self.base_dyn_raw = jnp.concatenate([raw_R, raw_r, raw_m, raw_s, raw_a, raw_b, raw_w], axis=0)
+        self.base_dyn_raw = jnp.concatenate([raw_R, raw_r, raw_m, raw_s, raw_a, raw_b, raw_w, raw_fcr], axis=0)
 
         # Precompute flat bounds for denormalization during init_state
         self._dyn_lo = jnp.concatenate([
@@ -135,6 +165,7 @@ class FlowLenia:
             jnp.full((self.k * 3,), self.bounds["a"][0]),
             jnp.full((self.k * 3,), self.bounds["b"][0]),
             jnp.full((self.k * 3,), self.bounds["w"][0]),
+            jnp.full((1,), self.bounds["fcr"][0]),
         ], axis=0)
         self._dyn_hi = jnp.concatenate([
             jnp.full((1,), self.bounds["R"][1]),
@@ -144,6 +175,7 @@ class FlowLenia:
             jnp.full((self.k * 3,), self.bounds["a"][1]),
             jnp.full((self.k * 3,), self.bounds["b"][1]),
             jnp.full((self.k * 3,), self.bounds["w"][1]),
+            jnp.full((1,), self.bounds["fcr"][1]),
         ], axis=0)
 
     # ---------- params interface ----------
@@ -171,6 +203,7 @@ class FlowLenia:
         a = dyn_vals[idx:idx + self.k * 3].reshape((self.k, 3)); idx += self.k * 3
         b = dyn_vals[idx:idx + self.k * 3].reshape((self.k, 3)); idx += self.k * 3
         w = dyn_vals[idx:idx + self.k * 3].reshape((self.k, 3)); idx += self.k * 3
+        fcr = dyn_vals[idx]; idx += 1
 
         # Prebuild reintegration operator (kept on substrate, not in state)
         self.RT = ReintegrationTracking(
@@ -182,6 +215,7 @@ class FlowLenia:
         fK = get_kernels_fft(self.cfg.X, self.cfg.Y, self.cfg.k, R, r, a, w, b)
         A = jnp.zeros((self.cfg.X, self.cfg.Y, self.cfg.C))
         P = jnp.zeros((self.cfg.X, self.cfg.Y, self.cfg.k))
+        Food = jnp.zeros((self.cfg.X, self.cfg.Y))
 
         # Seed patch(es): notebook-style or random
         kA, kP = split(rng)
@@ -257,7 +291,9 @@ class FlowLenia:
 
             A, P, _ = jax.lax.fori_loop(0, n_target, body, (A, P, key_loop))
 
-        state = {"A": A, "P": P, "fK": fK, "m": m, "s": s}
+        # step counter for scheduled events (food spawn)
+        t = jnp.array(0, dtype=jnp.int32)
+        state = {"A": A, "P": P, "fK": fK, "m": m, "s": s, "fcr": fcr, "Food": Food, "t": t}
         # Step once to avoid trivial zero image, like Lenia
         return self.step_state(rng, state, params)
 
@@ -265,6 +301,9 @@ class FlowLenia:
         # params are unused (Lenia-style), dynamics are embedded in state
         A, P, fK = state["A"], state["P"], state["fK"]
         m, s = state["m"], state["s"]
+        Food = state.get("Food", jnp.zeros(A.shape[:2]))
+        t = state.get("t", jnp.array(0, dtype=jnp.int32))
+        fcr = state.get("fcr", jnp.array(self.food_consume_rate))
 
         # Convolution in Fourier domain per FlowLenia
         fA = jnp.fft.fft2(A, axes=(0, 1))
@@ -298,7 +337,67 @@ class FlowLenia:
             msk = (jr.uniform(kprob, ()) < self.mutation_p).astype(nP.dtype)
             nP = nP + dP * msk
 
-        return {"A": nA, "P": nP, "fK": fK, "m": m, "s": s}
+        # Optional mass decay and food mechanics
+        if self.food_enabled or (self.mass_decay > 0):
+            # global decay on A
+            if self.mass_decay > 0:
+                nA = nA * (1.0 - self.mass_decay)
+
+            if self.food_enabled:
+                # periodic spawn
+                do_spawn = (self.food_spawn_interval > 0) & (jnp.mod(t, self.food_spawn_interval) == 0)
+                def spawn_food(Food_in, key):
+                    # Use max_sz as static patch container, compute dynamic active size fp_sz
+                    max_sz = min(self.food_patch_size, Food_in.shape[0], Food_in.shape[1])
+                    max_i = Food_in.shape[0] - max_sz
+                    max_j = Food_in.shape[1] - max_sz
+                    if self.food_auto_size and self.food_spawn_interval > 0 and self.mass_decay > 0:
+                        M = jnp.sum(nA)
+                        I = float(self.food_spawn_interval)
+                        d = float(self.mass_decay)
+                        lost = M * (1.0 - jnp.power(1.0 - d, I))
+                        required_food = lost / (self.food_bonus + 1e-8)
+                        cells_needed = required_food / (self.food_amount + 1e-8)
+                        per_patch = cells_needed / max(1, self.food_n_patches)
+                        side = jnp.sqrt(jnp.maximum(0.0, per_patch))
+                        fp_sz = jnp.floor(side).astype(jnp.int32)
+                        fp_sz = jnp.clip(fp_sz, 0, max_sz)
+                    else:
+                        fp_sz = jnp.array(self.food_patch_size, dtype=jnp.int32)
+                        fp_sz = jnp.clip(fp_sz, 0, max_sz)
+                    n = int(self.food_n_patches)
+                    def body(i, carry):
+                        Fcur, kcur = carry
+                        kcur, ki, kj = jr.split(kcur, 3)
+                        i0 = jr.randint(ki, (), 0, max_i + 1)
+                        j0 = jr.randint(kj, (), 0, max_j + 1)
+                        rows = jnp.arange(max_sz) < fp_sz
+                        mask = (rows[:, None] & rows[None, :]).astype(jnp.float32)
+                        patch = mask * self.food_amount
+                        Fcur = Fcur + jax.lax.dynamic_update_slice(jnp.zeros_like(Fcur), patch, (i0, j0))
+                        return (Fcur, kcur)
+                    Food_add, _ = jax.lax.fori_loop(0, n, body, (jnp.zeros_like(Food_in), rng))
+                    return Food_in + Food_add
+                Food = jax.lax.select(do_spawn, spawn_food(Food, rng), Food)
+
+                # consumption: only green channel consumes
+                gc = int(self.food_green_channel)
+                gc = max(0, min(gc, int(nA.shape[-1]) - 1))
+                A_g = nA[..., gc]
+                # amount to consume per pixel this step
+                if self.food_conv_mode == 'conv':
+                    # stationary food, identity kernel => signal equals Food
+                    rate_field = fcr * Food
+                else:
+                    rate_field = fcr * A_g
+                eat = jnp.minimum(Food, rate_field)
+                Food = Food - eat
+                # convert to mass in green channel with bonus
+                nA = nA.at[..., gc].add(eat * self.food_bonus)
+
+            t = t + jnp.array(1, dtype=jnp.int32)
+
+        return {"A": nA, "P": nP, "fK": fK, "m": m, "s": s, "Food": Food, "t": t}
 
     def render_state(self, state, params, img_size=None):
         mode = getattr(self, 'render_mode', 'A')
@@ -318,7 +417,15 @@ class FlowLenia:
                 img = jnp.dstack([A[..., 0], A[..., 0], A[..., 1]])
             else:
                 img = A[..., :3]
-
+        # overlay food (brown)
+        Food = state.get('Food', None)
+        if Food is not None:
+            f = Food * self.food_vis_scale
+            f = f / (1.0 + f)
+            brown = jnp.array([0.6, 0.3, 0.0])
+            overlay = f[..., None] * brown[None, None, :]
+            img = jnp.clip(img + overlay, 0.0, 1.0)
+        
         if img_size is not None:
             img = jax.image.resize(img, (img_size, img_size, 3), method="nearest")
         return img
