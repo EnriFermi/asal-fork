@@ -7,7 +7,7 @@ from jax.random import split
 import numpy as np
 import imageio.v3 as iio
 import imageio  # for streaming writer
-
+from tqdm import tqdm
 import substrates
 from rollout import rollout_simulation
 import util
@@ -102,15 +102,18 @@ def main():
     try:
         s = substrate.init_state(rng, best_member)
         steps_done = 0
-        while args.max_steps is None or steps_done < args.max_steps:
-            b = args.batch_steps if args.max_steps is None else min(args.batch_steps, args.max_steps - steps_done)
-            for _ in range(b):
-                rng, _rng = split(rng)
-                s = substrate.step_state(_rng, s, best_member)
-                frame = substrate.render_state(s, best_member, img_size=args.img_size)
-                frame_u8 = (np.clip(np.asarray(frame), 0.0, 1.0) * 255).astype(np.uint8)
-                writer.append_data(frame_u8)
-            steps_done += b
+        with tqdm() as pbar:
+            print(args.batch_steps, args.max_steps)
+            while args.max_steps is None or steps_done < args.max_steps:
+                b = args.batch_steps if args.max_steps is None else min(args.batch_steps, args.max_steps - steps_done)
+                for _ in range(b):
+                    rng, _rng = split(rng)
+                    s = substrate.step_state(_rng, s, best_member)
+                    frame = substrate.render_state(s, best_member, img_size=args.img_size)
+                    frame_u8 = (np. clip(np.asarray(frame), 0.0, 1.0) * 255).astype(np.uint8)
+                    writer.append_data(frame_u8)
+                steps_done += b
+                pbar.update(b)
     except KeyboardInterrupt:
         print("Interrupted by user; finalizing video...")
     finally:

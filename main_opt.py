@@ -58,7 +58,7 @@ group.add_argument("--pop_size", type=int, default=8, help="population size for 
 group.add_argument("--n_iters", type=int, default=1000, help="number of iterations to run")
 group.add_argument("--sigma", type=float, default=0.1, help="mutation rate")
 
-
+! 
 # #wandb logging
 # group = parser.add_argument_group("logging")
 # group = pa
