@@ -185,14 +185,20 @@ def main(args):
             loss, loss_dict = jax.tree.map(lambda x: x.mean(axis=1), (loss, loss_dict)) # mean over the init state rng
             next_es_state = strategy.tell(params, loss, next_es_state, es_params)
             data = dict(best_loss=next_es_state.best_fitness, loss_dict=loss_dict)
-            return next_es_state, data, rgb[jnp.argmin(loss), 0]
+            return next_es_state, data, rgb[jnp.argmin(loss), 0], params, loss
 
 
         data = []
+        best_params_traj = []
+        best_loss_traj = []
         pbar = tqdm(range(args.n_iters))
         for i_iter in pbar:
             rng, _rng = split(rng)
-            es_state, di, rgb = do_iter(es_state, _rng)
+            es_state, di, rgb, params_iter, loss_iter = do_iter(es_state, _rng)
+
+            # Track best-so-far parameter trajectory
+            best_params_traj.append(np.array(es_state.best_member))
+            best_loss_traj.append(float(es_state.best_fitness))
 
             show_video(rgb)
             run.log({'train_sample': wandb.Video((np.asarray(rgb) * 255).astype(np.uint8).transpose(0, 3, 1, 2), fps=4, format="gif")})
@@ -215,6 +221,47 @@ def main(args):
                 util.save_pkl(args.save_dir, "data", data_save)
                 best = jax.tree.map(lambda x: np.array(x), (es_state.best_member, es_state.best_fitness))
                 util.save_pkl(args.save_dir, "best", best)
+                if len(best_params_traj) > 0:
+                    traj = dict(
+                        params=np.stack(best_params_traj, axis=0),
+                        loss=np.array(best_loss_traj),
+                    )
+                    util.save_pkl(args.save_dir, "best_traj", traj)
+
+        # After optimization: log 2D PCA of best-parameter trajectory to W&B
+        if len(best_params_traj) > 1:
+            X = np.stack(best_params_traj, axis=0)
+            X_centered = X - X.mean(axis=0, keepdims=True)
+            try:
+                # Compute first two principal components via SVD
+                _, _, Vt = np.linalg.svd(X_centered, full_matrices=False)
+                pcs = X_centered @ Vt[:2].T  # shape (T, 2)
+
+                # Log as a table
+                pca_table = wandb.Table(
+                    data=[
+                        [int(i), float(pcs[i, 0]), float(pcs[i, 1]), float(best_loss_traj[i])]
+                        for i in range(pcs.shape[0])
+                    ],
+                    columns=["iter", "pc1", "pc2", "best_loss"],
+                )
+                run.log({"best_params_pca_traj": pca_table})
+
+                # Also log a static 2D trajectory plot
+                try:
+                    import matplotlib.pyplot as plt
+
+                    fig, ax = plt.subplots()
+                    ax.plot(pcs[:, 0], pcs[:, 1], "-o", markersize=2)
+                    ax.set_xlabel("PC1")
+                    ax.set_ylabel("PC2")
+                    ax.set_title("Best-parameter PCA trajectory")
+                    run.log({"best_params_pca_traj_plot": wandb.Image(fig)})
+                    plt.close(fig)
+                except Exception as e:
+                    print(f"Failed to log PCA trajectory plot: {e}")
+            except Exception as e:
+                print(f"Failed to compute PCA trajectory: {e}")
     finally:
         run.finish()
     
