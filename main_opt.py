@@ -223,7 +223,7 @@ def main(args):
                         "pca_best_pc2": float(pcs[-1, 1]),
                     })
                 except Exception as e:
-                    print(f\"PCA logging failed at iter {i_iter}: {e}\")
+                    print(f"PCA logging failed at iter {i_iter}: {e}")
 
             show_video(rgb)
             run.log({'train_sample': wandb.Video((np.asarray(rgb) * 255).astype(np.uint8).transpose(0, 3, 1, 2), fps=4, format="gif")})
