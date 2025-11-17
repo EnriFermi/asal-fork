@@ -207,12 +207,26 @@ def main(args):
                     X_centered = X - X.mean(axis=0, keepdims=True)
                     _, _, Vt = np.linalg.svd(X_centered, full_matrices=False)
                     pcs = X_centered @ Vt[:2].T  # (T, 2)
+                    # Log current PCA coordinates as scalars
                     run.log({
                         "pca_best_pc1": float(pcs[-1, 0]),
                         "pca_best_pc2": float(pcs[-1, 1]),
                     })
+                    # Also log a 2D PCA image (trajectory so far)
+                    try:
+                        import matplotlib.pyplot as plt
+
+                        fig, ax = plt.subplots()
+                        ax.plot(pcs[:, 0], pcs[:, 1], "-o", markersize=2)
+                        ax.set_xlabel("PC1")
+                        ax.set_ylabel("PC2")
+                        ax.set_title("Best-parameter PCA trajectory (iter {})".format(i_iter))
+                        run.log({"pca_best_traj_img": wandb.Image(fig)})
+                        plt.close(fig)
+                    except Exception as e_img:
+                        print(f"Failed to log PCA image at iter {i_iter}: {e_img}")
                 except Exception as e:
-                    print(f\"PCA logging failed at iter {i_iter}: {e}\")
+                    print(f"PCA logging failed at iter {i_iter}: {e}")
 
             show_video(rgb)
             run.log({'train_sample': wandb.Video((np.asarray(rgb) * 255).astype(np.uint8).transpose(0, 3, 1, 2), fps=4, format="gif")})
