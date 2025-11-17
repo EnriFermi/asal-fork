@@ -63,13 +63,13 @@ group.add_argument("--coef_oe", type=float, default=1., help="coefficient for AS
 group.add_argument("--coef_smooth", type=float, default=0.2, help="coefficient for latent embedding smoothness")
 
 
+
 group = parser.add_argument_group("optimization")
 group.add_argument("--bs", type=int, default=1, help="number of init states to average simulation over")
 group.add_argument("--pop_size", type=int, default=8, help="population size for Sep-CMA-ES")
 group.add_argument("--n_iters", type=int, default=1000, help="number of iterations to run")
 group.add_argument("--sigma", type=float, default=0.1, help="mutation rate")
 
-! 
 # #wandb logging
 # group = parser.add_argument_group("logging")
 # group = pa
@@ -128,6 +128,7 @@ def main(args):
         # Optional: food mechanics
         if hasattr(substrate, 'food_enabled'):
             try:
+                print('Food: ', bool(args.food))
                 substrate.food_enabled = bool(args.food)
                 substrate.food_spawn_interval = int(args.food_interval)
                 substrate.food_n_patches = int(args.food_n)
@@ -213,7 +214,8 @@ def main(args):
                 best_params = es_state.best_member
                 vid_data = rollout_simulation(_rng_vid, best_params, s0=None, substrate=substrate, fm=None,
                                               rollout_steps=args.rollout_steps, time_sampling='video', img_size=224, return_state=False)
-                vid = (np.asarray(vid_data['rgb']) * 255).astype(np.uint8).transpose(0, 3, 1, 2)
+                step = max(1, int(args.rollout_steps / 1024))
+                vid = (np.asarray(vid_data['rgb'][::step]) * 255).astype(np.uint8).transpose(0, 3, 1, 2)
                 run.log({'train_video': wandb.Video(vid, fps=8, format='gif')})
             except Exception as e:
                 print(f"Full video logging failed: {e}")
