@@ -44,7 +44,7 @@ def main():
     parser.add_argument('--food_n', type=int, default=3, help='For FlowLenia: number of food patches per spawn')
     parser.add_argument('--food_sz', type=int, default=16, help='For FlowLenia: food patch size')
     parser.add_argument('--food_amount', type=float, default=1.0, help='For FlowLenia: amount of food per cell in patch')
-    parser.add_argument('--food_consume_rate', type=float, default=0.05, help='For FlowLenia: rate of consumption per step per pixel relative to green mass')
+    parser.add_argument('--food_consume_rate', type=float, default=0.0, help='For FlowLenia: rate of consumption per step per pixel relative to green mass')
     parser.add_argument('--food_bonus', type=float, default=1.0, help='For FlowLenia: multiplier converting food to mass')
     parser.add_argument('--mass_decay', type=float, default=0.0, help='For FlowLenia: uniform mass decay per step')
     parser.add_argument('--food_channel', type=int, default=1, help='For FlowLenia: which channel consumes food (0=R,1=G,2=B)')
@@ -194,7 +194,7 @@ def main():
                     remaining -= mb
                     steps_done += mb
 
-                    pbar.update(b)
+                    pbar.update(mb)
 
     except KeyboardInterrupt:
         print("Interrupted by user; finalizing video...")
