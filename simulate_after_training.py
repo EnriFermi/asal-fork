@@ -59,6 +59,7 @@ def main():
     parser.add_argument('--max_steps', type=int, default=None, help='Total number of steps to run; None for until interrupted')
     parser.add_argument('--mass_plot', type=str, default='mass.png', help='Path to save mass traces plot (total and per-channel)')
     parser.add_argument('--log_mass_every', type=int, default=1000, help='Print total mass every N frames')
+    parser.add_argument('--traj_iter', type=int, default=None, help='If set, load parameters from best_traj at this 0-based iteration index instead of final best.pkl')
     args = parser.parse_args()
 
     best_path = os.path.join(args.save_dir, 'best.pkl')
@@ -66,6 +67,26 @@ def main():
         raise FileNotFoundError(f"best.pkl not found in {args.save_dir}. Ensure main_opt.py saved results with --save_dir.")
 
     best_member, best_fitness = util.load_pkl(args.save_dir, 'best')
+
+    # Optionally override params with a specific iteration from best_traj.pkl
+    if args.traj_iter is not None:
+        traj_path = os.path.join(args.save_dir, 'best_traj.pkl')
+        if not os.path.exists(traj_path):
+            raise FileNotFoundError(
+                f"traj_iter={args.traj_iter} requested but best_traj.pkl not found in {args.save_dir}. "
+                f"Re-run main_opt.py with the updated code that saves best_traj.pkl."
+            )
+        traj = util.load_pkl(args.save_dir, 'best_traj')
+        params_arr = traj.get('params', None)
+        if params_arr is None:
+            raise ValueError(f"best_traj.pkl in {args.save_dir} does not contain 'params'.")
+        n_iters_available = params_arr.shape[0]
+        if args.traj_iter < 0 or args.traj_iter >= n_iters_available:
+            raise ValueError(f"traj_iter {args.traj_iter} out of range [0, {n_iters_available-1}]")
+        best_member = params_arr[args.traj_iter]
+        loss_arr = traj.get('loss', None)
+        if loss_arr is not None and loss_arr.shape[0] == n_iters_available:
+            best_fitness = loss_arr[args.traj_iter]
 
     substrate = substrates.create_substrate(args.substrate)
     # If FlowLenia, allow overriding number of seeding patches
