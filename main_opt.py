@@ -200,6 +200,20 @@ def main(args):
             best_params_traj.append(np.array(es_state.best_member))
             best_loss_traj.append(float(es_state.best_fitness))
 
+            # Log 2D PCA projection of best-so-far parameters at each iteration
+            if len(best_params_traj) > 1:
+                try:
+                    X = np.stack(best_params_traj, axis=0)
+                    X_centered = X - X.mean(axis=0, keepdims=True)
+                    _, _, Vt = np.linalg.svd(X_centered, full_matrices=False)
+                    pcs = X_centered @ Vt[:2].T  # (T, 2)
+                    run.log({
+                        "pca_best_pc1": float(pcs[-1, 0]),
+                        "pca_best_pc2": float(pcs[-1, 1]),
+                    })
+                except Exception as e:
+                    print(f\"PCA logging failed at iter {i_iter}: {e}\")
+
             show_video(rgb)
             run.log({'train_sample': wandb.Video((np.asarray(rgb) * 255).astype(np.uint8).transpose(0, 3, 1, 2), fps=4, format="gif")})
 
