@@ -191,6 +191,8 @@ def main(args):
         data = []
         best_params_traj = []
         best_loss_traj = []
+        pop_params_traj = []
+        pop_loss_traj = []
         pbar = tqdm(range(args.n_iters))
         for i_iter in pbar:
             rng, _rng = split(rng)
@@ -199,6 +201,9 @@ def main(args):
             # Track best-so-far parameter trajectory
             best_params_traj.append(np.array(es_state.best_member))
             best_loss_traj.append(float(es_state.best_fitness))
+            # Track full CMA-ES population for this iteration
+            pop_params_traj.append(np.array(params_iter))
+            pop_loss_traj.append(np.array(loss_iter))
 
             # Log 2D PCA projection of best-so-far parameters at each iteration
             if len(best_params_traj) > 1:
@@ -255,6 +260,12 @@ def main(args):
                         loss=np.array(best_loss_traj),
                     )
                     util.save_pkl(args.save_dir, "best_traj", traj)
+                if len(pop_params_traj) > 0:
+                    pop_traj = dict(
+                        params=np.stack(pop_params_traj, axis=0),  # (T, pop_size, n_params)
+                        loss=np.stack(pop_loss_traj, axis=0),      # (T, pop_size)
+                    )
+                    util.save_pkl(args.save_dir, "pop_traj", pop_traj)
 
         # After optimization: log 2D PCA of best-parameter trajectory to W&B
         if len(best_params_traj) > 1:
