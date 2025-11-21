@@ -8,10 +8,13 @@ import numpy as np
 import imageio.v3 as iio
 import imageio  # for streaming writer
 import matplotlib.pyplot as plt
+import wandb
 
 import substrates
 from rollout import rollout_simulation
 import util
+import foundation_models
+import asal_metrics
 
 
 def parse_time_sampling(arg):
@@ -60,7 +63,13 @@ def main():
     parser.add_argument('--mass_plot', type=str, default='mass.png', help='Path to save mass traces plot (total and per-channel)')
     parser.add_argument('--log_mass_every', type=int, default=1000, help='Print total mass every N frames')
     parser.add_argument('--traj_iter', type=int, default=None, help='If set, load parameters from best_traj at this 0-based iteration index instead of final best.pkl')
+    parser.add_argument('--compute_oe', action='store_true', help='If set, compute open-endedness loss over time using CLIP.')
+    parser.add_argument('--oe_every', type=int, default=100, help='Steps between open-endedness evaluations')
+    parser.add_argument('--oe_plot', type=str, default='oe_loss.png', help='Path to save open-endedness loss plot')
+    parser.add_argument('--wandb_project', type=str, default='asal', help='W&B project name for logging simulation dynamics')
     args = parser.parse_args()
+
+    run = wandb.init(project=args.wandb_project, config={**vars(args)})
 
     best_path = os.path.join(args.save_dir, 'best.pkl')
     if not os.path.exists(best_path):
@@ -140,6 +149,14 @@ def main():
 
     rng = jax.random.PRNGKey(args.seed)
 
+    # Optional: set up foundation model for open-endedness
+    fm = None
+    oe_steps = []
+    oe_values = []
+    oe_embeds = []
+    if args.compute_oe:
+        fm = foundation_models.create_foundation_model('clip')
+
     if args.time_sampling != 'video':
         # Non-video modes can be done in one shot safely
         ts = parse_time_sampling(args.time_sampling)
@@ -150,6 +167,7 @@ def main():
         vid_u8 = (np.clip(vid, 0.0, 1.0) * 255).astype(np.uint8)
         iio.imwrite(args.output, vid_u8, fps=args.fps, codec=args.codec, macro_block_size=args.macro_block_size)
         print(f"Saved simulation to {args.output} (best fitness: {np.array(best_fitness).item():.4f})")
+        run.finish()
         return
 
     # Build JIT-compiled microbatch stepper that returns (state_next, frames[mb, H, W, 3])
@@ -199,14 +217,33 @@ def main():
                 batch_frames = np.asarray(batch_frames[:mb])  # (mb, H, W, 3)
                 batch_masses = np.asarray(batch_masses[:mb])  # (mb, C)
                 batch_u8 = (np.clip(batch_frames, 0.0, 1.0) * 255).astype(np.uint8)
-                for frame in batch_u8:
-                    writer.append_data(frame)
-                # record masses
-                for i in range(batch_masses.shape[0]):
-                    mchs = batch_masses[i]
+
+                for i_frame in range(batch_u8.shape[0]):
+                    frame_u8 = batch_u8[i_frame]
+                    writer.append_data(frame_u8)
+
+                    # record masses
+                    mchs = batch_masses[i_frame]
                     for c in range(C):
                         mass_channels[c].append(float(mchs[c]))
                     mass_total.append(float(np.sum(mchs)))
+
+                    global_step = steps_done + i_frame
+                    # optional: open-endedness evaluation
+                    if args.compute_oe and (global_step % args.oe_every == 0):
+                        img = batch_frames[i_frame]  # float32 in [0,1], shape (H, W, 3)
+                        z_img = fm.embed_img(jnp.array(img))
+                        oe_embeds.append(np.asarray(z_img))
+                        oe_steps.append(global_step)
+                        if len(oe_embeds) < 2:
+                            oe_val = 0.0
+                        else:
+                            z_all = jnp.asarray(oe_embeds)
+                            oe_val = float(asal_metrics.calc_open_endedness_score(z_all))
+                        oe_values.append(oe_val)
+                        # log to W&B for online visualization
+                        wandb.log({"oe_loss": oe_val, "step": global_step})
+
                 # periodic log
                 if args.log_mass_every > 0 and (steps_done // args.log_mass_every) != ((steps_done + mb) // args.log_mass_every):
                     print(f"Step {steps_done+mb}: total mass {mass_total[-1]:.6f}")
@@ -231,6 +268,24 @@ def main():
             print(f"Saved mass traces to {args.mass_plot}")
         except Exception as e:
             print(f"Failed to save mass plot: {e}")
+
+        # save open-endedness loss plot if requested
+        if args.compute_oe and len(oe_values) > 0:
+            try:
+                plt.figure(figsize=(8,4))
+                plt.plot(oe_steps, oe_values, label='open-endedness loss')
+                plt.xlabel('step')
+                plt.ylabel('OE loss')
+                plt.legend()
+                plt.tight_layout()
+                plt.savefig(args.oe_plot, dpi=150)
+                print(f"Saved open-endedness loss traces to {args.oe_plot}")
+                # also log plot to W&B
+                wandb.log({"oe_loss_plot": wandb.Image(plt.gcf())})
+            except Exception as e:
+                print(f"Failed to save open-endedness plot: {e}")
+
+        run.finish()
 
 
 if __name__ == '__main__':
