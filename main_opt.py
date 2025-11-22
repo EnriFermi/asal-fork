@@ -61,6 +61,7 @@ group.add_argument("--bs", type=int, default=1, help="number of init states to a
 group.add_argument("--pop_size", type=int, default=8, help="population size for Sep-CMA-ES")
 group.add_argument("--n_iters", type=int, default=1000, help="number of iterations to run")
 group.add_argument("--sigma", type=float, default=0.1, help="mutation rate")
+group.add_argument("--eval_splits", type=int, default=1, help="number of splits of CMA-ES population for loss evaluation (1 = no split)")
 
 
 # #wandb logging
@@ -176,16 +177,68 @@ def main(args):
             return loss, loss_dict, rollout_data['rgb']
 
         @jax.jit
-        def do_iter(es_state, rng): # do one iteration of the optimization
+        def eval_chunk(rng, params_chunk):
+            """
+            Evaluate loss for a chunk of the CMA-ES population.
+            params_chunk: (chunk_size, n_params)
+            Returns:
+                rng_next, loss_chunk (chunk_size,), loss_dict_chunk, best_loss_chunk, best_rgb_chunk
+            """
             rng, _rng = split(rng)
-            params, next_es_state = strategy.ask(_rng, es_state, es_params)
-            calc_loss_vv = jax.vmap(jax.vmap(calc_loss, in_axes=(0, None)), in_axes=(None, 0)) # vmap over the init state rng and then the parameters
+            calc_loss_vv = jax.vmap(jax.vmap(calc_loss, in_axes=(0, None)), in_axes=(None, 0))
+            rng, _rng2 = split(rng)
+            loss, loss_dict, rgb = calc_loss_vv(split(_rng2, args.bs), params_chunk)
+            # mean over init state rng axis (bs)
+            loss, loss_dict = jax.tree.map(lambda x: x.mean(axis=1), (loss, loss_dict))
+            # best within this chunk
+            best_idx = jnp.argmin(loss)
+            best_loss_chunk = loss[best_idx]
+            best_rgb_chunk = rgb[best_idx, 0]
+            return rng, loss, loss_dict, best_loss_chunk, best_rgb_chunk
+
+        def do_iter(es_state, rng): # do one iteration of the optimization with optional population splitting
             rng, _rng = split(rng)
-            loss, loss_dict, rgb = calc_loss_vv(split(_rng, args.bs), params)
-            loss, loss_dict = jax.tree.map(lambda x: x.mean(axis=1), (loss, loss_dict)) # mean over the init state rng
-            next_es_state = strategy.tell(params, loss, next_es_state, es_params)
-            data = dict(best_loss=next_es_state.best_fitness, loss_dict=loss_dict)
-            return next_es_state, data, rgb[jnp.argmin(loss), 0], params, loss
+            params_full, next_es_state = strategy.ask(_rng, es_state, es_params)
+            pop_size = params_full.shape[0]
+            splits = max(1, int(args.eval_splits))
+            if splits > pop_size:
+                splits = pop_size
+            if pop_size % splits != 0:
+                raise ValueError(f"pop_size={pop_size} not divisible by eval_splits={splits}; "
+                                 f"choose eval_splits that divides pop_size.")
+            chunk_size = pop_size // splits
+
+            loss_chunks = []
+            loss_dict_chunks = []
+            best_rgb = None
+            best_loss_scalar = None
+
+            for i in range(splits):
+                start = i * chunk_size
+                end = start + chunk_size
+                params_chunk = params_full[start:end]
+                rng, loss_chunk, loss_dict_chunk, best_loss_chunk, best_rgb_chunk = eval_chunk(rng, params_chunk)
+                loss_chunks.append(loss_chunk)
+                loss_dict_chunks.append(loss_dict_chunk)
+                # track best rgb over all chunks
+                loss_scalar = float(best_loss_chunk)
+                if best_loss_scalar is None or loss_scalar < best_loss_scalar:
+                    best_loss_scalar = loss_scalar
+                    best_rgb = best_rgb_chunk
+
+            # concatenate losses over population axis
+            loss_all = jnp.concatenate(loss_chunks, axis=0)
+
+            # concatenate loss_dict over population axis
+            def concat_tree(chunks):
+                return jax.tree.map(lambda *xs: jnp.concatenate(xs, axis=0), *chunks)
+
+            loss_dict_all = concat_tree(loss_dict_chunks)
+
+            # update CMA-ES state with full population loss
+            next_es_state = strategy.tell(params_full, loss_all, next_es_state, es_params)
+            data = dict(best_loss=next_es_state.best_fitness, loss_dict=loss_dict_all)
+            return next_es_state, data, best_rgb, params_full, loss_all
 
 
         data = []
@@ -205,33 +258,49 @@ def main(args):
             pop_params_traj.append(np.array(params_iter))
             pop_loss_traj.append(np.array(loss_iter))
 
-            # Log 2D PCA projection of best-so-far parameters at each iteration
-            if len(best_params_traj) > 1:
+            # Population loss statistics (mean/variance over CMA-ES samples)
+            loss_np = np.array(loss_iter)
+            loss_mean = float(loss_np.mean())
+            loss_var = float(loss_np.var())
+
+            # 3D PCA over all population samples seen so far (x,y=PCs, z=time)
+            pca_img = None
+            if len(pop_params_traj) > 1:
                 try:
-                    X = np.stack(best_params_traj, axis=0)
+                    import matplotlib.pyplot as plt
+                    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+                    pop_hist = np.stack(pop_params_traj, axis=0)  # (T, P, D)
+                    T_hist, P_hist, D_hist = pop_hist.shape
+                    X = pop_hist.reshape(T_hist * P_hist, D_hist)
+                    times = np.repeat(np.arange(T_hist), P_hist)
+
                     X_centered = X - X.mean(axis=0, keepdims=True)
                     _, _, Vt = np.linalg.svd(X_centered, full_matrices=False)
-                    pcs = X_centered @ Vt[:2].T  # (T, 2)
-                    # Log current PCA coordinates as scalars
-                    run.log({
-                        "pca_best_pc1": float(pcs[-1, 0]),
-                        "pca_best_pc2": float(pcs[-1, 1]),
-                    })
-                    # Also log a 2D PCA image (trajectory so far)
-                    try:
-                        import matplotlib.pyplot as plt
+                    pcs = X_centered @ Vt[:2].T  # (N, 2)
 
-                        fig, ax = plt.subplots()
-                        ax.plot(pcs[:, 0], pcs[:, 1], "-o", markersize=2)
-                        ax.set_xlabel("PC1")
-                        ax.set_ylabel("PC2")
-                        ax.set_title("Best-parameter PCA trajectory (iter {})".format(i_iter))
-                        run.log({"pca_best_traj_img": wandb.Image(fig)})
-                        plt.close(fig)
-                    except Exception as e_img:
-                        print(f"Failed to log PCA image at iter {i_iter}: {e_img}")
+                    fig = plt.figure(figsize=(6, 5))
+                    ax = fig.add_subplot(111, projection="3d")
+                    sc = ax.scatter(pcs[:, 0], pcs[:, 1], times, c=times, cmap="viridis", s=3)
+                    ax.set_xlabel("PC1")
+                    ax.set_ylabel("PC2")
+                    ax.set_zlabel("iter")
+                    ax.set_title(f"Population PCA trajectory up to iter {i_iter}")
+                    pca_img = wandb.Image(fig)
+                    plt.close(fig)
                 except Exception as e:
-                    print(f"PCA logging failed at iter {i_iter}: {e}")
+                    print(f\"PCA population logging failed at iter {i_iter}: {e}\")
+
+            # Log scalar stats and PCA image for this iteration
+            log_dict = {
+                "loss_pop_mean": loss_mean,
+                "loss_pop_var": loss_var,
+                "best_loss": float(es_state.best_fitness),
+                "iter": i_iter,
+            }
+            if pca_img is not None:
+                log_dict["pop_pca_traj_3d"] = pca_img
+            run.log(log_dict)
 
             show_video(rgb)
             run.log({'train_sample': wandb.Video((np.asarray(rgb) * 255).astype(np.uint8).transpose(0, 3, 1, 2), fps=4, format="gif")})
@@ -267,40 +336,7 @@ def main(args):
                     )
                     util.save_pkl(args.save_dir, "pop_traj", pop_traj)
 
-        # After optimization: log 2D PCA of best-parameter trajectory to W&B
-        if len(best_params_traj) > 1:
-            X = np.stack(best_params_traj, axis=0)
-            X_centered = X - X.mean(axis=0, keepdims=True)
-            try:
-                # Compute first two principal components via SVD
-                _, _, Vt = np.linalg.svd(X_centered, full_matrices=False)
-                pcs = X_centered @ Vt[:2].T  # shape (T, 2)
-
-                # Log as a table
-                pca_table = wandb.Table(
-                    data=[
-                        [int(i), float(pcs[i, 0]), float(pcs[i, 1]), float(best_loss_traj[i])]
-                        for i in range(pcs.shape[0])
-                    ],
-                    columns=["iter", "pc1", "pc2", "best_loss"],
-                )
-                run.log({"best_params_pca_traj": pca_table})
-
-                # Also log a static 2D trajectory plot
-                try:
-                    import matplotlib.pyplot as plt
-
-                    fig, ax = plt.subplots()
-                    ax.plot(pcs[:, 0], pcs[:, 1], "-o", markersize=2)
-                    ax.set_xlabel("PC1")
-                    ax.set_ylabel("PC2")
-                    ax.set_title("Best-parameter PCA trajectory")
-                    run.log({"best_params_pca_traj_plot": wandb.Image(fig)})
-                    plt.close(fig)
-                except Exception as e:
-                    print(f"Failed to log PCA trajectory plot: {e}")
-            except Exception as e:
-                print(f"Failed to compute PCA trajectory: {e}")
+        # (Optional) Final PCA summary is now covered by per-iteration logging above
     finally:
         run.finish()
     
