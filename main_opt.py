@@ -313,15 +313,15 @@ def main(args):
                 log_dict["pop_pca_traj_3d"] = pca_img
             run.log(log_dict)
 
-            show_video(rgb)
-            run.log({'train_sample': wandb.Video((np.asarray(rgb) * 255).astype(np.uint8).transpose(0, 3, 1, 2), fps=4, format="gif")})
+            # show_video(rgb)
+            # run.log({'train_sample': wandb.Video((np.asarray(rgb) * 255).astype(np.uint8).transpose(0, 3, 1, 2), fps=4, format="gif")})
 
             # After step: run a full rollout (all frames) for W&B logging using best-so-far params
             try:
                 rng, _rng_vid = split(rng)
                 best_params = es_state.best_member
                 vid_data = rollout_simulation(_rng_vid, best_params, s0=None, substrate=substrate, fm=None,
-                                              rollout_steps=args.rollout_steps, time_sampling='video', img_size=224,
+                                              rollout_steps=args.rollout_steps, time_sampling='video', img_size=128,
                                               return_state=False, return_mass=True)
                 vid = (np.asarray(vid_data['rgb']) * 255).astype(np.uint8).transpose(0, 3, 1, 2)
                 log_payload = {'train_video': wandb.Video(vid, fps=8, format='gif')}
