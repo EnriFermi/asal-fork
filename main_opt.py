@@ -120,23 +120,26 @@ def main(args):
             except Exception:
                 pass
         # Optional: food mechanics
-        if hasattr(substrate, 'food_enabled'):
-            try:
-                substrate.food_enabled = bool(args.food)
-                substrate.food_spawn_interval = int(args.food_interval)
-                substrate.food_n_patches = int(args.food_n)
-                substrate.food_patch_size = int(args.food_sz)
-                substrate.food_amount = float(args.food_amount)
-                substrate.food_consume_rate = float(args.food_consume_rate)
-                substrate.food_bonus = float(args.food_bonus)
-                substrate.mass_decay = float(args.mass_decay)
-                substrate.food_green_channel = int(args.food_channel)
-                if hasattr(substrate, 'food_auto_size'):
-                    substrate.food_auto_size = bool(args.food_auto_size)
-                if hasattr(substrate, 'food_conv_mode'):
-                    substrate.food_conv_mode = str(args.food_conv_mode)
-            except Exception:
-                pass
+    if hasattr(substrate, 'food_enabled'):
+        try:
+            substrate.food_enabled = bool(args.food)
+            substrate.food_spawn_interval = int(args.food_interval)
+            substrate.food_n_patches = int(args.food_n)
+            substrate.food_patch_size = int(args.food_sz)
+            substrate.food_amount = float(args.food_amount)
+            substrate.food_consume_rate = float(args.food_consume_rate)
+            substrate.food_bonus = float(args.food_bonus)
+            substrate.mass_decay = float(args.mass_decay)
+            substrate.food_green_channel = int(args.food_channel)
+            if hasattr(substrate, 'food_auto_size'):
+                substrate.food_auto_size = bool(args.food_auto_size)
+            if hasattr(substrate, 'food_conv_mode'):
+                substrate.food_conv_mode = str(args.food_conv_mode)
+            # Make food visible as white overlay in training videos
+            if hasattr(substrate, 'food_vis_color'):
+                substrate.food_vis_color = (1.0, 1.0, 1.0)
+        except Exception:
+            pass
         # Optional: control mutation behavior for FlowLenia
         if hasattr(substrate, 'mutation_enabled'):
             try:
