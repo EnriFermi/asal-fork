@@ -62,6 +62,7 @@ class FlowLenia:
         food_auto_size: bool = False,
         food_conv_mode: str = "scalar",  # 'scalar' | 'conv'
         food_vis_scale: float = 1.0,
+        food_vis_color=(0.6, 0.3, 0.0),  # RGB overlay for food
     ):
         self.grid_size = grid_size
         self.C = C
@@ -96,6 +97,7 @@ class FlowLenia:
         self.food_auto_size = bool(food_auto_size)
         self.food_conv_mode = food_conv_mode
         self.food_vis_scale = float(food_vis_scale)
+        self.food_vis_color = tuple(food_vis_color)
 
         # Connectivity: by default, all k kernels read from channel 0 and
         # contribute to channel 0 (for C=1). For C>1, still route all to ch 0.
@@ -423,8 +425,8 @@ class FlowLenia:
         if Food is not None:
             f = Food * self.food_vis_scale
             f = f / (1.0 + f)
-            brown = jnp.array([0.6, 0.3, 0.0])
-            overlay = f[..., None] * brown[None, None, :]
+            overlay_color = jnp.array(self.food_vis_color, dtype=img.dtype)
+            overlay = f[..., None] * overlay_color[None, None, :]
             img = jnp.clip(img + overlay, 0.0, 1.0)
         
         if img_size is not None:
