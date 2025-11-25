@@ -253,8 +253,33 @@ def main():
                     remaining -= mb
                     steps_done += mb
 
-                    pbar.update(mb)
+                    
+                    # record masses
+                    mchs = batch_masses[i_frame]
+                    for c in range(C):
+                        mass_channels[c].append(float(mchs[c]))
+                    m_tot = float(np.sum(mchs))
+                    mass_total.append(m_tot)
 
+                    global_step = steps_done + i_frame
+                    # log total mass per frame to W&B for trajectory tracking
+                    wandb.log({"mass_total": m_tot, "step": global_step})
+                    # optional: open-endedness evaluation
+                    if args.compute_oe and (global_step % args.oe_every == 0):
+                        img = batch_frames[i_frame]  # float32 in [0,1], shape (H, W, 3)
+                        z_img = fm.embed_img(jnp.array(img))
+                        oe_embeds.append(np.asarray(z_img))
+                        oe_steps.append(global_step)
+                        if len(oe_embeds) < 2:
+                            oe_val = 0.0
+                        else:
+                            z_all = jnp.asarray(oe_embeds)
+                            oe_val = float(asal_metrics.calc_open_endedness_score(z_all))
+                        oe_values.append(oe_val)
+                        # log to W&B for online visualization
+                        wandb.log({"oe_loss": oe_val, "step": global_step})
+                    
+                    pbar.update(mb)
 
     except KeyboardInterrupt:
         print("Interrupted by user; finalizing video...")
