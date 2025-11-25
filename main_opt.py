@@ -310,15 +310,15 @@ def main(args):
                 rng, _rng_vid = split(rng)
                 best_params = es_state.best_member
                 vid_data = rollout_simulation(_rng_vid, best_params, s0=None, substrate=substrate, fm=None,
-                                              rollout_steps=args.rollout_steps, time_sampling='video', img_size=224, return_state=True)
+                                              rollout_steps=args.rollout_steps, time_sampling='video', img_size=224,
+                                              return_state=False, return_mass=True)
                 vid = (np.asarray(vid_data['rgb']) * 255).astype(np.uint8).transpose(0, 3, 1, 2)
                 log_payload = {'train_video': wandb.Video(vid, fps=8, format='gif')}
 
                 # Log mass trajectory over the rollout to check stability (sum over grid and channels)
-                st = vid_data.get('state', None)
-                if st is not None and isinstance(st, dict) and 'A' in st:
-                    A_traj = np.asarray(st['A'])  # (T, X, Y, C)
-                    mass_traj = np.sum(A_traj, axis=(1, 2, 3))
+                mass_traj = vid_data.get('mass', None)
+                if mass_traj is not None:
+                    mass_traj = np.asarray(mass_traj)
                     line = wandb.plot.line_series(
                         xs=list(range(mass_traj.shape[0])),
                         ys=[mass_traj.tolist()],

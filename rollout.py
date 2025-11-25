@@ -3,7 +3,7 @@ import jax.numpy as jnp
 from jax.random import split
 
 def rollout_simulation(rng, params, s0=None,
-                       substrate=None, fm=None, rollout_steps=256, time_sampling='final', img_size=224, return_state=False):
+                       substrate=None, fm=None, rollout_steps=256, time_sampling='final', img_size=224, return_state=False, return_mass=False):
     """
     Rollout a simulation described by the specified substrate and parameters.
 
@@ -21,6 +21,7 @@ def rollout_simulation(rng, params, s0=None,
         - (K, chunk_ends): return the rollout at K sampled intervals, if chunk_ends is True then end of intervals is sampled
     img_size : image size to render at. Leave at 224 to avoid resizing again for CLIP.
     return_state : return the state data, leave as False, unless you really need it.
+    return_mass : when True and time_sampling='video', also return per-frame total mass (sum over grid+channels) without storing full states.
 
     Returns
     ----------
@@ -32,7 +33,7 @@ def rollout_simulation(rng, params, s0=None,
     'z' : the image embedding of the simulation using the foundation model,
         shape (D)
 
-    If time_sampling is 'video' then the returned shapes become (rollout_steps, ...).
+    If time_sampling is 'video' then the returned shapes become (rollout_steps, ...). If return_mass is True, a 'mass' array of shape (rollout_steps,) is included.
     If time_sampling is an int then the returned shapes become (time_sampling, ...).
 
     ----------
@@ -68,11 +69,20 @@ def rollout_simulation(rng, params, s0=None,
         z = embed_img_fn(img)
         return dict(rgb=img, z=z, state=(state_final if return_state else None))
     elif time_sampling == 'video': # return the entire rollout
-        def step_fn(state, _rng):
-            next_state = substrate.step_state(_rng, state, params)
-            img = substrate.render_state(state, params=params, img_size=img_size)
-            z = embed_img_fn(img)
-            return next_state, dict(rgb=img, z=z, state=(state if return_state else None))
+        if return_mass:
+            def step_fn(state, _rng):
+                next_state = substrate.step_state(_rng, state, params)
+                img = substrate.render_state(state, params=params, img_size=img_size)
+                z = embed_img_fn(img)
+                mass = jnp.sum(state["A"])
+                return next_state, dict(rgb=img, z=z, state=(state if return_state else None), mass=mass)
+        else:
+            def step_fn(state, _rng):
+                next_state = substrate.step_state(_rng, state, params)
+                img = substrate.render_state(state, params=params, img_size=img_size)
+                z = embed_img_fn(img)
+                return next_state, dict(rgb=img, z=z, state=(state if return_state else None))
+
         state_final, data = jax.lax.scan(step_fn, s0, split(rng, rollout_steps))
         # Include final state for chaining batches when requested
         return dict(**data, state_final=(state_final if return_state else None))
