@@ -360,7 +360,8 @@ class FlowLenia:
                         cells_needed = required_food / (self.food_amount + 1e-8)
                         per_patch = cells_needed / max(1, self.food_n_patches)
                         side = jnp.sqrt(jnp.maximum(0.0, per_patch))
-                        fp_sz = jnp.floor(side).astype(jnp.int32)
+                        # Round up so the spawned patch actually covers the required food mass instead of undershooting
+                        fp_sz = jnp.ceil(side).astype(jnp.int32)
                         fp_sz = jnp.clip(fp_sz, 0, max_sz)
                     else:
                         fp_sz = jnp.array(self.food_patch_size, dtype=jnp.int32)
