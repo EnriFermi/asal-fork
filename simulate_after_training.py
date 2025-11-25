@@ -226,9 +226,12 @@ def main():
                     mchs = batch_masses[i_frame]
                     for c in range(C):
                         mass_channels[c].append(float(mchs[c]))
-                    mass_total.append(float(np.sum(mchs)))
+                    m_tot = float(np.sum(mchs))
+                    mass_total.append(m_tot)
 
                     global_step = steps_done + i_frame
+                    # log total mass per frame to W&B for trajectory tracking
+                    wandb.log({"mass_total": m_tot, "step": global_step})
                     # optional: open-endedness evaluation
                     if args.compute_oe and (global_step % args.oe_every == 0):
                         img = batch_frames[i_frame]  # float32 in [0,1], shape (H, W, 3)

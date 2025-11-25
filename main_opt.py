@@ -310,9 +310,25 @@ def main(args):
                 rng, _rng_vid = split(rng)
                 best_params = es_state.best_member
                 vid_data = rollout_simulation(_rng_vid, best_params, s0=None, substrate=substrate, fm=None,
-                                              rollout_steps=args.rollout_steps, time_sampling='video', img_size=224, return_state=False)
+                                              rollout_steps=args.rollout_steps, time_sampling='video', img_size=224, return_state=True)
                 vid = (np.asarray(vid_data['rgb']) * 255).astype(np.uint8).transpose(0, 3, 1, 2)
-                run.log({'train_video': wandb.Video(vid, fps=8, format='gif')})
+                log_payload = {'train_video': wandb.Video(vid, fps=8, format='gif')}
+
+                # Log mass trajectory over the rollout to check stability (sum over grid and channels)
+                st = vid_data.get('state', None)
+                if st is not None and isinstance(st, dict) and 'A' in st:
+                    A_traj = np.asarray(st['A'])  # (T, X, Y, C)
+                    mass_traj = np.sum(A_traj, axis=(1, 2, 3))
+                    line = wandb.plot.line_series(
+                        xs=list(range(mass_traj.shape[0])),
+                        ys=[mass_traj.tolist()],
+                        keys=["mass_total"],
+                        title="Mass trajectory (best member rollout)",
+                        xname="step",
+                    )
+                    log_payload['train_mass_total_traj'] = line
+
+                run.log(log_payload)
             except Exception as e:
                 print(f"Full video logging failed: {e}")
 

@@ -347,26 +347,26 @@ class FlowLenia:
                 # periodic spawn
                 do_spawn = (self.food_spawn_interval > 0) & (jnp.mod(t, self.food_spawn_interval) == 0)
                 def spawn_food(Food_in, key):
-                    # Use max_sz as static patch container, compute dynamic active size fp_sz
+                    # Use max_sz as static patch container; fp_sz is fixed by food_sz (clipped)
                     max_sz = min(self.food_patch_size, Food_in.shape[0], Food_in.shape[1])
                     max_i = Food_in.shape[0] - max_sz
                     max_j = Food_in.shape[1] - max_sz
+                    # Patch side is fixed by food_sz (clipped to grid); we auto-compute density if enabled
+                    fp_sz = jnp.array(self.food_patch_size, dtype=jnp.int32)
+                    fp_sz = jnp.clip(fp_sz, 0, max_sz)
+                    n = int(self.food_n_patches)
+                    cells_per_patch = jnp.maximum(1.0, jnp.float32(fp_sz) * jnp.float32(fp_sz))
+                    patches = float(max(1, n))
                     if self.food_auto_size and self.food_spawn_interval > 0 and self.mass_decay > 0:
                         M = jnp.sum(nA)
                         I = float(self.food_spawn_interval)
                         d = float(self.mass_decay)
                         lost = M * (1.0 - jnp.power(1.0 - d, I))
                         required_food = lost / (self.food_bonus + 1e-8)
-                        cells_needed = required_food / (self.food_amount + 1e-8)
-                        per_patch = cells_needed / max(1, self.food_n_patches)
-                        side = jnp.sqrt(jnp.maximum(0.0, per_patch))
-                        # Round up so the spawned patch actually covers the required food mass instead of undershooting
-                        fp_sz = jnp.ceil(side).astype(jnp.int32)
-                        fp_sz = jnp.clip(fp_sz, 0, max_sz)
+                        # distribute required food evenly across the fixed patch area
+                        food_amt_cell = required_food / (cells_per_patch * patches + 1e-8)
                     else:
-                        fp_sz = jnp.array(self.food_patch_size, dtype=jnp.int32)
-                        fp_sz = jnp.clip(fp_sz, 0, max_sz)
-                    n = int(self.food_n_patches)
+                        food_amt_cell = jnp.array(self.food_amount, dtype=jnp.float32)
                     def body(i, carry):
                         Fcur, kcur = carry
                         kcur, ki, kj = jr.split(kcur, 3)
@@ -374,7 +374,7 @@ class FlowLenia:
                         j0 = jr.randint(kj, (), 0, max_j + 1)
                         rows = jnp.arange(max_sz) < fp_sz
                         mask = (rows[:, None] & rows[None, :]).astype(jnp.float32)
-                        patch = mask * self.food_amount
+                        patch = mask * food_amt_cell
                         Fcur = Fcur + jax.lax.dynamic_update_slice(jnp.zeros_like(Fcur), patch, (i0, j0))
                         return (Fcur, kcur)
                     Food_add, _ = jax.lax.fori_loop(0, n, body, (jnp.zeros_like(Food_in), rng))
