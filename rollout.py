@@ -21,7 +21,7 @@ def rollout_simulation(rng, params, s0=None,
         - (K, chunk_ends): return the rollout at K sampled intervals, if chunk_ends is True then end of intervals is sampled
     img_size : image size to render at. Leave at 224 to avoid resizing again for CLIP.
     return_state : return the state data, leave as False, unless you really need it.
-    return_mass : when True and time_sampling='video', also return per-frame total mass (sum over grid+channels) without storing full states.
+    return_mass : when True and time_sampling='video', also return per-frame total mass (sum over grid+channels) and food mass without storing full states.
 
     Returns
     ----------
@@ -33,7 +33,7 @@ def rollout_simulation(rng, params, s0=None,
     'z' : the image embedding of the simulation using the foundation model,
         shape (D)
 
-    If time_sampling is 'video' then the returned shapes become (rollout_steps, ...). If return_mass is True, a 'mass' array of shape (rollout_steps,) is included.
+    If time_sampling is 'video' then the returned shapes become (rollout_steps, ...). If return_mass is True, 'mass' and 'food_mass' arrays of shape (rollout_steps,) are included.
     If time_sampling is an int then the returned shapes become (time_sampling, ...).
 
     ----------
@@ -76,7 +76,8 @@ def rollout_simulation(rng, params, s0=None,
                 img = substrate.render_state(next_state, params=params, img_size=img_size)
                 z = embed_img_fn(img)
                 mass = jnp.sum(next_state["A"])
-                return next_state, dict(rgb=img, z=z, state=(next_state if return_state else None), mass=mass)
+                food_mass = jnp.sum(next_state.get("Food", 0))
+                return next_state, dict(rgb=img, z=z, state=(next_state if return_state else None), mass=mass, food_mass=food_mass)
         else:
             def step_fn(state, _rng):
                 next_state = substrate.step_state(_rng, state, params)

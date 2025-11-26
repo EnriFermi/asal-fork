@@ -320,12 +320,19 @@ def main(args):
 
                 # Log mass trajectory over the rollout to check stability (sum over grid and channels)
                 mass_traj = vid_data.get('mass', None)
+                food_traj = vid_data.get('food_mass', None)
                 if mass_traj is not None:
                     mass_traj = np.asarray(mass_traj)
+                    ys = [mass_traj.tolist()]
+                    keys = ["mass_total"]
+                    if food_traj is not None:
+                        food_traj = np.asarray(food_traj)
+                        ys.append(food_traj.tolist())
+                        keys.append("food_total")
                     line = wandb.plot.line_series(
                         xs=list(range(mass_traj.shape[0])),
-                        ys=[mass_traj.tolist()],
-                        keys=["mass_total"],
+                        ys=ys,
+                        keys=keys,
                         title="Mass trajectory (best member rollout)",
                         xname="step",
                     )
