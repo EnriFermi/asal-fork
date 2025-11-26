@@ -418,8 +418,12 @@ class FlowLenia:
                     kernel = jnp.array([[1.0, 2.0, 1.0],
                                         [2.0, 4.0, 2.0],
                                         [1.0, 2.0, 1.0]], dtype=Food.dtype) / 16.0
-                    boundary = 'wrap' if self.border == 'torus' else 'symm'
-                    diffused = jsp.signal.convolve2d(Food, kernel, mode='same', boundary=boundary)
+                    # jax.scipy.signal.convolve2d only supports boundary='fill', so pad manually
+                    if self.border == 'torus':
+                        Food_padded = jnp.pad(Food, 1, mode='wrap')
+                    else:
+                        Food_padded = jnp.pad(Food, 1, mode='edge')
+                    diffused = jsp.signal.convolve2d(Food_padded, kernel, mode='valid', boundary='fill')
                     a = self.food_diffusion_alpha
                     Food = (1.0 - a) * Food + a * diffused
 
