@@ -363,9 +363,11 @@ class FlowLenia:
                     cells_per_patch = jnp.maximum(1.0, jnp.float32(fp_sz) * jnp.float32(fp_sz))
                     patches = float(max(1, n))
                     # distribute required food evenly across the fixed patch area
+                    # when auto_size is on, enforce a per-cell floor of food_amount so we never stop spawning completely
+                    auto_density = required_food / (cells_per_patch * patches + 1e-8)
                     food_amt_cell = jnp.where(
                         self.food_auto_size,
-                        required_food / (cells_per_patch * patches + 1e-8),
+                        jnp.maximum(auto_density, jnp.array(self.food_amount, dtype=jnp.float32)),
                         jnp.array(self.food_amount, dtype=jnp.float32),
                     )
                     def body(i, carry):
@@ -384,8 +386,9 @@ class FlowLenia:
                 observed_loss = jnp.maximum(0.0, mass_cycle_start - mass_cur)
                 required_food = jnp.where(self.food_auto_size, observed_loss / (self.food_bonus + 1e-8), 0.0)
                 Food = jax.lax.select(do_spawn, spawn_food(Food, rng, required_food), Food)
-                # Reset cycle start mass after spawn (targeting restored mass if food is consumed)
-                mass_cycle_start = jax.lax.select(do_spawn & self.food_auto_size, mass_cur + required_food, mass_cycle_start)
+                # Reset cycle start mass after this step to the actual post-update mass
+                # so next cycle measures true observed loss (not an inflated target).
+                mass_cycle_start = mass_cycle_start  # will be overwritten below if we spawned
 
                 # consumption: only green channel consumes
                 gc = int(self.food_green_channel)
@@ -401,6 +404,9 @@ class FlowLenia:
                 Food = Food - eat
                 # convert to mass in green channel with bonus
                 nA = nA.at[..., gc].add(eat * self.food_bonus)
+                # After consumption, record true cycle start mass when we spawned this step
+                new_mass_cycle_start = jnp.sum(nA)
+                mass_cycle_start = jax.lax.select(do_spawn & self.food_auto_size, new_mass_cycle_start, mass_cycle_start)
 
             t = t + jnp.array(1, dtype=jnp.int32)
 
