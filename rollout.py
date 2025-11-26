@@ -72,16 +72,17 @@ def rollout_simulation(rng, params, s0=None,
         if return_mass:
             def step_fn(state, _rng):
                 next_state = substrate.step_state(_rng, state, params)
-                img = substrate.render_state(state, params=params, img_size=img_size)
+                # Render the updated state so spawned food and mutations appear in the frame
+                img = substrate.render_state(next_state, params=params, img_size=img_size)
                 z = embed_img_fn(img)
-                mass = jnp.sum(state["A"])
-                return next_state, dict(rgb=img, z=z, state=(state if return_state else None), mass=mass)
+                mass = jnp.sum(next_state["A"])
+                return next_state, dict(rgb=img, z=z, state=(next_state if return_state else None), mass=mass)
         else:
             def step_fn(state, _rng):
                 next_state = substrate.step_state(_rng, state, params)
-                img = substrate.render_state(state, params=params, img_size=img_size)
+                img = substrate.render_state(next_state, params=params, img_size=img_size)
                 z = embed_img_fn(img)
-                return next_state, dict(rgb=img, z=z, state=(state if return_state else None))
+                return next_state, dict(rgb=img, z=z, state=(next_state if return_state else None))
 
         state_final, data = jax.lax.scan(step_fn, s0, split(rng, rollout_steps))
         # Include final state for chaining batches when requested
