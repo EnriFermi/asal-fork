@@ -363,9 +363,11 @@ class FlowLenia:
                     cells_per_patch = jnp.maximum(1.0, jnp.float32(fp_sz) * jnp.float32(fp_sz))
                     patches = float(max(1, n))
                     # distribute required food evenly across the fixed patch area
+                    # when auto_size is on, enforce a per-cell floor of food_amount so we never stop spawning completely
+                    auto_density = required_food / (cells_per_patch * patches + 1e-8)
                     food_amt_cell = jnp.where(
                         self.food_auto_size,
-                        required_food / (cells_per_patch * patches + 1e-8),
+                        jnp.maximum(auto_density, jnp.array(self.food_amount, dtype=jnp.float32)),
                         jnp.array(self.food_amount, dtype=jnp.float32),
                     )
                     def body(i, carry):
