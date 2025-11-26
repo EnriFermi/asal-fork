@@ -346,9 +346,12 @@ class FlowLenia:
                 nA = nA * (1.0 - self.mass_decay)
 
             if self.food_enabled:
+                # Track mass at cycle start to compensate observed loss (measured, not predicted)
+                mass_cycle_start = state.get("mass_cycle_start", jnp.sum(nA))
+                mass_cur = jnp.sum(nA)
                 # periodic spawn
                 do_spawn = (self.food_spawn_interval > 0) & (jnp.mod(t, self.food_spawn_interval) == 0)
-                def spawn_food(Food_in, key):
+                def spawn_food(Food_in, key, required_food):
                     # Use max_sz as static patch container; fp_sz is fixed by food_sz (clipped)
                     max_sz = min(self.food_patch_size, Food_in.shape[0], Food_in.shape[1])
                     max_i = Food_in.shape[0] - max_sz
@@ -359,16 +362,12 @@ class FlowLenia:
                     n = int(self.food_n_patches)
                     cells_per_patch = jnp.maximum(1.0, jnp.float32(fp_sz) * jnp.float32(fp_sz))
                     patches = float(max(1, n))
-                    if self.food_auto_size and self.food_spawn_interval > 0 and self.mass_decay > 0:
-                        M = jnp.sum(nA)
-                        I = float(self.food_spawn_interval)
-                        d = float(self.mass_decay)
-                        lost = M * (1.0 - jnp.power(1.0 - d, I))
-                        required_food = lost / (self.food_bonus + 1e-8)
-                        # distribute required food evenly across the fixed patch area
-                        food_amt_cell = required_food / (cells_per_patch * patches + 1e-8)
-                    else:
-                        food_amt_cell = jnp.array(self.food_amount, dtype=jnp.float32)
+                    # distribute required food evenly across the fixed patch area
+                    food_amt_cell = jnp.where(
+                        self.food_auto_size,
+                        required_food / (cells_per_patch * patches + 1e-8),
+                        jnp.array(self.food_amount, dtype=jnp.float32),
+                    )
                     def body(i, carry):
                         Fcur, kcur = carry
                         kcur, ki, kj = jr.split(kcur, 3)
@@ -381,7 +380,12 @@ class FlowLenia:
                         return (Fcur, kcur)
                     Food_add, _ = jax.lax.fori_loop(0, n, body, (jnp.zeros_like(Food_in), rng))
                     return Food_in + Food_add
-                Food = jax.lax.select(do_spawn, spawn_food(Food, rng), Food)
+                # Observed loss since last cycle start
+                observed_loss = jnp.maximum(0.0, mass_cycle_start - mass_cur)
+                required_food = jnp.where(self.food_auto_size, observed_loss / (self.food_bonus + 1e-8), 0.0)
+                Food = jax.lax.select(do_spawn, spawn_food(Food, rng, required_food), Food)
+                # Reset cycle start mass after spawn (targeting restored mass if food is consumed)
+                mass_cycle_start = jax.lax.select(do_spawn & self.food_auto_size, mass_cur + required_food, mass_cycle_start)
 
                 # consumption: only green channel consumes
                 gc = int(self.food_green_channel)
@@ -400,7 +404,7 @@ class FlowLenia:
 
             t = t + jnp.array(1, dtype=jnp.int32)
 
-        return {"A": nA, "P": nP, "fK": fK, "m": m, "s": s, "Food": Food, "t": t}
+        return {"A": nA, "P": nP, "fK": fK, "m": m, "s": s, "Food": Food, "t": t, "mass_cycle_start": mass_cycle_start}
 
     def render_state(self, state, params, img_size=None):
         mode = getattr(self, 'render_mode', 'A')
