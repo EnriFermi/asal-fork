@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import jax.scipy as jsp
 from jax.random import split
 from .utils import conn_from_matrix, get_kernels_fft, sobel, growth
 from .reintegration_tracking import ReintegrationTracking
@@ -63,6 +64,7 @@ class FlowLenia:
         food_conv_mode: str = "scalar",  # 'scalar' | 'conv'
         food_vis_scale: float = 1.0,
         food_vis_color=(0.6, 0.3, 0.0),  # RGB overlay for food
+        food_diffusion_alpha: float = 0.0,  # blend factor for food diffusion (0=off)
     ):
         self.grid_size = grid_size
         self.C = C
@@ -98,6 +100,7 @@ class FlowLenia:
         self.food_conv_mode = food_conv_mode
         self.food_vis_scale = float(food_vis_scale)
         self.food_vis_color = tuple(food_vis_color)
+        self.food_diffusion_alpha = float(food_diffusion_alpha)
 
         # Connectivity: by default, all k kernels read from channel 0 and
         # contribute to channel 0 (for C=1). For C>1, still route all to ch 0.
@@ -349,8 +352,10 @@ class FlowLenia:
                 # Track mass at cycle start to compensate observed loss (measured, not predicted)
                 mass_cycle_start = state.get("mass_cycle_start", jnp.sum(nA))
                 mass_cur = jnp.sum(nA)
-                # periodic spawn
-                do_spawn = (self.food_spawn_interval > 0) & (jnp.mod(t, self.food_spawn_interval) == 0)
+                # periodic spawn; also force a spawn on the very first step to seed food immediately
+                first_spawn = (t == 0)
+                periodic_spawn = (self.food_spawn_interval > 0) & (jnp.mod(t, self.food_spawn_interval) == 0)
+                do_spawn = first_spawn | periodic_spawn
                 def spawn_food(Food_in, key, required_food):
                     # Use max_sz as static patch container; fp_sz is fixed by food_sz (clipped)
                     max_sz = min(self.food_patch_size, Food_in.shape[0], Food_in.shape[1])
@@ -407,6 +412,16 @@ class FlowLenia:
                 # After consumption, record true cycle start mass when we spawned this step
                 new_mass_cycle_start = jnp.sum(nA)
                 mass_cycle_start = jax.lax.select(do_spawn & self.food_auto_size, new_mass_cycle_start, mass_cycle_start)
+
+                # Optional food diffusion (conservative blur)
+                if self.food_diffusion_alpha > 0:
+                    kernel = jnp.array([[1.0, 2.0, 1.0],
+                                        [2.0, 4.0, 2.0],
+                                        [1.0, 2.0, 1.0]], dtype=Food.dtype) / 16.0
+                    boundary = 'wrap' if self.border == 'torus' else 'symm'
+                    diffused = jsp.signal.convolve2d(Food, kernel, mode='same', boundary=boundary)
+                    a = self.food_diffusion_alpha
+                    Food = (1.0 - a) * Food + a * diffused
 
             t = t + jnp.array(1, dtype=jnp.int32)
 
