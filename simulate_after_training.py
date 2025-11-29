@@ -53,6 +53,7 @@ def main():
     parser.add_argument('--food_channel', type=int, default=1, help='For FlowLenia: which channel consumes food (0=R,1=G,2=B)')
     parser.add_argument('--food_auto_size', action='store_true', help='For FlowLenia: auto-set food patch size to compensate decay per spawn')
     parser.add_argument('--food_conv_mode', type=str, default='scalar', choices=['scalar','conv'], help='For FlowLenia: consumption mode')
+    parser.add_argument('--food_diffusion_alpha', type=float, default=0.0, help='For FlowLenia: blend factor for food diffusion (0=off)')
     parser.add_argument('--output', type=str, default='out.mp4', help='Output MP4 path')
     parser.add_argument('--fps', type=int, default=250, help='Output video FPS')
     parser.add_argument('--codec', type=str, default='libx264', help='Video codec (e.g., libx264)')
@@ -142,6 +143,8 @@ def main():
                 substrate.food_auto_size = bool(args.food_auto_size)
             if hasattr(substrate, 'food_conv_mode'):
                 substrate.food_conv_mode = str(args.food_conv_mode)
+            if hasattr(substrate, 'food_diffusion_alpha'):
+                substrate.food_diffusion_alpha = float(args.food_diffusion_alpha)
         except Exception:
             pass
     substrate = substrates.FlattenSubstrateParameters(substrate)

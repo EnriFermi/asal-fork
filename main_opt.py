@@ -295,7 +295,7 @@ def main(args):
                     pca_img = wandb.Image(fig)
                     plt.close(fig)
                 except Exception as e:
-                    print(f\"PCA population logging failed at iter {i_iter}: {e}\")
+                    print("PCA population logging failed at iter {i_iter}: {e}")
 
             # Log scalar stats and PCA image for this iteration
             log_dict = {
