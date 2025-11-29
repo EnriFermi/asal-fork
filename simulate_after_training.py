@@ -54,6 +54,7 @@ def main():
     parser.add_argument('--food_auto_size', action='store_true', help='For FlowLenia: auto-set food patch size to compensate decay per spawn')
     parser.add_argument('--food_conv_mode', type=str, default='scalar', choices=['scalar','conv'], help='For FlowLenia: consumption mode')
     parser.add_argument('--food_diffusion_alpha', type=float, default=0.0, help='For FlowLenia: blend factor for food diffusion (0=off)')
+    parser.add_argument('--mass_clip_eps', type=float, default=0.0, help='For FlowLenia: zero-out per-pixel mass below this sum')
     parser.add_argument('--output', type=str, default='out.mp4', help='Output MP4 path')
     parser.add_argument('--fps', type=int, default=250, help='Output video FPS')
     parser.add_argument('--codec', type=str, default='libx264', help='Video codec (e.g., libx264)')
@@ -145,8 +146,16 @@ def main():
                 substrate.food_conv_mode = str(args.food_conv_mode)
             if hasattr(substrate, 'food_diffusion_alpha'):
                 substrate.food_diffusion_alpha = float(args.food_diffusion_alpha)
+            if hasattr(substrate, 'mass_clip_eps'):
+                substrate.mass_clip_eps = float(args.mass_clip_eps)
         except Exception:
             pass
+    # Ensure parameter length matches current substrate expectation to catch mismatches early
+    param_len = int(np.asarray(best_member).size)
+    expected_len = int(np.asarray(substrate.default_params(jax.random.PRNGKey(0))).size)
+    if param_len != expected_len:
+        raise ValueError(f"Loaded parameter length {param_len} does not match substrate expectation {expected_len}. "
+                         f"Check that training and simulation use the same substrate configuration.")
     substrate = substrates.FlattenSubstrateParameters(substrate)
     rollout_steps = substrate.rollout_steps if args.rollout_steps is None else args.rollout_steps
 

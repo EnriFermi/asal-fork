@@ -46,6 +46,7 @@ group.add_argument("--food_channel", type=int, default=1, help="for lenia_flow: 
 group.add_argument("--food_auto_size", action='store_true', help="for lenia_flow: auto-set food patch size to compensate decay per spawn")
 group.add_argument("--food_conv_mode", type=str, default='scalar', choices=['scalar','conv'], help="for lenia_flow: consumption mode")
 group.add_argument("--food_diffusion_alpha", type=float, default=0.0, help="for lenia_flow: blend factor for food diffusion (0=off)")
+group.add_argument("--mass_clip_eps", type=float, default=0.0, help="for lenia_flow: zero-out per-pixel mass below this sum")
 
 group = parser.add_argument_group("evaluation")
 group.add_argument("--foundation_model", type=str, default="clip", help="the foundation model to use (don't touch this)")
@@ -138,6 +139,8 @@ def main(args):
                     substrate.food_conv_mode = str(args.food_conv_mode)
                 if hasattr(substrate, 'food_diffusion_alpha'):
                     substrate.food_diffusion_alpha = float(args.food_diffusion_alpha)
+                if hasattr(substrate, 'mass_clip_eps'):
+                    substrate.mass_clip_eps = float(args.mass_clip_eps)
                 # Make food visible as white overlay in training videos
                 if hasattr(substrate, 'food_vis_color'):
                     substrate.food_vis_color = (1.0, 1.0, 1.0)
