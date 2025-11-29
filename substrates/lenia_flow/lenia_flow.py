@@ -65,6 +65,7 @@ class FlowLenia:
         food_vis_scale: float = 1.0,
         food_vis_color=(0.6, 0.3, 0.0),  # RGB overlay for food
         food_diffusion_alpha: float = 0.0,  # blend factor for food diffusion (0=off)
+        mass_clip_eps: float = 0.0,  # zero-out tiny masses below this per-pixel sum
     ):
         self.grid_size = grid_size
         self.C = C
@@ -101,6 +102,7 @@ class FlowLenia:
         self.food_vis_scale = float(food_vis_scale)
         self.food_vis_color = tuple(food_vis_color)
         self.food_diffusion_alpha = float(food_diffusion_alpha)
+        self.mass_clip_eps = float(mass_clip_eps)
 
         # Connectivity: by default, all k kernels read from channel 0 and
         # contribute to channel 0 (for C=1). For C>1, still route all to ch 0.
@@ -325,6 +327,11 @@ class FlowLenia:
         F = jnp.clip(F * (1 - alpha) - C_grad * alpha, -mag, mag)
 
         nA, nP = self.RT(A, P, F)
+
+        # Clip vanishingly small masses (per-pixel sum) to zero to avoid dust
+        if self.mass_clip_eps > 0:
+            msum = jnp.sum(nA, axis=-1, keepdims=True)
+            nA = jnp.where(msum < self.mass_clip_eps, 0.0, nA)
 
         # Optional mutation: inject a random parameter patch into P
         if self.mutation_enabled:
