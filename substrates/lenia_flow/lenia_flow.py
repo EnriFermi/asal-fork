@@ -349,6 +349,9 @@ class FlowLenia:
             msk = (jr.uniform(kprob, ()) < self.mutation_p).astype(nP.dtype)
             nP = nP + dP * msk
 
+        # Track cycle-start mass for food compensation; ensure defined even if food disabled
+        mass_cycle_start = state.get("mass_cycle_start", jnp.sum(nA))
+
         # Optional mass decay and food mechanics
         if self.food_enabled or (self.mass_decay > 0):
             # global decay on A
