@@ -42,6 +42,10 @@ def main():
     parser.add_argument('--mutations', action='store_true', help='For FlowLenia: enable parameter patch mutations during rollout')
     parser.add_argument('--mutation_sz', type=int, default=20, help='For FlowLenia: size of mutation patch')
     parser.add_argument('--mutation_p', type=float, default=0.1, help='For FlowLenia: probability of mutation each step')
+    parser.add_argument('--volcano', action='store_true', help='For FlowLenia: enable volcano mutation (mass removal + strong genome change)')
+    parser.add_argument('--volcano_sz', type=int, default=30, help='For FlowLenia: size of volcano patch')
+    parser.add_argument('--volcano_p', type=float, default=0.01, help='For FlowLenia: probability of volcano each step')
+    parser.add_argument('--volcano_delta', type=float, default=5.0, help='For FlowLenia: scale of genome perturbation in volcano')
     # food mechanics
     parser.add_argument('--food', action='store_true', help='For FlowLenia: enable food mechanics (decay + spawn + consumption)')
     parser.add_argument('--food_interval', type=int, default=128, help='For FlowLenia: steps between food spawns')
@@ -120,6 +124,15 @@ def main():
     if hasattr(substrate, 'render_mode'):
         try:
             substrate.render_mode = str(args.render_mode)
+        except Exception:
+            pass
+    # Volcano mutation controls
+    if hasattr(substrate, 'volcano_enabled'):
+        try:
+            substrate.volcano_enabled = bool(args.volcano)
+            substrate.volcano_sz = int(args.volcano_sz)
+            substrate.volcano_p = float(args.volcano_p)
+            substrate.volcano_delta_scale = float(args.volcano_delta)
         except Exception:
             pass
     if hasattr(substrate, 'mutation_enabled'):

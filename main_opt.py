@@ -38,6 +38,10 @@ group.add_argument("--seed_n_patches", type=int, default=1, help="for lenia_flow
 group.add_argument("--mutations", action='store_true', help="for lenia_flow: enable parameter patch mutations during rollout")
 group.add_argument("--mutation_sz", type=int, default=20, help="for lenia_flow: size of mutation patch")
 group.add_argument("--mutation_p", type=float, default=0.1, help="for lenia_flow: probability of mutation each step")
+group.add_argument("--volcano", action='store_true', help="for lenia_flow: enable volcano mutation (mass removal + strong genome change)")
+group.add_argument("--volcano_sz", type=int, default=30, help="for lenia_flow: size of volcano patch")
+group.add_argument("--volcano_p", type=float, default=0.01, help="for lenia_flow: probability of volcano each step")
+group.add_argument("--volcano_delta", type=float, default=5.0, help="for lenia_flow: scale of genome perturbation in volcano")
 group.add_argument("--seed_mode", type=str, default='notebook_centers', choices=['center','random_patches','notebook_centers'], help="for lenia_flow: seeding mode")
 group.add_argument("--p_constant_per_patch", type=int, default=1, help="for lenia_flow: 1 for per-patch constant P, 0 for per-pixel random P")
 group.add_argument("--render_mode", type=str, default='Pcolor', choices=['A','Pcolor'], help="for lenia_flow: rendering mode")
@@ -126,6 +130,15 @@ def main(args):
         if hasattr(substrate, 'render_mode'):
             try:
                 substrate.render_mode = str(args.render_mode)
+            except Exception:
+                pass
+        # Volcano mutation controls
+        if hasattr(substrate, 'volcano_enabled'):
+            try:
+                substrate.volcano_enabled = bool(args.volcano)
+                substrate.volcano_sz = int(args.volcano_sz)
+                substrate.volcano_p = float(args.volcano_p)
+                substrate.volcano_delta_scale = float(args.volcano_delta)
             except Exception:
                 pass
         # Optional: food mechanics
