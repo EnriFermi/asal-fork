@@ -364,24 +364,22 @@ class FlowLenia:
             kv_main, kv_key = jr.split(rng)
             def volcano_apply(carry):
                 nA_cur, nP_cur = carry
-                kpos, kdest, kgen = jr.split(kv_key, 3)
+                kpos, kmass, kgen = jr.split(kv_key, 3)
                 sz = max(1, min(self.volcano_sz, nA_cur.shape[0], nA_cur.shape[1]))
                 max_i = nA_cur.shape[0] - sz
                 max_j = nA_cur.shape[1] - sz
                 ki, kj = jr.split(kpos)
                 i0 = jr.randint(ki, (), 0, max_i + 1)
                 j0 = jr.randint(kj, (), 0, max_j + 1)
-                # remove mass in patch
+                # Capture current mass in patch
                 A_patch = jax.lax.dynamic_slice(nA_cur, (i0, j0, 0), (sz, sz, nA_cur.shape[-1]))
-                removed = jnp.sum(A_patch, axis=(0, 1))  # per-channel
-                nA_cur = jax.lax.dynamic_update_slice(nA_cur, jnp.zeros_like(A_patch), (i0, j0, 0))
-                # redistribute removed mass to another random patch to conserve total mass
-                kd_i, kd_j = jr.split(kdest)
-                i1 = jr.randint(kd_i, (), 0, max_i + 1)
-                j1 = jr.randint(kd_j, (), 0, max_j + 1)
-                add_patch = jnp.ones((sz, sz, nA_cur.shape[-1])) * (removed / (sz * sz + 1e-8))
-                nA_cur = nA_cur + jax.lax.dynamic_update_slice(jnp.zeros_like(nA_cur), add_patch, (i1, j1, 0))
-                # strong genome perturbation in the cleared patch (per-pixel noise, larger scale)
+                removed = jnp.sum(A_patch, axis=(0, 1))  # per-channel total to preserve
+                # Reshuffle mass inside the same patch using positive noise normalized per channel
+                noise = jnp.abs(jr.normal(kmass, (sz, sz, nA_cur.shape[-1]))) + 1e-8
+                norm = jnp.sum(noise, axis=(0, 1), keepdims=True)
+                new_patch = noise / norm * removed
+                nA_cur = jax.lax.dynamic_update_slice(nA_cur, new_patch, (i0, j0, 0))
+                # strong genome perturbation in the patch (per-pixel noise, larger scale)
                 kdim = nP_cur.shape[-1]
                 p_noise = jr.normal(kgen, (sz, sz, kdim)) * self.volcano_delta_scale
                 dP = jax.lax.dynamic_update_slice(jnp.zeros_like(nP_cur), p_noise, (i0, j0, 0))
