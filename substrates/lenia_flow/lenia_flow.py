@@ -374,7 +374,7 @@ class FlowLenia:
                 # remove mass in patch
                 A_patch = jax.lax.dynamic_slice(nA_cur, (i0, j0, 0), (sz, sz, nA_cur.shape[-1]))
                 removed = jnp.sum(A_patch, axis=(0, 1))  # per-channel
-                nA_cur = nA_cur.at[i0:i0+sz, j0:j0+sz, :].set(0.0)
+                nA_cur = jax.lax.dynamic_update_slice(nA_cur, jnp.zeros_like(A_patch), (i0, j0, 0))
                 # redistribute removed mass to another random patch to conserve total mass
                 kd_i, kd_j = jr.split(kdest)
                 i1 = jr.randint(kd_i, (), 0, max_i + 1)
