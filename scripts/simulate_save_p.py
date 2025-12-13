@@ -212,6 +212,7 @@ def main():
     file_idx = 0
 
     steps_done = 0
+    pbar = tqdm(total=total_steps, desc="Simulating")
     while steps_done < total_steps:
         outer_b = min(args.batch_steps, total_steps - steps_done)
         remaining = outer_b
@@ -232,6 +233,8 @@ def main():
                         steps_buf, snaps_buf = [], []
             remaining -= mb
             steps_done += mb
+            pbar.update(mb)
+    pbar.close()
 
     if snaps_buf:
         file_idx = save_chunk(out_dir, fps, steps_buf, snaps_buf, file_idx)
