@@ -1,0 +1,16 @@
+python simulate_after_training.py \
+  --save_dir ./data/supervised_2_food_notauto \
+  --substrate lenia_flow \
+  --traj_iter 70 \
+  --rollout_steps 8192 \
+  --seed 0 \
+  --n_seeds 8 \
+  --seed_mode random_patches \
+  --mutations --mutation_p 0.15 --mutation_sz 40 \
+  --food \
+  --food_interval 600 --food_n 30 --food_sz 5 \
+  --food_amount 1.0 --food_consume_rate 0.01 --food_bonus 16.0 \
+  --mass_decay 0.003 --food_conv_mode scalar \
+  --max_steps 1200000\
+  --food_diffusion_alpha 0.05 \
+  --output iter70.mp4 --fps 250

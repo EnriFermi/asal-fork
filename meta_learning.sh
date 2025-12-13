@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+python3 meta_learning.py \
+  --dataset cifar10 \
+  --device cuda \
+  --seed 0 \
+  --inner-steps 200 \
+  --batch-size 64 \
+  --train-size 20000 \
+  --val-size 1024 \
+  --mom-beta 0.9 \
+  --block-size 64 \
+  --d-model 16 \
+  --nhead 2 \
+  --num-layers 1 \
+  --outer-lr 3e-4 \
+  --init-sgd-lr 0.001 \
+  --resid-scale 0.05 \
+  --max-lr 0.01 \
+  --log-std-init -8 \
+  --log-std-min -12 \
+  --log-std-max -5 \
+  --ppo-updates 1500 \
+  --episodes-per-batch 32 \
+  --ppo-epochs 3 \
+  --minibatch 16 \
+  --ent-coef 0.001 \
+  --vf-coef 0.5 \
+  --clip 0.2 \
+  --gamma 0.99 \
+  --lam 0.95 \
+  --baseline-lr 1e-3 \
+  --eval-every 10
+

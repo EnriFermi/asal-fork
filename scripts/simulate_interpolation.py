@@ -7,8 +7,8 @@ import util
 
 # --- config: adjust paths/substrate if needed ---
 save_dir_0 = "data/supervised_0"   # checkpoint WITHOUT trajectory (best.pkl only)
-save_dir_1 = "data/supervised_1"   # checkpoint WITH best_traj.pkl
-substrate_name = "lenia"           # must match what you used in main_opt
+save_dir_1 = "data/supervised_pca_track"   # checkpoint WITH best_traj.pkl
+substrate_name = "lenia_flow"           # must match what you used in main_opt
 out_root = "data/interp_supervised_0_1"
 os.makedirs(out_root, exist_ok=True)
 
@@ -36,6 +36,13 @@ def run_sim_with_simulate_after_training(save_dir, output_path):
         "--substrate", substrate_name,
         "--time_sampling", "video",
         "--output", output_path,
+        "--rollout_steps", "1000",
+        "--mutations", "--mutation_p", "0.05",
+        "--mutation_sz", "40",
+        "--n_seeds", "16",
+        "--seed_mode", "random_patches",
+        "--img_size", "154", 
+        "--max_steps", "1200000"
     ]
     print("Running:", " ".join(cmd))
     subprocess.run(cmd, check=True)
@@ -47,6 +54,8 @@ def main():
     alphas = np.linspace(0.0, 1.0, 6)  # 0, 0.2, ..., 1.0
 
     for i, a in enumerate(alphas):
+        if i in [5]:
+            continue
         params_interp = (1.0 - a) * params1_start + a * params0
         interp_name = f"interp_{i+1}"
         interp_save_dir = os.path.join(out_root, interp_name)

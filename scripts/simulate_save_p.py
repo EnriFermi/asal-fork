@@ -12,7 +12,7 @@ from rollout import rollout_simulation
 import util
 import foundation_models
 import asal_metrics
-
+from tqdm import tqdm
 
 def parse_time_sampling(arg):
     if arg == 'final' or arg == 'video':
@@ -192,7 +192,7 @@ def main():
     snaps_buf: List[np.ndarray] = []
     file_idx = 0
 
-    for step in range(total_steps):
+    for step in tqdm(range(total_steps)):
         rng, _rng = split(rng)
         s = substrate.step_state(_rng, s, best_member)
         if step % snapshot_interval == 0:
