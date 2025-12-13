@@ -180,6 +180,25 @@ def main():
     rng = jax.random.PRNGKey(args.seed)
     s = substrate.init_state(rng, best_member)
 
+    # Jitted microbatch stepper to speed up simulation
+    def build_batch_stepper(mb: int):
+        def run_batch(state, rng):
+            rngs = jax.random.split(rng, mb)
+            P0 = jnp.zeros((mb, *state["P"].shape), dtype=state["P"].dtype)
+
+            def body(i, carry):
+                st, Pbuf = carry
+                st = substrate.step_state(rngs[i], st, best_member)
+                Pbuf = Pbuf.at[i].set(st["P"])
+                return (st, Pbuf)
+
+            state_next, Pbuf = jax.lax.fori_loop(0, mb, body, (state, P0))
+            return state_next, Pbuf
+
+        return jax.jit(run_batch)
+
+    step_micro = build_batch_stepper(int(args.jit_microbatch))
+
     # Prepare snapshot directory
     out_dir = os.path.join(args.save_dir, args.output_dir)
     os.makedirs(out_dir, exist_ok=True)
@@ -192,15 +211,27 @@ def main():
     snaps_buf: List[np.ndarray] = []
     file_idx = 0
 
-    for step in range(total_steps):
-        rng, _rng = split(rng)
-        s = substrate.step_state(_rng, s, best_member)
-        if step % snapshot_interval == 0:
-            steps_buf.append(step)
-            snaps_buf.append(np.asarray(s["P"]))
-            if len(snaps_buf) >= chunk_size:
-                file_idx = save_chunk(out_dir, fps, steps_buf, snaps_buf, file_idx)
-                steps_buf, snaps_buf = [], []
+    steps_done = 0
+    while steps_done < total_steps:
+        outer_b = min(args.batch_steps, total_steps - steps_done)
+        remaining = outer_b
+        while remaining > 0:
+            mb = int(args.jit_microbatch)
+            if remaining < mb:
+                mb = remaining
+            rng, _rng = split(rng)
+            s, batch_P = step_micro(s, _rng)
+            batch_P = np.asarray(batch_P[:mb])  # (mb, X, Y, k)
+            for i in range(mb):
+                global_step = steps_done + i
+                if global_step % snapshot_interval == 0:
+                    steps_buf.append(global_step)
+                    snaps_buf.append(batch_P[i])
+                    if len(snaps_buf) >= chunk_size:
+                        file_idx = save_chunk(out_dir, fps, steps_buf, snaps_buf, file_idx)
+                        steps_buf, snaps_buf = [], []
+            remaining -= mb
+            steps_done += mb
 
     if snaps_buf:
         file_idx = save_chunk(out_dir, fps, steps_buf, snaps_buf, file_idx)
