@@ -7,9 +7,10 @@ from jax.random import split
 import numpy as np
 import imageio.v3 as iio
 import imageio  # for streaming writer
+from tqdm import tqdm
 import matplotlib.pyplot as plt
-import wandb
 
+import wandb
 import substrates
 from rollout import rollout_simulation
 import util
@@ -51,7 +52,7 @@ def main():
     parser.add_argument('--food_n', type=int, default=3, help='For FlowLenia: number of food patches per spawn')
     parser.add_argument('--food_sz', type=int, default=16, help='For FlowLenia: food patch size')
     parser.add_argument('--food_amount', type=float, default=1.0, help='For FlowLenia: amount of food per cell in patch')
-    parser.add_argument('--food_consume_rate', type=float, default=0.05, help='For FlowLenia: rate of consumption per step per pixel relative to green mass')
+    parser.add_argument('--food_consume_rate', type=float, default=0.0, help='For FlowLenia: rate of consumption per step per pixel relative to green mass')
     parser.add_argument('--food_bonus', type=float, default=1.0, help='For FlowLenia: multiplier converting food to mass')
     parser.add_argument('--mass_decay', type=float, default=0.0, help='For FlowLenia: uniform mass decay per step')
     parser.add_argument('--food_channel', type=int, default=1, help='For FlowLenia: which channel consumes food (0=R,1=G,2=B)')
@@ -231,22 +232,53 @@ def main():
         mass_total = []
         mass_channels = [ [] for _ in range(C) ]
         steps_done = 0
-        while args.max_steps is None or steps_done < args.max_steps:
-            outer_b = args.batch_steps if args.max_steps is None else min(args.batch_steps, args.max_steps - steps_done)
-            remaining = outer_b
-            while remaining > 0:
-                mb = int(args.jit_microbatch)
-                mb = remaining if remaining < mb else mb
-                rng, _rng = split(rng)
-                s, batch_frames, batch_masses = step_micro(s, _rng)
-                batch_frames = np.asarray(batch_frames[:mb])  # (mb, H, W, 3)
-                batch_masses = np.asarray(batch_masses[:mb])  # (mb, C)
-                batch_u8 = (np.clip(batch_frames, 0.0, 1.0) * 255).astype(np.uint8)
+        with tqdm() as pbar:
+            print(args.batch_steps, args.max_steps)
+            while args.max_steps is None or steps_done < args.max_steps:
+                outer_b = args.batch_steps if args.max_steps is None else min(args.batch_steps, args.max_steps - steps_done)
+                remaining = outer_b
+                while remaining > 0:
+                    mb = int(args.jit_microbatch)
+                    mb = remaining if remaining < mb else mb
+                    rng, _rng = split(rng)
+                    s, batch_frames, batch_masses = step_micro(s, _rng)
+                    batch_frames = np.asarray(batch_frames[:mb])  # (mb, H, W, 3)
+                    batch_masses = np.asarray(batch_masses[:mb])  # (mb, C)
+                    batch_u8 = (np.clip(batch_frames, 0.0, 1.0) * 255).astype(np.uint8)
 
-                for i_frame in range(batch_u8.shape[0]):
-                    frame_u8 = batch_u8[i_frame]
-                    writer.append_data(frame_u8)
+                    for i_frame in range(batch_u8.shape[0]):
+                        frame_u8 = batch_u8[i_frame]
+                        writer.append_data(frame_u8)
 
+                        # record masses
+                        mchs = batch_masses[i_frame]
+                        for c in range(C):
+                            mass_channels[c].append(float(mchs[c]))
+                        mass_total.append(float(np.sum(mchs)))
+
+                        global_step = steps_done + i_frame
+                        # optional: open-endedness evaluation
+                        if args.compute_oe and (global_step % args.oe_every == 0):
+                            img = batch_frames[i_frame]  # float32 in [0,1], shape (H, W, 3)
+                            z_img = fm.embed_img(jnp.array(img))
+                            oe_embeds.append(np.asarray(z_img))
+                            oe_steps.append(global_step)
+                            if len(oe_embeds) < 2:
+                                oe_val = 0.0
+                            else:
+                                z_all = jnp.asarray(oe_embeds)
+                                oe_val = float(asal_metrics.calc_open_endedness_score(z_all))
+                            oe_values.append(oe_val)
+                            # log to W&B for online visualization
+                            wandb.log({"oe_loss": oe_val, "step": global_step})
+
+                    # periodic log
+                    if args.log_mass_every > 0 and (steps_done // args.log_mass_every) != ((steps_done + mb) // args.log_mass_every):
+                        print(f"Step {steps_done+mb}: total mass {mass_total[-1]:.6f}")
+                    remaining -= mb
+                    steps_done += mb
+
+                    
                     # record masses
                     mchs = batch_masses[i_frame]
                     for c in range(C):
@@ -271,12 +303,9 @@ def main():
                         oe_values.append(oe_val)
                         # log to W&B for online visualization
                         wandb.log({"oe_loss": oe_val, "step": global_step})
+                    
+                    pbar.update(mb)
 
-                # periodic log
-                if args.log_mass_every > 0 and (steps_done // args.log_mass_every) != ((steps_done + mb) // args.log_mass_every):
-                    print(f"Step {steps_done+mb}: total mass {mass_total[-1]:.6f}")
-                remaining -= mb
-                steps_done += mb
     except KeyboardInterrupt:
         print("Interrupted by user; finalizing video...")
     finally:

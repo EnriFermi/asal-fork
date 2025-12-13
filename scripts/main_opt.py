@@ -1,6 +1,6 @@
 import os
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-os.environ["JAX_PLATFORM_NAME"] = "cpu"
+# os.environ["JAX_PLATFORM_NAME"] = "cpu"
 
 import argparse
 from functools import partial
@@ -12,12 +12,19 @@ import numpy as np
 import evosax
 from tqdm.auto import tqdm
 
+from torch.profiler import profile, record_function, ProfilerActivity
+import jax.profiler
+# jax.profiler.start_server(6969)
+
 import substrates
 import foundation_models
 from rollout import rollout_simulation
 import asal_metrics
 import wandb
 import util
+
+print(jax.devices())
+print(jax.default_backend())
 
 parser = argparse.ArgumentParser()
 group = parser.add_argument_group("meta")
@@ -62,13 +69,13 @@ group.add_argument("--coef_oe", type=float, default=1., help="coefficient for AS
 group.add_argument("--coef_smooth", type=float, default=0.2, help="coefficient for latent embedding smoothness")
 
 
+
 group = parser.add_argument_group("optimization")
 group.add_argument("--bs", type=int, default=1, help="number of init states to average simulation over")
 group.add_argument("--pop_size", type=int, default=8, help="population size for Sep-CMA-ES")
 group.add_argument("--n_iters", type=int, default=1000, help="number of iterations to run")
 group.add_argument("--sigma", type=float, default=0.1, help="mutation rate")
 group.add_argument("--eval_splits", type=int, default=1, help="number of splits of CMA-ES population for loss evaluation (1 = no split)")
-
 
 # #wandb logging
 # group = parser.add_argument_group("logging")
@@ -157,6 +164,7 @@ def main(args):
                 # Make food visible as white overlay in training videos
                 if hasattr(substrate, 'food_vis_color'):
                     substrate.food_vis_color = (1.0, 1.0, 1.0)
+                    print(substrate.food_vis_color)
             except Exception:
                 pass
         # Optional: control mutation behavior for FlowLenia
@@ -269,7 +277,10 @@ def main(args):
         pop_params_traj = []
         pop_loss_traj = []
         pbar = tqdm(range(args.n_iters))
+        # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True, profile_memory=True) as prof:
+        # with jax.profiler.trace("prof_dir", create_perfetto_link=True):
         for i_iter in pbar:
+            # with record_function('opt_iter'):
             rng, _rng = split(rng)
             es_state, di, rgb, params_iter, loss_iter = do_iter(es_state, _rng)
 
@@ -311,7 +322,7 @@ def main(args):
                     pca_img = wandb.Image(fig)
                     plt.close(fig)
                 except Exception as e:
-                    print("PCA population logging failed at iter {i_iter}: {e}")
+                    print(f"PCA population logging failed at iter {i_iter}: {e}")
 
             # Log scalar stats and PCA image for this iteration
             log_dict = {
@@ -324,18 +335,18 @@ def main(args):
                 log_dict["pop_pca_traj_3d"] = pca_img
             run.log(log_dict)
 
-            show_video(rgb)
-            run.log({'train_sample': wandb.Video((np.asarray(rgb) * 255).astype(np.uint8).transpose(0, 3, 1, 2), fps=4, format="gif")})
+            # show_video(rgb)
+            # run.log({'train_sample': wandb.Video((np.asarray(rgb) * 255).astype(np.uint8).transpose(0, 3, 1, 2), fps=4, format="gif")})
 
             # After step: run a full rollout (all frames) for W&B logging using best-so-far params
             try:
                 rng, _rng_vid = split(rng)
                 best_params = es_state.best_member
                 vid_data = rollout_simulation(_rng_vid, best_params, s0=None, substrate=substrate, fm=None,
-                                              rollout_steps=args.rollout_steps, time_sampling='video', img_size=224,
+                                              rollout_steps=args.rollout_steps, time_sampling='video', img_size=140,
                                               return_state=False, return_mass=True)
                 vid = (np.asarray(vid_data['rgb']) * 255).astype(np.uint8).transpose(0, 3, 1, 2)
-                log_payload = {'train_video': wandb.Video(vid, fps=8, format='gif')}
+                log_payload = {'train_video': wandb.Video(vid, fps=24, format='gif')}
 
                 # Log mass trajectory over the rollout to check stability (sum over grid and channels)
                 mass_traj = vid_data.get('mass', None)
@@ -384,7 +395,9 @@ def main(args):
         # (Optional) Final PCA summary is now covered by per-iteration logging above
     finally:
         run.finish()
-    
+
+    # print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=50))
+
 
 if __name__ == '__main__':
     main(parse_args())

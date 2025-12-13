@@ -1,0 +1,16 @@
+python simulate_after_training.py \
+  --save_dir ./data/supervised_porcupine \
+  --substrate lenia_flow \
+  --rollout_steps 8192 \
+  --seed 0 \
+  --n_seeds 4 \
+  --seed_mode random_patches \
+  --mutations --mutation_p 0.2 --mutation_sz 40 \
+  --food \
+  --food_interval 200 --food_n 60 --food_sz 5 \
+  --max_steps 2000000 \
+  --food_amount 0.33 --food_consume_rate 0.5 --food_bonus 1.0 \
+  --mass_decay 0.002 --food_conv_mode scalar \
+  --food_diffusion_alpha 0.05 \
+  --mass_clip_eps 0.0005 \
+  --output porcupine.mp4 --fps 8

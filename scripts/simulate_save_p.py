@@ -12,7 +12,7 @@ from rollout import rollout_simulation
 import util
 import foundation_models
 import asal_metrics
-
+from tqdm import tqdm
 
 def parse_time_sampling(arg):
     if arg == 'final' or arg == 'video':

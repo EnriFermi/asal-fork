@@ -39,7 +39,7 @@ class FlowLenia:
         sigma: float = 0.65,
         border: str = "wall",
         mix_rule: str = "stoch",
-        seed_patch_size: int = 40,
+        seed_patch_size: int = 20,
         seed_n_patches: int = 1,
         seed_mode: str = "notebook_centers",  # 'center' | 'random_patches' | 'notebook_centers'
         p_constant_per_patch: bool = True,

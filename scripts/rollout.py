@@ -91,6 +91,7 @@ def rollout_simulation(rng, params, s0=None,
     elif isinstance(time_sampling, int) or isinstance(time_sampling, tuple): # return the rollout at K sampled intervals
         # Memory-efficient: do not store all T states; process in K chunks
         K, chunk_ends = time_sampling if isinstance(time_sampling, tuple) else (time_sampling, False)
+        print('WTF', K, rollout_steps)
         assert rollout_steps % K == 0, "For memory-efficient sampling, require rollout_steps % K == 0"
         chunk_steps = rollout_steps // K
         def step_fn(state, _rng):
