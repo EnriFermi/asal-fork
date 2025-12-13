@@ -3,6 +3,7 @@ import re
 import numpy as np
 from typing import Optional, Tuple, List
 import imageio.v3 as iio
+import imageio.v3 as iio
 
 _PATTERN = re.compile(
     r"P_steps_(\d+)_(\d+)__secs_([0-9.]+)_([0-9.]+)__idx_(\d+)\.npz$"
@@ -94,10 +95,10 @@ def load_snapshots(
     end_step: Optional[int] = None,
     start_sec: Optional[float] = None,
     end_sec: Optional[float] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
     """
-    Load P snapshots across chunk files for the requested step or second range.
-    Provide either step range or sec range. Returns (steps, P) sorted by step.
+    Load P (and optional A) snapshots across chunk files for the requested step or second range.
+    Provide either step range or sec range. Returns (steps, P, A) sorted by step. A is None if not saved.
     """
     files = list_snapshot_files(base_dir)
     if not files:
@@ -112,6 +113,7 @@ def load_snapshots(
 
     step_list: List[int] = []
     P_list: List[np.ndarray] = []
+    A_list: List[np.ndarray] = []
 
     for entry in files:
         if use_steps:
@@ -127,6 +129,7 @@ def load_snapshots(
         data = np.load(entry["path"])
         steps = np.asarray(data["steps"])
         P = np.asarray(data["P"])
+        A = np.asarray(data["A"]) if "A" in data.files else None
 
         # Filter within requested range
         if use_steps:
@@ -150,14 +153,83 @@ def load_snapshots(
             continue
         step_list.append(steps[mask])
         P_list.append(P[mask])
+        if A is not None:
+            A_list.append(A[mask])
 
     if not step_list:
         raise ValueError("No snapshots matched the requested range.")
 
     steps_all = np.concatenate(step_list, axis=0)
     P_all = np.concatenate(P_list, axis=0)
+    A_all = np.concatenate(A_list, axis=0) if A_list else None
     order = np.argsort(steps_all)
-    return steps_all[order], P_all[order]
+    if A_all is not None:
+        return steps_all[order], P_all[order], A_all[order]
+    return steps_all[order], P_all[order], None
+
+
+def render_snapshots_to_video(
+    P: np.ndarray,
+    out_path: str,
+    fps: int = 30,
+    per_frame_norm: bool = False,
+    A: Optional[np.ndarray] = None,
+) -> None:
+    """
+    Render a sequence of snapshots to an RGB video.
+
+    If A is provided, mimic Pcolor rendering: rgb = clip(sum(A) * P[:3], 0, 1).
+    Otherwise, normalize P[:3] for visualization.
+    """
+    if P.ndim != 4:
+        raise ValueError(f"P should have shape (T, H, W, C); got {P.shape}")
+
+    if A is not None and A.shape[0] != P.shape[0]:
+        raise ValueError(f"A and P length mismatch: {A.shape[0]} vs {P.shape[0]}")
+
+    frames = []
+    if A is None:
+        if per_frame_norm:
+            global_min = None
+            global_max = None
+        else:
+            p3_all = P[..., :3] if P.shape[-1] >= 3 else np.tile(P, (1, 1, 1, int(np.ceil(3 / P.shape[-1]))))[..., :3]
+            global_min = float(np.min(p3_all))
+            global_max = float(np.max(p3_all))
+    else:
+        # When A is present, we will clip after multiplying; no global scaling needed unless per_frame_norm True
+        global_min = None
+        global_max = None
+
+    for i in range(P.shape[0]):
+        p = P[i]
+        if p.shape[-1] < 3:
+            reps = (1, 1, int(np.ceil(3 / p.shape[-1])))
+            p3 = np.tile(p, reps)[..., :3]
+        else:
+            p3 = p[..., :3]
+
+        if A is not None:
+            a_sum = np.sum(A[i], axis=-1, keepdims=True)
+            rgb = np.clip(a_sum * p3, 0.0, 1.0)
+            if per_frame_norm:
+                mn = float(rgb.min())
+                mx = float(rgb.max())
+                if mx > mn:
+                    rgb = (rgb - mn) / (mx - mn + 1e-8)
+        else:
+            if per_frame_norm:
+                mn = float(np.min(p3))
+                mx = float(np.max(p3))
+            else:
+                mn = global_min
+                mx = global_max
+            if mx is None or mx <= mn:
+                rgb = np.zeros((*p3.shape[:2], 3), dtype=np.float32)
+            else:
+                rgb = (p3 - mn) / (mx - mn + 1e-8)
+        frames.append((np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8))
+    iio.imwrite(out_path, np.stack(frames, axis=0), fps=fps, codec="libx264")
 
 
 if __name__ == "__main__":
