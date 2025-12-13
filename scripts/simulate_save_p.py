@@ -222,12 +222,17 @@ def main():
                 mb = remaining
             rng, _rng = split(rng)
             s, batch_P = step_micro(s, _rng)
-            batch_P = np.asarray(batch_P[:mb])  # (mb, X, Y, k)
-            for i in range(mb):
-                global_step = steps_done + i
-                if global_step % snapshot_interval == 0:
+            # Identify which frames in this microbatch need saving
+            base_step = steps_done
+            idxs = [i for i in range(mb) if (base_step + i) % snapshot_interval == 0]
+            if idxs:
+                # Only pull required frames to host
+                sel = jnp.take(batch_P, jnp.array(idxs), axis=0)
+                sel_np = np.asarray(sel)
+                for i_local, i_global in zip(range(sel_np.shape[0]), idxs):
+                    global_step = base_step + i_global
                     steps_buf.append(global_step)
-                    snaps_buf.append(batch_P[i])
+                    snaps_buf.append(sel_np[i_local])
                     if len(snaps_buf) >= chunk_size:
                         file_idx = save_chunk(out_dir, fps, steps_buf, snaps_buf, file_idx)
                         steps_buf, snaps_buf = [], []
