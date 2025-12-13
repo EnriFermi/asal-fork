@@ -2,6 +2,7 @@ import os
 import re
 import numpy as np
 from typing import Optional, Tuple, List
+import imageio.v3 as iio
 
 _PATTERN = re.compile(
     r"P_steps_(\d+)_(\d+)__secs_([0-9.]+)_([0-9.]+)__idx_(\d+)\.npz$"
@@ -35,6 +36,56 @@ def list_snapshot_files(base_dir: str):
 
 def _overlaps(a0, a1, b0, b1):
     return not (a1 < b0 or b1 < a0)
+
+
+def render_snapshots_to_video(
+    P: np.ndarray,
+    out_path: str,
+    fps: int = 30,
+    per_frame_norm: bool = False,
+) -> None:
+    """
+    Render a sequence of P snapshots to an RGB video using the first 3 channels.
+
+    Args:
+        P: array of shape (T, H, W, C) containing snapshots.
+        out_path: output video path (e.g., .mp4).
+        fps: frames per second.
+        per_frame_norm: if True, normalize each frame independently; otherwise
+                        normalize using global min/max over the provided sequence.
+    """
+    if P.ndim != 4:
+        raise ValueError(f"P should have shape (T, H, W, C); got {P.shape}")
+
+    # Prepare global normalization if needed
+    if per_frame_norm:
+        global_min = None
+        global_max = None
+    else:
+        p3_all = P[..., :3] if P.shape[-1] >= 3 else np.tile(P, (1, 1, 1, int(np.ceil(3 / P.shape[-1]))))[..., :3]
+        global_min = float(np.min(p3_all))
+        global_max = float(np.max(p3_all))
+
+    frames = []
+    for i in range(P.shape[0]):
+        p = P[i]
+        if p.shape[-1] < 3:
+            reps = (1, 1, int(np.ceil(3 / p.shape[-1])))
+            p3 = np.tile(p, reps)[..., :3]
+        else:
+            p3 = p[..., :3]
+        if per_frame_norm:
+            mn = float(np.min(p3))
+            mx = float(np.max(p3))
+        else:
+            mn = global_min
+            mx = global_max
+        if mx is None or mx <= mn:
+            rgb = np.zeros((*p3.shape[:2], 3), dtype=np.float32)
+        else:
+            rgb = (p3 - mn) / (mx - mn + 1e-8)
+        frames.append((np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8))
+    iio.imwrite(out_path, np.stack(frames, axis=0), fps=fps, codec="libx264")
 
 
 def load_snapshots(
