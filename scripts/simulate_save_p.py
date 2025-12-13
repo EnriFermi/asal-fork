@@ -30,7 +30,7 @@ def save_chunk(out_dir: str, fps: float, steps: List[int], snaps: List[np.ndarra
     end_step = int(steps[-1])
     start_sec = start_step / fps
     end_sec = end_step / fps
-    arr = np.stack(snaps, axis=0)
+    arr = np.stack(snaps, axis=0).astype(np.float16)
     meta = {
         "steps": np.array(steps, dtype=np.int64),
         "fps": np.array(fps, dtype=np.float32),
