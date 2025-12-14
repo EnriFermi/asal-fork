@@ -23,14 +23,14 @@ def parse_time_sampling(arg):
         raise ValueError("time_sampling must be 'final', 'video', or an integer")
 
 
-def save_chunk(out_dir: str, fps: float, steps: List[int], snaps_P: List[np.ndarray], file_idx: int, snaps_A: List[np.ndarray]=None):
+def save_chunk(out_dir: str, fps: float, steps: List[int], snaps_P: List[np.ndarray], file_idx: int, snaps_A: List[np.ndarray]=None, use_fp16: bool=True, snaps_rgb: List[np.ndarray]=None):
     if not steps:
         return file_idx
     start_step = int(steps[0])
     end_step = int(steps[-1])
     start_sec = start_step / fps
     end_sec = end_step / fps
-    arrP = np.stack(snaps_P, axis=0).astype(np.float16)
+    arrP = np.stack(snaps_P, axis=0).astype(np.float16 if use_fp16 else np.float32)
     meta = {
         "steps": np.array(steps, dtype=np.int64),
         "fps": np.array(fps, dtype=np.float32),
@@ -38,12 +38,22 @@ def save_chunk(out_dir: str, fps: float, steps: List[int], snaps_P: List[np.ndar
     fname = f"P_steps_{start_step}_{end_step}__secs_{start_sec:.3f}_{end_sec:.3f}__idx_{file_idx:04d}.npz"
     path = os.path.join(out_dir, fname)
     if snaps_A is not None:
-        arrA = np.stack(snaps_A, axis=0).astype(np.float16)
-        np.savez_compressed(path, P=arrP, A=arrA, **meta)
-        print(f"Saved {len(steps)} snapshots (P,A) to {path}")
+        arrA = np.stack(snaps_A, axis=0).astype(np.float16 if use_fp16 else np.float32)
+        if snaps_rgb is not None:
+            arrRGB = np.stack(snaps_rgb, axis=0).astype(np.uint8)
+            np.savez_compressed(path, P=arrP, A=arrA, rgb=arrRGB, **meta)
+            print(f"Saved {len(steps)} snapshots (P,A,rgb) to {path}")
+        else:
+            np.savez_compressed(path, P=arrP, A=arrA, **meta)
+            print(f"Saved {len(steps)} snapshots (P,A) to {path}")
     else:
-        np.savez_compressed(path, P=arrP, **meta)
-        print(f"Saved {len(steps)} snapshots to {path}")
+        if snaps_rgb is not None:
+            arrRGB = np.stack(snaps_rgb, axis=0).astype(np.uint8)
+            np.savez_compressed(path, P=arrP, rgb=arrRGB, **meta)
+            print(f"Saved {len(steps)} snapshots (P,rgb) to {path}")
+        else:
+            np.savez_compressed(path, P=arrP, **meta)
+            print(f"Saved {len(steps)} snapshots to {path}")
     return file_idx + 1
 
 
@@ -84,6 +94,8 @@ def main():
     parser.add_argument('--snapshot_interval', type=int, default=100, help='Steps between P snapshots')
     parser.add_argument('--snapshots_per_file', type=int, default=50, help='Number of snapshots per chunk file')
     parser.add_argument('--save_A', action='store_true', help='Also save A snapshots alongside P')
+    parser.add_argument('--save_rgb', action='store_true', help='Also save rendered RGB (uint8) using A and first 3 P channels')
+    parser.add_argument('--save_fp16', action='store_true', help='Save snapshots in float16 (default). Disable to save float32.')
     parser.add_argument('--fps', type=int, default=250, help='Virtual FPS to map steps to seconds in filenames')
     parser.add_argument('--batch_steps', type=int, default=256, help='Number of steps per batch when iterating (no rendering)')
     parser.add_argument('--jit_microbatch', type=int, default=64, help='Frames computed per JIT call inside each batch')
@@ -218,6 +230,7 @@ def main():
     steps_buf: List[int] = []
     snaps_buf: List[np.ndarray] = []
     snaps_buf_A: List[np.ndarray] = []
+    snaps_buf_rgb: List[np.ndarray] = []
     file_idx = 0
 
     steps_done = 0
@@ -242,29 +255,40 @@ def main():
                 if args.save_A:
                     selA = jnp.take(batch_A, jnp.array(idxs), axis=0)
                     selA_np = np.asarray(selA)
+                selRGB = None
+                if args.save_rgb:
+                    if selA_np is None:
+                        selA = jnp.take(batch_A, jnp.array(idxs), axis=0)
+                        selA_np = np.asarray(selA)
+                    # Compute RGB = clip(sum(A) * P[:3], 0, 1), then to uint8
+                    a_sum = np.sum(selA_np, axis=-1, keepdims=True)
+                    p3 = selP_np[..., :3] if selP_np.shape[-1] >= 3 else np.tile(selP_np, (1, 1, 1, int(np.ceil(3 / selP_np.shape[-1]))))[..., :3]
+                    rgb = np.clip(a_sum * p3, 0.0, 1.0)
+                    selRGB = (np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8)
                 for i_local, i_global in zip(range(selP_np.shape[0]), idxs):
                     global_step = base_step + i_global
                     steps_buf.append(global_step)
-                    snaps_buf.append(selP_np[i_local].astype(np.float16))
+                    snaps_buf.append(selP_np[i_local].astype(np.float32 if not args.save_fp16 else np.float16))
                     if args.save_A:
-                        snaps_buf_A.append(selA_np[i_local].astype(np.float16))
+                        snaps_buf_A.append(selA_np[i_local].astype(np.float32 if not args.save_fp16 else np.float16))
+                    if args.save_rgb:
+                        snaps_buf_rgb.append(selRGB[i_local])
                     if len(snaps_buf) >= chunk_size:
                         # save chunk with optional A
+                        file_idx = save_chunk(
+                            out_dir,
+                            fps,
+                            steps_buf,
+                            snaps_buf,
+                            file_idx,
+                            snaps_buf_A if args.save_A else None,
+                            use_fp16=args.save_fp16,
+                            snaps_rgb=snaps_buf_rgb if args.save_rgb else None,
+                        )
                         if args.save_A:
-                            arrP = np.stack(snaps_buf, axis=0)
-                            arrA = np.stack(snaps_buf_A, axis=0)
-                            meta = {
-                                "steps": np.array(steps_buf, dtype=np.int64),
-                                "fps": np.array(fps, dtype=np.float32),
-                            }
-                            fname = f"P_steps_{steps_buf[0]}_{steps_buf[-1]}__secs_{steps_buf[0]/fps:.3f}_{steps_buf[-1]/fps:.3f}__idx_{file_idx:04d}.npz"
-                            path = os.path.join(out_dir, fname)
-                            np.savez_compressed(path, P=arrP, A=arrA, **meta)
-                            print(f"Saved {len(steps_buf)} snapshots (P,A) to {path}")
-                            file_idx += 1
                             snaps_buf_A = []
-                        else:
-                            file_idx = save_chunk(out_dir, fps, steps_buf, snaps_buf, file_idx)
+                        if args.save_rgb:
+                            snaps_buf_rgb = []
                         steps_buf, snaps_buf = [], []
             remaining -= mb
             steps_done += mb
@@ -272,20 +296,16 @@ def main():
     pbar.close()
 
     if snaps_buf:
-        if args.save_A:
-            arrP = np.stack(snaps_buf, axis=0)
-            arrA = np.stack(snaps_buf_A, axis=0)
-            meta = {
-                "steps": np.array(steps_buf, dtype=np.int64),
-                "fps": np.array(fps, dtype=np.float32),
-            }
-            fname = f"P_steps_{steps_buf[0]}_{steps_buf[-1]}__secs_{steps_buf[0]/fps:.3f}_{steps_buf[-1]/fps:.3f}__idx_{file_idx:04d}.npz"
-            path = os.path.join(out_dir, fname)
-            np.savez_compressed(path, P=arrP, A=arrA, **meta)
-            print(f"Saved {len(steps_buf)} snapshots (P,A) to {path}")
-            file_idx += 1
-        else:
-            file_idx = save_chunk(out_dir, fps, steps_buf, snaps_buf, file_idx)
+        file_idx = save_chunk(
+            out_dir,
+            fps,
+            steps_buf,
+            snaps_buf,
+            file_idx,
+            snaps_buf_A if args.save_A else None,
+            use_fp16=args.save_fp16,
+            snaps_rgb=snaps_buf_rgb if args.save_rgb else None,
+        )
 
     print(f"Finished simulation. Saved {file_idx} chunk files to {out_dir}")
 
