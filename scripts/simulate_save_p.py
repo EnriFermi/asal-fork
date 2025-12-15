@@ -217,7 +217,14 @@ def main():
 
         return jax.jit(run_batch)
 
-    step_micro = build_batch_stepper(int(args.jit_microbatch))
+    # Cache steppers per microbatch size to avoid recompiling when remaining steps are smaller
+    _stepper_cache = {}
+
+    def get_stepper(mb: int):
+        mb = int(mb)
+        if mb not in _stepper_cache:
+            _stepper_cache[mb] = build_batch_stepper(mb)
+        return _stepper_cache[mb]
 
     # Prepare snapshot directory
     out_dir = os.path.join(args.save_dir, args.output_dir)
@@ -243,6 +250,7 @@ def main():
             if remaining < mb:
                 mb = remaining
             rng, _rng = split(rng)
+            step_micro = get_stepper(mb)
             s, batch_P, batch_A = step_micro(s, _rng)
             # Identify which frames in this microbatch need saving
             base_step = steps_done
