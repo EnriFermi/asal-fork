@@ -40,7 +40,7 @@ def create_substrate(substrate_name):
         substrate = Lenia(grid_size=128, center_phenotype=True, phenotype_size=64, start_pattern="5N7KKM", clip1=1.)
         rollout_steps = 256
     elif substrate_name=='lenia_flow':
-        substrate = FlowLenia(grid_size=768, C=3, dd=5, dt=0.2, sigma=0.65, border='torus', mix_rule='stoch', M= jax.numpy.array([[2, 1, 0],[0, 2, 1],[1, 0, 2]], dtype=int), k=9)
+        substrate = FlowLenia(grid_size=384, C=3, dd=5, dt=0.2, sigma=0.65, border='wall', mix_rule='stoch', M= jax.numpy.array([[2, 1, 0],[0, 2, 1],[1, 0, 2]], dtype=int), k=9)
         # M= jax.numpy.array([[3, 2, 2],[2, 3, 2],[2, 2, 3]], dtype=int), k=21)
         rollout_steps = 512
     elif substrate_name=='plife':

@@ -1,0 +1,11 @@
+python scripts/simulate_after_training_old.py \
+  --save_dir ./data/interp_supervised_0_1/interp_6 \
+  --substrate lenia_flow \
+  --rollout_steps 1200000 \
+  --seed 0 \
+  --n_seeds 16 \
+  --img_size 154 \
+  --seed_mode random_patches \
+  --mutations --mutation_p 0.05 --mutation_sz 40 \
+  --max_steps 1200000 \
+  --output reference.mp4 --fps 250
