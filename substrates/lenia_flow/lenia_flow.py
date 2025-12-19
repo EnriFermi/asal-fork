@@ -12,6 +12,33 @@ def inv_sigmoid(x):
     return jnp.log(x) - jnp.log1p(-x)
 
 
+def quantize_K(x: jnp.ndarray, K: int) -> jnp.ndarray:
+    """Quantize x in [0,1] to K discrete levels."""
+    K_arr = jnp.maximum(2, jnp.asarray(K))
+    x = jnp.clip(x, 0.0, 1.0)
+    return jnp.round(x * (K_arr - 1)) / (K_arr - 1)
+
+
+def entropy_sink_patch(
+    patch: jnp.ndarray,
+    K: int,
+    delta: float,
+    key: jax.random.PRNGKey,
+    per_channel: bool = True,
+) -> jnp.ndarray:
+    """
+    Reduce entropy by quantizing to K levels with a small dithering jitter.
+    If per_channel=True, one random sign per channel is broadcast across the patch.
+    """
+    if per_channel:
+        noise_shape = (1, 1, patch.shape[-1])
+    else:
+        noise_shape = (1, 1, 1)
+    sign = (jax.random.bernoulli(key, 0.5, shape=noise_shape).astype(patch.dtype) * 2.0) - 1.0
+    y = patch + delta * sign
+    return quantize_K(y, K)
+
+
 class FlowLenia:
     """
     FlowLenia substrate wrapper matching the ASAL substrate interface.
@@ -379,11 +406,12 @@ class FlowLenia:
                 norm = jnp.sum(noise, axis=(0, 1), keepdims=True)
                 new_patch = noise / norm * removed
                 nA_cur = jax.lax.dynamic_update_slice(nA_cur, new_patch, (i0, j0, 0))
-                # strong genome perturbation in the patch (per-pixel noise, larger scale)
-                kdim = nP_cur.shape[-1]
-                p_noise = jr.normal(kgen, (sz, sz, kdim)) * self.volcano_delta_scale
-                dP = jax.lax.dynamic_update_slice(jnp.zeros_like(nP_cur), p_noise, (i0, j0, 0))
-                nP_cur = nP_cur + dP
+                # entropy sink on genome patch: quantize with small dither to reduce entropy
+                K_levels = jnp.maximum(2.0, jnp.ceil(self.volcano_delta_scale))
+                dither = 0.05  # small jitter before quantization
+                P_patch = jax.lax.dynamic_slice(nP_cur, (i0, j0, 0), (sz, sz, nP_cur.shape[-1]))
+                P_quant = entropy_sink_patch(P_patch, K_levels, dither, kgen, per_channel=True)
+                nP_cur = jax.lax.dynamic_update_slice(nP_cur, P_quant, (i0, j0, 0))
                 return (nA_cur, nP_cur)
             do_volcano = (jr.uniform(kv_main, ()) < self.volcano_p)
             nA, nP = jax.lax.cond(do_volcano, volcano_apply, lambda carry: carry, (nA, nP))
