@@ -93,6 +93,7 @@ class FlowLenia:
         mass_decay: float = 0.0,
         food_green_channel: int = 1,
         food_auto_size: bool = False,
+        food_auto_scale: float = 1.0,
         food_conv_mode: str = "scalar",  # 'scalar' | 'conv'
         food_vis_scale: float = 1.0,
         food_vis_color=(0.6, 0.3, 0.0),  # RGB overlay for food
@@ -135,6 +136,7 @@ class FlowLenia:
         self.mass_decay = float(mass_decay)
         self.food_green_channel = int(food_green_channel)
         self.food_auto_size = bool(food_auto_size)
+        self.food_auto_scale = float(food_auto_scale)
         self.food_conv_mode = food_conv_mode
         self.food_vis_scale = float(food_vis_scale)
         self.food_vis_color = tuple(food_vis_color)
@@ -466,7 +468,11 @@ class FlowLenia:
                     return Food_in + Food_add
                 # Observed loss since last cycle start
                 observed_loss = jnp.maximum(0.0, mass_cycle_start - mass_cur)
-                required_food = jnp.where(self.food_auto_size, observed_loss / (self.food_bonus + 1e-8), 0.0)
+                required_food = jnp.where(
+                    self.food_auto_size,
+                    self.food_auto_scale * observed_loss / (self.food_bonus + 1e-8),
+                    0.0,
+                )
                 Food = jax.lax.select(do_spawn, spawn_food(Food, rng, required_food), Food)
                 # Reset cycle start mass after this step to the actual post-update mass
                 # so next cycle measures true observed loss (not an inflated target).

@@ -57,6 +57,7 @@ def main():
     parser.add_argument('--mass_decay', type=float, default=0.0, help='For FlowLenia: uniform mass decay per step')
     parser.add_argument('--food_channel', type=int, default=1, help='For FlowLenia: which channel consumes food (0=R,1=G,2=B)')
     parser.add_argument('--food_auto_size', action='store_true', help='For FlowLenia: auto-set food patch size to compensate decay per spawn')
+    parser.add_argument('--food_auto_scale', type=float, default=1.0, help='Scale factor when auto-sizing food to slightly over/under compensate observed loss')
     parser.add_argument('--food_conv_mode', type=str, default='scalar', choices=['scalar','conv'], help='For FlowLenia: consumption mode')
     parser.add_argument('--food_diffusion_alpha', type=float, default=0.0, help='For FlowLenia: blend factor for food diffusion (0=off)')
     parser.add_argument('--mass_clip_eps', type=float, default=0.0, help='For FlowLenia: zero-out per-pixel mass below this sum')
@@ -156,6 +157,8 @@ def main():
             substrate.food_green_channel = int(args.food_channel)
             if hasattr(substrate, 'food_auto_size'):
                 substrate.food_auto_size = bool(args.food_auto_size)
+            if hasattr(substrate, 'food_auto_scale'):
+                substrate.food_auto_scale = float(args.food_auto_scale)
             if hasattr(substrate, 'food_conv_mode'):
                 substrate.food_conv_mode = str(args.food_conv_mode)
             if hasattr(substrate, 'food_diffusion_alpha'):
