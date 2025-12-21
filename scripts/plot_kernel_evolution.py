@@ -5,6 +5,7 @@ import pickle
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 import numpy as np
 
 import substrates
@@ -86,18 +87,16 @@ def plot_grid(kernels_over_time, output, crop_size, src_ch, tgt_ch):
         for ki in range(k):
             ax = axs[ki, t]
             ax.imshow(K[:, :, ki], cmap="coolwarm", vmin=vmin, vmax=vmax)
-            ax.axis("off")
-            # Color-code spines: source channel on left/bottom, target channel on top/right
+            ax.set_xticks([])
+            ax.set_yticks([])
+            # Color-code edges: source channel as left strip, target channel as top strip
             scol = color_for_ch(src_ch[ki])
             tcol = color_for_ch(tgt_ch[ki])
-            for spine in ("left", "bottom"):
-                ax.spines[spine].set_visible(True)
-                ax.spines[spine].set_color(scol)
-                ax.spines[spine].set_linewidth(3.0)
-            for spine in ("top", "right"):
-                ax.spines[spine].set_visible(True)
-                ax.spines[spine].set_color(tcol)
-                ax.spines[spine].set_linewidth(3.0)
+            bar = 0.08  # fraction of axis
+            ax.add_patch(patches.Rectangle((0, 0), bar, 1, transform=ax.transAxes,
+                                           color=scol, alpha=0.9, linewidth=0))
+            ax.add_patch(patches.Rectangle((0, 1 - bar), 1, bar, transform=ax.transAxes,
+                                           color=tcol, alpha=0.9, linewidth=0))
             if ki == 0:
                 ax.set_title(f"step {t}", fontsize=10)
             if t == 0:
