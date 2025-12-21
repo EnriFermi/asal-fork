@@ -27,8 +27,8 @@ def _sobel_conv(A, kernel):
     """
     H, W, C = A.shape
     lhs = A[jnp.newaxis, ...]  # (1,H,W,C)
-    # Expand kernel to depthwise HWIO with one filter per channel
-    ker = jnp.tile(kernel[:, :, None, None], (1, 1, C, 1))
+    # Depthwise: in_channels_per_group=1, out_channels_per_group=1 -> total OC=C
+    ker = jnp.tile(kernel[:, :, None, None], (1, 1, 1, C))  # (3,3,1,C)
     out = jax.lax.conv_general_dilated(
         lhs,
         ker,
