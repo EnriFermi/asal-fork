@@ -44,7 +44,26 @@ def decode_kernels(params_flat, fl):
     return nK
 
 
-def plot_grid(kernels_over_time, output, crop_size):
+def channel_maps(fl):
+    """Return source/target channel for each kernel index."""
+    src = list(fl.cfg.c0)
+    tgt = [None] * len(src)
+    for c, ks in enumerate(fl.cfg.c1):
+        for kidx in ks:
+            tgt[kidx] = c
+    return src, tgt
+
+
+def color_for_ch(ch):
+    palette = {
+        0: (1.0, 0.2, 0.2),  # red-ish
+        1: (0.2, 0.9, 0.2),  # green-ish
+        2: (0.2, 0.4, 1.0),  # blue-ish
+    }
+    return palette.get(int(ch), (0.7, 0.7, 0.7))
+
+
+def plot_grid(kernels_over_time, output, crop_size, src_ch, tgt_ch):
     """
     kernels_over_time: list of (kH,kW,k) arrays, length T
     """
@@ -68,6 +87,17 @@ def plot_grid(kernels_over_time, output, crop_size):
             ax = axs[ki, t]
             ax.imshow(K[:, :, ki], cmap="coolwarm", vmin=vmin, vmax=vmax)
             ax.axis("off")
+            # Color-code spines: source channel on left/bottom, target channel on top/right
+            scol = color_for_ch(src_ch[ki])
+            tcol = color_for_ch(tgt_ch[ki])
+            for spine in ("left", "bottom"):
+                ax.spines[spine].set_visible(True)
+                ax.spines[spine].set_color(scol)
+                ax.spines[spine].set_linewidth(3.0)
+            for spine in ("top", "right"):
+                ax.spines[spine].set_visible(True)
+                ax.spines[spine].set_color(tcol)
+                ax.spines[spine].set_linewidth(3.0)
             if ki == 0:
                 ax.set_title(f"step {t}", fontsize=10)
             if t == 0:
@@ -92,6 +122,7 @@ def main():
     fl = substrates.create_substrate("lenia_flow")
     fl = substrates.FlattenSubstrateParameters(fl)
     fl_base = fl.substrate  # unwrap for internal fields
+    src_ch, tgt_ch = channel_maps(fl_base)
 
     kernels_over_time = []
     for path in args.checkpoints:
@@ -100,7 +131,7 @@ def main():
         K = decode_kernels(params, fl_base)
         kernels_over_time.append(K)
 
-    plot_grid(kernels_over_time, args.output, args.crop_size)
+    plot_grid(kernels_over_time, args.output, args.crop_size, src_ch, tgt_ch)
 
 
 if __name__ == "__main__":
