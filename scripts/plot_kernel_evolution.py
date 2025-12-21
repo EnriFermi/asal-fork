@@ -104,7 +104,7 @@ def plot_grid(kernels_over_time, output, crop_size, src_ch, tgt_ch):
                 ax.set_ylabel(f"K{ki}", fontsize=10)
 
     plt.tight_layout()
-    plt.savefig(output, dpi=200)
+    plt.savefig(output, dpi=500)
     print(f"Saved kernel evolution to {output}")
 
 
