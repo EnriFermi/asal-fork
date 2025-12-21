@@ -44,12 +44,20 @@ def decode_kernels(params_flat, fl):
     return nK
 
 
-def plot_grid(kernels_over_time, output):
+def plot_grid(kernels_over_time, output, crop_size):
     """
     kernels_over_time: list of (kH,kW,k) arrays, length T
     """
     T = len(kernels_over_time)
     kH, kW, k = kernels_over_time[0].shape
+    if crop_size is not None:
+        cs = int(crop_size)
+        i0 = max(0, kH // 2 - cs // 2)
+        j0 = max(0, kW // 2 - cs // 2)
+        i1 = min(kH, i0 + cs)
+        j1 = min(kW, j0 + cs)
+        kernels_over_time = [K[i0:i1, j0:j1, :] for K in kernels_over_time]
+        kH, kW, _ = kernels_over_time[0].shape
     fig, axs = plt.subplots(k, T, figsize=(2 * T, 2 * k), squeeze=False)
 
     vmin = min(k.min() for k in kernels_over_time)
@@ -75,6 +83,7 @@ def main():
     ap.add_argument("checkpoints", nargs="+", help="Paths to best.pkl files (ordered over time).")
     ap.add_argument("--substrate", type=str, default="lenia_flow", help="Substrate name (must be lenia_flow).")
     ap.add_argument("--output", type=str, default="kernel_evolution.png", help="Output image path.")
+    ap.add_argument("--crop_size", type=int, default=None, help="If set, center-crop kernels to this size before plotting.")
     args = ap.parse_args()
 
     if args.substrate != "lenia_flow":
@@ -91,7 +100,7 @@ def main():
         K = decode_kernels(params, fl_base)
         kernels_over_time.append(K)
 
-    plot_grid(kernels_over_time, args.output)
+    plot_grid(kernels_over_time, args.output, args.crop_size)
 
 
 if __name__ == "__main__":
