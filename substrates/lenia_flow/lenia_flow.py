@@ -77,6 +77,7 @@ class FlowLenia:
         mutation: bool = False,
         mutation_patch_size: int = 20,
         mutation_prob: float = 0.1,
+        mutation_scale: float = 1.0,
         # volcano mutation (mass removal + strong genome change)
         volcano: bool = False,
         volcano_patch_size: int = 30,
@@ -117,6 +118,7 @@ class FlowLenia:
         self.clip1 = clip1
         self.clip2 = clip2
         # mutation
+        self.mutation_scale = float(mutation_scale)
         self.mutation_enabled = bool(mutation)
         self.mutation_sz = int(mutation_patch_size)
         self.mutation_p = float(mutation_prob)
@@ -378,7 +380,7 @@ class FlowLenia:
             sz = max(1, min(self.mutation_sz, nP.shape[0], nP.shape[1]))
             kdim = nP.shape[-1]
             # mutation tensor and location
-            mut = jnp.ones((sz, sz, kdim)) * jr.normal(kmut, (1, 1, kdim))
+            mut = jnp.ones((sz, sz, kdim)) * jr.normal(kmut, (1, 1, kdim)) * self.mutation_scale
             max_i = nP.shape[0] - sz
             max_j = nP.shape[1] - sz
             ki, kj = jr.split(kpos)
