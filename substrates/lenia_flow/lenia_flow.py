@@ -57,6 +57,7 @@ class FlowLenia:
         grid_size: int = 128,
         C: int = 1,
         k: int = 10,
+        kernel_components: int = 3,
         M: jnp.ndarray = jnp.array([
                 [2, 1, 0],
                 [0, 2, 1],
@@ -103,6 +104,7 @@ class FlowLenia:
         self.grid_size = grid_size
         self.C = C
         self.k = k
+        self.kc = int(kernel_components)
         self.M = M
         self.dd = dd
         self.dt = dt
@@ -179,9 +181,9 @@ class FlowLenia:
         base_r = jr.uniform(kr, (self.k,), minval=0.2, maxval=1.0)
         base_m = jr.uniform(km, (self.k,), minval=0.05, maxval=0.5)
         base_s = jr.uniform(ks, (self.k,), minval=0.001, maxval=0.18)
-        base_a = jr.uniform(ka, (self.k, 3), minval=0.0, maxval=1.0)
-        base_b = jr.uniform(kb, (self.k, 3), minval=0.001, maxval=1.0)
-        base_w = jr.uniform(kw, (self.k, 3), minval=0.01, maxval=0.5)
+        base_a = jr.uniform(ka, (self.k, self.kc), minval=0.0, maxval=1.0)
+        base_b = jr.uniform(kb, (self.k, self.kc), minval=0.001, maxval=1.0)
+        base_w = jr.uniform(kw, (self.k, self.kc), minval=0.01, maxval=0.5)
 
         # Flattened base in logit space around which we take deltas (Lenia-style)
         def to_raw(x, name):
@@ -208,9 +210,9 @@ class FlowLenia:
             jnp.full((self.k,), self.bounds["r"][0]),
             jnp.full((self.k,), self.bounds["m"][0]),
             jnp.full((self.k,), self.bounds["s"][0]),
-            jnp.full((self.k * 3,), self.bounds["a"][0]),
-            jnp.full((self.k * 3,), self.bounds["b"][0]),
-            jnp.full((self.k * 3,), self.bounds["w"][0]),
+            jnp.full((self.k * self.kc,), self.bounds["a"][0]),
+            jnp.full((self.k * self.kc,), self.bounds["b"][0]),
+            jnp.full((self.k * self.kc,), self.bounds["w"][0]),
             jnp.full((1,), self.bounds["fcr"][0]),
         ], axis=0)
         self._dyn_hi = jnp.concatenate([
@@ -218,9 +220,9 @@ class FlowLenia:
             jnp.full((self.k,), self.bounds["r"][1]),
             jnp.full((self.k,), self.bounds["m"][1]),
             jnp.full((self.k,), self.bounds["s"][1]),
-            jnp.full((self.k * 3,), self.bounds["a"][1]),
-            jnp.full((self.k * 3,), self.bounds["b"][1]),
-            jnp.full((self.k * 3,), self.bounds["w"][1]),
+            jnp.full((self.k * self.kc,), self.bounds["a"][1]),
+            jnp.full((self.k * self.kc,), self.bounds["b"][1]),
+            jnp.full((self.k * self.kc,), self.bounds["w"][1]),
             jnp.full((1,), self.bounds["fcr"][1]),
         ], axis=0)
 
@@ -246,9 +248,9 @@ class FlowLenia:
         r = dyn_vals[idx:idx + self.k]; idx += self.k
         m = dyn_vals[idx:idx + self.k]; idx += self.k
         s = dyn_vals[idx:idx + self.k]; idx += self.k
-        a = dyn_vals[idx:idx + self.k * 3].reshape((self.k, 3)); idx += self.k * 3
-        b = dyn_vals[idx:idx + self.k * 3].reshape((self.k, 3)); idx += self.k * 3
-        w = dyn_vals[idx:idx + self.k * 3].reshape((self.k, 3)); idx += self.k * 3
+        a = dyn_vals[idx:idx + self.k * self.kc].reshape((self.k, self.kc)); idx += self.k * self.kc
+        b = dyn_vals[idx:idx + self.k * self.kc].reshape((self.k, self.kc)); idx += self.k * self.kc
+        w = dyn_vals[idx:idx + self.k * self.kc].reshape((self.k, self.kc)); idx += self.k * self.kc
         fcr = dyn_vals[idx]; idx += 1
 
         # Prebuild reintegration operator (kept on substrate, not in state)
