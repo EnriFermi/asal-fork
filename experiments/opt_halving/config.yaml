@@ -4,7 +4,7 @@ meta:
 
 substrate:
   substrate: lenia_flow
-  rollout_steps: 8192
+  rollout_steps: 32768
   grid_size: 384
   C: 3
   k: 9
@@ -60,10 +60,10 @@ evaluation:
 optimization:
   bs: 1
   pop_size: 12
-  n_iters: 100
+  n_iters: 20
   sigma: 0.2
-  stage_steps: [256, 512, 1024, 2048]
-  keep_fracs: [0.5, 0.5, 0.5, 0.5]
+  stage_steps: [4096, 8192, 16384, 32768]
+  keep_fracs: [0.7, 0.7, 0.7, 0.7]
 
 logging:
   pca_every: 25
