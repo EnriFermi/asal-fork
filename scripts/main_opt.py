@@ -34,6 +34,17 @@ group.add_argument("--save_dir", type=str, default=None, help="path to save resu
 group = parser.add_argument_group("substrate")
 group.add_argument("--substrate", type=str, default='lenia', help="name of the substrate")
 group.add_argument("--rollout_steps", type=int, default=None, help="number of rollout timesteps, leave None for the default of the substrate")
+group.add_argument("--grid_size", type=int, default=128, help="for lenia_flow: grid size")
+group.add_argument("--C", type=int, default=1, help="for lenia_flow: number of channels")
+group.add_argument("--k", type=int, default=10, help="for lenia_flow: number of kernels")
+group.add_argument("--kernel_components", type=int, default=3, help="for lenia_flow: number of kernel components")
+group.add_argument("--M", type=str, default="2,1,0;0,2,1;1,0,2", help="for lenia_flow: connectivity matrix as 'a,b,c;d,e,f;g,h,i'")
+group.add_argument("--dd", type=int, default=5, help="for lenia_flow: dd parameter")
+group.add_argument("--dt", type=float, default=0.2, help="for lenia_flow: dt parameter")
+group.add_argument("--sigma", type=float, default=0.65, help="for lenia_flow: sigma parameter")
+group.add_argument("--border", type=str, default="wall", help="for lenia_flow: border mode")
+group.add_argument("--mix_rule", type=str, default="stoch", help="for lenia_flow: mix rule")
+group.add_argument("--seed_patch_size", type=int, default=20, help="for lenia_flow: size of seed patch")
 group.add_argument("--seed_n_patches", type=int, default=1, help="for lenia_flow: number of random non-overlapping seed patches")
 group.add_argument("--mutations", action='store_true', help="for lenia_flow: enable parameter patch mutations during rollout")
 group.add_argument("--mutation_sz", type=int, default=20, help="for lenia_flow: size of mutation patch")
@@ -45,6 +56,8 @@ group.add_argument("--volcano_delta", type=float, default=5.0, help="for lenia_f
 group.add_argument("--seed_mode", type=str, default='notebook_centers', choices=['center','random_patches','notebook_centers'], help="for lenia_flow: seeding mode")
 group.add_argument("--p_constant_per_patch", type=int, default=1, help="for lenia_flow: 1 for per-patch constant P, 0 for per-pixel random P")
 group.add_argument("--render_mode", type=str, default='Pcolor', choices=['A','Pcolor'], help="for lenia_flow: rendering mode")
+group.add_argument("--clip1", type=float, default=float("inf"), help="for lenia_flow: clip1 for parameter deltas")
+group.add_argument("--clip2", type=float, default=float("inf"), help="for lenia_flow: clip2 for parameter deltas")
 group.add_argument("--food", action='store_true', help="for lenia_flow: enable food mechanics (decay + spawn + consumption)")
 group.add_argument("--food_interval", type=int, default=128, help="for lenia_flow: steps between food spawns")
 group.add_argument("--food_n", type=int, default=3, help="for lenia_flow: number of food patches per spawn")
@@ -55,7 +68,10 @@ group.add_argument("--food_bonus", type=float, default=1.0, help="for lenia_flow
 group.add_argument("--mass_decay", type=float, default=0.0, help="for lenia_flow: uniform mass decay per step")
 group.add_argument("--food_channel", type=int, default=1, help="for lenia_flow: which channel consumes food (0=R,1=G,2=B)")
 group.add_argument("--food_auto_size", action='store_true', help="for lenia_flow: auto-set food patch size to compensate decay per spawn")
+group.add_argument("--food_auto_scale", type=float, default=1.0, help="for lenia_flow: scale factor for auto-sized food compensation")
 group.add_argument("--food_conv_mode", type=str, default='scalar', choices=['scalar','conv'], help="for lenia_flow: consumption mode")
+group.add_argument("--food_vis_scale", type=float, default=1.0, help="for lenia_flow: food visualization scale")
+group.add_argument("--food_vis_color", type=str, default="0.6,0.3,0.0", help="for lenia_flow: food visualization color as 'r,g,b'")
 group.add_argument("--food_diffusion_alpha", type=float, default=0.0, help="for lenia_flow: blend factor for food diffusion (0=off)")
 group.add_argument("--mass_clip_eps", type=float, default=0.0, help="for lenia_flow: zero-out per-pixel mass below this sum")
 
@@ -100,7 +116,6 @@ def show_video(x, fps=25, path="tmp.gif"):
     iio.imwrite(path, x, duration=1/fps)
     # display(Image(path))
 
-
 def main(args):
     run = wandb.init( project="asal", config={**vars(args)})
     try:
@@ -110,7 +125,13 @@ def main(args):
         print(args)
         
         fm = foundation_models.create_foundation_model(args.foundation_model)
-        substrate = substrates.create_substrate(args.substrate)
+        if args.substrate == "lenia_flow":
+            substrate = substrates.create_substrate(
+                args.substrate,
+                **util.flow_lenia_kwargs_from_args(args),
+            )
+        else:
+            substrate = substrates.create_substrate(args.substrate)
         # Optional: control initial seeding for FlowLenia
         if hasattr(substrate, 'seed_n_patches'):
             try:
