@@ -3,11 +3,11 @@ meta:
   save_dir: null
 
 substrate:
-  substrate: lenia
-  rollout_steps: null
-  grid_size: 128
-  C: 1
-  k: 10
+  substrate: lenia_flow
+  rollout_steps: 8192
+  grid_size: 384
+  C: 3
+  k: 9
   kernel_components: 3
   M: "2,1,0;0,2,1;1,0,2"
   dd: 5
@@ -16,15 +16,15 @@ substrate:
   border: wall
   mix_rule: stoch
   seed_patch_size: 20
-  seed_n_patches: 1
-  seed_mode: notebook_centers
+  seed_n_patches: 16
+  seed_mode: random_patches
   p_constant_per_patch: 1
   render_mode: Pcolor
   clip1: .inf
   clip2: .inf
-  mutations: false
-  mutation_sz: 20
-  mutation_p: 0.1
+  mutations: true
+  mutation_sz: 40
+  mutation_p: 0.2
   volcano: false
   volcano_sz: 30
   volcano_p: 0.01
@@ -48,7 +48,7 @@ substrate:
 
 evaluation:
   foundation_model: clip
-  time_sampling: 32
+  time_sampling: 16
   prompts:
     - a biological cell
     - two biological cells
@@ -59,9 +59,9 @@ evaluation:
 
 optimization:
   bs: 1
-  pop_size: 8
-  n_iters: 1000
-  sigma: 0.1
+  pop_size: 12
+  n_iters: 100
+  sigma: 0.2
   stage_steps: [256, 512, 1024, 2048]
   keep_fracs: [0.5, 0.5, 0.5, 0.5]
 
