@@ -98,12 +98,12 @@ def main(cfg, args):
             )
             def eval_chunk(rng_pop, params_pop, state_pop):
                 def run_one(rng_bs, params, state_bs):
-                def run_bs(rng, s0):
-                    out = rollout_fn(rng=rng, params=params, s0=s0)
-                    state_final = out.get("state_final", None)
-                    if state_final is None:
-                        state_final = out["state"][-1]
-                    return out["z"], state_final
+                    def run_bs(rng, s0):
+                        out = rollout_fn(rng=rng, params=params, s0=s0)
+                        state_final = out.get("state_final", None)
+                        if state_final is None:
+                            state_final = out["state"][-1]
+                        return out["z"], state_final
                     z_bs, state_final = jax.vmap(run_bs)(rng_bs, state_bs)
                     return z_bs, state_final
                 z_pop, state_pop_next = jax.vmap(run_one)(rng_pop, params_pop, state_pop)
