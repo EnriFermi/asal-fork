@@ -98,9 +98,12 @@ def main(cfg, args):
             )
             def eval_chunk(rng_pop, params_pop, state_pop):
                 def run_one(rng_bs, params, state_bs):
-                    def run_bs(rng, s0):
-                        out = rollout_fn(rng=rng, params=params, s0=s0)
-                        return out["z"], out["state_final"]
+                def run_bs(rng, s0):
+                    out = rollout_fn(rng=rng, params=params, s0=s0)
+                    state_final = out.get("state_final", None)
+                    if state_final is None:
+                        state_final = out["state"][-1]
+                    return out["z"], state_final
                     z_bs, state_final = jax.vmap(run_bs)(rng_bs, state_bs)
                     return z_bs, state_final
                 z_pop, state_pop_next = jax.vmap(run_one)(rng_pop, params_pop, state_pop)
@@ -127,16 +130,23 @@ def main(cfg, args):
         rng, _rng = split(rng)
         init_keys = split(_rng, args.bs)
 
-        def init_states(params_pop):
+        def init_states_chunk(params_chunk):
             def init_one(params):
                 return jax.vmap(substrate.init_state, in_axes=(0, None))(init_keys, params)
-            return jax.vmap(init_one)(params_pop)
+            return jax.vmap(init_one)(params_chunk)
+
+        init_states_chunk_jit = jax.jit(init_states_chunk)
+        pop_batch = int(getattr(args, "pop_batch", args.pop_size))
 
         for i_iter in pbar:
             rng, _rng = split(rng)
             params_full, es_state = strategy.ask(_rng, es_state, es_params)
 
-            state_alive = init_states(params_full)
+            state_chunks = []
+            for start in range(0, args.pop_size, pop_batch):
+                end = min(args.pop_size, start + pop_batch)
+                state_chunks.append(init_states_chunk_jit(params_full[start:end]))
+            state_alive = jax.tree.map(lambda *xs: jnp.concatenate(xs, axis=0), *state_chunks)
             alive_idx = np.arange(args.pop_size, dtype=int)
             z_prefix = [None] * args.pop_size
             final_loss = np.zeros(args.pop_size, dtype=np.float32)
@@ -149,9 +159,21 @@ def main(cfg, args):
                 prev_step = stage_step
 
                 rng, _rng = split(rng)
-                rng_pop = split(_rng, len(alive_idx) * args.bs).reshape(len(alive_idx), args.bs, 2)
+                rng_all = split(_rng, len(alive_idx) * args.bs).reshape(len(alive_idx), args.bs, 2)
                 params_alive = params_full[alive_idx]
-                z_chunk, state_alive = eval_fn(rng_pop, params_alive, state_alive)
+                z_chunks = []
+                state_chunks = []
+                for start in range(0, len(alive_idx), pop_batch):
+                    end = min(len(alive_idx), start + pop_batch)
+                    z_chunk, state_chunk = eval_fn(
+                        rng_all[start:end],
+                        params_alive[start:end],
+                        jax.tree.map(lambda x: x[start:end], state_alive),
+                    )
+                    z_chunks.append(z_chunk)
+                    state_chunks.append(state_chunk)
+                z_chunk = jnp.concatenate(z_chunks, axis=0)
+                state_alive = jax.tree.map(lambda *xs: jnp.concatenate(xs, axis=0), *state_chunks)
 
                 for j, idx in enumerate(alive_idx):
                     if z_prefix[idx] is None:

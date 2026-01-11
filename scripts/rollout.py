@@ -103,7 +103,9 @@ def rollout_simulation(rng, params, s0=None,
             img = substrate.render_state(state_to_use, params=params, img_size=img_size)
             z = embed_img_fn(img)
             return next_state, dict(rgb=img, z=z, state=(state_to_use if return_state else None))
-        _, data = jax.lax.scan(chunk_fn, s0, split(rng, K))
+        state_final, data = jax.lax.scan(chunk_fn, s0, split(rng, K))
+        if return_state:
+            return dict(**data, state_final=state_final)
         return data
     else:
         raise ValueError(f"time_sampling {time_sampling} not recognized")
