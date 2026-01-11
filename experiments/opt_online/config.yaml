@@ -59,6 +59,7 @@ evaluation:
 
 optimization:
   bs: 1
+  pop_batch: 4
   pop_size: 12
   n_iters: 100
   chunk_steps: 256

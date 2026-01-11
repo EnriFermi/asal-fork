@@ -88,7 +88,10 @@ def main(cfg, args):
             def run_one(rng_bs, params, state_bs):
                 def run_bs(rng, s0):
                     out = rollout_fn(rng=rng, params=params, s0=s0)
-                    return out["z"], out["state_final"]
+                    state_final = out.get("state_final", None)
+                    if state_final is None:
+                        state_final = out["state"][-1]
+                    return out["z"], state_final
                 z_bs, state_final = jax.vmap(run_bs)(rng_bs, state_bs)
                 loss_bs = jax.vmap(calc_loss_from_z)(z_bs)
                 return loss_bs.mean(), state_final
@@ -109,12 +112,19 @@ def main(cfg, args):
         rng, _rng = split(rng)
         init_keys = split(_rng, args.bs)
 
-        def init_states(params_pop):
+        def init_states_chunk(params_chunk):
             def init_one(params):
                 return jax.vmap(substrate.init_state, in_axes=(0, None))(init_keys, params)
-            return jax.vmap(init_one)(params_pop)
+            return jax.vmap(init_one)(params_chunk)
 
-        state_pop = init_states(params_pop)
+        init_states_chunk_jit = jax.jit(init_states_chunk)
+
+        pop_batch = int(getattr(args, "pop_batch", args.pop_size))
+        state_chunks = []
+        for start in range(0, args.pop_size, pop_batch):
+            end = min(args.pop_size, start + pop_batch)
+            state_chunks.append(init_states_chunk_jit(params_pop[start:end]))
+        state_pop = jax.tree.map(lambda *xs: jnp.concatenate(xs, axis=0), *state_chunks)
 
         data = []
         best_params_traj = []
@@ -125,9 +135,21 @@ def main(cfg, args):
 
         for i_iter in pbar:
             rng, _rng = split(rng)
-            rng_pop = split(_rng, args.pop_size * args.bs).reshape(args.pop_size, args.bs, 2)
+            rng_all = split(_rng, args.pop_size * args.bs).reshape(args.pop_size, args.bs, 2)
 
-            loss_pop, state_pop = eval_chunk_jit(rng_pop, params_pop, state_pop)
+            loss_chunks = []
+            state_chunks = []
+            for start in range(0, args.pop_size, pop_batch):
+                end = min(args.pop_size, start + pop_batch)
+                loss_chunk, state_chunk = eval_chunk_jit(
+                    rng_all[start:end],
+                    params_pop[start:end],
+                    jax.tree.map(lambda x: x[start:end], state_pop),
+                )
+                loss_chunks.append(loss_chunk)
+                state_chunks.append(state_chunk)
+            loss_pop = jnp.concatenate(loss_chunks, axis=0)
+            state_pop = jax.tree.map(lambda *xs: jnp.concatenate(xs, axis=0), *state_chunks)
 
             es_state = strategy.tell(params_pop, loss_pop, es_state, es_params)
 
