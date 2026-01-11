@@ -43,6 +43,8 @@ def main(cfg, args):
         prompts = args.prompts
         if isinstance(prompts, str):
             prompts = [p for p in prompts.split(";") if p]
+        else:
+            prompts = OmegaConf.to_container(prompts, resolve=True)
         if args.time_sampling < len(prompts):
             args.time_sampling = len(prompts)
 
