@@ -42,6 +42,7 @@ def main():
     parser.add_argument('--mutations', action='store_true', help='For FlowLenia: enable parameter patch mutations during rollout')
     parser.add_argument('--mutation_sz', type=int, default=20, help='For FlowLenia: size of mutation patch')
     parser.add_argument('--mutation_p', type=float, default=0.1, help='For FlowLenia: probability of mutation each step')
+    parser.add_argument('--mutation_scale', type=float, default=1.0, help='For FlowLenia: scale for mutation noise')
     parser.add_argument('--volcano', action='store_true', help='For FlowLenia: enable volcano mutation (mass removal + strong genome change)')
     parser.add_argument('--volcano_sz', type=int, default=30, help='For FlowLenia: size of volcano patch')
     parser.add_argument('--volcano_p', type=float, default=0.01, help='For FlowLenia: probability of volcano each step')
@@ -141,6 +142,7 @@ def main():
             substrate.mutation_enabled = bool(args.mutations)
             substrate.mutation_sz = int(args.mutation_sz)
             substrate.mutation_p = float(args.mutation_p)
+            substrate.mutation_scale = float(args.mutation_scale)
         except Exception:
             pass
     # Food mechanics
