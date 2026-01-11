@@ -1,0 +1,69 @@
+meta:
+  seed: 1
+  save_dir: null
+
+substrate:
+  substrate: lenia
+  rollout_steps: null
+  grid_size: 128
+  C: 1
+  k: 10
+  kernel_components: 3
+  M: "2,1,0;0,2,1;1,0,2"
+  dd: 5
+  dt: 0.2
+  sigma: 0.65
+  border: wall
+  mix_rule: stoch
+  seed_patch_size: 20
+  seed_n_patches: 1
+  seed_mode: notebook_centers
+  p_constant_per_patch: 1
+  render_mode: Pcolor
+  clip1: .inf
+  clip2: .inf
+  mutations: false
+  mutation_sz: 20
+  mutation_p: 0.1
+  volcano: false
+  volcano_sz: 30
+  volcano_p: 0.01
+  volcano_delta: 5.0
+  food: false
+  food_interval: 128
+  food_n: 3
+  food_sz: 16
+  food_amount: 1.0
+  food_consume_rate: 0.05
+  food_bonus: 1.0
+  mass_decay: 0.0
+  food_channel: 1
+  food_auto_size: false
+  food_auto_scale: 1.0
+  food_conv_mode: scalar
+  food_vis_scale: 1.0
+  food_vis_color: "0.6,0.3,0.0"
+  food_diffusion_alpha: 0.0
+  mass_clip_eps: 0.0
+
+evaluation:
+  foundation_model: clip
+  time_sampling: 32
+  prompts:
+    - a biological cell
+    - two biological cells
+  coef_prompt: 0.0
+  coef_softmax: 0.0
+  coef_oe: 1.0
+  coef_smooth: 0.2
+
+optimization:
+  bs: 1
+  pop_size: 8
+  n_iters: 1000
+  chunk_steps: 256
+  sigma: 0.1
+
+logging:
+  pca_every: 25
+  pca_history: 100

@@ -36,6 +36,17 @@ def main():
     parser.add_argument('--img_size', type=int, default=224, help='Render size')
     parser.add_argument('--seed', type=int, default=0, help='Random seed for rollout')
     parser.add_argument('--n_seeds', type=int, default=1, help='For FlowLenia: number of random non-overlapping seed patches')
+    parser.add_argument('--grid_size', type=int, default=128, help='For FlowLenia: grid size')
+    parser.add_argument('--C', type=int, default=1, help='For FlowLenia: number of channels')
+    parser.add_argument('--k', type=int, default=10, help='For FlowLenia: number of kernels')
+    parser.add_argument('--kernel_components', type=int, default=3, help='For FlowLenia: number of kernel components')
+    parser.add_argument('--M', type=str, default="2,1,0;0,2,1;1,0,2", help="For FlowLenia: connectivity matrix as 'a,b,c;d,e,f;g,h,i'")
+    parser.add_argument('--dd', type=int, default=5, help='For FlowLenia: dd parameter')
+    parser.add_argument('--dt', type=float, default=0.2, help='For FlowLenia: dt parameter')
+    parser.add_argument('--sigma', type=float, default=0.65, help='For FlowLenia: sigma parameter')
+    parser.add_argument('--border', type=str, default="wall", help='For FlowLenia: border mode')
+    parser.add_argument('--mix_rule', type=str, default="stoch", help='For FlowLenia: mix rule')
+    parser.add_argument('--seed_patch_size', type=int, default=20, help='For FlowLenia: size of seed patch')
     parser.add_argument('--seed_mode', type=str, default='notebook_centers', choices=['center','random_patches','notebook_centers'], help='For FlowLenia: seeding mode')
     parser.add_argument('--p_constant_per_patch', type=int, default=1, help='For FlowLenia: 1 per-patch constant P, 0 per-pixel random P')
     parser.add_argument('--render_mode', type=str, default='Pcolor', choices=['A','Pcolor'], help='For FlowLenia: rendering mode')
@@ -47,6 +58,8 @@ def main():
     parser.add_argument('--volcano_sz', type=int, default=30, help='For FlowLenia: size of volcano patch')
     parser.add_argument('--volcano_p', type=float, default=0.01, help='For FlowLenia: probability of volcano each step')
     parser.add_argument('--volcano_delta', type=float, default=5.0, help='For FlowLenia: scale of genome perturbation in volcano')
+    parser.add_argument('--clip1', type=float, default=float("inf"), help='For FlowLenia: clip1 for parameter deltas')
+    parser.add_argument('--clip2', type=float, default=float("inf"), help='For FlowLenia: clip2 for parameter deltas')
     # food mechanics
     parser.add_argument('--food', action='store_true', help='For FlowLenia: enable food mechanics (decay + spawn + consumption)')
     parser.add_argument('--food_interval', type=int, default=128, help='For FlowLenia: steps between food spawns')
@@ -60,6 +73,8 @@ def main():
     parser.add_argument('--food_auto_size', action='store_true', help='For FlowLenia: auto-set food patch size to compensate decay per spawn')
     parser.add_argument('--food_auto_scale', type=float, default=1.0, help='Scale factor when auto-sizing food to slightly over/under compensate observed loss')
     parser.add_argument('--food_conv_mode', type=str, default='scalar', choices=['scalar','conv'], help='For FlowLenia: consumption mode')
+    parser.add_argument('--food_vis_scale', type=float, default=1.0, help='For FlowLenia: food visualization scale')
+    parser.add_argument('--food_vis_color', type=str, default="0.6,0.3,0.0", help="For FlowLenia: food visualization color as 'r,g,b'")
     parser.add_argument('--food_diffusion_alpha', type=float, default=0.0, help='For FlowLenia: blend factor for food diffusion (0=off)')
     parser.add_argument('--mass_clip_eps', type=float, default=0.0, help='For FlowLenia: zero-out per-pixel mass below this sum')
     parser.add_argument('--output', type=str, default='out.mp4', help='Output MP4 path')
@@ -106,7 +121,13 @@ def main():
         if loss_arr is not None and loss_arr.shape[0] == n_iters_available:
             best_fitness = loss_arr[args.traj_iter]
 
-    substrate = substrates.create_substrate(args.substrate)
+    if args.substrate == "lenia_flow":
+        substrate = substrates.create_substrate(
+            args.substrate,
+            **util.flow_lenia_kwargs_from_args(args),
+        )
+    else:
+        substrate = substrates.create_substrate(args.substrate)
     # If FlowLenia, allow overriding number of seeding patches
     if hasattr(substrate, 'seed_n_patches') and args.n_seeds is not None:
         try:

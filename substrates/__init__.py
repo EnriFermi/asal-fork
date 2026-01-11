@@ -12,7 +12,7 @@ from .nca import NCA
 from .gol import GameOfLife
 
 
-def create_substrate(substrate_name):
+def create_substrate(substrate_name, **kwargs):
     """
     Create the substrate given a substrate name.
     The substrate parameterizes the space of simulations to search over.
@@ -35,28 +35,28 @@ def create_substrate(substrate_name):
     """
     rollout_steps = 1000
     if substrate_name=='boids':
-        substrate = Boids(n_boids=128, n_nbrs=16, visual_range=0.1, speed=0.5, controller='network', dt=0.01, bird_render_size=0.015, bird_render_sharpness=40.)
+        substrate = Boids(n_boids=128, n_nbrs=16, visual_range=0.1, speed=0.5, controller='network', dt=0.01, bird_render_size=0.015, bird_render_sharpness=40., **kwargs)
     elif substrate_name=='lenia':
-        substrate = Lenia(grid_size=128, center_phenotype=True, phenotype_size=64, start_pattern="5N7KKM", clip1=1.)
+        substrate = Lenia(grid_size=128, center_phenotype=True, phenotype_size=64, start_pattern="5N7KKM", clip1=1., **kwargs)
         rollout_steps = 256
     elif substrate_name=='lenia_flow':
-        substrate = FlowLenia(grid_size=384, C=3, dd=5, dt=0.2, sigma=0.65, border='wall', mix_rule='stoch', M= jax.numpy.array([[2, 1, 0],[0, 2, 1],[1, 0, 2]], dtype=int), k=9)
+        substrate = FlowLenia(grid_size=384, C=3, dd=5, dt=0.2, sigma=0.65, border='wall', mix_rule='stoch', M= jax.numpy.array([[2, 1, 0],[0, 2, 1],[1, 0, 2]], dtype=int), k=9, **kwargs)
         # M= jax.numpy.array([[3, 2, 2],[2, 3, 2],[2, 2, 3]], dtype=int), k=21)
         rollout_steps = 512
     elif substrate_name=='plife':
-        substrate = ParticleLife(n_particles=5000, n_colors=6, search_space="beta+alpha", dt=2e-3, render_radius=1e-2)  
+        substrate = ParticleLife(n_particles=5000, n_colors=6, search_space="beta+alpha", dt=2e-3, render_radius=1e-2, **kwargs)  
     elif substrate_name=='plife_plus':
-        substrate = ParticleLifePlus(n_particles=1000, dt=0.02, render_radius=0.04, sharpness=30., background_color='black')
+        substrate = ParticleLifePlus(n_particles=1000, dt=0.02, render_radius=0.04, sharpness=30., background_color='black', **kwargs)
     elif substrate_name=='plenia':
-        substrate = ParticleLenia(n_particles=200, dt=0.1)
+        substrate = ParticleLenia(n_particles=200, dt=0.1, **kwargs)
     elif substrate_name=='dnca':
-        substrate = DNCA(grid_size=128, d_state=8, n_groups=1, identity_bias=0., temperature=1e-3)
+        substrate = DNCA(grid_size=128, d_state=8, n_groups=1, identity_bias=0., temperature=1e-3, **kwargs)
     elif substrate_name=='nca_d1':
-        substrate = NCA(grid_size=128, d_state=1, p_drop=0.5, dt=0.1)
+        substrate = NCA(grid_size=128, d_state=1, p_drop=0.5, dt=0.1, **kwargs)
     elif substrate_name=='nca_d3':
-        substrate = NCA(grid_size=128, d_state=3, p_drop=0.5, dt=0.1)
+        substrate = NCA(grid_size=128, d_state=3, p_drop=0.5, dt=0.1, **kwargs)
     elif substrate_name=='gol':
-        substrate = GameOfLife(grid_size=64)
+        substrate = GameOfLife(grid_size=64, **kwargs)
         rollout_steps = 1024
     else:
         raise ValueError(f"Unknown substrate name: {substrate_name}")
