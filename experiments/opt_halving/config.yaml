@@ -1,6 +1,6 @@
 meta:
   seed: 1
-  save_dir: null
+  save_dir: experiments/opt_halving/checkpoints/2601112357
 
 substrate:
   substrate: lenia
