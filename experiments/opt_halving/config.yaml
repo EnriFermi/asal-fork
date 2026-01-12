@@ -59,11 +59,11 @@ evaluation:
 
 optimization:
   bs: 1
-  pop_batch: 4
+  pop_batch: 12
   pop_size: 12
   n_iters: 20
   sigma: 0.2
-  stage_steps: [4096, 8192, 16384, 32768]
+  stage_steps: [8192, 16384, 32768, 65536]
   keep_fracs: [0.7, 0.7, 0.7, 0.7]
 
 logging:
