@@ -64,7 +64,7 @@ optimization:
   n_iters: 20
   sigma: 0.2
   stage_steps: [8192, 16384, 32768, 65536]
-  keep_fracs: [0.7, 0.7, 0.7, 0.7]
+  keep_counts: [8, 6, 4, 2]
 
 logging:
   pca_every: 25

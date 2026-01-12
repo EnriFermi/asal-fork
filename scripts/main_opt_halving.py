@@ -37,6 +37,10 @@ def load_config():
     return cfg, flat
 
 
+def parse_int_list(items):
+    return [int(x) for x in items]
+
+
 def main(cfg, args):
     run = wandb.init(project="asal", config=OmegaConf.to_container(cfg, resolve=True))
     try:
@@ -54,9 +58,9 @@ def main(cfg, args):
         if stage_steps != sorted(stage_steps):
             raise ValueError("stage_steps must be strictly increasing.")
 
-        keep_fracs = list(args.keep_fracs)
-        if len(keep_fracs) < len(stage_steps):
-            keep_fracs = keep_fracs + [keep_fracs[-1]] * (len(stage_steps) - len(keep_fracs))
+        keep_counts = parse_int_list(args.keep_counts)
+        if len(keep_counts) < len(stage_steps):
+            keep_counts = keep_counts + [keep_counts[-1]] * (len(stage_steps) - len(keep_counts))
 
         for i in range(len(stage_steps)):
             delta = stage_steps[i] - (stage_steps[i - 1] if i > 0 else 0)
@@ -154,7 +158,7 @@ def main(cfg, args):
 
             prev_step = 0
             last_loss_alive = None
-            for stage_i, (stage_step, keep_frac, eval_fn) in enumerate(zip(stage_steps, keep_fracs, eval_fns)):
+            for stage_i, (stage_step, keep_count, eval_fn) in enumerate(zip(stage_steps, keep_counts, eval_fns)):
                 steps_to_run = stage_step - prev_step
                 prev_step = stage_step
 
@@ -190,7 +194,7 @@ def main(cfg, args):
                 last_loss_alive = jax.vmap(loss_from_prefix)(z_stack)
                 loss_alive_np = np.array(last_loss_alive)
 
-                keep_n = max(1, int(np.ceil(len(alive_idx) * keep_frac)))
+                keep_n = max(1, min(int(keep_count), len(alive_idx)))
                 order = np.argsort(loss_alive_np)
                 keep_sel = order[:keep_n]
                 drop_sel = order[keep_n:]
