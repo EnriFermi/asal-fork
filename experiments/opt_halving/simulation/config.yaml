@@ -1,5 +1,5 @@
 meta:
-  save_dir: ./data/opt_halving_run
+  save_dir: experiments/opt_halving/checkpoints/2601112357
 
 substrate:
   substrate: lenia_flow
@@ -51,19 +51,19 @@ simulation:
   img_size: 154
   seed: 0
   n_seeds: 16
-  output: ./data/opt_halving_run/sim.mp4
+  output: experiments/opt_halving/figures/2601121325_simulation.mp4
   fps: 250
   codec: libx264
   macro_block_size: null
   batch_steps: 256
   jit_microbatch: 64
-  max_steps: 1200000
-  mass_plot: ./data/opt_halving_run/mass.png
+  max_steps: 500000
+  mass_plot: experiments/opt_halving/figures/2601121325_mass.png
   log_mass_every: 1000
   traj_iter: null
   compute_oe: false
   oe_every: 100
-  oe_plot: ./data/opt_halving_run/oe_loss.png
+  oe_plot: experiments/opt_halving/figures/2601121325_oe_loss.png
 
 logging:
   wandb_project: asal

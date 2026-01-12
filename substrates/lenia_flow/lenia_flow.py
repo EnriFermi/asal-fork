@@ -5,8 +5,20 @@ import jax.scipy as jsp
 from jax.random import split
 from .utils import conn_from_matrix, get_kernels_fft, sobel, growth
 from .reintegration_tracking import ReintegrationTracking
-from .lenia_flow_impl import Config
+from typing import NamedTuple
 
+class Config(NamedTuple):
+    X: int=128
+    Y: int=128
+    C: int=1
+    c0: list[int]=[0]
+    c1: list[list[int]]=[[0]]
+    k: int=10
+    dd: int=5
+    dt: float=0.2
+    sigma: float=.65
+    border: str="wall"
+    mix_rule: str="stoch"
 
 def inv_sigmoid(x):
     return jnp.log(x) - jnp.log1p(-x)
