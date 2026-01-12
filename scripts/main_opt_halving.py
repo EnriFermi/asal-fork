@@ -129,6 +129,7 @@ def main(cfg, args):
         best_loss_traj = []
         pop_params_traj = []
         pop_loss_traj = []
+        palette_traj = []
         pbar = tqdm(range(args.n_iters))
 
         rng, _rng = split(rng)
@@ -268,11 +269,32 @@ def main(cfg, args):
                 "best_stage": int(final_stage[best_idx]),
                 "iter": i_iter,
             }
+            palette_stats = util.flow_lenia_palette_stats(np.array(es_state.best_member), substrate)
+            if palette_stats is not None:
+                try:
+                    import matplotlib.pyplot as plt
+                    fig = plt.figure(figsize=(6, 2))
+                    ax = fig.add_subplot(111)
+                    im = ax.imshow(palette_stats["w_soft"], aspect="auto", cmap="viridis")
+                    ax.set_xlabel("kernel")
+                    ax.set_ylabel("RGB")
+                    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                    log_dict["pcolor_palette"] = wandb.Image(fig)
+                    plt.close(fig)
+                except Exception as e:
+                    print(f"Palette logging failed: {e}")
+                ent = palette_stats["entropy"]
+                log_dict["pcolor_entropy_mean"] = float(ent.mean())
+                log_dict["pcolor_entropy_r"] = float(ent[0])
+                log_dict["pcolor_entropy_g"] = float(ent[1])
+                log_dict["pcolor_entropy_b"] = float(ent[2])
             if pca_img is not None:
                 log_dict["pop_pca_traj_3d"] = pca_img
             run.log(log_dict)
 
             data.append(dict(best_loss=es_state.best_fitness, loss=loss_rank))
+            if palette_stats is not None:
+                palette_traj.append(dict(iter=i_iter, **palette_stats))
             pbar.set_postfix(best_loss=es_state.best_fitness.item())
 
             if args.save_dir is not None and (i_iter % max(1, args.n_iters // 10) == 0 or i_iter == args.n_iters - 1):
@@ -292,6 +314,8 @@ def main(cfg, args):
                         loss=np.stack(pop_loss_traj, axis=0),
                     )
                     util.save_pkl(args.save_dir, "pop_traj", pop_traj)
+                if len(palette_traj) > 0:
+                    util.save_pkl(args.save_dir, "palette_traj", palette_traj)
 
     finally:
         run.finish()

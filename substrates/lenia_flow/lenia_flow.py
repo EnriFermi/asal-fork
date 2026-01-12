@@ -71,7 +71,7 @@ class FlowLenia:
         seed_n_patches: int = 1,
         seed_mode: str = "notebook_centers",  # 'center' | 'random_patches' | 'notebook_centers'
         p_constant_per_patch: bool = True,
-        render_mode: str = "Pcolor",  # 'A' | 'Pcolor'
+        render_mode: str = "Pcolor",  # 'A' | 'Pcolor' | 'PcolorMix'
         clip1: float = float("inf"),
         clip2: float = float("inf"),
         # mutation controls (optional)
@@ -79,6 +79,7 @@ class FlowLenia:
         mutation_patch_size: int = 20,
         mutation_prob: float = 0.1,
         mutation_scale: float = 1.0,
+        optimize_mutation_scale: bool = False,
         # volcano mutation (mass removal + strong genome change)
         volcano: bool = False,
         volcano_patch_size: int = 30,
@@ -117,10 +118,13 @@ class FlowLenia:
         self.seed_mode = seed_mode
         self.p_constant_per_patch = bool(p_constant_per_patch)
         self.render_mode = render_mode
+        self.palette_mode = (self.render_mode == "PcolorMix")
         self.clip1 = clip1
         self.clip2 = clip2
         # mutation
         self.mutation_scale = float(mutation_scale)
+        self.optimize_mutation_scale = bool(optimize_mutation_scale)
+        self.mutation_scale_log_bounds = (-5.0, 3.0)
         self.mutation_enabled = bool(mutation)
         self.mutation_sz = int(mutation_patch_size)
         self.mutation_p = float(mutation_prob)
@@ -230,9 +234,17 @@ class FlowLenia:
 
     # ---------- params interface ----------
     def default_params(self, rng):
-        # Single flat vector of deltas like Lenia (dynamics only)
+        # Single flat vector of deltas like Lenia (dynamics only) + optional extras
         n_dyn = self.base_dyn_raw.size
-        return jr.normal(rng, (n_dyn,)) * 0.1
+        rng, k1 = jr.split(rng)
+        parts = [jr.normal(k1, (n_dyn,)) * 0.1]
+        if self.palette_mode:
+            rng, k2 = jr.split(rng)
+            parts.append(jr.normal(k2, (self.k * 3,)) * 0.1)
+        if self.optimize_mutation_scale:
+            rng, k3 = jr.split(rng)
+            parts.append(jr.normal(k3, (1,)) * 0.1)
+        return jnp.concatenate(parts, axis=0)
 
     # ---------- state interface ----------
     def init_state(self, rng, params):
@@ -378,11 +390,19 @@ class FlowLenia:
 
         # Optional mutation: inject a random parameter patch into P
         if self.mutation_enabled:
+            mut_scale = self.mutation_scale
+            if self.optimize_mutation_scale and params is not None:
+                n_dyn = self.base_dyn_raw.size
+                extra = self.k * 3 if self.palette_mode else 0
+                idx = n_dyn + extra
+                if params.shape[0] > idx:
+                    log_ms = jnp.clip(params[idx], self.mutation_scale_log_bounds[0], self.mutation_scale_log_bounds[1])
+                    mut_scale = jnp.exp(log_ms)
             kmut, kpos, kprob = jr.split(rng, 3)
             sz = max(1, min(self.mutation_sz, nP.shape[0], nP.shape[1]))
             kdim = nP.shape[-1]
             # mutation tensor and location
-            mut = jnp.ones((sz, sz, kdim)) * jr.normal(kmut, (1, 1, kdim)) * self.mutation_scale
+            mut = jnp.ones((sz, sz, kdim)) * jr.normal(kmut, (1, 1, kdim)) * mut_scale
             max_i = nP.shape[0] - sz
             max_j = nP.shape[1] - sz
             ki, kj = jr.split(kpos)
@@ -521,7 +541,21 @@ class FlowLenia:
     def render_state(self, state, params, img_size=None):
         mode = getattr(self, 'render_mode', 'A')
         A = state["A"]
-        if mode == 'Pcolor':
+        if mode == 'PcolorMix':
+            # Intensity times learned palette mixing of P over kernels
+            P = state["P"]
+            inten = A.sum(axis=-1, keepdims=True)
+            if params is None:
+                w = jnp.ones((self.k, 3)) / float(self.k)
+            else:
+                n_dyn = self.base_dyn_raw.size
+                w_raw = params[n_dyn:n_dyn + self.k * 3]
+                w_raw = jnp.reshape(w_raw, (3, self.k))
+                w_soft = jax.nn.softmax(w_raw, axis=1)
+                w = jnp.transpose(w_soft, (1, 0))  # (k, 3)
+            color = jnp.tensordot(P, w, axes=([2], [0]))
+            img = jnp.clip(inten * color, 0.0, 1.0)
+        elif mode == 'Pcolor':
             # Notebook-style: intensity = sum(A) times first 3 channels of P
             P = state["P"]
             inten = A.sum(axis=-1, keepdims=True)

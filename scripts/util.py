@@ -50,6 +50,8 @@ def parse_color_str(s: str) -> Tuple[float, float, float]:
 
 def flow_lenia_kwargs_from_args(args: Any) -> Dict[str, Any]:
     seed_n = getattr(args, "n_seeds", getattr(args, "seed_n_patches"))
+    mutation_scale = getattr(args, "mutation_scale", 1.0)
+    optimize_mutation_scale = getattr(args, "optimize_mutation_scale", False)
     return dict(
         grid_size=int(args.grid_size),
         C=int(args.C),
@@ -71,7 +73,8 @@ def flow_lenia_kwargs_from_args(args: Any) -> Dict[str, Any]:
         mutation=bool(args.mutations),
         mutation_patch_size=int(args.mutation_sz),
         mutation_prob=float(args.mutation_p),
-        mutation_scale=float(args.mutation_scale),
+        mutation_scale=float(mutation_scale),
+        optimize_mutation_scale=bool(optimize_mutation_scale),
         volcano=bool(args.volcano),
         volcano_patch_size=int(args.volcano_sz),
         volcano_prob=float(args.volcano_p),
@@ -93,3 +96,27 @@ def flow_lenia_kwargs_from_args(args: Any) -> Dict[str, Any]:
         food_diffusion_alpha=float(args.food_diffusion_alpha),
         mass_clip_eps=float(args.mass_clip_eps),
     )
+
+
+def _softmax_np(x: np.ndarray, axis: int = -1) -> np.ndarray:
+    x = x - np.max(x, axis=axis, keepdims=True)
+    exp_x = np.exp(x)
+    return exp_x / np.sum(exp_x, axis=axis, keepdims=True)
+
+
+def flow_lenia_palette_stats(params: np.ndarray, substrate: Any) -> Dict[str, Any] | None:
+    base = substrate.substrate if hasattr(substrate, "substrate") else substrate
+    if not hasattr(base, "base_dyn_raw"):
+        return None
+    if getattr(base, "render_mode", None) != "PcolorMix":
+        return None
+    n_dyn = int(base.base_dyn_raw.size)
+    k = int(base.k)
+    size = 3 * k
+    if params is None or params.size < n_dyn + size:
+        return None
+    w_raw = np.asarray(params[n_dyn:n_dyn + size]).reshape(3, k)
+    w_soft = _softmax_np(w_raw, axis=1)
+    eps = 1e-8
+    entropy = -np.sum(w_soft * np.log(w_soft + eps), axis=1)
+    return dict(w_raw=w_raw, w_soft=w_soft, entropy=entropy)
