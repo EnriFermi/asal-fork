@@ -255,10 +255,13 @@ def main(cfg, args):
                 except Exception as e:
                     print(f"PCA population logging failed at iter {i_iter}: {e}")
 
+            best_idx = order[0]
             log_dict = {
                 "loss_pop_mean": loss_mean,
                 "loss_pop_var": loss_var,
                 "best_loss": float(es_state.best_fitness),
+                "best_loss_raw": float(final_loss[best_idx]),
+                "best_stage": int(final_stage[best_idx]),
                 "iter": i_iter,
             }
             if pca_img is not None:
