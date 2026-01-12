@@ -224,8 +224,8 @@ def main(cfg, args):
             pop_params_traj.append(np.array(params_full))
             pop_loss_traj.append(np.array(loss_rank))
 
-            loss_mean = float(loss_rank.mean())
-            loss_var = float(loss_rank.var())
+            loss_mean = float(final_loss.mean())
+            loss_var = float(final_loss.var())
 
             pca_img = None
             if args.pca_every > 0 and (i_iter % args.pca_every == 0) and len(pop_params_traj) > 1:
