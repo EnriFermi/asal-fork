@@ -71,6 +71,7 @@ def flow_lenia_kwargs_from_args(args: Any) -> Dict[str, Any]:
         mutation=bool(args.mutations),
         mutation_patch_size=int(args.mutation_sz),
         mutation_prob=float(args.mutation_p),
+        mutation_scale=float(args.mutation_scale),
         volcano=bool(args.volcano),
         volcano_patch_size=int(args.volcano_sz),
         volcano_prob=float(args.volcano_p),
