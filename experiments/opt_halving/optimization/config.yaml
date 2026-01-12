@@ -26,6 +26,7 @@ substrate:
   mutation_sz: 40
   mutation_p: 0.2
   mutation_scale: 1.0
+  optimize_mutation_scale: false
   volcano: false
   volcano_sz: 30
   volcano_p: 0.01

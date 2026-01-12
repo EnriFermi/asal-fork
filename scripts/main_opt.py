@@ -49,13 +49,15 @@ group.add_argument("--seed_n_patches", type=int, default=1, help="for lenia_flow
 group.add_argument("--mutations", action='store_true', help="for lenia_flow: enable parameter patch mutations during rollout")
 group.add_argument("--mutation_sz", type=int, default=20, help="for lenia_flow: size of mutation patch")
 group.add_argument("--mutation_p", type=float, default=0.1, help="for lenia_flow: probability of mutation each step")
+group.add_argument("--mutation_scale", type=float, default=1.0, help="for lenia_flow: scale for mutation noise")
+group.add_argument("--optimize_mutation_scale", action='store_true', help="for lenia_flow: make mutation_scale optimizable")
 group.add_argument("--volcano", action='store_true', help="for lenia_flow: enable volcano mutation (mass removal + strong genome change)")
 group.add_argument("--volcano_sz", type=int, default=30, help="for lenia_flow: size of volcano patch")
 group.add_argument("--volcano_p", type=float, default=0.01, help="for lenia_flow: probability of volcano each step")
 group.add_argument("--volcano_delta", type=float, default=5.0, help="for lenia_flow: scale of genome perturbation in volcano")
 group.add_argument("--seed_mode", type=str, default='notebook_centers', choices=['center','random_patches','notebook_centers'], help="for lenia_flow: seeding mode")
 group.add_argument("--p_constant_per_patch", type=int, default=1, help="for lenia_flow: 1 for per-patch constant P, 0 for per-pixel random P")
-group.add_argument("--render_mode", type=str, default='Pcolor', choices=['A','Pcolor'], help="for lenia_flow: rendering mode")
+group.add_argument("--render_mode", type=str, default='Pcolor', choices=['A','Pcolor','PcolorMix'], help="for lenia_flow: rendering mode")
 group.add_argument("--clip1", type=float, default=float("inf"), help="for lenia_flow: clip1 for parameter deltas")
 group.add_argument("--clip2", type=float, default=float("inf"), help="for lenia_flow: clip2 for parameter deltas")
 group.add_argument("--food", action='store_true', help="for lenia_flow: enable food mechanics (decay + spawn + consumption)")
@@ -297,6 +299,7 @@ def main(args):
         best_loss_traj = []
         pop_params_traj = []
         pop_loss_traj = []
+        palette_traj = []
         pbar = tqdm(range(args.n_iters))
         # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True, profile_memory=True) as prof:
         # with jax.profiler.trace("prof_dir", create_perfetto_link=True):
@@ -352,6 +355,25 @@ def main(args):
                 "best_loss": float(es_state.best_fitness),
                 "iter": i_iter,
             }
+            palette_stats = util.flow_lenia_palette_stats(np.array(es_state.best_member), substrate)
+            if palette_stats is not None:
+                try:
+                    import matplotlib.pyplot as plt
+                    fig = plt.figure(figsize=(6, 2))
+                    ax = fig.add_subplot(111)
+                    im = ax.imshow(palette_stats["w_soft"], aspect="auto", cmap="viridis")
+                    ax.set_xlabel("kernel")
+                    ax.set_ylabel("RGB")
+                    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                    log_dict["pcolor_palette"] = wandb.Image(fig)
+                    plt.close(fig)
+                except Exception as e:
+                    print(f"Palette logging failed: {e}")
+                ent = palette_stats["entropy"]
+                log_dict["pcolor_entropy_mean"] = float(ent.mean())
+                log_dict["pcolor_entropy_r"] = float(ent[0])
+                log_dict["pcolor_entropy_g"] = float(ent[1])
+                log_dict["pcolor_entropy_b"] = float(ent[2])
             if pca_img is not None:
                 log_dict["pop_pca_traj_3d"] = pca_img
             run.log(log_dict)
@@ -394,6 +416,8 @@ def main(args):
                 print(f"Full video logging failed: {e}")
 
             data.append(di)
+            if palette_stats is not None:
+                palette_traj.append(dict(iter=i_iter, **palette_stats))
             pbar.set_postfix(best_loss=es_state.best_fitness.item())
             if args.save_dir is not None and (i_iter % (args.n_iters//10)==0 or i_iter==args.n_iters-1): # save data every 10% of the run
                 data_save = jax.tree.map(lambda *x: np.array(jnp.stack(x, axis=0)), *data)
@@ -412,6 +436,8 @@ def main(args):
                         loss=np.stack(pop_loss_traj, axis=0),      # (T, pop_size)
                     )
                     util.save_pkl(args.save_dir, "pop_traj", pop_traj)
+                if len(palette_traj) > 0:
+                    util.save_pkl(args.save_dir, "palette_traj", palette_traj)
 
         # (Optional) Final PCA summary is now covered by per-iteration logging above
     finally:
