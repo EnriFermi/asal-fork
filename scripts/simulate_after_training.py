@@ -1,5 +1,5 @@
 import os
-import argparse
+import sys
 
 import jax
 import jax.numpy as jnp
@@ -16,9 +16,12 @@ from rollout import rollout_simulation
 import util
 import foundation_models
 import asal_metrics
+from omegaconf import OmegaConf
 
 
 def parse_time_sampling(arg):
+    if isinstance(arg, int):
+        return arg
     if arg == 'final' or arg == 'video':
         return arg
     try:
@@ -27,73 +30,21 @@ def parse_time_sampling(arg):
         raise ValueError("time_sampling must be 'final', 'video', or an integer")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Run a simulation using best params from main_opt training and save a GIF.")
-    parser.add_argument('--save_dir', type=str, required=True, help='Directory containing best.pkl from main_opt.py')
-    parser.add_argument('--substrate', type=str, default='lenia_flow', help='Substrate name used during training')
-    parser.add_argument('--rollout_steps', type=int, default=None, help='Number of simulation steps (defaults to substrate default)')
-    parser.add_argument('--time_sampling', type=str, default='video', help="'final', 'video', or integer for K samples")
-    parser.add_argument('--img_size', type=int, default=224, help='Render size')
-    parser.add_argument('--seed', type=int, default=0, help='Random seed for rollout')
-    parser.add_argument('--n_seeds', type=int, default=1, help='For FlowLenia: number of random non-overlapping seed patches')
-    parser.add_argument('--grid_size', type=int, default=128, help='For FlowLenia: grid size')
-    parser.add_argument('--C', type=int, default=1, help='For FlowLenia: number of channels')
-    parser.add_argument('--k', type=int, default=10, help='For FlowLenia: number of kernels')
-    parser.add_argument('--kernel_components', type=int, default=3, help='For FlowLenia: number of kernel components')
-    parser.add_argument('--M', type=str, default="2,1,0;0,2,1;1,0,2", help="For FlowLenia: connectivity matrix as 'a,b,c;d,e,f;g,h,i'")
-    parser.add_argument('--dd', type=int, default=5, help='For FlowLenia: dd parameter')
-    parser.add_argument('--dt', type=float, default=0.2, help='For FlowLenia: dt parameter')
-    parser.add_argument('--sigma', type=float, default=0.65, help='For FlowLenia: sigma parameter')
-    parser.add_argument('--border', type=str, default="wall", help='For FlowLenia: border mode')
-    parser.add_argument('--mix_rule', type=str, default="stoch", help='For FlowLenia: mix rule')
-    parser.add_argument('--seed_patch_size', type=int, default=20, help='For FlowLenia: size of seed patch')
-    parser.add_argument('--seed_mode', type=str, default='notebook_centers', choices=['center','random_patches','notebook_centers'], help='For FlowLenia: seeding mode')
-    parser.add_argument('--p_constant_per_patch', type=int, default=1, help='For FlowLenia: 1 per-patch constant P, 0 per-pixel random P')
-    parser.add_argument('--render_mode', type=str, default='Pcolor', choices=['A','Pcolor'], help='For FlowLenia: rendering mode')
-    parser.add_argument('--mutations', action='store_true', help='For FlowLenia: enable parameter patch mutations during rollout')
-    parser.add_argument('--mutation_sz', type=int, default=20, help='For FlowLenia: size of mutation patch')
-    parser.add_argument('--mutation_p', type=float, default=0.1, help='For FlowLenia: probability of mutation each step')
-    parser.add_argument('--mutation_scale', type=float, default=1.0, help='For FlowLenia: scale for mutation noise')
-    parser.add_argument('--volcano', action='store_true', help='For FlowLenia: enable volcano mutation (mass removal + strong genome change)')
-    parser.add_argument('--volcano_sz', type=int, default=30, help='For FlowLenia: size of volcano patch')
-    parser.add_argument('--volcano_p', type=float, default=0.01, help='For FlowLenia: probability of volcano each step')
-    parser.add_argument('--volcano_delta', type=float, default=5.0, help='For FlowLenia: scale of genome perturbation in volcano')
-    parser.add_argument('--clip1', type=float, default=float("inf"), help='For FlowLenia: clip1 for parameter deltas')
-    parser.add_argument('--clip2', type=float, default=float("inf"), help='For FlowLenia: clip2 for parameter deltas')
-    # food mechanics
-    parser.add_argument('--food', action='store_true', help='For FlowLenia: enable food mechanics (decay + spawn + consumption)')
-    parser.add_argument('--food_interval', type=int, default=128, help='For FlowLenia: steps between food spawns')
-    parser.add_argument('--food_n', type=int, default=3, help='For FlowLenia: number of food patches per spawn')
-    parser.add_argument('--food_sz', type=int, default=16, help='For FlowLenia: food patch size')
-    parser.add_argument('--food_amount', type=float, default=1.0, help='For FlowLenia: amount of food per cell in patch')
-    parser.add_argument('--food_consume_rate', type=float, default=0.0, help='For FlowLenia: rate of consumption per step per pixel relative to green mass')
-    parser.add_argument('--food_bonus', type=float, default=1.0, help='For FlowLenia: multiplier converting food to mass')
-    parser.add_argument('--mass_decay', type=float, default=0.0, help='For FlowLenia: uniform mass decay per step')
-    parser.add_argument('--food_channel', type=int, default=1, help='For FlowLenia: which channel consumes food (0=R,1=G,2=B)')
-    parser.add_argument('--food_auto_size', action='store_true', help='For FlowLenia: auto-set food patch size to compensate decay per spawn')
-    parser.add_argument('--food_auto_scale', type=float, default=1.0, help='Scale factor when auto-sizing food to slightly over/under compensate observed loss')
-    parser.add_argument('--food_conv_mode', type=str, default='scalar', choices=['scalar','conv'], help='For FlowLenia: consumption mode')
-    parser.add_argument('--food_vis_scale', type=float, default=1.0, help='For FlowLenia: food visualization scale')
-    parser.add_argument('--food_vis_color', type=str, default="0.6,0.3,0.0", help="For FlowLenia: food visualization color as 'r,g,b'")
-    parser.add_argument('--food_diffusion_alpha', type=float, default=0.0, help='For FlowLenia: blend factor for food diffusion (0=off)')
-    parser.add_argument('--mass_clip_eps', type=float, default=0.0, help='For FlowLenia: zero-out per-pixel mass below this sum')
-    parser.add_argument('--output', type=str, default='out.mp4', help='Output MP4 path')
-    parser.add_argument('--fps', type=int, default=250, help='Output video FPS')
-    parser.add_argument('--codec', type=str, default='libx264', help='Video codec (e.g., libx264)')
-    parser.add_argument('--macro_block_size', type=int, default=None, help='Macro block size for encoder (set None to disable)')
-    parser.add_argument('--batch_steps', type=int, default=256, help='Number of steps per batch when streaming (frames written per outer loop)')
-    parser.add_argument('--jit_microbatch', type=int, default=64, help='Frames computed per JIT call inside each batch (smaller avoids OOM)')
-    parser.add_argument('--max_steps', type=int, default=None, help='Total number of steps to run; None for until interrupted')
-    parser.add_argument('--mass_plot', type=str, default='mass.png', help='Path to save mass traces plot (total and per-channel)')
-    parser.add_argument('--log_mass_every', type=int, default=1000, help='Print total mass every N frames')
-    parser.add_argument('--traj_iter', type=int, default=None, help='If set, load parameters from best_traj at this 0-based iteration index instead of final best.pkl')
-    parser.add_argument('--compute_oe', action='store_true', help='If set, compute open-endedness loss over time using CLIP.')
-    parser.add_argument('--oe_every', type=int, default=100, help='Steps between open-endedness evaluations')
-    parser.add_argument('--oe_plot', type=str, default='oe_loss.png', help='Path to save open-endedness loss plot')
-    parser.add_argument('--wandb_project', type=str, default='asal', help='W&B project name for logging simulation dynamics')
-    args = parser.parse_args()
+def load_config():
+    if len(sys.argv) < 2:
+        raise SystemExit("Usage: python scripts/simulate_after_training.py <config.yaml>")
+    cfg = OmegaConf.load(sys.argv[1])
+    flat = OmegaConf.merge(
+        cfg.get("meta", {}),
+        cfg.get("substrate", {}),
+        cfg.get("simulation", {}),
+        cfg.get("logging", {}),
+    )
+    return cfg, flat
 
-    run = wandb.init(project=args.wandb_project, config={**vars(args)})
+
+def main(cfg, args):
+    run = wandb.init(project=args.wandb_project, config=OmegaConf.to_container(cfg, resolve=True))
 
     best_path = os.path.join(args.save_dir, 'best.pkl')
     if not os.path.exists(best_path):
@@ -372,4 +323,5 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    cfg, flat = load_config()
+    main(cfg, flat)
