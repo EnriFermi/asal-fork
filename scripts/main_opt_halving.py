@@ -269,7 +269,7 @@ def main(cfg, args):
                 "best_stage": int(final_stage[best_idx]),
                 "iter": i_iter,
             }
-            palette_stats = util.flow_lenia_palette_stats(np.array(es_state.best_member), substrate)
+            palette_stats = util.flow_lenia_palette_stats(np.array(params_full[best_idx]), substrate)
             if palette_stats is not None:
                 try:
                     import matplotlib.pyplot as plt
@@ -288,6 +288,20 @@ def main(cfg, args):
                 log_dict["pcolor_entropy_r"] = float(ent[0])
                 log_dict["pcolor_entropy_g"] = float(ent[1])
                 log_dict["pcolor_entropy_b"] = float(ent[2])
+                # Population-level palette stats (helps detect stagnation)
+                base = substrate.substrate if hasattr(substrate, "substrate") else substrate
+                n_dyn = int(base.base_dyn_raw.size)
+                k = int(base.k)
+                params_np = np.array(params_full)
+                w_raw_pop = params_np[:, n_dyn:n_dyn + 3 * k].reshape(params_np.shape[0], 3, k)
+                w_raw_pop = w_raw_pop - w_raw_pop.max(axis=2, keepdims=True)
+                w_soft_pop = np.exp(w_raw_pop)
+                w_soft_pop = w_soft_pop / w_soft_pop.sum(axis=2, keepdims=True)
+                eps = 1e-8
+                ent_pop = -np.sum(w_soft_pop * np.log(w_soft_pop + eps), axis=2)
+                log_dict["pcolor_entropy_pop_mean"] = float(ent_pop.mean())
+                log_dict["pcolor_wraw_pop_std"] = float(w_raw_pop.std())
+                log_dict["pcolor_wsoft_pop_std"] = float(w_soft_pop.std())
             if pca_img is not None:
                 log_dict["pop_pca_traj_3d"] = pca_img
             run.log(log_dict)
