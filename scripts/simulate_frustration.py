@@ -138,17 +138,7 @@ def main(cfg, args):
     def step_one(state, rng_in):
         return block_substrate.step_state(rng_in, state, params)
 
-    step_blocks_vmap = jax.jit(jax.vmap(step_one, in_axes=(0, 0)))
-    devices = jax.devices()
-    n_dev = len(devices)
-    use_pmap = bool(getattr(args, "multi_device", True)) and n_dev > 1 and (B % n_dev == 0)
-    if use_pmap:
-        per_dev = B // n_dev
-
-        def step_blocks_pmap(state_shard, rng_shard):
-            return jax.vmap(step_one, in_axes=(0, 0))(state_shard, rng_shard)
-
-        step_blocks_pmap = jax.pmap(step_blocks_pmap)
+    step_blocks_vmap = jax.vmap(step_one, in_axes=(0, 0))
 
     output_dir = getattr(args, "output_dir", None) or args.save_dir
     os.makedirs(output_dir, exist_ok=True)
@@ -159,33 +149,78 @@ def main(cfg, args):
     # setup video writer
     writer = imageio.get_writer(output_path, fps=int(args.fps), codec=args.codec, macro_block_size=args.macro_block_size)
 
-    def render_from_blocks(blocks_list):
-        A_pre, P_pre, Food_pre = assemble_blocks(blocks_list, split_n, block_size, int(args.C))
-        state_vis = {"A": jnp.asarray(A_pre), "P": jnp.asarray(P_pre), "Food": jnp.asarray(Food_pre)}
-        img = global_substrate.render_state(state_vis, params, img_size=int(args.img_size))
-        return np.asarray(img)
+    def assemble_blocks_jax(blocks_list):
+        A_blocks = blocks_list["A"]
+        P_blocks = blocks_list["P"]
+        Food_blocks = blocks_list.get("Food", None)
+        C = int(args.C)
+        K = int(args.k)
+        A_grid = A_blocks.reshape((split_n, split_n, block_size, block_size, C))
+        A_grid = jnp.transpose(A_grid, (0, 2, 1, 3, 4))
+        A_full = A_grid.reshape((H, H, C))
+        P_grid = P_blocks.reshape((split_n, split_n, block_size, block_size, K))
+        P_grid = jnp.transpose(P_grid, (0, 2, 1, 3, 4))
+        P_full = P_grid.reshape((H, H, K))
+        if Food_blocks is None:
+            Food_full = jnp.zeros((H, H), dtype=A_full.dtype)
+        else:
+            F_grid = Food_blocks.reshape((split_n, split_n, block_size, block_size))
+            F_grid = jnp.transpose(F_grid, (0, 2, 1, 3))
+            Food_full = F_grid.reshape((H, H))
+        return A_full, P_full, Food_full
+
+    def render_from_blocks_jax(blocks_list):
+        A_pre, P_pre, Food_pre = assemble_blocks_jax(blocks_list)
+        state_vis = {"A": A_pre, "P": P_pre, "Food": Food_pre}
+        return global_substrate.render_state(state_vis, params, img_size=int(args.img_size))
 
     # render initial state before any warmup
-    writer.append_data((render_from_blocks(blocks_state) * 255).astype(np.uint8))
+    first_frame = np.asarray(render_from_blocks_jax(blocks_state))
+    writer.append_data((np.clip(first_frame, 0.0, 1.0) * 255).astype(np.uint8))
 
     if warmup_steps > 0:
-        for _ in tqdm(range(warmup_steps), desc="warmup", leave=False):
-            rng, _rng = split(rng)
-            rkeys = split(_rng, B)
-            if use_pmap:
-                rkeys_shard = rkeys.reshape((n_dev, per_dev, 2))
-                blocks_shard = jax.tree.map(
-                    lambda x: x.reshape((n_dev, per_dev) + x.shape[1:]),
-                    blocks_state,
-                )
-                blocks_shard = step_blocks_pmap(blocks_shard, rkeys_shard)
-                blocks_state = jax.tree.map(
-                    lambda x: x.reshape((B,) + x.shape[2:]),
-                    blocks_shard,
-                )
-            else:
-                blocks_state = step_blocks_vmap(blocks_state, rkeys)
-            writer.append_data((render_from_blocks(blocks_state) * 255).astype(np.uint8))
+        warmup_stepper_cache = {}
+
+        def build_warmup_stepper(mb: int):
+            def run_batch(state, rng_in):
+                rngs = split(rng_in, mb)
+                frames0 = jnp.zeros((mb, int(args.img_size), int(args.img_size), 3), dtype=jnp.float32)
+
+                def body(i, carry):
+                    s, frames = carry
+                    rkeys = split(rngs[i], B)
+                    s = step_blocks_vmap(s, rkeys)
+                    frame = render_from_blocks_jax(s)
+                    frames = frames.at[i].set(frame)
+                    return (s, frames)
+
+                state_next, frames = jax.lax.fori_loop(0, mb, body, (state, frames0))
+                return state_next, frames
+
+            return jax.jit(run_batch)
+
+        def get_warmup_stepper(mb: int):
+            if mb not in warmup_stepper_cache:
+                warmup_stepper_cache[mb] = build_warmup_stepper(mb)
+            return warmup_stepper_cache[mb]
+
+        steps_done = 0
+        pbar = tqdm(total=warmup_steps, desc="warmup", leave=False)
+        while steps_done < warmup_steps:
+            cur = min(batch_steps, warmup_steps - steps_done)
+            inner = 0
+            while inner < cur:
+                m = min(jit_micro, cur - inner)
+                rng, _rng = split(rng)
+                stepper = get_warmup_stepper(m)
+                blocks_state, frames = stepper(blocks_state, _rng)
+                frames = np.asarray(frames)
+                frames = (np.clip(frames, 0.0, 1.0) * 255).astype(np.uint8)
+                for f in frames:
+                    writer.append_data(f)
+                inner += m
+            steps_done += cur
+            pbar.update(cur)
 
     # save state before walls removed (after warmup)
     A_pre, P_pre, Food_pre = assemble_blocks(blocks_state, split_n, block_size, int(args.C))
@@ -229,7 +264,12 @@ def main(cfg, args):
 
         return jax.jit(run_batch)
 
-    step_micro = build_batch_stepper(int(args.jit_microbatch))
+    stepper_cache = {}
+
+    def get_stepper(mb: int):
+        if mb not in stepper_cache:
+            stepper_cache[mb] = build_batch_stepper(mb)
+        return stepper_cache[mb]
 
     state = state_merged
     steps_done = 0
@@ -241,8 +281,9 @@ def main(cfg, args):
         while inner < cur:
             m = min(jit_micro, cur - inner)
             rng, _rng = split(rng)
-            state, frames = step_micro(state, _rng)
-            frames = np.asarray(frames[:m])
+            stepper = get_stepper(m)
+            state, frames = stepper(state, _rng)
+            frames = np.asarray(frames)
             frames = (np.clip(frames, 0.0, 1.0) * 255).astype(np.uint8)
             for f in frames:
                 writer.append_data(f)
