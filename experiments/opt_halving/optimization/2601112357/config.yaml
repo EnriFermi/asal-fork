@@ -1,11 +1,11 @@
 meta:
-  save_dir: ./experiments/frustration/checkpoints
-  output_dir: ./experiments/frustration/outputs
+  seed: 1
+  save_dir: experiments/opt_halving/checkpoints/2601112357
 
 substrate:
   substrate: lenia_flow
   rollout_steps: 32768
-  grid_size: 120
+  grid_size: 384
   C: 3
   k: 9
   kernel_components: 3
@@ -48,17 +48,26 @@ substrate:
   food_diffusion_alpha: 0.0
   mass_clip_eps: 0.0
 
-simulation:
-  grid_split: ${env:GRID_SPLIT,2}
-  warmup_steps: 1024
-  max_steps: 1200000
-  img_size: 154
-  seed: 0
-  output: null
-  fps: 250
-  codec: libx264
-  macro_block_size: null
-  batch_steps: 256
-  jit_microbatch: 64
+evaluation:
+  foundation_model: clip
+  time_sampling: 16
+  prompts:
+    - a biological cell
+    - two biological cells
+  coef_prompt: 0.0
+  coef_softmax: 0.0
+  coef_oe: 1.0
+  coef_smooth: 0.2
 
-logging: {}
+optimization:
+  bs: 1
+  pop_batch: 12
+  pop_size: 12
+  n_iters: 20
+  sigma: 0.2
+  stage_steps: [8192, 16384, 32768, 65536]
+  keep_fracs: [0.7, 0.7, 0.7, 0.7]
+
+logging:
+  pca_every: 25
+  pca_history: 100

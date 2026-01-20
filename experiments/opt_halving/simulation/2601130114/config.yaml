@@ -1,0 +1,70 @@
+meta:
+  save_dir: experiments/opt_halving/checkpoints/2601121351
+
+substrate:
+  substrate: lenia_flow
+  rollout_steps: 8192
+  grid_size: 384
+  C: 3
+  k: 9
+  kernel_components: 3
+  M: "2,1,0;0,2,1;1,0,2"
+  dd: 5
+  dt: 0.2
+  sigma: 0.65
+  border: wall
+  mix_rule: stoch
+  seed_patch_size: 20
+  seed_n_patches: 16
+  seed_mode: random_patches
+  p_constant_per_patch: 1
+  render_mode: Pcolor
+  clip1: .inf
+  clip2: .inf
+  mutations: true
+  mutation_sz: 40
+  mutation_p: 0.2
+  mutation_scale: 1.0
+  optimize_mutation_scale: false
+  volcano: false
+  volcano_sz: 30
+  volcano_p: 0.01
+  volcano_delta: 5.0
+  food: false
+  food_interval: 128
+  food_n: 3
+  food_sz: 16
+  food_amount: 1.0
+  food_consume_rate: 0.0
+  food_bonus: 1.0
+  mass_decay: 0.0
+  food_channel: 1
+  food_auto_size: false
+  food_auto_scale: 1.0
+  food_conv_mode: scalar
+  food_vis_scale: 1.0
+  food_vis_color: "0.6,0.3,0.0"
+  food_diffusion_alpha: 0.0
+  mass_clip_eps: 0.0
+
+simulation:
+  time_sampling: video
+  img_size: 154
+  seed: 0
+  n_seeds: 16
+  output: experiments/opt_halving/figures/2601130114_simulation.mp4
+  fps: 250
+  codec: libx264
+  macro_block_size: null
+  batch_steps: 256
+  jit_microbatch: 64
+  max_steps: 500000
+  mass_plot: experiments/opt_halving/figures/2601130114_mass.png
+  log_mass_every: 1000
+  traj_iter: 49
+  compute_oe: false
+  oe_every: 100
+  oe_plot: experiments/opt_halving/figures/2601130114_oe_loss.png
+
+logging:
+  wandb_project: asal
