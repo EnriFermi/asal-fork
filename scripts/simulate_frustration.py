@@ -166,7 +166,7 @@ def main(cfg, args):
         s_final, s_hist = jax.lax.scan(step_fn, state, rngs)
         return s_final, s_hist
 
-    step_batch_jit = jax.jit(step_batch)
+    step_batch_jit = jax.jit(step_batch, static_argnums=(2,))
 
     state = state_merged
     steps_done = 0
@@ -177,7 +177,7 @@ def main(cfg, args):
         while inner < cur:
             m = min(jit_micro, cur - inner)
             rng, _rng = split(rng)
-            state, s_hist = step_batch_jit(state, _rng, m)
+            state, s_hist = step_batch_jit(state, _rng, int(m))
             frames = np.asarray(jax.vmap(lambda s: global_substrate.render_state(s, params, img_size=int(args.img_size)))(s_hist))
             frames = (np.clip(frames, 0.0, 1.0) * 255).astype(np.uint8)
             for f in frames:
