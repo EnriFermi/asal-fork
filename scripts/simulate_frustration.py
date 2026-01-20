@@ -37,6 +37,22 @@ def to_np(x):
 def assemble_blocks(blocks, split_n, block_size, C):
     H = block_size * split_n
     A_full = np.zeros((H, H, C), dtype=np.float32)
+    if isinstance(blocks, dict):
+        P_full = np.zeros((H, H, blocks["P"].shape[-1]), dtype=np.float32)
+        A_blocks = to_np(blocks["A"])
+        P_blocks = to_np(blocks["P"])
+        Food_blocks = to_np(blocks.get("Food", 0.0))
+        B = A_blocks.shape[0]
+        for bi in range(B):
+            i = bi // split_n
+            j = bi % split_n
+            i0 = i * block_size
+            j0 = j * block_size
+            A_full[i0:i0 + block_size, j0:j0 + block_size] = A_blocks[bi]
+            P_full[i0:i0 + block_size, j0:j0 + block_size] = P_blocks[bi]
+            Food_full = Food_full if "Food_full" in locals() else np.zeros((H, H), dtype=np.float32)
+            Food_full[i0:i0 + block_size, j0:j0 + block_size] = Food_blocks[bi]
+        return A_full, P_full, Food_full
     P_full = np.zeros((H, H, blocks[0]["P"].shape[-1]), dtype=np.float32)
     Food_full = np.zeros((H, H), dtype=np.float32)
     for bi, blk in enumerate(blocks):
@@ -76,8 +92,7 @@ def main(cfg, args):
     rng = jax.random.PRNGKey(args.seed)
     state_global = global_substrate.init_state(rng, params)
 
-    # prepare block substrates
-    blocks = []
+    # prepare block substrate and batched block state
     kw_block = util.flow_lenia_kwargs_from_args(args)
     kw_block["grid_size"] = block_size
     block_substrate = substrates.FlattenSubstrateParameters(
@@ -88,26 +103,52 @@ def main(cfg, args):
     P0 = np.asarray(state_global["P"])
     Food0 = np.asarray(state_global.get("Food", np.zeros(A0.shape[:2])))
 
-    for bi in range(split_n * split_n):
+    B = split_n * split_n
+    A_blocks = np.zeros((B, block_size, block_size, int(args.C)), dtype=np.float32)
+    P_blocks = np.zeros((B, block_size, block_size, int(args.k)), dtype=np.float32)
+    Food_blocks = np.zeros((B, block_size, block_size), dtype=np.float32)
+    for bi in range(B):
         i = bi // split_n
         j = bi % split_n
         i0 = i * block_size
         j0 = j * block_size
-        blk_state = block_substrate.init_state(rng, params)
-        blk_state = dict(blk_state)
-        blk_state["A"] = jnp.asarray(A0[i0:i0 + block_size, j0:j0 + block_size])
-        blk_state["P"] = jnp.asarray(P0[i0:i0 + block_size, j0:j0 + block_size])
-        blk_state["Food"] = jnp.asarray(Food0[i0:i0 + block_size, j0:j0 + block_size])
-        blk_state["t"] = state_global.get("t", jnp.array(0, dtype=jnp.int32))
-        blk_state["mass_cycle_start"] = jnp.sum(blk_state["A"])
-        blocks.append(blk_state)
+        A_blocks[bi] = A0[i0:i0 + block_size, j0:j0 + block_size]
+        P_blocks[bi] = P0[i0:i0 + block_size, j0:j0 + block_size]
+        Food_blocks[bi] = Food0[i0:i0 + block_size, j0:j0 + block_size]
+
+    base_block = block_substrate.init_state(rng, params)
+    blocks_state = {}
+    for k, v in base_block.items():
+        if k == "A":
+            blocks_state[k] = jnp.asarray(A_blocks)
+        elif k == "P":
+            blocks_state[k] = jnp.asarray(P_blocks)
+        elif k == "Food":
+            blocks_state[k] = jnp.asarray(Food_blocks)
+        elif k == "mass_cycle_start":
+            blocks_state[k] = jnp.sum(jnp.asarray(A_blocks), axis=(1, 2, 3))
+        elif k == "t":
+            t0 = state_global.get("t", jnp.array(0, dtype=jnp.int32))
+            blocks_state[k] = jnp.broadcast_to(t0, (B,))
+        else:
+            blocks_state[k] = jnp.broadcast_to(v, (B,) + v.shape)
 
     # step blocks independently for warmup_steps and render to video
     warmup_steps = int(args.warmup_steps)
     def step_one(state, rng_in):
         return block_substrate.step_state(rng_in, state, params)
 
-    step_one_jit = jax.jit(step_one)
+    step_blocks_vmap = jax.jit(jax.vmap(step_one, in_axes=(0, 0)))
+    devices = jax.devices()
+    n_dev = len(devices)
+    use_pmap = bool(getattr(args, "multi_device", True)) and n_dev > 1 and (B % n_dev == 0)
+    if use_pmap:
+        per_dev = B // n_dev
+
+        def step_blocks_pmap(state_shard, rng_shard):
+            return jax.vmap(step_one, in_axes=(0, 0))(state_shard, rng_shard)
+
+        step_blocks_pmap = jax.pmap(step_blocks_pmap)
 
     output_dir = getattr(args, "output_dir", None) or args.save_dir
     os.makedirs(output_dir, exist_ok=True)
@@ -125,17 +166,29 @@ def main(cfg, args):
         return np.asarray(img)
 
     # render initial state before any warmup
-    writer.append_data((render_from_blocks(blocks) * 255).astype(np.uint8))
+    writer.append_data((render_from_blocks(blocks_state) * 255).astype(np.uint8))
 
     if warmup_steps > 0:
         for _ in tqdm(range(warmup_steps), desc="warmup", leave=False):
             rng, _rng = split(rng)
-            rkeys = split(_rng, len(blocks))
-            blocks = [step_one_jit(s, r) for s, r in zip(blocks, rkeys)]
-            writer.append_data((render_from_blocks(blocks) * 255).astype(np.uint8))
+            rkeys = split(_rng, B)
+            if use_pmap:
+                rkeys_shard = rkeys.reshape((n_dev, per_dev, 2))
+                blocks_shard = jax.tree.map(
+                    lambda x: x.reshape((n_dev, per_dev) + x.shape[1:]),
+                    blocks_state,
+                )
+                blocks_shard = step_blocks_pmap(blocks_shard, rkeys_shard)
+                blocks_state = jax.tree.map(
+                    lambda x: x.reshape((B,) + x.shape[2:]),
+                    blocks_shard,
+                )
+            else:
+                blocks_state = step_blocks_vmap(blocks_state, rkeys)
+            writer.append_data((render_from_blocks(blocks_state) * 255).astype(np.uint8))
 
     # save state before walls removed (after warmup)
-    A_pre, P_pre, Food_pre = assemble_blocks(blocks, split_n, block_size, int(args.C))
+    A_pre, P_pre, Food_pre = assemble_blocks(blocks_state, split_n, block_size, int(args.C))
     pre_state = dict(A=A_pre, P=P_pre, Food=Food_pre)
     util.save_pkl(output_dir, "state_before_walls", pre_state)
 
