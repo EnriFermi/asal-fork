@@ -1,5 +1,6 @@
 meta:
   save_dir: ./experiments/frustration/checkpoints
+  output_dir: ./experiments/frustration/outputs
 
 substrate:
   substrate: lenia_flow
@@ -53,7 +54,7 @@ simulation:
   max_steps: 1200000
   img_size: 154
   seed: 0
-  output: ./experiments/frustration/checkpoints/frustration.mp4
+  output: null
   fps: 250
   codec: libx264
   macro_block_size: null
