@@ -155,6 +155,7 @@ def main(cfg, args):
         Food_blocks = blocks_list.get("Food", None)
         C = int(args.C)
         K = int(args.k)
+        H = block_size * split_n
         A_grid = A_blocks.reshape((split_n, split_n, block_size, block_size, C))
         A_grid = jnp.transpose(A_grid, (0, 2, 1, 3, 4))
         A_full = A_grid.reshape((H, H, C))
@@ -179,6 +180,8 @@ def main(cfg, args):
     writer.append_data((np.clip(first_frame, 0.0, 1.0) * 255).astype(np.uint8))
 
     if warmup_steps > 0:
+        warmup_batch_steps = int(args.batch_steps)
+        warmup_jit_micro = int(args.jit_microbatch)
         warmup_stepper_cache = {}
 
         def build_warmup_stepper(mb: int):
@@ -207,10 +210,10 @@ def main(cfg, args):
         steps_done = 0
         pbar = tqdm(total=warmup_steps, desc="warmup", leave=False)
         while steps_done < warmup_steps:
-            cur = min(batch_steps, warmup_steps - steps_done)
+            cur = min(warmup_batch_steps, warmup_steps - steps_done)
             inner = 0
             while inner < cur:
-                m = min(jit_micro, cur - inner)
+                m = min(warmup_jit_micro, cur - inner)
                 rng, _rng = split(rng)
                 stepper = get_warmup_stepper(m)
                 blocks_state, frames = stepper(blocks_state, _rng)
