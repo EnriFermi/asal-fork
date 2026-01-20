@@ -17,6 +17,8 @@ from omegaconf import OmegaConf
 def load_config():
     if len(sys.argv) < 2:
         raise SystemExit("Usage: python scripts/simulate_frustration.py <config.yaml>")
+    if not OmegaConf.has_resolver("env"):
+        OmegaConf.register_new_resolver("env", lambda k, default=None: os.getenv(k, default))
     cfg = OmegaConf.load(sys.argv[1])
     flat = OmegaConf.merge(
         cfg.get("meta", {}),
