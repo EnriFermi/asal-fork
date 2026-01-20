@@ -106,8 +106,14 @@ def main(cfg, args):
 
     step_one_jit = jax.jit(step_one)
 
+    output_dir = getattr(args, "output_dir", None) or args.save_dir
+    os.makedirs(output_dir, exist_ok=True)
+
+    output_path = getattr(args, "output", None)
+    if output_path is None:
+        output_path = os.path.join(output_dir, "frustration.mp4")
     # setup video writer
-    writer = imageio.get_writer(args.output, fps=int(args.fps), codec=args.codec, macro_block_size=args.macro_block_size)
+    writer = imageio.get_writer(output_path, fps=int(args.fps), codec=args.codec, macro_block_size=args.macro_block_size)
 
     def render_from_blocks(blocks_list):
         A_pre, P_pre, Food_pre = assemble_blocks(blocks_list, split_n, block_size, int(args.C))
@@ -128,7 +134,7 @@ def main(cfg, args):
     # save state before walls removed (after warmup)
     A_pre, P_pre, Food_pre = assemble_blocks(blocks, split_n, block_size, int(args.C))
     pre_state = dict(A=A_pre, P=P_pre, Food=Food_pre)
-    util.save_pkl(args.save_dir, "state_before_walls", pre_state)
+    util.save_pkl(output_dir, "state_before_walls", pre_state)
 
     # merge into global state
     base_global = global_substrate.init_state(rng, params)
@@ -185,7 +191,7 @@ def main(cfg, args):
         P=to_np(state["P"]),
         Food=to_np(state.get("Food", None)),
     )
-    util.save_pkl(args.save_dir, "state_final", final_state)
+    util.save_pkl(output_dir, "state_final", final_state)
 
 
 if __name__ == "__main__":
