@@ -12,6 +12,7 @@ import substrates
 from rollout import rollout_simulation
 import util
 from omegaconf import OmegaConf
+from tqdm import tqdm
 
 
 def load_config():
@@ -127,7 +128,7 @@ def main(cfg, args):
     writer.append_data((render_from_blocks(blocks) * 255).astype(np.uint8))
 
     if warmup_steps > 0:
-        for _ in range(warmup_steps):
+        for _ in tqdm(range(warmup_steps), desc="warmup", leave=False):
             rng, _rng = split(rng)
             rkeys = split(_rng, len(blocks))
             blocks = [step_one_jit(s, r) for s, r in zip(blocks, rkeys)]
@@ -170,6 +171,7 @@ def main(cfg, args):
 
     state = state_merged
     steps_done = 0
+    pbar = tqdm(total=remaining, desc="after_walls", leave=True)
     while steps_done < remaining:
         cur = min(batch_steps, remaining - steps_done)
         # inner micro-batches
@@ -184,6 +186,7 @@ def main(cfg, args):
                 writer.append_data(f)
             inner += m
         steps_done += cur
+        pbar.update(cur)
 
     writer.close()
 
