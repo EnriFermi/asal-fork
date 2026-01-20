@@ -139,6 +139,16 @@ def main(cfg, args):
         return block_substrate.step_state(rng_in, state, params)
 
     step_blocks_vmap = jax.vmap(step_one, in_axes=(0, 0))
+    devices = jax.devices()
+    n_dev = len(devices)
+    use_pmap = bool(getattr(args, "multi_device", False)) and n_dev > 1 and (B % n_dev == 0)
+    if use_pmap:
+        per_dev = B // n_dev
+
+        def step_blocks_pmap(state_shard, rng_shard):
+            return jax.vmap(step_one, in_axes=(0, 0))(state_shard, rng_shard)
+
+        step_blocks_pmap = jax.pmap(step_blocks_pmap)
 
     output_dir = getattr(args, "output_dir", None) or args.save_dir
     os.makedirs(output_dir, exist_ok=True)
@@ -175,6 +185,15 @@ def main(cfg, args):
         state_vis = {"A": A_pre, "P": P_pre, "Food": Food_pre}
         return global_substrate.render_state(state_vis, params, img_size=int(args.img_size))
 
+    def render_from_blocks_jax_sharded(blocks_list):
+        blocks_flat = jax.tree.map(
+            lambda x: x.reshape((B,) + x.shape[2:]),
+            blocks_list,
+        )
+        A_pre, P_pre, Food_pre = assemble_blocks_jax(blocks_flat)
+        state_vis = {"A": A_pre, "P": P_pre, "Food": Food_pre}
+        return global_substrate.render_state(state_vis, params, img_size=int(args.img_size))
+
     # render initial state before any warmup
     first_frame = np.asarray(render_from_blocks_jax(blocks_state))
     writer.append_data((np.clip(first_frame, 0.0, 1.0) * 255).astype(np.uint8))
@@ -202,13 +221,41 @@ def main(cfg, args):
 
             return jax.jit(run_batch)
 
+        def build_warmup_stepper_pmap(mb: int):
+            def run_batch(state_shard, rng_in):
+                rngs = split(rng_in, mb)
+                frames0 = jnp.zeros((mb, int(args.img_size), int(args.img_size), 3), dtype=jnp.float32)
+
+                def body(i, carry):
+                    s, frames = carry
+                    rkeys = split(rngs[i], B).reshape((n_dev, per_dev, 2))
+                    s = step_blocks_pmap(s, rkeys)
+                    frame = render_from_blocks_jax_sharded(s)
+                    frames = frames.at[i].set(frame)
+                    return (s, frames)
+
+                state_next, frames = jax.lax.fori_loop(0, mb, body, (state_shard, frames0))
+                return state_next, frames
+
+            return jax.jit(run_batch)
+
         def get_warmup_stepper(mb: int):
             if mb not in warmup_stepper_cache:
-                warmup_stepper_cache[mb] = build_warmup_stepper(mb)
+                if use_pmap:
+                    warmup_stepper_cache[mb] = build_warmup_stepper_pmap(mb)
+                else:
+                    warmup_stepper_cache[mb] = build_warmup_stepper(mb)
             return warmup_stepper_cache[mb]
 
         steps_done = 0
         pbar = tqdm(total=warmup_steps, desc="warmup", leave=False)
+        if use_pmap:
+            blocks_state_warm = jax.tree.map(
+                lambda x: x.reshape((n_dev, per_dev) + x.shape[1:]),
+                blocks_state,
+            )
+        else:
+            blocks_state_warm = blocks_state
         while steps_done < warmup_steps:
             cur = min(warmup_batch_steps, warmup_steps - steps_done)
             inner = 0
@@ -216,7 +263,7 @@ def main(cfg, args):
                 m = min(warmup_jit_micro, cur - inner)
                 rng, _rng = split(rng)
                 stepper = get_warmup_stepper(m)
-                blocks_state, frames = stepper(blocks_state, _rng)
+                blocks_state_warm, frames = stepper(blocks_state_warm, _rng)
                 frames = np.asarray(frames)
                 frames = (np.clip(frames, 0.0, 1.0) * 255).astype(np.uint8)
                 for f in frames:
@@ -224,6 +271,13 @@ def main(cfg, args):
                 inner += m
             steps_done += cur
             pbar.update(cur)
+        if use_pmap:
+            blocks_state = jax.tree.map(
+                lambda x: x.reshape((B,) + x.shape[2:]),
+                blocks_state_warm,
+            )
+        else:
+            blocks_state = blocks_state_warm
 
     # save state before walls removed (after warmup)
     A_pre, P_pre, Food_pre = assemble_blocks(blocks_state, split_n, block_size, int(args.C))
