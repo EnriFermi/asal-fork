@@ -159,15 +159,24 @@ def main(cfg, args):
     batch_steps = int(args.batch_steps)
     jit_micro = int(args.jit_microbatch)
 
-    def step_batch(state, rng_in, steps):
-        def step_fn(s, r):
-            ns = global_substrate.step_state(r, s, params)
-            return ns, ns
-        rngs = split(rng_in, steps)
-        s_final, s_hist = jax.lax.scan(step_fn, state, rngs)
-        return s_final, s_hist
+    def build_batch_stepper(mb: int):
+        def run_batch(state, rng_in):
+            rngs = split(rng_in, mb)
+            frames0 = jnp.zeros((mb, int(args.img_size), int(args.img_size), 3), dtype=jnp.float32)
 
-    step_batch_jit = jax.jit(step_batch, static_argnums=(2,))
+            def body(i, carry):
+                s, frames = carry
+                s = global_substrate.step_state(rngs[i], s, params)
+                frame = global_substrate.render_state(s, params, img_size=int(args.img_size))
+                frames = frames.at[i].set(frame)
+                return (s, frames)
+
+            state_next, frames = jax.lax.fori_loop(0, mb, body, (state, frames0))
+            return state_next, frames
+
+        return jax.jit(run_batch)
+
+    step_micro = build_batch_stepper(int(args.jit_microbatch))
 
     state = state_merged
     steps_done = 0
@@ -179,8 +188,8 @@ def main(cfg, args):
         while inner < cur:
             m = min(jit_micro, cur - inner)
             rng, _rng = split(rng)
-            state, s_hist = step_batch_jit(state, _rng, int(m))
-            frames = np.asarray(jax.vmap(lambda s: global_substrate.render_state(s, params, img_size=int(args.img_size)))(s_hist))
+            state, frames = step_micro(state, _rng)
+            frames = np.asarray(frames[:m])
             frames = (np.clip(frames, 0.0, 1.0) * 255).astype(np.uint8)
             for f in frames:
                 writer.append_data(f)
