@@ -7,10 +7,12 @@ from jax.random import split
 import numpy as np
 import imageio
 import imageio.v3 as iio
+import matplotlib.pyplot as plt
 
 import substrates
 from rollout import rollout_simulation
 import util
+import evolutionary_metrics as evo
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
@@ -194,9 +196,43 @@ def main(cfg, args):
         state_vis = {"A": A_pre, "P": P_pre, "Food": Food_pre}
         return global_substrate.render_state(state_vis, params, img_size=int(args.img_size))
 
+    metrics_cfg = cfg.get("evolutionary_metrics", {})
+    metrics_enabled = bool(metrics_cfg.get("enabled", False))
+    if metrics_enabled:
+        frames_u8 = []
+        masses = []
+
+    def mass_from_A(A):
+        m = jnp.sum(A, axis=-1)
+        if args.img_size is not None:
+            m = jax.image.resize(m[..., None], (int(args.img_size), int(args.img_size), 1), method="nearest")[..., 0]
+        return m
+
+    def render_and_mass_from_blocks_jax(blocks_list):
+        A_pre, P_pre, Food_pre = assemble_blocks_jax(blocks_list)
+        state_vis = {"A": A_pre, "P": P_pre, "Food": Food_pre}
+        img = global_substrate.render_state(state_vis, params, img_size=int(args.img_size))
+        mass = mass_from_A(A_pre)
+        return img, mass
+
+    def render_and_mass_from_blocks_jax_sharded(blocks_list):
+        blocks_flat = jax.tree.map(
+            lambda x: x.reshape((B,) + x.shape[2:]),
+            blocks_list,
+        )
+        A_pre, P_pre, Food_pre = assemble_blocks_jax(blocks_flat)
+        state_vis = {"A": A_pre, "P": P_pre, "Food": Food_pre}
+        img = global_substrate.render_state(state_vis, params, img_size=int(args.img_size))
+        mass = mass_from_A(A_pre)
+        return img, mass
+
     # render initial state before any warmup
-    first_frame = np.asarray(render_from_blocks_jax(blocks_state))
+    first_frame, first_mass = render_and_mass_from_blocks_jax(blocks_state)
+    first_frame = np.asarray(first_frame)
     writer.append_data((np.clip(first_frame, 0.0, 1.0) * 255).astype(np.uint8))
+    if metrics_enabled:
+        frames_u8.append((np.clip(first_frame, 0.0, 1.0) * 255).astype(np.uint8))
+        masses.append(np.asarray(first_mass))
 
     if warmup_steps > 0:
         warmup_batch_steps = int(args.batch_steps)
@@ -207,17 +243,19 @@ def main(cfg, args):
             def run_batch(state, rng_in):
                 rngs = split(rng_in, mb)
                 frames0 = jnp.zeros((mb, int(args.img_size), int(args.img_size), 3), dtype=jnp.float32)
+                masses0 = jnp.zeros((mb, int(args.img_size), int(args.img_size)), dtype=jnp.float32)
 
                 def body(i, carry):
-                    s, frames = carry
+                    s, frames, masses = carry
                     rkeys = split(rngs[i], B)
                     s = step_blocks_vmap(s, rkeys)
-                    frame = render_from_blocks_jax(s)
+                    frame, mass = render_and_mass_from_blocks_jax(s)
                     frames = frames.at[i].set(frame)
-                    return (s, frames)
+                    masses = masses.at[i].set(mass)
+                    return (s, frames, masses)
 
-                state_next, frames = jax.lax.fori_loop(0, mb, body, (state, frames0))
-                return state_next, frames
+                state_next, frames, masses = jax.lax.fori_loop(0, mb, body, (state, frames0, masses0))
+                return state_next, frames, masses
 
             return jax.jit(run_batch)
 
@@ -225,17 +263,19 @@ def main(cfg, args):
             def run_batch(state_shard, rng_in):
                 rngs = split(rng_in, mb)
                 frames0 = jnp.zeros((mb, int(args.img_size), int(args.img_size), 3), dtype=jnp.float32)
+                masses0 = jnp.zeros((mb, int(args.img_size), int(args.img_size)), dtype=jnp.float32)
 
                 def body(i, carry):
-                    s, frames = carry
+                    s, frames, masses = carry
                     rkeys = split(rngs[i], B).reshape((n_dev, per_dev, 2))
                     s = step_blocks_pmap(s, rkeys)
-                    frame = render_from_blocks_jax_sharded(s)
+                    frame, mass = render_and_mass_from_blocks_jax_sharded(s)
                     frames = frames.at[i].set(frame)
-                    return (s, frames)
+                    masses = masses.at[i].set(mass)
+                    return (s, frames, masses)
 
-                state_next, frames = jax.lax.fori_loop(0, mb, body, (state_shard, frames0))
-                return state_next, frames
+                state_next, frames, masses = jax.lax.fori_loop(0, mb, body, (state_shard, frames0, masses0))
+                return state_next, frames, masses
 
             return jax.jit(run_batch)
 
@@ -263,11 +303,16 @@ def main(cfg, args):
                 m = min(warmup_jit_micro, cur - inner)
                 rng, _rng = split(rng)
                 stepper = get_warmup_stepper(m)
-                blocks_state_warm, frames = stepper(blocks_state_warm, _rng)
+                blocks_state_warm, frames, mass_batch = stepper(blocks_state_warm, _rng)
                 frames = np.asarray(frames)
                 frames = (np.clip(frames, 0.0, 1.0) * 255).astype(np.uint8)
-                for f in frames:
+                mass_batch = np.asarray(mass_batch)
+                for i in range(frames.shape[0]):
+                    f = frames[i]
                     writer.append_data(f)
+                    if metrics_enabled:
+                        frames_u8.append(f)
+                        masses.append(mass_batch[i])
                 inner += m
             steps_done += cur
             pbar.update(cur)
@@ -296,7 +341,12 @@ def main(cfg, args):
     # write one frame right before walls removed (merged state)
     def render_state(state):
         return np.asarray(global_substrate.render_state(state, params, img_size=int(args.img_size)))
-    writer.append_data((render_state(state_merged) * 255).astype(np.uint8))
+    merged_frame = render_state(state_merged)
+    writer.append_data((merged_frame * 255).astype(np.uint8))
+    if metrics_enabled:
+        frames_u8.append((np.clip(merged_frame, 0.0, 1.0) * 255).astype(np.uint8))
+        merged_mass = mass_from_A(state_merged["A"])
+        masses.append(np.asarray(merged_mass))
 
     # simulate after walls removed
     max_steps = int(args.max_steps)
@@ -308,16 +358,19 @@ def main(cfg, args):
         def run_batch(state, rng_in):
             rngs = split(rng_in, mb)
             frames0 = jnp.zeros((mb, int(args.img_size), int(args.img_size), 3), dtype=jnp.float32)
+            masses0 = jnp.zeros((mb, int(args.img_size), int(args.img_size)), dtype=jnp.float32)
 
             def body(i, carry):
-                s, frames = carry
+                s, frames, masses = carry
                 s = global_substrate.step_state(rngs[i], s, params)
                 frame = global_substrate.render_state(s, params, img_size=int(args.img_size))
+                mass = mass_from_A(s["A"])
                 frames = frames.at[i].set(frame)
-                return (s, frames)
+                masses = masses.at[i].set(mass)
+                return (s, frames, masses)
 
-            state_next, frames = jax.lax.fori_loop(0, mb, body, (state, frames0))
-            return state_next, frames
+            state_next, frames, masses = jax.lax.fori_loop(0, mb, body, (state, frames0, masses0))
+            return state_next, frames, masses
 
         return jax.jit(run_batch)
 
@@ -339,11 +392,16 @@ def main(cfg, args):
             m = min(jit_micro, cur - inner)
             rng, _rng = split(rng)
             stepper = get_stepper(m)
-            state, frames = stepper(state, _rng)
+            state, frames, mass_batch = stepper(state, _rng)
             frames = np.asarray(frames)
             frames = (np.clip(frames, 0.0, 1.0) * 255).astype(np.uint8)
-            for f in frames:
+            mass_batch = np.asarray(mass_batch)
+            for i in range(frames.shape[0]):
+                f = frames[i]
                 writer.append_data(f)
+                if metrics_enabled:
+                    frames_u8.append(f)
+                    masses.append(mass_batch[i])
             inner += m
         steps_done += cur
         pbar.update(cur)
@@ -357,6 +415,59 @@ def main(cfg, args):
         Food=to_np(state.get("Food", None)),
     )
     util.save_pkl(output_dir, "state_final", final_state)
+
+    if metrics_enabled:
+        frames_rgb_u8 = np.stack(frames_u8, axis=0)
+        frames_mass = np.stack(masses, axis=0)
+        masses_T, centers, palette = evo.compute_mass_trajectories(
+            frames_rgb_u8,
+            frames_mass,
+            q=int(metrics_cfg.get("q", 4)),
+            min_bin_mass=float(metrics_cfg.get("min_bin_mass", 0.0)),
+            lam=float(metrics_cfg.get("lam", 18.0)),
+            dp_iters=int(metrics_cfg.get("dp_iters", 8)),
+            mass_eps_rel=float(metrics_cfg.get("mass_eps_rel", 1e-6)),
+            rgb_void=int(metrics_cfg.get("rgb_void", 3)),
+            max_rgb_dist=float(metrics_cfg.get("max_rgb_dist", 0.0)),
+            backend=metrics_cfg.get("backend", None),
+            return_labels=False,
+        )
+        metrics_dir = metrics_cfg.get("output_dir", None) or output_dir
+        os.makedirs(metrics_dir, exist_ok=True)
+        prefix = metrics_cfg.get("save_prefix", "evo_metrics")
+        np.save(os.path.join(metrics_dir, f"{prefix}_masses.npy"), masses_T)
+        np.save(os.path.join(metrics_dir, f"{prefix}_centers.npy"), centers)
+        np.save(os.path.join(metrics_dir, f"{prefix}_palette.npy"), palette)
+
+        # plot trajectories
+        include_void = bool(metrics_cfg.get("include_void", False))
+        top_k = int(metrics_cfg.get("top_k", 12))
+        mass_floor = float(metrics_cfg.get("mass_floor", 0.0))
+        logy = bool(metrics_cfg.get("logy", False))
+        figsize = metrics_cfg.get("figsize", (12, 6))
+        title = metrics_cfg.get("title", None)
+        M = np.asarray(masses_T, dtype=np.float64)
+        T, L = M.shape
+        totals = M.sum(axis=0)
+        start = 0 if include_void else 1
+        idx = np.arange(start, L, dtype=int)
+        idx = idx[totals[idx] >= mass_floor]
+        idx = idx[np.argsort(-totals[idx])][:top_k]
+        x = np.arange(T)
+        fig, ax = plt.subplots(figsize=figsize)
+        for lab in idx:
+            y = M[:, lab]
+            c = np.asarray(palette[lab], dtype=np.float64) / 255.0
+            ax.plot(x, y, label=str(lab), color=c)
+        if logy:
+            ax.set_yscale("log")
+        ax.set_xlabel("step")
+        ax.set_ylabel("total mass")
+        ax.set_title(title or "Mass trajectories per label")
+        ax.legend(ncol=2, fontsize=9)
+        fig.tight_layout()
+        fig.savefig(os.path.join(metrics_dir, f"{prefix}_masses.png"), dpi=200)
+        plt.close(fig)
 
 
 if __name__ == "__main__":
