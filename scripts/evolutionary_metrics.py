@@ -218,7 +218,7 @@ def plot_mass_trajectories(masses_T, palette=None, include_void=False, top_k=12,
         if palette is not None:
             c = np.asarray(palette[lab], dtype=np.float64) / 255.0
             # Avoid pure white blending into the background
-            if np.all(c >= 0.98):
+            if np.all(c >= 0.95):
                 c = np.array([0.85, 0.85, 0.85], dtype=np.float64)
             plt.plot(x, y, label=str(lab), color=c)
         else:
