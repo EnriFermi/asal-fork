@@ -36,7 +36,7 @@ def to_np(x):
     return np.asarray(x) if x is not None else None
 
 
-def assemble_blocks(blocks, split_n, block_size, C):
+def assemble_blocks(blocks, split_n, block_size, C, pad=0):
     H = block_size * split_n
     A_full = np.zeros((H, H, C), dtype=np.float32)
     if isinstance(blocks, dict):
@@ -44,6 +44,11 @@ def assemble_blocks(blocks, split_n, block_size, C):
         A_blocks = to_np(blocks["A"])
         P_blocks = to_np(blocks["P"])
         Food_blocks = to_np(blocks.get("Food", 0.0))
+        if pad > 0:
+            A_blocks = A_blocks[:, pad:pad + block_size, pad:pad + block_size]
+            P_blocks = P_blocks[:, pad:pad + block_size, pad:pad + block_size]
+            if Food_blocks is not None:
+                Food_blocks = Food_blocks[:, pad:pad + block_size, pad:pad + block_size]
         B = A_blocks.shape[0]
         for bi in range(B):
             i = bi // split_n
@@ -62,9 +67,17 @@ def assemble_blocks(blocks, split_n, block_size, C):
         j = bi % split_n
         i0 = i * block_size
         j0 = j * block_size
-        A_full[i0:i0 + block_size, j0:j0 + block_size] = to_np(blk["A"])
-        P_full[i0:i0 + block_size, j0:j0 + block_size] = to_np(blk["P"])
-        Food_full[i0:i0 + block_size, j0:j0 + block_size] = to_np(blk.get("Food", 0.0))
+        A_blk = to_np(blk["A"])
+        P_blk = to_np(blk["P"])
+        Food_blk = to_np(blk.get("Food", 0.0))
+        if pad > 0:
+            A_blk = A_blk[pad:pad + block_size, pad:pad + block_size]
+            P_blk = P_blk[pad:pad + block_size, pad:pad + block_size]
+            if Food_blk is not None:
+                Food_blk = Food_blk[pad:pad + block_size, pad:pad + block_size]
+        A_full[i0:i0 + block_size, j0:j0 + block_size] = A_blk
+        P_full[i0:i0 + block_size, j0:j0 + block_size] = P_blk
+        Food_full[i0:i0 + block_size, j0:j0 + block_size] = Food_blk
     return A_full, P_full, Food_full
 
 
@@ -82,6 +95,8 @@ def main(cfg, args):
     if grid_size % split_n != 0:
         raise ValueError(f"grid_size {grid_size} not divisible by grid_split {split_n}")
     block_size = grid_size // split_n
+    pad = int(getattr(args, "wall_pad", int(args.dd)))
+    block_sim_size = block_size + 2 * pad
 
     # global substrate
     if args.substrate == "lenia_flow":
@@ -96,7 +111,7 @@ def main(cfg, args):
 
     # prepare block substrate and batched block state
     kw_block = util.flow_lenia_kwargs_from_args(args)
-    kw_block["grid_size"] = block_size
+    kw_block["grid_size"] = block_sim_size
     block_substrate = substrates.FlattenSubstrateParameters(
         substrates.create_substrate("lenia_flow", **kw_block)
     )
@@ -106,17 +121,17 @@ def main(cfg, args):
     Food0 = np.asarray(state_global.get("Food", np.zeros(A0.shape[:2])))
 
     B = split_n * split_n
-    A_blocks = np.zeros((B, block_size, block_size, int(args.C)), dtype=np.float32)
-    P_blocks = np.zeros((B, block_size, block_size, int(args.k)), dtype=np.float32)
-    Food_blocks = np.zeros((B, block_size, block_size), dtype=np.float32)
+    A_blocks = np.zeros((B, block_sim_size, block_sim_size, int(args.C)), dtype=np.float32)
+    P_blocks = np.zeros((B, block_sim_size, block_sim_size, int(args.k)), dtype=np.float32)
+    Food_blocks = np.zeros((B, block_sim_size, block_sim_size), dtype=np.float32)
     for bi in range(B):
         i = bi // split_n
         j = bi % split_n
         i0 = i * block_size
         j0 = j * block_size
-        A_blocks[bi] = A0[i0:i0 + block_size, j0:j0 + block_size]
-        P_blocks[bi] = P0[i0:i0 + block_size, j0:j0 + block_size]
-        Food_blocks[bi] = Food0[i0:i0 + block_size, j0:j0 + block_size]
+        A_blocks[bi, pad:pad + block_size, pad:pad + block_size] = A0[i0:i0 + block_size, j0:j0 + block_size]
+        P_blocks[bi, pad:pad + block_size, pad:pad + block_size] = P0[i0:i0 + block_size, j0:j0 + block_size]
+        Food_blocks[bi, pad:pad + block_size, pad:pad + block_size] = Food0[i0:i0 + block_size, j0:j0 + block_size]
 
     base_block = block_substrate.init_state(rng, params)
     blocks_state = {}
@@ -137,6 +152,7 @@ def main(cfg, args):
 
     # step blocks independently for warmup_steps and render to video
     warmup_steps = int(args.warmup_steps)
+    pre_wall_count = 1 + warmup_steps
     def step_one(state, rng_in):
         return block_substrate.step_state(rng_in, state, params)
 
@@ -168,6 +184,11 @@ def main(cfg, args):
         C = int(args.C)
         K = int(args.k)
         H = block_size * split_n
+        if pad > 0:
+            A_blocks = A_blocks[:, pad:pad + block_size, pad:pad + block_size, :]
+            P_blocks = P_blocks[:, pad:pad + block_size, pad:pad + block_size, :]
+            if Food_blocks is not None:
+                Food_blocks = Food_blocks[:, pad:pad + block_size, pad:pad + block_size]
         A_grid = A_blocks.reshape((split_n, split_n, block_size, block_size, C))
         A_grid = jnp.transpose(A_grid, (0, 2, 1, 3, 4))
         A_full = A_grid.reshape((H, H, C))
@@ -325,7 +346,7 @@ def main(cfg, args):
             blocks_state = blocks_state_warm
 
     # save state before walls removed (after warmup)
-    A_pre, P_pre, Food_pre = assemble_blocks(blocks_state, split_n, block_size, int(args.C))
+    A_pre, P_pre, Food_pre = assemble_blocks(blocks_state, split_n, block_size, int(args.C), pad=pad)
     pre_state = dict(A=A_pre, P=P_pre, Food=Food_pre)
     util.save_pkl(output_dir, "state_before_walls", pre_state)
 
@@ -419,7 +440,25 @@ def main(cfg, args):
     if metrics_enabled:
         frames_rgb_u8 = np.stack(frames_u8, axis=0)
         frames_mass = np.stack(masses, axis=0)
-        masses_T, centers, palette = evo.compute_mass_trajectories(
+
+        metrics_dir = metrics_cfg.get("output_dir", None) or output_dir
+        os.makedirs(metrics_dir, exist_ok=True)
+        prefix = metrics_cfg.get("save_prefix", "evo_metrics")
+
+        # total mass over time (all frames)
+        total_mass = frames_mass.sum(axis=(1, 2))
+        np.save(os.path.join(metrics_dir, f"{prefix}_total_mass.npy"), total_mass)
+        fig, ax = plt.subplots(figsize=metrics_cfg.get("figsize", (12, 6)))
+        ax.plot(np.arange(total_mass.shape[0]), total_mass)
+        ax.set_xlabel("step")
+        ax.set_ylabel("total mass")
+        ax.set_title(metrics_cfg.get("title", "Total mass over time"))
+        fig.tight_layout()
+        fig.savefig(os.path.join(metrics_dir, f"{prefix}_total_mass.png"), dpi=200)
+        plt.close(fig)
+
+        # global species centers + per-frame labels
+        masses_T, centers, palette, labels_T = evo.compute_mass_trajectories(
             frames_rgb_u8,
             frames_mass,
             q=int(metrics_cfg.get("q", 4)),
@@ -430,44 +469,38 @@ def main(cfg, args):
             rgb_void=int(metrics_cfg.get("rgb_void", 3)),
             max_rgb_dist=float(metrics_cfg.get("max_rgb_dist", 0.0)),
             backend=metrics_cfg.get("backend", None),
-            return_labels=False,
+            return_labels=True,
         )
-        metrics_dir = metrics_cfg.get("output_dir", None) or output_dir
-        os.makedirs(metrics_dir, exist_ok=True)
-        prefix = metrics_cfg.get("save_prefix", "evo_metrics")
-        np.save(os.path.join(metrics_dir, f"{prefix}_masses.npy"), masses_T)
         np.save(os.path.join(metrics_dir, f"{prefix}_centers.npy"), centers)
         np.save(os.path.join(metrics_dir, f"{prefix}_palette.npy"), palette)
 
-        # plot trajectories
-        include_void = bool(metrics_cfg.get("include_void", False))
-        top_k = int(metrics_cfg.get("top_k", 12))
-        mass_floor = float(metrics_cfg.get("mass_floor", 0.0))
-        logy = bool(metrics_cfg.get("logy", False))
-        figsize = metrics_cfg.get("figsize", (12, 6))
-        title = metrics_cfg.get("title", None)
-        M = np.asarray(masses_T, dtype=np.float64)
-        T, L = M.shape
-        totals = M.sum(axis=0)
-        start = 0 if include_void else 1
-        idx = np.arange(start, L, dtype=int)
-        idx = idx[totals[idx] >= mass_floor]
-        idx = idx[np.argsort(-totals[idx])][:top_k]
-        x = np.arange(T)
-        fig, ax = plt.subplots(figsize=figsize)
-        for lab in idx:
-            y = M[:, lab]
-            c = np.asarray(palette[lab], dtype=np.float64) / 255.0
-            ax.plot(x, y, label=str(lab), color=c)
-        if logy:
-            ax.set_yscale("log")
-        ax.set_xlabel("step")
-        ax.set_ylabel("total mass")
-        ax.set_title(title or "Mass trajectories per label")
-        ax.legend(ncol=2, fontsize=9)
-        fig.tight_layout()
-        fig.savefig(os.path.join(metrics_dir, f"{prefix}_masses.png"), dpi=200)
-        plt.close(fig)
+        # per-block label masses before walls removed
+        T_pre = min(pre_wall_count, labels_T.shape[0])
+        labels_pre = labels_T[:T_pre]
+        mass_pre = frames_mass[:T_pre]
+        H_img, W_img = labels_pre.shape[1], labels_pre.shape[2]
+        bs_h = H_img // split_n
+        bs_w = W_img // split_n
+        Hc = bs_h * split_n
+        Wc = bs_w * split_n
+        if Hc != H_img or Wc != W_img:
+            labels_pre = labels_pre[:, :Hc, :Wc]
+            mass_pre = mass_pre[:, :Hc, :Wc]
+        K = int(centers.shape[0])
+        block_masses = np.zeros((T_pre, split_n, split_n, K + 1), dtype=np.float32)
+        for bi in range(split_n):
+            for bj in range(split_n):
+                i0 = bi * bs_h
+                j0 = bj * bs_w
+                lab_blk = labels_pre[:, i0:i0 + bs_h, j0:j0 + bs_w]
+                mass_blk = mass_pre[:, i0:i0 + bs_h, j0:j0 + bs_w]
+                for t in range(T_pre):
+                    block_masses[t, bi, bj] = np.bincount(
+                        lab_blk[t].reshape(-1),
+                        weights=mass_blk[t].reshape(-1),
+                        minlength=K + 1,
+                    )
+        np.save(os.path.join(metrics_dir, f"{prefix}_block_masses_pre_walls.npy"), block_masses)
 
 
 if __name__ == "__main__":
