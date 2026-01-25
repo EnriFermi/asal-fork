@@ -177,10 +177,14 @@ class TrackerSAM2HF:
             raise RuntimeError("Session not initialized.")
         pts = np.asarray(points_xy, dtype=np.float32)
         if pts.ndim == 2:
-            pts = pts[None, :, :]
+            pts = pts[None, None, :, :]
+        elif pts.ndim == 3:
+            pts = pts[None, :, :, :]
         lbs = np.asarray(labels, dtype=np.int64)
         if lbs.ndim == 1:
-            lbs = lbs[None, :]
+            lbs = lbs[None, None, :]
+        elif lbs.ndim == 2:
+            lbs = lbs[None, :, :]
 
         kwargs = {}
         if "frame_idx" in self._add_inputs_sig.parameters:
