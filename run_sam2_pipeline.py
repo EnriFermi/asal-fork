@@ -145,6 +145,7 @@ class TrackerSAM2HF:
         self._init_session_sig = inspect.signature(self.processor.init_video_session)
         self._propagate_sig = inspect.signature(self.model.propagate_in_video_iterator)
         self._forward_sig = inspect.signature(self.model.forward)
+        self._has_initial_conditioning = False
 
     @staticmethod
     def _default_dtype(device: torch.device) -> torch.dtype:
@@ -177,12 +178,31 @@ class TrackerSAM2HF:
         new_ids: List[int] = []
         if mode != "new_obj":
             return new_ids
-        for seed in seeds:
-            obj_id = self.next_obj_id
-            self.next_obj_id += 1
-            self.obj_ids.append(obj_id)
-            self._add_points(frame_idx, obj_id, [(seed.x, seed.y)], [1])
-            new_ids.append(obj_id)
+        if not seeds:
+            return new_ids
+        use_batch = ("obj_ids" in self._add_inputs_sig.parameters) or (
+            "input_obj_ids" in self._add_inputs_sig.parameters
+        )
+        if use_batch and len(seeds) > 1:
+            obj_ids: List[int] = []
+            points_by_obj: List[List[Tuple[int, int]]] = []
+            labels_by_obj: List[List[int]] = []
+            for seed in seeds:
+                obj_id = self.next_obj_id
+                self.next_obj_id += 1
+                self.obj_ids.append(obj_id)
+                obj_ids.append(obj_id)
+                points_by_obj.append([(seed.x, seed.y)])
+                labels_by_obj.append([1])
+                new_ids.append(obj_id)
+            self._add_points_batch(frame_idx, obj_ids, points_by_obj, labels_by_obj)
+        else:
+            for seed in seeds:
+                obj_id = self.next_obj_id
+                self.next_obj_id += 1
+                self.obj_ids.append(obj_id)
+                self._add_points(frame_idx, obj_id, [(seed.x, seed.y)], [1])
+                new_ids.append(obj_id)
         return new_ids
 
     def add_points(
@@ -239,6 +259,45 @@ class TrackerSAM2HF:
 
         self.processor.add_inputs_to_inference_session(self.session, **kwargs)
 
+    def _add_points_batch(
+        self,
+        frame_idx: int,
+        obj_ids: List[int],
+        points_by_obj: List[List[Tuple[int, int]]],
+        labels_by_obj: List[List[int]],
+    ) -> None:
+        if self.session is None:
+            raise RuntimeError("Session not initialized.")
+        pts = np.asarray(points_by_obj, dtype=np.float32)
+        if pts.ndim == 3:
+            pts = pts[None, :, :, :]
+        lbs = np.asarray(labels_by_obj, dtype=np.int64)
+        if lbs.ndim == 2:
+            lbs = lbs[None, :, :]
+
+        kwargs = {}
+        if "frame_idx" in self._add_inputs_sig.parameters:
+            kwargs["frame_idx"] = frame_idx
+        elif "frame_index" in self._add_inputs_sig.parameters:
+            kwargs["frame_index"] = frame_idx
+
+        if "obj_ids" in self._add_inputs_sig.parameters:
+            kwargs["obj_ids"] = [int(x) for x in obj_ids]
+        elif "input_obj_ids" in self._add_inputs_sig.parameters:
+            kwargs["input_obj_ids"] = [int(x) for x in obj_ids]
+
+        if "input_points" in self._add_inputs_sig.parameters:
+            kwargs["input_points"] = pts
+        elif "point_coords" in self._add_inputs_sig.parameters:
+            kwargs["point_coords"] = pts
+
+        if "input_labels" in self._add_inputs_sig.parameters:
+            kwargs["input_labels"] = lbs
+        elif "point_labels" in self._add_inputs_sig.parameters:
+            kwargs["point_labels"] = lbs
+
+        self.processor.add_inputs_to_inference_session(self.session, **kwargs)
+
     def propagate_iter(self, start_frame_idx: Optional[int] = None):
         if self.session is None:
             raise RuntimeError("Session not initialized.")
@@ -256,21 +315,64 @@ class TrackerSAM2HF:
             kwargs["original_sizes"] = [original_size]
         elif "target_sizes" in self._postprocess_sig.parameters:
             kwargs["target_sizes"] = [original_size]
-        masks = self.processor.post_process_masks(pred_masks, **kwargs)
+        masks_in = pred_masks
+        if not isinstance(masks_in, (list, tuple)):
+            masks_in = [masks_in]
+        masks = self.processor.post_process_masks(masks_in, **kwargs)
         if isinstance(masks, list):
             masks = masks[0]
         if isinstance(masks, torch.Tensor):
             masks = masks.detach().cpu().numpy()
+        if masks.ndim == 4 and masks.shape[1] == 1:
+            masks = masks[:, 0, :, :]
         if masks.ndim == 2:
             masks = masks[None, :, :]
         return masks
 
-    def run_frame_inference(self, frame_idx: int):
+    def run_frame_inference(
+        self,
+        frame_idx: int,
+        is_initial: Optional[bool] = None,
+        is_conditioning: Optional[bool] = None,
+    ):
         if self.session is None:
             raise RuntimeError("Session not initialized.")
-        if "inference_session" in self._forward_sig.parameters:
-            return self.model(inference_session=self.session, frame_idx=frame_idx)
-        return self.model(self.session, frame_idx=frame_idx)
+        if is_initial is None:
+            is_initial = (frame_idx == 0) and (not self._has_initial_conditioning)
+        if is_conditioning is None:
+            is_conditioning = True
+
+        kwargs = {}
+        accepts_kwargs = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in self._forward_sig.parameters.values()
+        )
+
+        if "inference_session" in self._forward_sig.parameters or accepts_kwargs:
+            kwargs["inference_session"] = self.session
+        if "frame_idx" in self._forward_sig.parameters or accepts_kwargs:
+            kwargs["frame_idx"] = frame_idx
+        elif "frame_index" in self._forward_sig.parameters:
+            kwargs["frame_index"] = frame_idx
+
+        if "is_initial_conditioning_frame" in self._forward_sig.parameters or accepts_kwargs:
+            kwargs["is_initial_conditioning_frame"] = bool(is_initial)
+        elif "is_initial_frame" in self._forward_sig.parameters:
+            kwargs["is_initial_frame"] = bool(is_initial)
+        elif "initial_conditioning" in self._forward_sig.parameters:
+            kwargs["initial_conditioning"] = bool(is_initial)
+
+        if "is_conditioning_frame" in self._forward_sig.parameters or accepts_kwargs:
+            kwargs["is_conditioning_frame"] = bool(is_conditioning)
+        elif "conditioning_frame" in self._forward_sig.parameters:
+            kwargs["conditioning_frame"] = bool(is_conditioning)
+
+        if kwargs:
+            out = self.model(**kwargs)
+        else:
+            out = self.model(self.session, frame_idx=frame_idx)
+        if is_initial:
+            self._has_initial_conditioning = True
+        return out
 
 
 class PostProcess:
@@ -640,7 +742,7 @@ def run_pipeline(
     if not seeds0:
         raise RuntimeError("No initial seeds found on frame 0.")
     tracker.add_seeds(0, seeds0, mode="new_obj")
-    tracker.run_frame_inference(0)
+    tracker.run_frame_inference(0, is_initial=True, is_conditioning=True)
 
     video_segments: Dict[int, Dict[int, np.ndarray]] = {}
 
@@ -677,7 +779,7 @@ def run_pipeline(
             for obj_id, (pts, labels) in refine_points.items():
                 tracker.add_points(t, obj_id, pts, labels)
             if new_seeds or refine_points:
-                tracker.run_frame_inference(t)
+                tracker.run_frame_inference(t, is_initial=False, is_conditioning=True)
 
     overlay_path = os.path.join(out_dir, "overlay.mp4")
     Visualizer.write_overlay_video(
