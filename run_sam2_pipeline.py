@@ -190,6 +190,10 @@ class TrackerSAM2HF:
 
         if "obj_id" in self._add_inputs_sig.parameters:
             kwargs["obj_id"] = obj_id
+        if "obj_ids" in self._add_inputs_sig.parameters:
+            kwargs["obj_ids"] = [int(obj_id)]
+        elif "input_obj_ids" in self._add_inputs_sig.parameters:
+            kwargs["input_obj_ids"] = [int(obj_id)]
 
         if "input_points" in self._add_inputs_sig.parameters:
             kwargs["input_points"] = pts
