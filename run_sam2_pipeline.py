@@ -144,6 +144,7 @@ class TrackerSAM2HF:
         self._postprocess_sig = inspect.signature(self.processor.post_process_masks)
         self._init_session_sig = inspect.signature(self.processor.init_video_session)
         self._propagate_sig = inspect.signature(self.model.propagate_in_video_iterator)
+        self._forward_sig = inspect.signature(self.model.forward)
 
     @staticmethod
     def _default_dtype(device: torch.device) -> torch.dtype:
@@ -263,6 +264,13 @@ class TrackerSAM2HF:
         if masks.ndim == 2:
             masks = masks[None, :, :]
         return masks
+
+    def run_frame_inference(self, frame_idx: int):
+        if self.session is None:
+            raise RuntimeError("Session not initialized.")
+        if "inference_session" in self._forward_sig.parameters:
+            return self.model(inference_session=self.session, frame_idx=frame_idx)
+        return self.model(self.session, frame_idx=frame_idx)
 
 
 class PostProcess:
@@ -632,6 +640,7 @@ def run_pipeline(
     if not seeds0:
         raise RuntimeError("No initial seeds found on frame 0.")
     tracker.add_seeds(0, seeds0, mode="new_obj")
+    tracker.run_frame_inference(0)
 
     video_segments: Dict[int, Dict[int, np.ndarray]] = {}
 
@@ -667,6 +676,8 @@ def run_pipeline(
             refine_points = refiner.propose(t, rgb, masks_resolved, masks_raw=masks_by_obj)
             for obj_id, (pts, labels) in refine_points.items():
                 tracker.add_points(t, obj_id, pts, labels)
+            if new_seeds or refine_points:
+                tracker.run_frame_inference(t)
 
     overlay_path = os.path.join(out_dir, "overlay.mp4")
     Visualizer.write_overlay_video(
