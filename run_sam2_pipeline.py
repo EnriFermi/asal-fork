@@ -141,6 +141,7 @@ class TrackerSAM2HF:
         self.next_obj_id = 1
         self._add_inputs_sig = inspect.signature(self.processor.add_inputs_to_inference_session)
         self._postprocess_sig = inspect.signature(self.processor.post_process_masks)
+        self._propagate_sig = inspect.signature(self.model.propagate_in_video_iterator)
 
     def init_session(self, frames: List[Image.Image]) -> None:
         self.session = self.processor.init_video_session(frames)
@@ -211,10 +212,16 @@ class TrackerSAM2HF:
 
         self.processor.add_inputs_to_inference_session(self.session, **kwargs)
 
-    def propagate_iter(self):
+    def propagate_iter(self, start_frame_idx: Optional[int] = None):
         if self.session is None:
             raise RuntimeError("Session not initialized.")
-        return self.model.propagate_in_video_iterator(self.session)
+        kwargs = {}
+        if start_frame_idx is not None:
+            if "start_frame_idx" in self._propagate_sig.parameters:
+                kwargs["start_frame_idx"] = start_frame_idx
+            elif "start_frame_index" in self._propagate_sig.parameters:
+                kwargs["start_frame_index"] = start_frame_idx
+        return self.model.propagate_in_video_iterator(self.session, **kwargs)
 
     def post_process_masks(self, pred_masks, original_size: Tuple[int, int]) -> np.ndarray:
         kwargs = {"binarize": True}
@@ -603,7 +610,7 @@ def run_pipeline(
     video_segments: Dict[int, Dict[int, np.ndarray]] = {}
 
     with torch.no_grad():
-        for t, out in enumerate(tracker.propagate_iter()):
+        for t, out in enumerate(tracker.propagate_iter(start_frame_idx=0)):
             if t >= len(frames):
                 break
             rgb = np.array(frames[t])
