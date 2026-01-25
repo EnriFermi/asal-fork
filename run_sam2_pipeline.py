@@ -130,21 +130,47 @@ class SeedGenerator:
 
 
 class TrackerSAM2HF:
-    def __init__(self, model_id: str, device: torch.device):
+    def __init__(self, model_id: str, device: torch.device, dtype: Optional[torch.dtype] = None):
         self.processor = Sam2VideoProcessor.from_pretrained(model_id)
         self.model = Sam2VideoModel.from_pretrained(model_id)
-        self.model.to(device)
-        self.model.eval()
         self.device = device
+        self.dtype = dtype if dtype is not None else self._default_dtype(device)
+        self.model.to(device, dtype=self.dtype)
+        self.model.eval()
         self.session = None
         self.obj_ids: List[int] = []
         self.next_obj_id = 1
         self._add_inputs_sig = inspect.signature(self.processor.add_inputs_to_inference_session)
         self._postprocess_sig = inspect.signature(self.processor.post_process_masks)
+        self._init_session_sig = inspect.signature(self.processor.init_video_session)
         self._propagate_sig = inspect.signature(self.model.propagate_in_video_iterator)
 
+    @staticmethod
+    def _default_dtype(device: torch.device) -> torch.dtype:
+        if device.type == "cuda":
+            if torch.cuda.is_bf16_supported():
+                return torch.bfloat16
+            return torch.float16
+        return torch.float32
+
     def init_session(self, frames: List[Image.Image]) -> None:
-        self.session = self.processor.init_video_session(frames)
+        kwargs = {}
+        if "video" in self._init_session_sig.parameters:
+            kwargs["video"] = frames
+        elif "frames" in self._init_session_sig.parameters:
+            kwargs["frames"] = frames
+        else:
+            kwargs["video"] = frames
+
+        if "inference_device" in self._init_session_sig.parameters:
+            kwargs["inference_device"] = self.device
+        elif "device" in self._init_session_sig.parameters:
+            kwargs["device"] = self.device
+
+        if "dtype" in self._init_session_sig.parameters:
+            kwargs["dtype"] = self.dtype
+
+        self.session = self.processor.init_video_session(**kwargs)
 
     def add_seeds(self, frame_idx: int, seeds: List[Seed], mode: str = "new_obj") -> List[int]:
         new_ids: List[int] = []
