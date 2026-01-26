@@ -235,10 +235,29 @@ class TrackerClassic:
 
         if T > 0 and D > 0:
             if SCIPY_AVAILABLE:
-                row_ind, col_ind = linear_sum_assignment(cost)
-                for r, c in zip(row_ind, col_ind):
-                    if np.isfinite(cost[r, c]):
-                        matches.append((r, c))
+                finite_any = np.isfinite(cost).any()
+                if finite_any:
+                    try:
+                        cost_f = cost.copy()
+                        cost_f[~np.isfinite(cost_f)] = 1e9
+                        row_ind, col_ind = linear_sum_assignment(cost_f)
+                        for r, c in zip(row_ind, col_ind):
+                            if np.isfinite(cost[r, c]):
+                                matches.append((r, c))
+                    except ValueError:
+                        # fallback to greedy if scipy deems matrix infeasible
+                        finite_any = False
+                if not finite_any:
+                    pairs = [(i, j, cost[i, j]) for i in range(T) for j in range(D) if np.isfinite(cost[i, j])]
+                    pairs.sort(key=lambda x: x[2])
+                    used_t = set()
+                    used_d = set()
+                    for i, j, _ in pairs:
+                        if i in used_t or j in used_d:
+                            continue
+                        matches.append((i, j))
+                        used_t.add(i)
+                        used_d.add(j)
             else:
                 pairs = [(i, j, cost[i, j]) for i in range(T) for j in range(D) if np.isfinite(cost[i, j])]
                 pairs.sort(key=lambda x: x[2])
