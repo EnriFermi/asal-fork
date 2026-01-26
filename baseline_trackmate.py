@@ -42,8 +42,17 @@ def export_for_trackmate(video_path: str, out_dir: str, cfg: Config, stride: int
         label_img = np.zeros(rgb.shape[:2], dtype=np.uint16)
         for lab, det in enumerate(detections, start=1):
             label_img[det.mask_u8.astype(bool)] = lab
+        # write RGB frame
         Image.fromarray(np.array(pil_frame)).save(os.path.join(frames_dir, f"frame_{frame_key:05d}.png"))
-        Image.fromarray(label_img).save(os.path.join(labels_dir, f"label_{frame_key:05d}.png"))
+        # write label stack scaled for visibility and a binary mask helper
+        if label_img.max() > 0:
+            scale = 65535.0 / float(label_img.max())
+            label_vis = (label_img.astype(np.float32) * scale).astype(np.uint16)
+        else:
+            label_vis = label_img
+        Image.fromarray(label_vis).save(os.path.join(labels_dir, f"label_{frame_key:05d}.png"))
+        mask_vis = (label_img > 0).astype(np.uint8) * 255
+        Image.fromarray(mask_vis).save(os.path.join(labels_dir, f"mask_{frame_key:05d}.png"))
 
     macro_path = os.path.join(export_dir, "trackmate_macro.ijm")
     with open(macro_path, "w", encoding="utf-8") as f:
@@ -54,7 +63,7 @@ labelDir = "{labels_dir.replace(os.sep, '/')}";
 outCsv = "{os.path.join(export_dir, 'tracks.csv').replace(os.sep, '/')}";
 // Load RGB frames as stack
 run("Image Sequence...", "open=" + inputDir + " sort");
-// Optional: load labels to a second stack if you want to visualize segmentation
+// Optional: load labels or masks to a second stack if you want to visualize segmentation
 // run("Image Sequence...", "open=" + labelDir + " sort");
 // Launch TrackMate with LAP tracker, gap closing and merge/split enabled.
 // Please adjust detector radius/threshold if needed.

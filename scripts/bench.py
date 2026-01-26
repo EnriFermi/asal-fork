@@ -162,7 +162,7 @@ def main():
                 config_path=args.btrack_config,
             )
         elif method == "trackmate":
-            export_for_trackmate(
+            export_dir = export_for_trackmate(
                 video_path=args.video,
                 out_dir=mdir,
                 cfg=cfg,
@@ -170,6 +170,19 @@ def main():
                 max_frames=args.max_frames,
                 resize=resize,
             )
+            # if user already produced tracks.csv (e.g., rerun), import and create overlays/json to match others
+            csv_candidate = os.path.join(export_dir, "tracks.csv")
+            if os.path.exists(csv_candidate):
+                from import_trackmate_csv import import_trackmate_csv
+
+                import_trackmate_csv(
+                    csv_path=csv_candidate,
+                    export_dir=export_dir,
+                    video_path=args.video,
+                    stride=max(1, args.stride),
+                    resize=resize,
+                    draw_ids_largest_k=args.draw_ids_largest_k,
+                )
         else:
             print(f"[bench] Unknown method '{method}', skipping.")
 
