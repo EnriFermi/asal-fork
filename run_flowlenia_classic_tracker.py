@@ -44,6 +44,9 @@ class Config:
     w_area: float = 10.0
     w_col: float = 30.0
     strict_color: bool = False
+    iou_zero_dist_gate: Optional[float] = None  # if None -> 0.7*max_dist
+    iou_dilate_r: int = 2
+    hue_dist_max: float = 0.5  # normalized (0..1) distance in hue-bin space for strict_color
 
     # grouping
     group_window: int = 50
@@ -185,6 +188,14 @@ def area_ratio(a: float, b: float) -> float:
     return abs(math.log((a + eps) / (b + eps)))
 
 
+def dilate_mask(mask_u8: np.ndarray, r: int) -> np.ndarray:
+    if r <= 0:
+        return mask_u8
+    k = 2 * r + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    return cv2.dilate(mask_u8.astype(np.uint8), kernel)
+
+
 # --------------------------- TrackerClassic ------------------------------ #
 @dataclass
 class Track:
@@ -194,6 +205,8 @@ class Track:
     cy: float
     area: float
     hue_bin: int
+    vx: float
+    vy: float
     last_frame: int
     missed: int
 
@@ -215,18 +228,29 @@ class TrackerClassic:
         for i, tid in enumerate(track_ids):
             tr = self.tracks[tid]
             for j, det in enumerate(detections):
-                dist = math.hypot(tr.cx - det.cx, tr.cy - det.cy)
+                dt = max(1, frame_idx - tr.last_frame)
+                cx_pred = tr.cx + tr.vx * dt
+                cy_pred = tr.cy + tr.vy * dt
+                dist = math.hypot(cx_pred - det.cx, cy_pred - det.cy)
                 if dist > self.cfg.max_dist:
                     continue
-                iou = iou_u8(tr.mask_u8, det.mask_u8)
-                if iou < self.cfg.min_iou:
+                prev_mask_dil = dilate_mask(tr.mask_u8, self.cfg.iou_dilate_r)
+                iou = iou_u8(prev_mask_dil, det.mask_u8)
+                if iou == 0.0 and dist > (self.cfg.iou_zero_dist_gate or (0.7 * self.cfg.max_dist)):
                     continue
-                col_mismatch = (tr.hue_bin != det.hue_bin) and self.cfg.strict_color
-                if col_mismatch:
-                    continue
+
+                col_pen = 0.0
+                if self.cfg.use_hue_bins and tr.hue_bin >= 0 and det.hue_bin >= 0:
+                    bins = self.cfg.h_bins
+                    d_bin = abs(tr.hue_bin - det.hue_bin)
+                    d_bin = min(d_bin, bins - d_bin)
+                    dist_norm = d_bin / (bins / 2.0)
+                    if self.cfg.strict_color and dist_norm > self.cfg.hue_dist_max:
+                        continue
+                    col_pen = self.cfg.w_col * dist_norm
+
                 ar = area_ratio(tr.area, det.area)
-                col = 0.0 if tr.hue_bin == det.hue_bin else 1.0
-                c = self.cfg.w_dist * dist + self.cfg.w_iou * (1.0 - iou) + self.cfg.w_area * ar + self.cfg.w_col * col
+                c = self.cfg.w_dist * dist + self.cfg.w_iou * (1.0 - iou) + self.cfg.w_area * ar + col_pen
                 cost[i, j] = c
 
         matches = []
@@ -275,6 +299,9 @@ class TrackerClassic:
             unmatched_dets.discard(j)
             tid = track_ids[i]
             det = detections[j]
+            dt = max(1, frame_idx - self.tracks[tid].last_frame)
+            vx = (det.cx - self.tracks[tid].cx) / dt
+            vy = (det.cy - self.tracks[tid].cy) / dt
             self.tracks[tid] = Track(
                 track_id=tid,
                 mask_u8=det.mask_u8,
@@ -282,6 +309,8 @@ class TrackerClassic:
                 cy=det.cy,
                 area=det.area,
                 hue_bin=det.hue_bin,
+                vx=vx,
+                vy=vy,
                 last_frame=frame_idx,
                 missed=0,
             )
@@ -298,6 +327,8 @@ class TrackerClassic:
                 cy=det.cy,
                 area=det.area,
                 hue_bin=det.hue_bin,
+                vx=0.0,
+                vy=0.0,
                 last_frame=frame_idx,
                 missed=0,
             )
@@ -316,11 +347,24 @@ class TrackerClassic:
         for tid in to_del:
             del self.tracks[tid]
 
-        # output masks for active tracks at this frame (even if missed? only matched + new)
+        # output masks for active tracks; if missed, use last mask shifted by velocity
         masks_out: Dict[int, np.ndarray] = {}
         for tid, tr in self.tracks.items():
-            if tr.last_frame == frame_idx and tr.missed == 0:
+            if tr.missed == 0 and tr.last_frame == frame_idx:
                 masks_out[tid] = tr.mask_u8.astype(np.uint8)
+            elif tr.missed > 0 and tr.missed <= self.cfg.max_missed:
+                dt_shift = min(tr.missed, 3)
+                dx = int(round(tr.vx * dt_shift))
+                dy = int(round(tr.vy * dt_shift))
+                M = np.float32([[1, 0, dx], [0, 1, dy]])
+                shifted = cv2.warpAffine(
+                    tr.mask_u8.astype(np.uint8),
+                    M,
+                    (tr.mask_u8.shape[1], tr.mask_u8.shape[0]),
+                    flags=cv2.INTER_NEAREST,
+                    borderValue=0,
+                )
+                masks_out[tid] = shifted
         return masks_out
 
 
@@ -552,11 +596,10 @@ class EaterPolicy:
 
     @staticmethod
     def _fill_holes(mask: np.ndarray) -> np.ndarray:
-        h, w = mask.shape
-        filled = mask.copy().astype(np.uint8)
-        border = np.zeros((h + 2, w + 2), dtype=np.uint8)
-        cv2.floodFill(filled, border, (0, 0), 255)
-        holes = (filled == 0).astype(np.uint8)
+        inv = (mask == 0).astype(np.uint8)
+        ff = inv.copy()
+        cv2.floodFill(ff, None, (0, 0), 2)
+        holes = (ff == 0).astype(np.uint8)
         return mask | holes
 
 
@@ -807,22 +850,27 @@ def main():
     parser.add_argument("--h_bins", type=int, default=Config.h_bins)
     parser.add_argument("--min_area", type=int, default=Config.min_area)
     parser.add_argument("--min_mass", type=float, default=Config.min_mass)
-    parser.add_argument("--use_hue_bins", action="store_true", default=Config.use_hue_bins)
+    parser.add_argument("--use_hue_bins", dest="use_hue_bins", action="store_true", default=True)
+    parser.add_argument("--no_use_hue_bins", dest="use_hue_bins", action="store_false")
     parser.add_argument("--max_dist", type=float, default=Config.max_dist)
-    parser.add_argument("--min_iou", type=float, default=Config.min_iou)
+    parser.add_argument("--min_iou", type=float, default=Config.min_iou)  # kept for compatibility, not used as gate
     parser.add_argument("--max_missed", type=int, default=Config.max_missed)
     parser.add_argument("--w_dist", type=float, default=Config.w_dist)
     parser.add_argument("--w_iou", type=float, default=Config.w_iou)
     parser.add_argument("--w_area", type=float, default=Config.w_area)
     parser.add_argument("--w_col", type=float, default=Config.w_col)
     parser.add_argument("--strict_color", action="store_true", default=Config.strict_color)
+    parser.add_argument("--iou_zero_dist_gate", type=float, default=None)
+    parser.add_argument("--iou_dilate_r", type=int, default=Config.iou_dilate_r)
+    parser.add_argument("--hue_dist_max", type=float, default=Config.hue_dist_max)
     parser.add_argument("--group_window", type=int, default=Config.group_window)
     parser.add_argument("--tau_sigma", type=float, default=Config.tau_sigma)
     parser.add_argument("--tau_dist", type=float, default=Config.tau_dist)
     parser.add_argument("--eta_eat", type=float, default=Config.eta_eat)
     parser.add_argument("--close_r", type=int, default=Config.close_r)
     parser.add_argument("--eat_confirm_frames", type=int, default=Config.eat_confirm_frames)
-    parser.add_argument("--save_parts_debug", action="store_true", default=Config.save_parts_debug)
+    parser.add_argument("--save_parts_debug", dest="save_parts_debug", action="store_true", default=True)
+    parser.add_argument("--no_save_parts_debug", dest="save_parts_debug", action="store_false")
     args = parser.parse_args()
 
     cfg = Config(
@@ -839,6 +887,9 @@ def main():
         w_area=args.w_area,
         w_col=args.w_col,
         strict_color=args.strict_color,
+        iou_zero_dist_gate=args.iou_zero_dist_gate if args.iou_zero_dist_gate is not None else 0.7 * args.max_dist,
+        iou_dilate_r=args.iou_dilate_r,
+        hue_dist_max=args.hue_dist_max,
         group_window=args.group_window,
         tau_sigma=args.tau_sigma,
         tau_dist=args.tau_dist,
