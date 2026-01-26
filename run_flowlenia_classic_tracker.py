@@ -227,14 +227,14 @@ class TrackerClassic:
         cost = np.full((T, D), np.inf, dtype=np.float32)
         for i, tid in enumerate(track_ids):
             tr = self.tracks[tid]
+            dt_pred = tr.missed + 1
+            cx_pred = tr.cx + tr.vx * dt_pred
+            cy_pred = tr.cy + tr.vy * dt_pred
+            prev_mask_dil = dilate_mask(tr.mask_u8, self.cfg.iou_dilate_r)
             for j, det in enumerate(detections):
-                dt = max(1, frame_idx - tr.last_frame)
-                cx_pred = tr.cx + tr.vx * dt
-                cy_pred = tr.cy + tr.vy * dt
                 dist = math.hypot(cx_pred - det.cx, cy_pred - det.cy)
                 if dist > self.cfg.max_dist:
                     continue
-                prev_mask_dil = dilate_mask(tr.mask_u8, self.cfg.iou_dilate_r)
                 iou = iou_u8(prev_mask_dil, det.mask_u8)
                 if iou == 0.0 and dist > (self.cfg.iou_zero_dist_gate or (0.7 * self.cfg.max_dist)):
                     continue
@@ -299,9 +299,10 @@ class TrackerClassic:
             unmatched_dets.discard(j)
             tid = track_ids[i]
             det = detections[j]
-            dt = max(1, frame_idx - self.tracks[tid].last_frame)
-            vx = (det.cx - self.tracks[tid].cx) / dt
-            vy = (det.cy - self.tracks[tid].cy) / dt
+            old = self.tracks[tid]
+            dt_obs = max(1, frame_idx - old.last_frame)
+            vx = (det.cx - old.cx) / dt_obs
+            vy = (det.cy - old.cy) / dt_obs
             self.tracks[tid] = Track(
                 track_id=tid,
                 mask_u8=det.mask_u8,
@@ -339,7 +340,6 @@ class TrackerClassic:
             tid = track_ids[i]
             tr = self.tracks[tid]
             tr.missed += 1
-            tr.last_frame = frame_idx
             if tr.missed > self.cfg.max_missed:
                 to_del.append(tid)
             else:
@@ -596,11 +596,15 @@ class EaterPolicy:
 
     @staticmethod
     def _fill_holes(mask: np.ndarray) -> np.ndarray:
-        inv = (mask == 0).astype(np.uint8)
+        mask_u8 = (mask > 0).astype(np.uint8)
+        h, w = mask_u8.shape
+        inv = (mask_u8 == 0).astype(np.uint8)
         ff = inv.copy()
-        cv2.floodFill(ff, None, (0, 0), 2)
-        holes = (ff == 0).astype(np.uint8)
-        return mask | holes
+        flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+        cv2.floodFill(ff, flood_mask, (0, 0), 2)
+        holes = (ff == 1).astype(np.uint8)
+        filled = (mask_u8 | holes).astype(np.uint8)
+        return filled
 
 
 # --------------------------- Visualization ------------------------------- #
