@@ -23,7 +23,7 @@ from transformers import Sam2VideoModel, Sam2VideoProcessor
 class Config:
     # visibility / seed thresholds
     v_thr: int = 25
-    h_bins: int = 12
+    h_bins: int = 24
     min_area: int = 20
     min_mass: float = 500.0
     birth_v_thr: int = 35
@@ -115,16 +115,19 @@ class SeedGenerator:
         hsv = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2HSV)
         h = hsv[:, :, 0]
         v = hsv[:, :, 2]
-        thr = self.cfg.v_thr if v_thr_override is None else v_thr_override
-        mask_visible = v > thr
+        thr_hi = self.cfg.v_thr if v_thr_override is None else v_thr_override
+        thr_lo = max(0, thr_hi - 15)
+        strong = v > thr_hi
+        weak = v > thr_lo
         if uncovered_mask is not None:
-            mask_visible &= uncovered_mask
-        if not np.any(mask_visible):
+            strong &= uncovered_mask
+            weak &= uncovered_mask
+        if not np.any(strong):
             return []
         h_bin = (h.astype(np.int32) * self.cfg.h_bins) // 180
         seeds: List[Seed] = []
         for b in range(self.cfg.h_bins):
-            mask_b = mask_visible & (h_bin == b)
+            mask_b = strong & (h_bin == b)
             if not np.any(mask_b):
                 continue
             num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
@@ -138,8 +141,13 @@ class SeedGenerator:
                 mass = float(v[comp_mask].sum())
                 if mass < self.cfg.min_mass:
                     continue
+                # include weak pixels only inside this component mask
+                weak_comp = weak & comp_mask
                 temp = v.copy()
-                temp[~comp_mask] = 0
+                temp[~weak_comp] = 0
+                if temp.max() <= 0:
+                    temp = v.copy()
+                    temp[~comp_mask] = 0
                 flat_idx = int(temp.argmax())
                 if temp.flat[flat_idx] <= 0:
                     continue
@@ -213,6 +221,7 @@ class TrackerSAM2HF:
         self.session = None
         self.obj_ids: List[int] = []
         self.next_obj_id = 1
+        self.seed_xy: Dict[int, Tuple[int, int]] = {}
         self._add_inputs_sig = inspect.signature(self.processor.add_inputs_to_inference_session)
         self._postprocess_sig = inspect.signature(self.processor.post_process_masks)
         self._init_session_sig = inspect.signature(self.processor.init_video_session)
@@ -262,6 +271,7 @@ class TrackerSAM2HF:
                 obj_id = self.next_obj_id
                 self.next_obj_id += 1
                 self.obj_ids.append(obj_id)
+                self.seed_xy[obj_id] = (seed.x, seed.y)
                 obj_ids.append(obj_id)
                 points_by_obj.append([(seed.x, seed.y)])
                 labels_by_obj.append([1])
@@ -272,6 +282,7 @@ class TrackerSAM2HF:
                 obj_id = self.next_obj_id
                 self.next_obj_id += 1
                 self.obj_ids.append(obj_id)
+                self.seed_xy[obj_id] = (seed.x, seed.y)
                 self._add_points(frame_idx, obj_id, [(seed.x, seed.y)], [1])
                 new_ids.append(obj_id)
         return new_ids
@@ -446,7 +457,46 @@ class TrackerSAM2HF:
 # --------------------------- Post-process overlaps ----------------------- #
 class PostProcess:
     @staticmethod
-    def resolve_overlaps(
+    def keep_single_component(
+        mask_u8: np.ndarray,
+        prev_mask_u8: Optional[np.ndarray] = None,
+        seed_xy: Optional[Tuple[int, int]] = None,
+    ) -> np.ndarray:
+        if mask_u8.ndim != 2:
+            mask_u8 = mask_u8.squeeze()
+        mask = (mask_u8 > 0).astype(np.uint8)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        if num_labels <= 2:
+            return mask
+        # choose component
+        choose_id = None
+        if prev_mask_u8 is not None:
+            prev = (prev_mask_u8 > 0).astype(np.uint8)
+            best_inter = 0
+            for comp_id in range(1, num_labels):
+                inter = int(((labels == comp_id) & (prev > 0)).sum())
+                if inter > best_inter:
+                    best_inter = inter
+                    choose_id = comp_id
+        if choose_id is None and seed_xy is not None:
+            sx, sy = seed_xy
+            if 0 <= sy < labels.shape[0] and 0 <= sx < labels.shape[1]:
+                comp_id = labels[sy, sx]
+                if comp_id != 0:
+                    choose_id = comp_id
+        if choose_id is None:
+            # pick largest area
+            best_area = 0
+            for comp_id in range(1, num_labels):
+                area = int(stats[comp_id, cv2.CC_STAT_AREA])
+                if area > best_area:
+                    best_area = area
+                    choose_id = comp_id
+        out = (labels == choose_id).astype(np.uint8)
+        return out
+
+    @staticmethod
+    def resolve_overlaps_confidence(
         masks_by_obj: Dict[int, np.ndarray],
         v_u8: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, Dict[int, np.ndarray]]:
@@ -471,6 +521,47 @@ class PostProcess:
             label_map[mask_bool & (label_map == 0)] = obj_id
         resolved = {obj_id: (label_map == obj_id).astype(np.uint8) for obj_id in masks_by_obj}
         return label_map, resolved
+
+    @staticmethod
+    def resolve_overlaps_nearest_center(
+        masks_by_obj: Dict[int, np.ndarray],
+    ) -> Dict[int, np.ndarray]:
+        if not masks_by_obj:
+            return {}
+        obj_ids = list(masks_by_obj.keys())
+        any_mask = masks_by_obj[obj_ids[0]]
+        h, w = any_mask.shape[:2]
+        centers: Dict[int, Tuple[float, float]] = {}
+        for oid, m in masks_by_obj.items():
+            ys, xs = np.where(m > 0)
+            if len(xs) == 0:
+                centers[oid] = (w * 0.5, h * 0.5)
+            else:
+                centers[oid] = (float(xs.mean()), float(ys.mean()))
+        sum_masks = np.zeros((h, w), dtype=np.int32)
+        for m in masks_by_obj.values():
+            sum_masks += m.astype(np.int32)
+        resolved = {oid: np.zeros_like(any_mask, dtype=np.uint8) for oid in obj_ids}
+        # pixels with single ownership
+        single = sum_masks == 1
+        for oid, m in masks_by_obj.items():
+            resolved[oid][single & (m > 0)] = 1
+        # overlap pixels
+        overlap_y, overlap_x = np.where(sum_masks > 1)
+        if len(overlap_x) > 0:
+            centers_arr = np.array([centers[oid] for oid in obj_ids], dtype=np.float32)  # (N,2)
+            for y, x in zip(overlap_y, overlap_x):
+                # which obj cover this pixel
+                present = [i for i, oid in enumerate(obj_ids) if masks_by_obj[oid][y, x] > 0]
+                if not present:
+                    continue
+                dx = centers_arr[present, 0] - x
+                dy = centers_arr[present, 1] - y
+                dist2 = dx * dx + dy * dy
+                best_idx = present[int(dist2.argmin())]
+                best_oid = obj_ids[best_idx]
+                resolved[best_oid][y, x] = 1
+        return resolved
 
 
 # --------------------------- Refinement ---------------------------------- #
@@ -506,6 +597,13 @@ class Refiner:
                 continue
             dilated = cv2.dilate(mask_u8, self.kernel).astype(bool)
             candidate = dilated & (v > self.cfg.refine_v_thr) & (~mask_bool)
+            if masks_resolved:
+                covered_other = np.zeros_like(mask_bool, dtype=bool)
+                for oid, m_other in masks_resolved.items():
+                    if oid == obj_id:
+                        continue
+                    covered_other |= m_other.astype(bool)
+                candidate &= ~covered_other
             pos_points = self._top_component_seeds(v, candidate, self.cfg.refine_topk)
             points: List[Tuple[int, int]] = []
             labels: List[int] = []
@@ -939,6 +1037,8 @@ def run_pipeline(
     tracker.run_frame_inference(0, is_initial=True, is_conditioning=True)
 
     part_segments: Dict[int, Dict[int, np.ndarray]] = {}
+    part_segments_raw: Dict[int, Dict[int, np.ndarray]] = {}
+    prev_mask_by_obj: Dict[int, np.ndarray] = {}
 
     with torch.no_grad():
         for t, out in enumerate(tracker.propagate_iter(start_frame_idx=0)):
@@ -960,7 +1060,23 @@ def run_pipeline(
                     break
                 masks_by_obj[int(obj_id)] = (masks[idx_m] > 0).astype(np.uint8)
 
-            _, masks_resolved = PostProcess.resolve_overlaps(masks_by_obj, v_u8=v)
+            # enforce single connected component per part
+            cleaned_masks: Dict[int, np.ndarray] = {}
+            for oid, m in masks_by_obj.items():
+                prev = prev_mask_by_obj.get(oid)
+                seed_xy = tracker.seed_xy.get(oid)
+                cleaned_masks[oid] = PostProcess.keep_single_component(m, prev_mask_u8=prev, seed_xy=seed_xy)
+
+            # store raw (after single-component but before overlap resolution)
+            frame_id = frame_indices[t]
+            part_segments_raw[frame_id] = {oid: m.copy().astype(np.uint8) for oid, m in cleaned_masks.items()}
+
+            # resolve overlaps by nearest center
+            masks_resolved = PostProcess.resolve_overlaps_nearest_center(cleaned_masks)
+
+            # update prev for next frame
+            prev_mask_by_obj = {oid: m.copy() for oid, m in cleaned_masks.items()}
+
             frame_id = frame_indices[t]
             part_segments[frame_id] = masks_resolved
             feature_parts.update(frame_id, v, masks_resolved)
@@ -1008,12 +1124,24 @@ def run_pipeline(
         frame_indices=frame_indices,
     )
     overlay_parts = None
+    overlay_parts_raw = None
     if cfg.save_parts_debug:
         overlay_parts = os.path.join(out_dir, "overlay_parts.mp4")
         Visualizer.write_overlay_video(
             frames,
             part_segments,
             overlay_parts,
+            out_fps,
+            alpha=0.45,
+            draw_contours=True,
+            draw_ids=True,
+            frame_indices=frame_indices,
+        )
+        overlay_parts_raw = os.path.join(out_dir, "overlay_parts_raw.mp4")
+        Visualizer.write_overlay_video(
+            frames,
+            part_segments_raw,
+            overlay_parts_raw,
             out_fps,
             alpha=0.45,
             draw_contours=True,
@@ -1059,12 +1187,29 @@ def run_pipeline(
         "initial_part_to_org": {str(k): int(v) for k, v in part_to_org_initial.items()},
         "final_part_to_org": {str(k): int(v) for k, v in part_to_org_final.items()},
         "org_groups_final": [list(map(int, g)) for g in org_groups_final],
+        "debug": {
+            "overlap_mode_parts": "nearest_center",
+            "seed_params": {
+                "h_bins": cfg.h_bins,
+                "v_thr_hi": cfg.v_thr,
+                "v_thr_lo": max(0, cfg.v_thr - 15),
+            },
+        },
     }
     with open(os.path.join(out_dir, "tracks_organisms.json"), "w", encoding="utf-8") as f:
         json.dump(tracks_org_json, f, indent=2)
 
+    # raw summary areas to avoid huge dumps
+    raw_summary = {
+        str(fid): {str(oid): int(mask.sum()) for oid, mask in masks.items()}
+        for fid, masks in part_segments_raw.items()
+    }
+    with open(os.path.join(out_dir, "part_segments_raw_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(raw_summary, f, indent=2)
+
     return {
         "part_segments": part_segments,
+        "part_segments_raw": part_segments_raw,
         "organism_segments": organism_segments,
         "part_tracks": part_tracks,
         "organism_tracks": organism_tracks,
@@ -1072,6 +1217,7 @@ def run_pipeline(
         "part_to_org_final": part_to_org_final,
         "overlay_org": overlay_org,
         "overlay_parts": overlay_parts,
+        "overlay_parts_raw": overlay_parts_raw,
     }
 
 
