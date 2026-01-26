@@ -97,7 +97,23 @@ def run_ultrack(
     ucfg = MainConfig()
     tracker = Tracker(ucfg)
     tracker.track(labels=label_stack)
-    tracks_df, _ = tracker.to_tracks_layer()
+
+    tracks_df = None
+    if hasattr(tracker, "to_tracks_layer"):
+        tracks_df, _ = tracker.to_tracks_layer()
+    elif hasattr(tracker, "tracks"):
+        try:
+            import pandas as pd
+        except Exception:
+            pd = None
+        if pd is not None:
+            try:
+                tracks_df = pd.DataFrame(tracker.tracks)
+            except Exception:
+                tracks_df = None
+    if tracks_df is None:
+        print("[ultrack] Could not extract tracks dataframe from Tracker; skipping.")
+        return {"label_stack": label_path}
 
     part_segments: Dict[int, Dict[int, np.ndarray]] = {}
     for _, row in tracks_df.iterrows():
