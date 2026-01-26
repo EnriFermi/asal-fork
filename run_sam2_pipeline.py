@@ -254,8 +254,8 @@ class TrackerSAM2HF:
         if not masks:
             return []
         arr = np.stack([m.astype(np.float32) for m in masks], axis=0)  # (N,H,W)
-        arr = arr[None, ...]  # (1,N,H,W) as expected by HF
-        num = arr.shape[1]
+        arr = arr[:, None, :, :]  # (N,1,H,W) for HF mask prompts
+        num = arr.shape[0]
         obj_ids = list(range(self.next_obj_id, self.next_obj_id + num))
         self.next_obj_id += num
         self.obj_ids.extend(obj_ids)
