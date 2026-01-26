@@ -138,6 +138,7 @@ def main():
                 max_frames=args.max_frames,
                 resize=resize,
                 draw_ids_largest_k=args.draw_ids_largest_k,
+                search_range_override=args.max_dist,  # can be overridden via CLI if needed
             )
         elif method == "ultrack":
             run_ultrack(

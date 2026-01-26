@@ -30,6 +30,7 @@ def run_trackpy(
     max_frames: Optional[int] = None,
     resize: Optional[Tuple[int, int]] = None,
     draw_ids_largest_k: int = 0,
+    search_range_override: Optional[float] = None,
 ):
     try:
         import pandas as pd
@@ -84,13 +85,24 @@ def run_trackpy(
 
     df = pd.DataFrame.from_records(records)
     df = df.sort_values("frame")
-    linked = tp.link_df(
-        df,
-        search_range=cfg.max_dist,
-        memory=cfg.max_missed,
-        t_column="frame",
-        pos_columns=["x", "y"],
-    )
+    # trackpy can explode if search_range is too large; adaptively shrink on failure
+    sr_try = search_range_override if search_range_override is not None else cfg.max_dist
+    linked = None
+    while sr_try >= 2.0:
+        try:
+            linked = tp.link_df(
+                df,
+                search_range=sr_try,
+                memory=cfg.max_missed,
+                t_column="frame",
+                pos_columns=["x", "y"],
+            )
+            break
+        except Exception as exc:  # narrow down to SubnetOversizeException if available
+            print(f"[trackpy] link_df failed at search_range={sr_try}: {exc}")
+            sr_try *= 0.5
+    if linked is None:
+        raise RuntimeError("trackpy linking failed even after reducing search_range")
 
     for _, row in linked.iterrows():
         frame_key = int(row["frame"])
@@ -196,6 +208,7 @@ def main():
     parser.add_argument("--w_col", type=float, default=Config.w_col)
     parser.add_argument("--strict_color", action="store_true", default=Config.strict_color)
     parser.add_argument("--draw_ids_largest_k", type=int, default=Config.draw_ids_largest_k)
+    parser.add_argument("--trackpy_search_range", type=float, default=None, help="Override search_range for trackpy")
     args = parser.parse_args()
 
     cfg = Config(
@@ -221,6 +234,7 @@ def main():
         max_frames=args.max_frames,
         resize=resize,
         draw_ids_largest_k=args.draw_ids_largest_k,
+        search_range_override=args.trackpy_search_range,
     )
 
 
