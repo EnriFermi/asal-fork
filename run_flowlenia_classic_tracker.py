@@ -34,11 +34,13 @@ class Config:
     min_area: int = 20
     min_mass: float = 500.0
     use_hue_bins: bool = True
+    marker_split: bool = True
+    seed_radius: int = 3
 
     # tracker
     max_dist: float = 60.0
     min_iou: float = 0.05
-    max_missed: int = 5
+    max_missed: int = 10
     w_dist: float = 1.0
     w_iou: float = 80.0
     w_area: float = 10.0
@@ -60,6 +62,7 @@ class Config:
 
     # outputs
     save_parts_debug: bool = True
+    draw_ids_largest_k: int = 0
 
 
 # --------------------------- Video I/O ----------------------------------- #
@@ -114,64 +117,151 @@ class Detection:
     cx: float
     cy: float
     bbox: Tuple[int, int, int, int]
+    seed_track_id: Optional[int] = None
 
 
 class MaskGenerator:
     def __init__(self, cfg: Config):
         self.cfg = cfg
 
-    def generate_detections(self, rgb_u8: np.ndarray, v_thr_hi: int) -> List[Detection]:
+    def generate_detections(
+        self,
+        rgb_u8: np.ndarray,
+        v_thr_hi: int,
+        seeds: Optional[List[Tuple[int, float, float]]] = None,
+        use_marker_split: bool = False,
+        seed_radius: int = 3,
+    ) -> Tuple[List[Detection], Dict[int, Detection]]:
         hsv = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2HSV)
         h = hsv[:, :, 0]
         v = hsv[:, :, 2]
         strong = v > v_thr_hi
         if not np.any(strong):
-            return []
+            return [], {}
+        if use_marker_split and seeds:
+            return self._marker_split(h, v, strong, seeds, seed_radius)
+
         detections: List[Detection] = []
         use_bins = self.cfg.use_hue_bins
         if use_bins:
             h_bin = (h.astype(np.int32) * self.cfg.h_bins) // 180
             for b in range(self.cfg.h_bins):
                 mask_b = strong & (h_bin == b)
-                detections.extend(self._components(mask_b, v, b))
+                detections.extend(self._components(mask_b, v, h, b))
         else:
-            detections.extend(self._components(strong, v, -1))
-        return detections
+            detections.extend(self._components(strong, v, h, -1))
+        return detections, {}
 
-    def _components(self, mask_bin: np.ndarray, v: np.ndarray, hue_bin: int) -> List[Detection]:
+    def _mask_to_detection(
+        self,
+        mask_bin: np.ndarray,
+        v: np.ndarray,
+        h: np.ndarray,
+        hue_bin_override: Optional[int] = None,
+    ) -> Optional[Detection]:
+        if not np.any(mask_bin):
+            return None
+        area = int(mask_bin.sum())
+        if area < self.cfg.min_area:
+            return None
+        mass = float(v[mask_bin].sum())
+        if mass < self.cfg.min_mass:
+            return None
+        ys, xs = np.where(mask_bin)
+        cx = float(xs.mean())
+        cy = float(ys.mean())
+        x0 = int(xs.min())
+        x1 = int(xs.max())
+        y0 = int(ys.min())
+        y1 = int(ys.max())
+        hue_bin = -1
+        if self.cfg.use_hue_bins:
+            if hue_bin_override is not None and hue_bin_override >= 0:
+                hue_bin = hue_bin_override
+            else:
+                bins = (h.astype(np.int32) * self.cfg.h_bins) // 180
+                vals = bins[mask_bin]
+                if vals.size > 0:
+                    hue_bin = int(np.bincount(vals.flatten(), minlength=self.cfg.h_bins).argmax())
+        return Detection(
+            mask_u8=mask_bin.astype(np.uint8),
+            hue_bin=hue_bin,
+            area=area,
+            mass=mass,
+            cx=cx,
+            cy=cy,
+            bbox=(x0, y0, x1, y1),
+        )
+
+    def _components(
+        self, mask_bin: np.ndarray, v: np.ndarray, h: np.ndarray, hue_bin: int
+    ) -> List[Detection]:
         if not np.any(mask_bin):
             return []
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        num_labels, labels, _, _ = cv2.connectedComponentsWithStats(
             mask_bin.astype(np.uint8), connectivity=8
         )
         outs: List[Detection] = []
         for comp_id in range(1, num_labels):
-            area = int(stats[comp_id, cv2.CC_STAT_AREA])
-            if area < self.cfg.min_area:
-                continue
             comp_mask = labels == comp_id
-            mass = float(v[comp_mask].sum())
-            if mass < self.cfg.min_mass:
-                continue
-            ys, xs = np.where(comp_mask)
-            cx = float(xs.mean())
-            cy = float(ys.mean())
-            x0 = int(xs.min())
-            x1 = int(xs.max())
-            y0 = int(ys.min())
-            y1 = int(ys.max())
-            outs.append(
-                Detection(
-                    mask_u8=comp_mask.astype(np.uint8),
-                    hue_bin=hue_bin,
-                    area=area,
-                    mass=mass,
-                    cx=cx,
-                    cy=cy,
-                    bbox=(x0, y0, x1, y1),
-                )
-            )
+            det = self._mask_to_detection(comp_mask, v, h, hue_bin_override=hue_bin if hue_bin >= 0 else None)
+            if det is not None:
+                outs.append(det)
         return outs
+
+    def _marker_split(
+        self,
+        h: np.ndarray,
+        v: np.ndarray,
+        strong: np.ndarray,
+        seeds: List[Tuple[int, float, float]],
+        seed_radius: int,
+    ) -> Tuple[List[Detection], Dict[int, Detection]]:
+        strong_u8 = strong.astype(np.uint8)
+        hgt, wdt = strong.shape
+        markers = np.zeros_like(strong_u8, dtype=np.int32)
+        seed_ids: List[int] = []
+        for tid, cx, cy in seeds:
+            xi = int(round(cx))
+            yi = int(round(cy))
+            if xi < 0 or xi >= wdt or yi < 0 or yi >= hgt:
+                continue
+            cv2.circle(markers, (xi, yi), max(1, seed_radius), int(tid), -1)
+            seed_ids.append(int(tid))
+
+        num_labels, comp_labels = cv2.connectedComponents(strong_u8)
+        next_label = (max(seed_ids) + 1) if seed_ids else 1
+        for comp_id in range(1, num_labels):
+            comp_mask = comp_labels == comp_id
+            if np.any(markers[comp_mask] > 0):
+                continue
+            markers[comp_mask] = next_label
+            next_label += 1
+
+        dist = cv2.distanceTransform(strong_u8, cv2.DIST_L2, 5)
+        elevation = cv2.normalize(-dist, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        elevation_color = cv2.cvtColor(elevation, cv2.COLOR_GRAY2BGR)
+        markers_ws = markers.copy()
+        cv2.watershed(elevation_color, markers_ws)
+        markers_ws[~strong] = 0
+
+        detections: List[Detection] = []
+        seeded: Dict[int, Detection] = {}
+        seed_set = set(seed_ids)
+        labels = np.unique(markers_ws)
+        for lbl in labels:
+            if lbl <= 0:
+                continue
+            region = markers_ws == lbl
+            det = self._mask_to_detection(region, v, h, None)
+            if det is None:
+                continue
+            if lbl in seed_set:
+                det.seed_track_id = int(lbl)
+                seeded[int(lbl)] = det
+            else:
+                detections.append(det)
+        return detections, seeded
 
 
 # --------------------------- Metrics ------------------------------------- #
@@ -196,6 +286,34 @@ def dilate_mask(mask_u8: np.ndarray, r: int) -> np.ndarray:
     return cv2.dilate(mask_u8.astype(np.uint8), kernel)
 
 
+def bbox_from_mask(mask_u8: np.ndarray) -> Tuple[int, int, int, int]:
+    ys, xs = np.where(mask_u8 > 0)
+    if xs.size == 0:
+        return (0, 0, 0, 0)
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def roi_iou(
+    mask_a: np.ndarray,
+    mask_b: np.ndarray,
+    bbox_a: Tuple[int, int, int, int],
+    bbox_b: Tuple[int, int, int, int],
+) -> float:
+    x0 = max(bbox_a[0], bbox_b[0])
+    y0 = max(bbox_a[1], bbox_b[1])
+    x1 = min(bbox_a[2], bbox_b[2])
+    y1 = min(bbox_a[3], bbox_b[3])
+    if x1 < x0 or y1 < y0:
+        return 0.0
+    a_roi = mask_a[y0 : y1 + 1, x0 : x1 + 1]
+    b_roi = mask_b[y0 : y1 + 1, x0 : x1 + 1]
+    inter = float((a_roi.astype(np.uint8) & b_roi.astype(np.uint8)).sum())
+    union = float((a_roi.astype(np.uint8) | b_roi.astype(np.uint8)).sum())
+    if union == 0:
+        return 0.0
+    return inter / union
+
+
 # --------------------------- TrackerClassic ------------------------------ #
 @dataclass
 class Track:
@@ -209,6 +327,7 @@ class Track:
     vy: float
     last_frame: int
     missed: int
+    bbox: Tuple[int, int, int, int]
 
 
 class TrackerClassic:
@@ -217,47 +336,114 @@ class TrackerClassic:
         self.next_id = 1
         self.tracks: Dict[int, Track] = {}
 
-    def update(self, frame_idx: int, detections: List[Detection]) -> Dict[int, np.ndarray]:
-        # cost matrix
-        track_ids = list(self.tracks.keys())
-        T = len(track_ids)
-        D = len(detections)
-        if T == 0 and D == 0:
-            return {}
-        cost = np.full((T, D), np.inf, dtype=np.float32)
-        for i, tid in enumerate(track_ids):
-            tr = self.tracks[tid]
-            dt_pred = tr.missed + 1
+    def predict_seeds(self, frame_idx: int) -> List[Tuple[int, float, float]]:
+        seeds: List[Tuple[int, float, float]] = []
+        for tid, tr in self.tracks.items():
+            if tr.missed > self.cfg.max_missed:
+                continue
+            dt_pred = max(1, frame_idx - tr.last_frame)
             cx_pred = tr.cx + tr.vx * dt_pred
             cy_pred = tr.cy + tr.vy * dt_pred
-            prev_mask_dil = dilate_mask(tr.mask_u8, self.cfg.iou_dilate_r)
-            for j, det in enumerate(detections):
-                dist = math.hypot(cx_pred - det.cx, cy_pred - det.cy)
-                if dist > self.cfg.max_dist:
-                    continue
-                iou = iou_u8(prev_mask_dil, det.mask_u8)
-                if iou == 0.0 and dist > (self.cfg.iou_zero_dist_gate or (0.7 * self.cfg.max_dist)):
-                    continue
+            seeds.append((tid, cx_pred, cy_pred))
+        return seeds
 
-                col_pen = 0.0
-                if self.cfg.use_hue_bins and tr.hue_bin >= 0 and det.hue_bin >= 0:
-                    bins = self.cfg.h_bins
-                    d_bin = abs(tr.hue_bin - det.hue_bin)
-                    d_bin = min(d_bin, bins - d_bin)
-                    dist_norm = d_bin / (bins / 2.0)
-                    if self.cfg.strict_color and dist_norm > self.cfg.hue_dist_max:
-                        continue
-                    col_pen = self.cfg.w_col * dist_norm
+    def _update_track_from_det(self, tid: int, det: Detection, frame_idx: int) -> None:
+        old = self.tracks[tid]
+        dt_obs = max(1, frame_idx - old.last_frame)
+        vx = (det.cx - old.cx) / dt_obs
+        vy = (det.cy - old.cy) / dt_obs
+        self.tracks[tid] = Track(
+            track_id=tid,
+            mask_u8=det.mask_u8,
+            cx=det.cx,
+            cy=det.cy,
+            area=det.area,
+            hue_bin=det.hue_bin,
+            vx=vx,
+            vy=vy,
+            last_frame=frame_idx,
+            missed=0,
+            bbox=det.bbox,
+        )
 
-                ar = area_ratio(tr.area, det.area)
-                c = self.cfg.w_dist * dist + self.cfg.w_iou * (1.0 - iou) + self.cfg.w_area * ar + col_pen
-                cost[i, j] = c
+    def update(
+        self,
+        frame_idx: int,
+        detections: List[Detection],
+        seeded: Optional[Dict[int, Detection]] = None,
+    ) -> Dict[int, np.ndarray]:
+        seeded = seeded or {}
+        track_ids_all = list(self.tracks.keys())
+        if not track_ids_all and not detections and not seeded:
+            return {}
 
-        matches = []
-        unmatched_tracks = set(range(T))
-        unmatched_dets = set(range(D))
+        unmatched_tracks: Set[int] = set(track_ids_all)
+        unmatched_dets: Set[int] = set(range(len(detections)))
 
+        # apply seeded matches (marker-based watershed regions)
+        for tid, det in seeded.items():
+            if tid not in self.tracks:
+                continue
+            self._update_track_from_det(tid, det, frame_idx)
+            unmatched_tracks.discard(tid)
+
+        track_list = list(unmatched_tracks)
+        T = len(track_list)
+        D = len(detections)
+        matches: List[Tuple[int, int]] = []
         if T > 0 and D > 0:
+            # spatial grid on detections
+            cell = max(1.0, self.cfg.max_dist)
+            grid: Dict[Tuple[int, int], List[int]] = {}
+            for idx, det in enumerate(detections):
+                gx = int(det.cx // cell)
+                gy = int(det.cy // cell)
+                grid.setdefault((gx, gy), []).append(idx)
+
+            dilated_cache: Dict[int, np.ndarray] = {}
+            dilated_bbox_cache: Dict[int, Tuple[int, int, int, int]] = {}
+            for tid in track_list:
+                dil = dilate_mask(self.tracks[tid].mask_u8, self.cfg.iou_dilate_r)
+                dilated_cache[tid] = dil
+                dilated_bbox_cache[tid] = bbox_from_mask(dil)
+
+            cost = np.full((T, D), np.inf, dtype=np.float32)
+            for row, tid in enumerate(track_list):
+                tr = self.tracks[tid]
+                dt_pred = max(1, frame_idx - tr.last_frame)
+                cx_pred = tr.cx + tr.vx * dt_pred
+                cy_pred = tr.cy + tr.vy * dt_pred
+                cell_x = int(cx_pred // cell)
+                cell_y = int(cy_pred // cell)
+                candidates: List[int] = []
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        candidates.extend(grid.get((cell_x + dx, cell_y + dy), []))
+                seen: Set[int] = set()
+                for det_idx in candidates:
+                    if det_idx in seen:
+                        continue
+                    seen.add(det_idx)
+                    det = detections[det_idx]
+                    dist = math.hypot(cx_pred - det.cx, cy_pred - det.cy)
+                    if dist > self.cfg.max_dist:
+                        continue
+                    col_pen = 0.0
+                    if self.cfg.use_hue_bins and tr.hue_bin >= 0 and det.hue_bin >= 0:
+                        bins = self.cfg.h_bins
+                        d_bin = abs(tr.hue_bin - det.hue_bin)
+                        d_bin = min(d_bin, bins - d_bin)
+                        dist_norm = d_bin / (bins / 2.0)
+                        if self.cfg.strict_color and dist_norm > self.cfg.hue_dist_max:
+                            continue
+                        col_pen = self.cfg.w_col * dist_norm
+                    ar = area_ratio(tr.area, det.area)
+                    c_val = self.cfg.w_dist * dist + self.cfg.w_area * ar + col_pen
+                    if self.cfg.w_iou != 0:
+                        iou = roi_iou(dilated_cache[tid], det.mask_u8, dilated_bbox_cache[tid], det.bbox)
+                        c_val += self.cfg.w_iou * (1.0 - iou)
+                    cost[row, det_idx] = c_val
+
             if SCIPY_AVAILABLE:
                 finite_any = np.isfinite(cost).any()
                 if finite_any:
@@ -269,13 +455,14 @@ class TrackerClassic:
                             if np.isfinite(cost[r, c]):
                                 matches.append((r, c))
                     except ValueError:
-                        # fallback to greedy if scipy deems matrix infeasible
                         finite_any = False
                 if not finite_any:
-                    pairs = [(i, j, cost[i, j]) for i in range(T) for j in range(D) if np.isfinite(cost[i, j])]
+                    pairs = [
+                        (i, j, cost[i, j]) for i in range(T) for j in range(D) if np.isfinite(cost[i, j])
+                    ]
                     pairs.sort(key=lambda x: x[2])
-                    used_t = set()
-                    used_d = set()
+                    used_t: Set[int] = set()
+                    used_d: Set[int] = set()
                     for i, j, _ in pairs:
                         if i in used_t or j in used_d:
                             continue
@@ -285,8 +472,8 @@ class TrackerClassic:
             else:
                 pairs = [(i, j, cost[i, j]) for i in range(T) for j in range(D) if np.isfinite(cost[i, j])]
                 pairs.sort(key=lambda x: x[2])
-                used_t = set()
-                used_d = set()
+                used_t: Set[int] = set()
+                used_d: Set[int] = set()
                 for i, j, _ in pairs:
                     if i in used_t or j in used_d:
                         continue
@@ -294,29 +481,13 @@ class TrackerClassic:
                     used_t.add(i)
                     used_d.add(j)
 
-        for i, j in matches:
-            unmatched_tracks.discard(i)
-            unmatched_dets.discard(j)
-            tid = track_ids[i]
-            det = detections[j]
-            old = self.tracks[tid]
-            dt_obs = max(1, frame_idx - old.last_frame)
-            vx = (det.cx - old.cx) / dt_obs
-            vy = (det.cy - old.cy) / dt_obs
-            self.tracks[tid] = Track(
-                track_id=tid,
-                mask_u8=det.mask_u8,
-                cx=det.cx,
-                cy=det.cy,
-                area=det.area,
-                hue_bin=det.hue_bin,
-                vx=vx,
-                vy=vy,
-                last_frame=frame_idx,
-                missed=0,
-            )
+        for row, col in matches:
+            tid = track_list[row]
+            det = detections[col]
+            self._update_track_from_det(tid, det, frame_idx)
+            unmatched_tracks.discard(tid)
+            unmatched_dets.discard(col)
 
-        # new tracks
         for j in unmatched_dets:
             det = detections[j]
             tid = self.next_id
@@ -332,12 +503,11 @@ class TrackerClassic:
                 vy=0.0,
                 last_frame=frame_idx,
                 missed=0,
+                bbox=det.bbox,
             )
 
-        # missed tracks
-        to_del = []
-        for i in unmatched_tracks:
-            tid = track_ids[i]
+        to_del: List[int] = []
+        for tid in unmatched_tracks:
             tr = self.tracks[tid]
             tr.missed += 1
             if tr.missed > self.cfg.max_missed:
@@ -347,7 +517,6 @@ class TrackerClassic:
         for tid in to_del:
             del self.tracks[tid]
 
-        # output masks for active tracks; if missed, use last mask shifted by velocity
         masks_out: Dict[int, np.ndarray] = {}
         for tid, tr in self.tracks.items():
             if tr.missed == 0 and tr.last_frame == frame_idx:
@@ -628,6 +797,7 @@ class Visualizer:
         draw_contours: bool = True,
         draw_ids: bool = True,
         frame_indices: Optional[List[int]] = None,
+        draw_ids_largest_k: int = 0,
     ) -> None:
         if not frames:
             return
@@ -663,7 +833,13 @@ class Visualizer:
                         color = Visualizer._color_from_id(obj_id)
                         cv2.drawContours(frame_rgb, contours, -1, color, 1)
                 if draw_ids:
-                    for obj_id, mask_u8 in masks_t.items():
+                    ids_to_draw = list(masks_t.keys())
+                    if draw_ids_largest_k and draw_ids_largest_k > 0:
+                        areas = [(obj_id, int(mask_u8.sum())) for obj_id, mask_u8 in masks_t.items()]
+                        areas.sort(key=lambda x: x[1], reverse=True)
+                        ids_to_draw = [obj for obj, _ in areas[:draw_ids_largest_k]]
+                    for obj_id in ids_to_draw:
+                        mask_u8 = masks_t[obj_id]
                         if not np.any(mask_u8):
                             continue
                         ys, xs = np.where(mask_u8 > 0)
@@ -709,6 +885,7 @@ def run_pipeline(
     stride: int = 1,
     max_frames: Optional[int] = None,
     resize: Optional[Tuple[int, int]] = None,
+    draw_ids_largest_k: int = 0,
 ):
     os.makedirs(out_dir, exist_ok=True)
     fps, _, _ = VideoLoader.get_video_info(video_path)
@@ -730,8 +907,15 @@ def run_pipeline(
 
     for t, pil_frame in enumerate(frames):
         rgb = np.array(pil_frame)
-        detections = mask_gen.generate_detections(rgb, cfg.det_v_thr_hi)
-        masks_by_track = tracker.update(frame_indices[t], detections)
+        seeds = tracker.predict_seeds(frame_indices[t]) if cfg.marker_split else []
+        detections, seeded = mask_gen.generate_detections(
+            rgb,
+            cfg.det_v_thr_hi,
+            seeds=seeds,
+            use_marker_split=cfg.marker_split,
+            seed_radius=cfg.seed_radius,
+        )
+        masks_by_track = tracker.update(frame_indices[t], detections, seeded)
         part_segments[frame_indices[t]] = masks_by_track
         feature_parts.update(frame_indices[t], v_per_frame[frame_indices[t]], masks_by_track)
 
@@ -761,6 +945,7 @@ def run_pipeline(
         draw_contours=True,
         draw_ids=True,
         frame_indices=frame_indices,
+        draw_ids_largest_k=draw_ids_largest_k,
     )
     overlay_parts = os.path.join(out_dir, "overlay_parts.mp4")
     Visualizer.write_overlay_video(
@@ -772,6 +957,7 @@ def run_pipeline(
         draw_contours=True,
         draw_ids=True,
         frame_indices=frame_indices,
+        draw_ids_largest_k=draw_ids_largest_k,
     )
 
     tracks_parts_json = {
@@ -815,6 +1001,8 @@ def run_pipeline(
             "det_v_thr_hi": cfg.det_v_thr_hi,
             "h_bins": cfg.h_bins,
             "use_hue_bins": cfg.use_hue_bins,
+            "marker_split": cfg.marker_split,
+            "seed_radius": cfg.seed_radius,
             "tracker": {
                 "max_dist": cfg.max_dist,
                 "min_iou": cfg.min_iou,
@@ -824,7 +1012,9 @@ def run_pipeline(
                 "w_area": cfg.w_area,
                 "w_col": cfg.w_col,
                 "strict_color": cfg.strict_color,
+                "iou_dilate_r": cfg.iou_dilate_r,
             },
+            "draw_ids_largest_k": cfg.draw_ids_largest_k,
         },
     }
     with open(os.path.join(out_dir, "tracks_organisms.json"), "w", encoding="utf-8") as f:
@@ -856,6 +1046,9 @@ def main():
     parser.add_argument("--min_mass", type=float, default=Config.min_mass)
     parser.add_argument("--use_hue_bins", dest="use_hue_bins", action="store_true", default=True)
     parser.add_argument("--no_use_hue_bins", dest="use_hue_bins", action="store_false")
+    parser.add_argument("--marker_split", dest="marker_split", action="store_true", default=Config.marker_split)
+    parser.add_argument("--no_marker_split", dest="marker_split", action="store_false")
+    parser.add_argument("--seed_radius", type=int, default=Config.seed_radius)
     parser.add_argument("--max_dist", type=float, default=Config.max_dist)
     parser.add_argument("--min_iou", type=float, default=Config.min_iou)  # kept for compatibility, not used as gate
     parser.add_argument("--max_missed", type=int, default=Config.max_missed)
@@ -875,6 +1068,7 @@ def main():
     parser.add_argument("--eat_confirm_frames", type=int, default=Config.eat_confirm_frames)
     parser.add_argument("--save_parts_debug", dest="save_parts_debug", action="store_true", default=True)
     parser.add_argument("--no_save_parts_debug", dest="save_parts_debug", action="store_false")
+    parser.add_argument("--draw_ids_largest_k", type=int, default=Config.draw_ids_largest_k)
     args = parser.parse_args()
 
     cfg = Config(
@@ -883,6 +1077,8 @@ def main():
         min_area=args.min_area,
         min_mass=args.min_mass,
         use_hue_bins=args.use_hue_bins,
+        marker_split=args.marker_split,
+        seed_radius=args.seed_radius,
         max_dist=args.max_dist,
         min_iou=args.min_iou,
         max_missed=args.max_missed,
@@ -901,6 +1097,7 @@ def main():
         close_r=args.close_r,
         eat_confirm_frames=args.eat_confirm_frames,
         save_parts_debug=args.save_parts_debug,
+        draw_ids_largest_k=args.draw_ids_largest_k,
     )
     resize = _parse_resize(args.resize)
     run_pipeline(
@@ -910,6 +1107,7 @@ def main():
         stride=max(1, args.stride),
         max_frames=args.max_frames,
         resize=resize,
+        draw_ids_largest_k=args.draw_ids_largest_k,
     )
 
 
