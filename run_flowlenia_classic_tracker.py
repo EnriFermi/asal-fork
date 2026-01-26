@@ -71,6 +71,9 @@ class Config:
     stitch_max_gap: int = 15
     stitch_max_dist: float = 60.0
     stitch_hue_max: int = 3
+    teleport_thr_mult: float = 2.5  # multiplier for max_dist to flag teleports
+    fragmentation_len_thr: int = 5  # track length threshold for fragmentation proxy
+    min_track_len_for_stitch: int = 3  # drop shorter tracks before stitching
 
 
 # --------------------------- Video I/O ----------------------------------- #
@@ -367,6 +370,62 @@ def iou_u8_cropped(
     return inter / union
 
 
+def compute_label_overlap_iou(
+    trk_masks: List[np.ndarray],
+    det_masks: List[np.ndarray],
+    pad: int = 0,
+    dilate_r: int = 0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if not trk_masks or not det_masks:
+        return (
+            np.zeros((len(trk_masks), len(det_masks)), dtype=np.float32),
+            np.zeros((len(trk_masks),), dtype=np.float32),
+            np.zeros((len(det_masks),), dtype=np.float32),
+        )
+    h, w = trk_masks[0].shape
+    trk_lab = np.zeros((h, w), dtype=np.int32)
+    det_lab = np.zeros((h, w), dtype=np.int32)
+    if dilate_r > 0:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilate_r + 1, 2 * dilate_r + 1))
+    else:
+        kernel = None
+
+    for idx, m in enumerate(trk_masks):
+        if pad > 0:
+            x0, y0, x1, y1 = expand_bbox(bbox_from_mask(m), pad, m.shape)
+            roi = m[y0 : y1 + 1, x0 : x1 + 1]
+            if kernel is not None:
+                roi = cv2.dilate(roi.astype(np.uint8), kernel)
+            trk_lab[y0 : y1 + 1, x0 : x1 + 1][roi > 0] = idx + 1
+        else:
+            if kernel is not None:
+                m = cv2.dilate(m.astype(np.uint8), kernel)
+            trk_lab[m > 0] = idx + 1
+
+    for idx, m in enumerate(det_masks):
+        if pad > 0:
+            x0, y0, x1, y1 = expand_bbox(bbox_from_mask(m), pad, m.shape)
+            roi = m[y0 : y1 + 1, x0 : x1 + 1]
+            if kernel is not None:
+                roi = cv2.dilate(roi.astype(np.uint8), kernel)
+            det_lab[y0 : y1 + 1, x0 : x1 + 1][roi > 0] = idx + 1
+        else:
+            if kernel is not None:
+                m = cv2.dilate(m.astype(np.uint8), kernel)
+            det_lab[m > 0] = idx + 1
+
+    T = len(trk_masks)
+    D = len(det_masks)
+    key = trk_lab.ravel().astype(np.int64) * (D + 1) + det_lab.ravel().astype(np.int64)
+    counts = np.bincount(key, minlength=(T + 1) * (D + 1)).reshape(T + 1, D + 1)
+    inter = counts[1:, 1:].astype(np.float32)
+    area_trk = counts[1:, :].sum(axis=1).astype(np.float32)
+    area_det = counts[:, 1:].sum(axis=0).astype(np.float32)
+    denom = area_trk[:, None] + area_det[None, :] - inter + 1e-6
+    iou = inter / denom
+    return iou, area_trk, area_det
+
+
 # --------------------------- TrackerClassic ------------------------------ #
 @dataclass
 class Track:
@@ -406,6 +465,11 @@ class TrackerClassic:
         self.track_meta: Dict[int, TrackMeta] = {}
         self.merge_events: int = 0
         self.split_reacquire_events: int = 0
+        self.births: int = 0
+        self.deaths: int = 0
+        self.teleport_events: int = 0
+        self.track_obs_count: Dict[int, int] = {}
+        self.teleport_thr: float = cfg.max_dist * cfg.teleport_thr_mult
 
     def predict_seeds(self, frame_idx: int) -> List[Tuple[int, float, float]]:
         seeds: List[Tuple[int, float, float]] = []
@@ -423,6 +487,9 @@ class TrackerClassic:
         dt_obs = max(1, frame_idx - old.last_frame)
         vx = (det.cx - old.cx) / dt_obs
         vy = (det.cy - old.cy) / dt_obs
+        jump = math.hypot(det.cx - old.cx, det.cy - old.cy)
+        if jump > self.teleport_thr:
+            self.teleport_events += 1
         was_merged = old.state == "merged"
         self.tracks[tid] = Track(
             track_id=tid,
@@ -461,6 +528,7 @@ class TrackerClassic:
         meta.end = frame_idx
         meta.hue_bin = det.hue_bin if det.hue_bin >= 0 else meta.hue_bin
         self.track_meta[tid] = meta
+        self.track_obs_count[tid] = self.track_obs_count.get(tid, 0) + 1
 
     def update(
         self,
@@ -497,39 +565,42 @@ class TrackerClassic:
                 gy = int(det.cy // cell)
                 grid.setdefault((gx, gy), []).append(idx)
 
-            dilated_cache: Dict[int, np.ndarray] = {}
-            dilated_bbox_cache: Dict[int, Tuple[int, int, int, int]] = {}
-            for tid in track_list:
-                dil = dilate_mask(self.tracks[tid].mask_u8, self.cfg.iou_dilate_r)
-                dilated_cache[tid] = dil
-                dilated_bbox_cache[tid] = bbox_from_mask(dil)
+            trk_masks = [self.tracks[tid].mask_u8 for tid in track_list]
+            det_masks = [det.mask_u8 for det in detections]
+            iou_mat, area_trk_vec, area_det_vec = compute_label_overlap_iou(
+                trk_masks, det_masks, pad=self.cfg.bbox_pad, dilate_r=self.cfg.iou_dilate_r
+            )
 
             cost = np.full((T, D), np.inf, dtype=np.float32)
             merge_det_ids: Set[int] = set()
+            tid_to_row = {tid: idx for idx, tid in enumerate(track_list)}
+            merge_repr: Dict[int, int] = {}
 
-            # precompute merge candidates
+            # precompute merge candidates using fast IoU matrix
             for det_idx, det in enumerate(detections):
-                overlap_tracks: List[int] = []
-                areas_tr: List[float] = []
-                for tid in track_list:
-                    tr = self.tracks[tid]
-                    tb = expand_bbox(tr.bbox, self.cfg.bbox_pad, tr.mask_u8.shape)
-                    db = expand_bbox(det.bbox, self.cfg.bbox_pad, tr.mask_u8.shape)
-                    if not bboxes_intersect(tb, db):
-                        continue
-                    ubox = bbox_union(tb, db)
-                    iou = iou_u8_cropped(dilated_cache[tid], det.mask_u8, ubox)
-                    if iou >= self.cfg.merge_iou_min:
-                        overlap_tracks.append(tid)
-                        areas_tr.append(tr.area)
-                if overlap_tracks:
-                    max_area = max(areas_tr)
-                    if len(overlap_tracks) >= 2 or det.area > self.cfg.merge_area_ratio * max_area:
+                overlaps = [track_list[row] for row in range(T) if iou_mat[row, det_idx] >= self.cfg.merge_iou_min]
+                if overlaps:
+                    max_area = max(self.tracks[tid].area for tid in overlaps)
+                    if len(overlaps) >= 2 or det.area > self.cfg.merge_area_ratio * max_area:
                         merge_det_ids.add(det_idx)
-                        merge_clusters[det_idx] = overlap_tracks
+                        merge_clusters[det_idx] = overlaps
                         self.merge_events += 1
 
+            # representative update for merge detections
+            for det_idx, tids in merge_clusters.items():
+                if det_idx in unmatched_dets:
+                    rep_tid = max(
+                        tids,
+                        key=lambda tid: iou_mat[tid_to_row.get(tid, 0), det_idx] if tid in tid_to_row else 0.0,
+                    )
+                    merge_repr[det_idx] = rep_tid
+                    self._update_track_from_det(rep_tid, detections[det_idx], frame_idx)
+                    unmatched_tracks.discard(rep_tid)
+                    unmatched_dets.discard(det_idx)
+
             for row, tid in enumerate(track_list):
+                if tid not in unmatched_tracks:
+                    continue
                 tr = self.tracks[tid]
                 dt_pred = max(1, frame_idx - tr.last_frame)
                 cx_pred = tr.cx + tr.vx * dt_pred
@@ -547,31 +618,48 @@ class TrackerClassic:
                     seen.add(det_idx)
                     det = detections[det_idx]
                     dist = math.hypot(cx_pred - det.cx, cy_pred - det.cy)
-                    if dist > self.cfg.max_dist:
+                    if tr.state == "merged":
+                        if dist > self.cfg.split_reacquire_dist:
+                            continue
+                    elif dist > self.cfg.max_dist:
                         continue
                     tb = expand_bbox(tr.bbox, self.cfg.bbox_pad, tr.mask_u8.shape)
                     db = expand_bbox(det.bbox, self.cfg.bbox_pad, tr.mask_u8.shape)
-                    if not bboxes_intersect(tb, db):
-                        if tr.state == "merged" and dist <= self.cfg.split_reacquire_dist:
-                            pass
-                        else:
-                            continue
-                    col_pen = 0.0
+                    if not bboxes_intersect(tb, db) and tr.state != "merged":
+                        continue
+
+                    hue_bonus = 0.0
+                    hue_pen = 0.0
+                    dist_norm_hue = 0.0
                     if self.cfg.use_hue_bins and tr.hue_bin >= 0 and det.hue_bin >= 0:
                         bins = self.cfg.h_bins
                         d_bin = abs(tr.hue_bin - det.hue_bin)
                         d_bin = min(d_bin, bins - d_bin)
-                        dist_norm = d_bin / (bins / 2.0)
-                        if self.cfg.strict_color and dist_norm > self.cfg.hue_dist_max:
+                        dist_norm_hue = d_bin / (bins / 2.0)
+                        if self.cfg.strict_color and dist_norm_hue > self.cfg.hue_dist_max:
                             continue
-                        col_pen = self.cfg.w_col * dist_norm
+                        hue_pen = self.cfg.w_col * dist_norm_hue
+                        hue_bonus = self.cfg.w_col * max(0.0, 1.0 - dist_norm_hue)
+
                     ar = area_ratio(tr.area, det.area)
-                    c_val = self.cfg.w_dist * dist + self.cfg.w_area * ar + col_pen
-                    if self.cfg.w_iou != 0:
-                        ubox = bbox_union(tb, db)
-                        iou = iou_u8_cropped(dilated_cache[tid], det.mask_u8, ubox)
-                        c_val += self.cfg.w_iou * (1.0 - iou)
-                    cost[row, det_idx] = c_val
+                    iou_val = float(iou_mat[row, det_idx])
+
+                    if tr.state == "merged":
+                        dist_score = math.exp(
+                            -((dist ** 2) / (self.cfg.split_reacquire_dist ** 2 + 1e-6))
+                        )
+                        score = (
+                            self.cfg.w_iou * iou_val
+                            + self.cfg.w_dist * dist_score
+                            + hue_bonus
+                            - self.cfg.w_area * ar
+                        )
+                        cost[row, det_idx] = -score
+                    else:
+                        c_val = self.cfg.w_dist * dist + self.cfg.w_area * ar + hue_pen
+                        if self.cfg.w_iou != 0:
+                            c_val += self.cfg.w_iou * (1.0 - iou_val)
+                        cost[row, det_idx] = c_val
 
             if SCIPY_AVAILABLE:
                 finite_any = np.isfinite(cost).any()
@@ -622,6 +710,8 @@ class TrackerClassic:
             for tid in tids:
                 if tid not in self.tracks:
                     continue
+                if det_idx in merge_repr and tid == merge_repr[det_idx]:
+                    continue
                 tr = self.tracks[tid]
                 tr.state = "merged"
                 tr.merge_group_id = det_idx
@@ -661,11 +751,19 @@ class TrackerClassic:
                 last_area=det.area,
                 hue_bin=det.hue_bin,
             )
+            self.track_obs_count[tid] = 1
+            self.births += 1
 
         to_del: List[int] = []
         for tid in unmatched_tracks:
             tr = self.tracks[tid]
             tr.missed += 1
+            if tr.state == "merged":
+                if tr.missed > self.cfg.max_missed:
+                    to_del.append(tid)
+                else:
+                    self.tracks[tid] = tr
+                continue
             if tr.missed > self.cfg.max_missed:
                 to_del.append(tid)
             else:
@@ -677,7 +775,9 @@ class TrackerClassic:
             if meta:
                 meta.end = max(meta.end, self.tracks[tid].last_frame if tid in self.tracks else meta.end)
                 self.track_meta[tid] = meta
-            del self.tracks[tid]
+            if tid in self.tracks:
+                del self.tracks[tid]
+            self.deaths += 1
 
         masks_out: Dict[int, np.ndarray] = {}
         for tid, tr in self.tracks.items():
@@ -720,6 +820,10 @@ class TrackerClassic:
                 meta.last_cy = tr.cy
                 meta.last_area = tr.area
                 self.track_meta[tid] = meta
+
+    def fragmentation_proxy(self) -> int:
+        thr = self.cfg.fragmentation_len_thr
+        return sum(1 for _, cnt in self.track_obs_count.items() if cnt < thr)
 
 
 # --------------------------- Feature Extraction -------------------------- #
@@ -1176,6 +1280,19 @@ def run_pipeline(
         part_segments[frame_indices[t]] = masks_by_track
     tracker.finalize_meta()
 
+    if cfg.min_track_len_for_stitch and cfg.min_track_len_for_stitch > 1:
+        short_ids = {
+            tid for tid, cnt in tracker.track_obs_count.items() if cnt < cfg.min_track_len_for_stitch
+        }
+        if short_ids:
+            for t, masks in part_segments.items():
+                for sid in list(masks.keys()):
+                    if sid in short_ids:
+                        masks.pop(sid, None)
+            for sid in short_ids:
+                tracker.track_meta.pop(sid, None)
+                tracker.track_obs_count.pop(sid, None)
+
     id_remap: Dict[int, int] = {}
     initial_ids = len(tracker.track_meta)
     if cfg.enable_stitching:
@@ -1288,11 +1405,19 @@ def run_pipeline(
             "stitch_max_gap": cfg.stitch_max_gap,
             "stitch_max_dist": cfg.stitch_max_dist,
             "stitch_hue_max": cfg.stitch_hue_max,
+            "teleport_thr_mult": cfg.teleport_thr_mult,
+            "fragmentation_len_thr": cfg.fragmentation_len_thr,
+            "min_track_len_for_stitch": cfg.min_track_len_for_stitch,
             "stats": {
                 "track_ids_before_stitch": initial_ids,
                 "track_ids_after_stitch": stitched_ids,
                 "merge_events": tracker.merge_events,
                 "split_reacquire": tracker.split_reacquire_events,
+                "births": tracker.births,
+                "deaths": tracker.deaths,
+                "id_switch_proxy": tracker.teleport_events,
+                "fragmentation_proxy": tracker.fragmentation_proxy(),
+                "fragmentation_len_thr": cfg.fragmentation_len_thr,
             },
         },
     }
@@ -1362,6 +1487,9 @@ def main():
     parser.add_argument("--stitch_max_gap", type=int, default=Config.stitch_max_gap)
     parser.add_argument("--stitch_max_dist", type=float, default=Config.stitch_max_dist)
     parser.add_argument("--stitch_hue_max", type=int, default=Config.stitch_hue_max)
+    parser.add_argument("--teleport_thr_mult", type=float, default=Config.teleport_thr_mult)
+    parser.add_argument("--fragmentation_len_thr", type=int, default=Config.fragmentation_len_thr)
+    parser.add_argument("--min_track_len_for_stitch", type=int, default=Config.min_track_len_for_stitch)
     args = parser.parse_args()
 
     cfg = Config(
@@ -1399,6 +1527,9 @@ def main():
         stitch_max_gap=args.stitch_max_gap,
         stitch_max_dist=args.stitch_max_dist,
         stitch_hue_max=args.stitch_hue_max,
+        teleport_thr_mult=args.teleport_thr_mult,
+        fragmentation_len_thr=args.fragmentation_len_thr,
+        min_track_len_for_stitch=args.min_track_len_for_stitch,
     )
     resize = _parse_resize(args.resize)
     run_pipeline(
