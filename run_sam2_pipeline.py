@@ -253,9 +253,8 @@ class TrackerSAM2HF:
             raise RuntimeError("Session not initialized.")
         if not masks:
             return []
-        arr = np.stack([m.astype(np.float32) for m in masks], axis=0)  # (N,H,W)
-        arr = arr[:, None, :, :]  # (N,1,H,W) for HF mask prompts
-        num = arr.shape[0]
+        mask_list = [m.astype(np.float32) for m in masks]  # list of (H,W)
+        num = len(mask_list)
         obj_ids = list(range(self.next_obj_id, self.next_obj_id + num))
         self.next_obj_id += num
         self.obj_ids.extend(obj_ids)
@@ -272,11 +271,11 @@ class TrackerSAM2HF:
             kwargs["input_obj_ids"] = obj_ids
 
         if "input_masks" in self._add_inputs_sig.parameters:
-            kwargs["input_masks"] = arr
+            kwargs["input_masks"] = mask_list
         elif "mask_inputs" in self._add_inputs_sig.parameters:
-            kwargs["mask_inputs"] = arr
+            kwargs["mask_inputs"] = mask_list
         elif "masks" in self._add_inputs_sig.parameters:
-            kwargs["masks"] = arr
+            kwargs["masks"] = mask_list
 
         self.processor.add_inputs_to_inference_session(self.session, **kwargs)
         return obj_ids
