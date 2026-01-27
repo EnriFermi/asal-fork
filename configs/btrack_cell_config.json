@@ -1,24 +1,29 @@
 {
-  "MotionModel": {
+  "motion_model": {
     "name": "Cell",
     "dt": 1.0,
-    "process_noise": [150.0, 150.0, 0.05],
-    "measurement_noise": [1.0, 1.0, 1.0],
-    "acceleration": 200.0,
-    "max_speed": 80.0,
-    "prob_not_assign": 0.05,
+    "measurements": ["x", "y"],
+    "states": ["x", "y", "vx", "vy"],
+    "process_noise": [50.0, 50.0, 10.0, 10.0],
+    "measurement_noise": [1.0, 1.0],
+    "initial_state_uncertainty": [5.0, 5.0, 20.0, 20.0],
+    "max_lost": 5,
+    "prob_not_assign": 0.01,
     "prob_detection": 0.98,
     "prob_init": 0.0005
   },
-  "HypothesisModel": {
+  "hypothesis_model": {
     "name": "Cell",
     "lambda_birth": 0.2,
     "lambda_death": 0.2,
-    "lambda_branch": 0.02,
-    "lambda_fusion": 0.0,
-    "P_D": 0.98,
-    "P_F": 0.01,
+    "lambda_transition": 0.3,
+    "lambda_division": 0.01,
+    "division_threshold": 0.9,
     "min_length": 2,
-    "max_length": 50
+    "max_length": 80
+  },
+  "tracker": {
+    "max_search_radius": 60.0,
+    "max_lost": 5
   }
 }

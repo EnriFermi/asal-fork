@@ -11,6 +11,7 @@ import argparse
 import json
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Set
 
@@ -23,6 +24,53 @@ try:
     SCIPY_AVAILABLE = True
 except Exception:
     SCIPY_AVAILABLE = False
+
+
+# --------------------------- Timing utils ------------------------------- #
+class StageTimers:
+    def __init__(self):
+        self.data: Dict[str, List[float]] = {}
+
+    def record(self, name: str, dt: float) -> None:
+        self.data.setdefault(name, []).append(float(dt))
+
+    def timeit(self, name: str):
+        start = time.perf_counter()
+
+        class _Ctx:
+            def __enter__(_self):
+                return _self
+
+            def __exit__(_self, exc_type, exc, tb):
+                self.record(name, time.perf_counter() - start)
+                return False
+
+        return _Ctx()
+
+    def summary(self, order: Optional[List[str]] = None) -> List[Tuple[str, int, float, float, float]]:
+        keys = order or list(self.data.keys())
+        out: List[Tuple[str, int, float, float, float]] = []
+        for k in keys:
+            vals = self.data.get(k, [])
+            if not vals:
+                continue
+            total = float(sum(vals))
+            mean = total / len(vals)
+            p95 = float(np.percentile(vals, 95)) if len(vals) > 1 else vals[0]
+            out.append((k, len(vals), total, mean, p95))
+        return out
+
+
+class _NullContext:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+def _nullcontext():
+    return _NullContext()
 
 
 # --------------------------- Config ------------------------------------- #
@@ -96,6 +144,7 @@ class VideoLoader:
         stride: int = 1,
         max_frames: Optional[int] = None,
         resize: Optional[Tuple[int, int]] = None,
+        timers: Optional[StageTimers] = None,
     ) -> List[Image.Image]:
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
@@ -103,6 +152,7 @@ class VideoLoader:
         frames: List[Image.Image] = []
         idx = 0
         while True:
+            t0 = time.perf_counter()
             ok, frame_bgr = cap.read()
             if not ok:
                 break
@@ -111,6 +161,8 @@ class VideoLoader:
                     frame_bgr = cv2.resize(frame_bgr, resize, interpolation=cv2.INTER_AREA)
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 frames.append(Image.fromarray(frame_rgb))
+                if timers is not None:
+                    timers.record("decode", time.perf_counter() - t0)
                 if max_frames is not None and len(frames) >= max_frames:
                     break
             idx += 1
@@ -129,11 +181,15 @@ class Detection:
     cy: float
     bbox: Tuple[int, int, int, int]
     seed_track_id: Optional[int] = None
+    dilated_mask: Optional[np.ndarray] = None
+    dilated_bbox: Optional[Tuple[int, int, int, int]] = None
 
 
 class MaskGenerator:
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self.marker_split_calls = 0
+        self.marker_split_area_sum = 0.0
 
     def generate_detections(
         self,
@@ -142,137 +198,196 @@ class MaskGenerator:
         seeds: Optional[List[Tuple[int, float, float]]] = None,
         use_marker_split: bool = False,
         seed_radius: int = 3,
+        timers: Optional[StageTimers] = None,
     ) -> Tuple[List[Detection], Dict[int, Detection]]:
+        t0 = time.perf_counter()
         hsv = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2HSV)
         h = hsv[:, :, 0]
         v = hsv[:, :, 2]
         strong = v > v_thr_hi
+        if timers is not None:
+            timers.record("hsv", time.perf_counter() - t0)
         if not np.any(strong):
             return [], {}
+
+        use_bins = self.cfg.use_hue_bins
+        h_bins_map = (h.astype(np.int32) * self.cfg.h_bins) // 180 if use_bins else None
+
+        t_cc = time.perf_counter()
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            strong.astype(np.uint8), connectivity=8
+        )
+        if timers is not None:
+            timers.record("cc", time.perf_counter() - t_cc)
+
+        seeds_by_comp: Dict[int, List[Tuple[int, float, float]]] = {}
         if use_marker_split and seeds:
-            return self._marker_split(h, v, strong, seeds, seed_radius)
+            hgt, wdt = strong.shape
+            for tid, cx, cy in seeds:
+                xi = int(round(cx))
+                yi = int(round(cy))
+                if xi < 0 or xi >= wdt or yi < 0 or yi >= hgt:
+                    continue
+                if not strong[yi, xi]:
+                    continue
+                comp_id = int(labels[yi, xi])
+                if comp_id <= 0:
+                    continue
+                seeds_by_comp.setdefault(comp_id, []).append((tid, cx, cy))
 
         detections: List[Detection] = []
-        use_bins = self.cfg.use_hue_bins
-        if use_bins:
-            h_bin = (h.astype(np.int32) * self.cfg.h_bins) // 180
-            for b in range(self.cfg.h_bins):
-                mask_b = strong & (h_bin == b)
-                detections.extend(self._components(mask_b, v, h, b))
-        else:
-            detections.extend(self._components(strong, v, h, -1))
-        return detections, {}
-
-    def _mask_to_detection(
-        self,
-        mask_bin: np.ndarray,
-        v: np.ndarray,
-        h: np.ndarray,
-        hue_bin_override: Optional[int] = None,
-    ) -> Optional[Detection]:
-        if not np.any(mask_bin):
-            return None
-        area = int(mask_bin.sum())
-        if area < self.cfg.min_area:
-            return None
-        mass = float(v[mask_bin].sum())
-        if mass < self.cfg.min_mass:
-            return None
-        ys, xs = np.where(mask_bin)
-        cx = float(xs.mean())
-        cy = float(ys.mean())
-        x0 = int(xs.min())
-        x1 = int(xs.max())
-        y0 = int(ys.min())
-        y1 = int(ys.max())
-        hue_bin = -1
-        if self.cfg.use_hue_bins:
-            if hue_bin_override is not None and hue_bin_override >= 0:
-                hue_bin = hue_bin_override
-            else:
-                bins = (h.astype(np.int32) * self.cfg.h_bins) // 180
-                vals = bins[mask_bin]
-                if vals.size > 0:
-                    hue_bin = int(np.bincount(vals.flatten(), minlength=self.cfg.h_bins).argmax())
-        return Detection(
-            mask_u8=mask_bin.astype(np.uint8),
-            hue_bin=hue_bin,
-            area=area,
-            mass=mass,
-            cx=cx,
-            cy=cy,
-            bbox=(x0, y0, x1, y1),
-        )
-
-    def _components(
-        self, mask_bin: np.ndarray, v: np.ndarray, h: np.ndarray, hue_bin: int
-    ) -> List[Detection]:
-        if not np.any(mask_bin):
-            return []
-        num_labels, labels, _, _ = cv2.connectedComponentsWithStats(
-            mask_bin.astype(np.uint8), connectivity=8
-        )
-        outs: List[Detection] = []
+        seeded_out: Dict[int, Detection] = {}
         for comp_id in range(1, num_labels):
-            comp_mask = labels == comp_id
-            det = self._mask_to_detection(comp_mask, v, h, hue_bin_override=hue_bin if hue_bin >= 0 else None)
-            if det is not None:
-                outs.append(det)
-        return outs
+            area = int(stats[comp_id, cv2.CC_STAT_AREA])
+            if area < self.cfg.min_area:
+                continue
+            x0 = int(stats[comp_id, cv2.CC_STAT_LEFT])
+            y0 = int(stats[comp_id, cv2.CC_STAT_TOP])
+            w = int(stats[comp_id, cv2.CC_STAT_WIDTH])
+            hgt = int(stats[comp_id, cv2.CC_STAT_HEIGHT])
+            x1 = x0 + w - 1
+            y1 = y0 + hgt - 1
+            roi_mask = labels[y0 : y1 + 1, x0 : x1 + 1] == comp_id
+            mass = float(v[y0 : y1 + 1, x0 : x1 + 1][roi_mask].sum())
+            if mass < self.cfg.min_mass:
+                continue
 
-    def _marker_split(
+            seeds_here = seeds_by_comp.get(comp_id)
+            if use_marker_split and seeds_here:
+                with timers.timeit("marker_split") if timers is not None else _nullcontext():
+                    dets_split, seeded_split = self._marker_split_component(
+                        roi_mask,
+                        x0,
+                        y0,
+                        v,
+                        h,
+                        h_bins_map,
+                        seeds_here,
+                        seed_radius,
+                    )
+                detections.extend(dets_split)
+                seeded_out.update(seeded_split)
+                continue
+
+            hue_bin = -1
+            if use_bins and h_bins_map is not None:
+                vals = h_bins_map[y0 : y1 + 1, x0 : x1 + 1][roi_mask]
+                if vals.size > 0:
+                    hue_bin = int(np.bincount(vals, minlength=self.cfg.h_bins).argmax())
+            cx = float(centroids[comp_id, 0])
+            cy = float(centroids[comp_id, 1])
+            mask_full = np.zeros_like(strong, dtype=np.uint8)
+            mask_full[y0 : y1 + 1, x0 : x1 + 1][roi_mask] = 1
+            detections.append(
+                Detection(
+                    mask_u8=mask_full,
+                    hue_bin=hue_bin,
+                    area=area,
+                    mass=mass,
+                    cx=cx,
+                    cy=cy,
+                    bbox=(x0, y0, x1, y1),
+                )
+            )
+        return detections, seeded_out
+
+    def _marker_split_component(
         self,
-        h: np.ndarray,
+        roi_mask: np.ndarray,
+        x0: int,
+        y0: int,
         v: np.ndarray,
-        strong: np.ndarray,
+        h: np.ndarray,
+        h_bins_map: Optional[np.ndarray],
         seeds: List[Tuple[int, float, float]],
         seed_radius: int,
     ) -> Tuple[List[Detection], Dict[int, Detection]]:
-        strong_u8 = strong.astype(np.uint8)
-        hgt, wdt = strong.shape
-        markers = np.zeros_like(strong_u8, dtype=np.int32)
+        self.marker_split_calls += 1
+        self.marker_split_area_sum += float(roi_mask.size)
+        markers = np.zeros_like(roi_mask, dtype=np.int32)
         seed_ids: List[int] = []
         for tid, cx, cy in seeds:
-            xi = int(round(cx))
-            yi = int(round(cy))
-            if xi < 0 or xi >= wdt or yi < 0 or yi >= hgt:
+            xi = int(round(cx)) - x0
+            yi = int(round(cy)) - y0
+            if xi < 0 or yi < 0 or xi >= roi_mask.shape[1] or yi >= roi_mask.shape[0]:
+                continue
+            if not roi_mask[yi, xi]:
                 continue
             cv2.circle(markers, (xi, yi), max(1, seed_radius), int(tid), -1)
             seed_ids.append(int(tid))
 
-        num_labels, comp_labels = cv2.connectedComponents(strong_u8)
-        next_label = (max(seed_ids) + 1) if seed_ids else 1
-        for comp_id in range(1, num_labels):
-            comp_mask = comp_labels == comp_id
-            if np.any(markers[comp_mask] > 0):
-                continue
-            markers[comp_mask] = next_label
-            next_label += 1
+        if not seed_ids:
+            return [], {}
 
-        dist = cv2.distanceTransform(strong_u8, cv2.DIST_L2, 5)
+        dist = cv2.distanceTransform(roi_mask.astype(np.uint8), cv2.DIST_L2, 5)
         elevation = cv2.normalize(-dist, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         elevation_color = cv2.cvtColor(elevation, cv2.COLOR_GRAY2BGR)
         markers_ws = markers.copy()
         cv2.watershed(elevation_color, markers_ws)
-        markers_ws[~strong] = 0
+        markers_ws[~roi_mask] = 0
 
         detections: List[Detection] = []
         seeded: Dict[int, Detection] = {}
-        seed_set = set(seed_ids)
-        labels = np.unique(markers_ws)
-        for lbl in labels:
+        labels_ws = np.unique(markers_ws)
+        for lbl in labels_ws:
             if lbl <= 0:
                 continue
             region = markers_ws == lbl
-            det = self._mask_to_detection(region, v, h, None)
+            det = self._detection_from_roi(region, x0, y0, v, h, h_bins_map, hue_bin_override=None)
             if det is None:
                 continue
-            if lbl in seed_set:
+            if lbl in seed_ids:
                 det.seed_track_id = int(lbl)
                 seeded[int(lbl)] = det
             else:
                 detections.append(det)
         return detections, seeded
+
+    def _detection_from_roi(
+        self,
+        roi_mask: np.ndarray,
+        x0: int,
+        y0: int,
+        v: np.ndarray,
+        h: np.ndarray,
+        h_bins_map: Optional[np.ndarray],
+        hue_bin_override: Optional[int] = None,
+    ) -> Optional[Detection]:
+        area = int(roi_mask.sum())
+        if area < self.cfg.min_area:
+            return None
+        v_roi = v[y0 : y0 + roi_mask.shape[0], x0 : x0 + roi_mask.shape[1]]
+        mass = float(v_roi[roi_mask].sum())
+        if mass < self.cfg.min_mass:
+            return None
+        ys, xs = np.nonzero(roi_mask)
+        if xs.size == 0:
+            return None
+        cx = float(xs.mean() + x0)
+        cy = float(ys.mean() + y0)
+        x_min = int(xs.min() + x0)
+        x_max = int(xs.max() + x0)
+        y_min = int(ys.min() + y0)
+        y_max = int(ys.max() + y0)
+        hue_bin = -1
+        if self.cfg.use_hue_bins:
+            if hue_bin_override is not None and hue_bin_override >= 0:
+                hue_bin = int(hue_bin_override)
+            elif h_bins_map is not None:
+                vals = h_bins_map[y0 : y0 + roi_mask.shape[0], x0 : x0 + roi_mask.shape[1]][roi_mask]
+                if vals.size > 0:
+                    hue_bin = int(np.bincount(vals, minlength=self.cfg.h_bins).argmax())
+        mask_full = np.zeros_like(v, dtype=np.uint8)
+        mask_full[y0 : y0 + roi_mask.shape[0], x0 : x0 + roi_mask.shape[1]][roi_mask] = 1
+        return Detection(
+            mask_u8=mask_full,
+            hue_bin=hue_bin,
+            area=area,
+            mass=mass,
+            cx=cx,
+            cy=cy,
+            bbox=(x_min, y_min, x_max, y_max),
+        )
 
 
 # --------------------------- Metrics ------------------------------------- #
@@ -442,6 +557,8 @@ class Track:
     bbox: Tuple[int, int, int, int]
     state: str = "active"  # active | merged
     merge_group_id: Optional[int] = None
+    dilated_mask: Optional[np.ndarray] = None
+    dilated_bbox: Optional[Tuple[int, int, int, int]] = None
 
 
 @dataclass
@@ -470,6 +587,7 @@ class TrackerClassic:
         self.teleport_events: int = 0
         self.track_obs_count: Dict[int, int] = {}
         self.teleport_thr: float = cfg.max_dist * cfg.teleport_thr_mult
+        self.candidate_pairs_evaluated: int = 0
 
     def predict_seeds(self, frame_idx: int) -> List[Tuple[int, float, float]]:
         seeds: List[Tuple[int, float, float]] = []
@@ -482,6 +600,14 @@ class TrackerClassic:
             seeds.append((tid, cx_pred, cy_pred))
         return seeds
 
+    def _dilated_mask_bbox(
+        self, mask_u8: np.ndarray, bbox: Tuple[int, int, int, int]
+    ) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+        if self.cfg.iou_dilate_r <= 0:
+            return mask_u8, bbox
+        dil = dilate_mask(mask_u8, self.cfg.iou_dilate_r)
+        return dil, bbox_from_mask(dil)
+
     def _update_track_from_det(self, tid: int, det: Detection, frame_idx: int) -> None:
         old = self.tracks[tid]
         dt_obs = max(1, frame_idx - old.last_frame)
@@ -491,6 +617,7 @@ class TrackerClassic:
         if jump > self.teleport_thr:
             self.teleport_events += 1
         was_merged = old.state == "merged"
+        dilated_mask, dilated_bbox = self._dilated_mask_bbox(det.mask_u8, det.bbox)
         self.tracks[tid] = Track(
             track_id=tid,
             mask_u8=det.mask_u8,
@@ -505,6 +632,8 @@ class TrackerClassic:
             bbox=det.bbox,
             state="active",
             merge_group_id=None,
+            dilated_mask=dilated_mask,
+            dilated_bbox=dilated_bbox,
         )
         if was_merged:
             self.split_reacquire_events += 1
@@ -535,6 +664,7 @@ class TrackerClassic:
         frame_idx: int,
         detections: List[Detection],
         seeded: Optional[Dict[int, Detection]] = None,
+        timers: Optional[StageTimers] = None,
     ) -> Dict[int, np.ndarray]:
         seeded = seeded or {}
         track_ids_all = list(self.tracks.keys())
@@ -556,127 +686,179 @@ class TrackerClassic:
         D = len(detections)
         matches: List[Tuple[int, int]] = []
         merge_clusters: Dict[int, List[int]] = {}
+        merge_repr: Dict[int, int] = {}
         if T > 0 and D > 0:
-            # spatial grid on detections
             cell = max(1.0, self.cfg.max_dist)
-            grid: Dict[Tuple[int, int], List[int]] = {}
+            det_grid: Dict[Tuple[int, int], List[int]] = {}
             for idx, det in enumerate(detections):
                 gx = int(det.cx // cell)
                 gy = int(det.cy // cell)
-                grid.setdefault((gx, gy), []).append(idx)
+                det_grid.setdefault((gx, gy), []).append(idx)
 
-            trk_masks = [self.tracks[tid].mask_u8 for tid in track_list]
-            det_masks = [det.mask_u8 for det in detections]
-            iou_mat, area_trk_vec, area_det_vec = compute_label_overlap_iou(
-                trk_masks, det_masks, pad=self.cfg.bbox_pad, dilate_r=self.cfg.iou_dilate_r
-            )
+            track_grid: Dict[Tuple[int, int], List[int]] = {}
+            for tid in track_list:
+                tr = self.tracks[tid]
+                gx = int(tr.cx // cell)
+                gy = int(tr.cy // cell)
+                track_grid.setdefault((gx, gy), []).append(tid)
 
             cost = np.full((T, D), np.inf, dtype=np.float32)
             merge_det_ids: Set[int] = set()
             tid_to_row = {tid: idx for idx, tid in enumerate(track_list)}
             merge_repr: Dict[int, int] = {}
+            iou_cache: Dict[Tuple[int, int], float] = {}
 
-            # precompute merge candidates using fast IoU matrix
-            for det_idx, det in enumerate(detections):
-                overlaps = [track_list[row] for row in range(T) if iou_mat[row, det_idx] >= self.cfg.merge_iou_min]
-                if overlaps:
-                    max_area = max(self.tracks[tid].area for tid in overlaps)
-                    if len(overlaps) >= 2 or det.area > self.cfg.merge_area_ratio * max_area:
-                        merge_det_ids.add(det_idx)
-                        merge_clusters[det_idx] = overlaps
-                        self.merge_events += 1
+            def _det_mask(idx: int) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+                det = detections[idx]
+                if det.dilated_mask is None and self.cfg.iou_dilate_r > 0:
+                    det.dilated_mask = dilate_mask(det.mask_u8, self.cfg.iou_dilate_r)
+                    det.dilated_bbox = bbox_from_mask(det.dilated_mask)
+                if det.dilated_bbox is None:
+                    det.dilated_bbox = det.bbox
+                mask = det.dilated_mask if self.cfg.iou_dilate_r > 0 else det.mask_u8
+                return mask, det.dilated_bbox
 
-            # representative update for merge detections
-            for det_idx, tids in merge_clusters.items():
-                if det_idx in unmatched_dets:
-                    rep_tid = max(
-                        tids,
-                        key=lambda tid: iou_mat[tid_to_row.get(tid, 0), det_idx] if tid in tid_to_row else 0.0,
-                    )
+            def _track_mask(tid: int) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+                tr = self.tracks[tid]
+                if tr.dilated_mask is None or tr.dilated_bbox is None:
+                    tr.dilated_mask, tr.dilated_bbox = self._dilated_mask_bbox(tr.mask_u8, tr.bbox)
+                    self.tracks[tid] = tr
+                mask = tr.dilated_mask if self.cfg.iou_dilate_r > 0 else tr.mask_u8
+                bbox = tr.dilated_bbox if tr.dilated_bbox is not None else tr.bbox
+                return mask, bbox
+
+            def _pair_iou(tid: int, det_idx: int) -> float:
+                key = (tid, det_idx)
+                if key in iou_cache:
+                    return iou_cache[key]
+                t_mask, t_bbox = _track_mask(tid)
+                d_mask, d_bbox = _det_mask(det_idx)
+                tb = expand_bbox(t_bbox, self.cfg.bbox_pad, t_mask.shape)
+                db = expand_bbox(d_bbox, self.cfg.bbox_pad, t_mask.shape)
+                if not bboxes_intersect(tb, db):
+                    iou_val = 0.0
+                else:
+                    iou_val = iou_u8_cropped(t_mask, d_mask, bbox_union(tb, db))
+                iou_cache[key] = iou_val
+                return iou_val
+
+            with timers.timeit("track_assoc") if timers is not None else _nullcontext():
+                for det_idx, det in enumerate(detections):
+                    gx = int(det.cx // cell)
+                    gy = int(det.cy // cell)
+                    cand_t: List[int] = []
+                    for dx in (-1, 0, 1):
+                        for dy in (-1, 0, 1):
+                            cand_t.extend(track_grid.get((gx + dx, gy + dy), []))
+                    overlaps: List[int] = []
+                    for tid in cand_t:
+                        iou_val = _pair_iou(tid, det_idx)
+                        if iou_val >= self.cfg.merge_iou_min:
+                            overlaps.append(tid)
+                    if overlaps:
+                        max_area = max(self.tracks[tid].area for tid in overlaps)
+                        if len(overlaps) >= 2 or det.area > self.cfg.merge_area_ratio * max_area:
+                            merge_det_ids.add(det_idx)
+                            merge_clusters[det_idx] = overlaps
+                            self.merge_events += 1
+
+                for det_idx, tids in merge_clusters.items():
+                    if det_idx not in unmatched_dets:
+                        continue
+                    rep_tid = max(tids, key=lambda tid: _pair_iou(tid, det_idx))
                     merge_repr[det_idx] = rep_tid
                     self._update_track_from_det(rep_tid, detections[det_idx], frame_idx)
                     unmatched_tracks.discard(rep_tid)
                     unmatched_dets.discard(det_idx)
 
-            for row, tid in enumerate(track_list):
-                if tid not in unmatched_tracks:
-                    continue
-                tr = self.tracks[tid]
-                dt_pred = max(1, frame_idx - tr.last_frame)
-                cx_pred = tr.cx + tr.vx * dt_pred
-                cy_pred = tr.cy + tr.vy * dt_pred
-                cell_x = int(cx_pred // cell)
-                cell_y = int(cy_pred // cell)
-                candidates: List[int] = []
-                for dx in (-1, 0, 1):
-                    for dy in (-1, 0, 1):
-                        candidates.extend(grid.get((cell_x + dx, cell_y + dy), []))
-                seen: Set[int] = set()
-                for det_idx in candidates:
-                    if det_idx in seen or det_idx in merge_clusters:
+                for row, tid in enumerate(track_list):
+                    if tid not in unmatched_tracks:
                         continue
-                    seen.add(det_idx)
-                    det = detections[det_idx]
-                    dist = math.hypot(cx_pred - det.cx, cy_pred - det.cy)
-                    if tr.state == "merged":
-                        if dist > self.cfg.split_reacquire_dist:
+                    tr = self.tracks[tid]
+                    dt_pred = max(1, frame_idx - tr.last_frame)
+                    cx_pred = tr.cx + tr.vx * dt_pred
+                    cy_pred = tr.cy + tr.vy * dt_pred
+                    cell_x = int(cx_pred // cell)
+                    cell_y = int(cy_pred // cell)
+                    candidates: List[int] = []
+                    for dx in (-1, 0, 1):
+                        for dy in (-1, 0, 1):
+                            candidates.extend(det_grid.get((cell_x + dx, cell_y + dy), []))
+                    seen: Set[int] = set()
+                    for det_idx in candidates:
+                        if det_idx in seen or det_idx in merge_clusters:
                             continue
-                    elif dist > self.cfg.max_dist:
-                        continue
-                    tb = expand_bbox(tr.bbox, self.cfg.bbox_pad, tr.mask_u8.shape)
-                    db = expand_bbox(det.bbox, self.cfg.bbox_pad, tr.mask_u8.shape)
-                    if not bboxes_intersect(tb, db) and tr.state != "merged":
-                        continue
-
-                    hue_bonus = 0.0
-                    hue_pen = 0.0
-                    dist_norm_hue = 0.0
-                    if self.cfg.use_hue_bins and tr.hue_bin >= 0 and det.hue_bin >= 0:
-                        bins = self.cfg.h_bins
-                        d_bin = abs(tr.hue_bin - det.hue_bin)
-                        d_bin = min(d_bin, bins - d_bin)
-                        dist_norm_hue = d_bin / (bins / 2.0)
-                        if self.cfg.strict_color and dist_norm_hue > self.cfg.hue_dist_max:
+                        seen.add(det_idx)
+                        det = detections[det_idx]
+                        dist = math.hypot(cx_pred - det.cx, cy_pred - det.cy)
+                        if tr.state == "merged":
+                            if dist > self.cfg.split_reacquire_dist:
+                                continue
+                        elif dist > self.cfg.max_dist:
                             continue
-                        hue_pen = self.cfg.w_col * dist_norm_hue
-                        hue_bonus = self.cfg.w_col * max(0.0, 1.0 - dist_norm_hue)
+                        iou_val = _pair_iou(tid, det_idx)
+                        if iou_val <= 0.0 and tr.state != "merged":
+                            continue
 
-                    ar = area_ratio(tr.area, det.area)
-                    iou_val = float(iou_mat[row, det_idx])
+                        hue_bonus = 0.0
+                        hue_pen = 0.0
+                        if self.cfg.use_hue_bins and tr.hue_bin >= 0 and det.hue_bin >= 0:
+                            bins = self.cfg.h_bins
+                            d_bin = abs(tr.hue_bin - det.hue_bin)
+                            d_bin = min(d_bin, bins - d_bin)
+                            dist_norm_hue = d_bin / (bins / 2.0)
+                            if self.cfg.strict_color and dist_norm_hue > self.cfg.hue_dist_max:
+                                continue
+                            hue_pen = self.cfg.w_col * dist_norm_hue
+                            hue_bonus = self.cfg.w_col * max(0.0, 1.0 - dist_norm_hue)
 
-                    if tr.state == "merged":
-                        dist_score = math.exp(
-                            -((dist ** 2) / (self.cfg.split_reacquire_dist ** 2 + 1e-6))
-                        )
-                        score = (
-                            self.cfg.w_iou * iou_val
-                            + self.cfg.w_dist * dist_score
-                            + hue_bonus
-                            - self.cfg.w_area * ar
-                        )
-                        cost[row, det_idx] = -score
-                    else:
-                        c_val = self.cfg.w_dist * dist + self.cfg.w_area * ar + hue_pen
-                        if self.cfg.w_iou != 0:
-                            c_val += self.cfg.w_iou * (1.0 - iou_val)
-                        cost[row, det_idx] = c_val
+                        ar = area_ratio(tr.area, det.area)
+                        self.candidate_pairs_evaluated += 1
 
-            if SCIPY_AVAILABLE:
-                finite_any = np.isfinite(cost).any()
-                if finite_any:
-                    try:
-                        cost_f = cost.copy()
-                        cost_f[~np.isfinite(cost_f)] = 1e9
-                        row_ind, col_ind = linear_sum_assignment(cost_f)
-                        for r, c in zip(row_ind, col_ind):
-                            if np.isfinite(cost[r, c]):
-                                matches.append((r, c))
-                    except ValueError:
-                        finite_any = False
-                if not finite_any:
-                    pairs = [
-                        (i, j, cost[i, j]) for i in range(T) for j in range(D) if np.isfinite(cost[i, j])
-                    ]
+                        if tr.state == "merged":
+                            dist_score = math.exp(
+                                -((dist ** 2) / (self.cfg.split_reacquire_dist ** 2 + 1e-6))
+                            )
+                            score = (
+                                self.cfg.w_iou * iou_val
+                                + self.cfg.w_dist * dist_score
+                                + hue_bonus
+                                - self.cfg.w_area * ar
+                            )
+                            cost[row, det_idx] = -score
+                        else:
+                            c_val = self.cfg.w_dist * dist + self.cfg.w_area * ar + hue_pen
+                            if self.cfg.w_iou != 0:
+                                c_val += self.cfg.w_iou * (1.0 - iou_val)
+                            cost[row, det_idx] = c_val
+
+                if SCIPY_AVAILABLE:
+                    finite_any = np.isfinite(cost).any()
+                    if finite_any:
+                        try:
+                            cost_f = cost.copy()
+                            cost_f[~np.isfinite(cost_f)] = 1e9
+                            row_ind, col_ind = linear_sum_assignment(cost_f)
+                            for r, c in zip(row_ind, col_ind):
+                                if np.isfinite(cost[r, c]):
+                                    matches.append((r, c))
+                        except ValueError:
+                            finite_any = False
+                    if not finite_any:
+                        pairs = [
+                            (i, j, cost[i, j]) for i in range(T) for j in range(D) if np.isfinite(cost[i, j])
+                        ]
+                        pairs.sort(key=lambda x: x[2])
+                        used_t: Set[int] = set()
+                        used_d: Set[int] = set()
+                        for i, j, _ in pairs:
+                            if i in used_t or j in used_d:
+                                continue
+                            matches.append((i, j))
+                            used_t.add(i)
+                            used_d.add(j)
+                else:
+                    pairs = [(i, j, cost[i, j]) for i in range(T) for j in range(D) if np.isfinite(cost[i, j])]
                     pairs.sort(key=lambda x: x[2])
                     used_t: Set[int] = set()
                     used_d: Set[int] = set()
@@ -686,17 +868,6 @@ class TrackerClassic:
                         matches.append((i, j))
                         used_t.add(i)
                         used_d.add(j)
-            else:
-                pairs = [(i, j, cost[i, j]) for i in range(T) for j in range(D) if np.isfinite(cost[i, j])]
-                pairs.sort(key=lambda x: x[2])
-                used_t: Set[int] = set()
-                used_d: Set[int] = set()
-                for i, j, _ in pairs:
-                    if i in used_t or j in used_d:
-                        continue
-                    matches.append((i, j))
-                    used_t.add(i)
-                    used_d.add(j)
 
         for row, col in matches:
             tid = track_list[row]
@@ -725,6 +896,7 @@ class TrackerClassic:
             det = detections[j]
             tid = self.next_id
             self.next_id += 1
+            dilated_mask, dilated_bbox = self._dilated_mask_bbox(det.mask_u8, det.bbox)
             self.tracks[tid] = Track(
                 track_id=tid,
                 mask_u8=det.mask_u8,
@@ -739,6 +911,8 @@ class TrackerClassic:
                 bbox=det.bbox,
                 state="active",
                 merge_group_id=None,
+                dilated_mask=dilated_mask,
+                dilated_bbox=dilated_bbox,
             )
             self.track_meta[tid] = TrackMeta(
                 start=frame_idx,
@@ -784,6 +958,7 @@ class TrackerClassic:
             if tr.missed == 0 and tr.last_frame == frame_idx:
                 masks_out[tid] = tr.mask_u8.astype(np.uint8)
             elif tr.state == "merged":
+                t_warp = time.perf_counter()
                 dt_shift = max(1, frame_idx - tr.last_frame)
                 dx = int(round(tr.vx * dt_shift))
                 dy = int(round(tr.vy * dt_shift))
@@ -796,7 +971,10 @@ class TrackerClassic:
                     borderValue=0,
                 )
                 masks_out[tid] = shifted
+                if timers is not None:
+                    timers.record("mask_warp", time.perf_counter() - t_warp)
             elif tr.missed > 0 and tr.missed <= self.cfg.max_missed:
+                t_warp = time.perf_counter()
                 dt_shift = min(tr.missed, 3)
                 dx = int(round(tr.vx * dt_shift))
                 dy = int(round(tr.vy * dt_shift))
@@ -809,6 +987,8 @@ class TrackerClassic:
                     borderValue=0,
                 )
                 masks_out[tid] = shifted
+                if timers is not None:
+                    timers.record("mask_warp", time.perf_counter() - t_warp)
         return masks_out
 
     def finalize_meta(self) -> None:
@@ -1249,10 +1429,15 @@ def run_pipeline(
     max_frames: Optional[int] = None,
     resize: Optional[Tuple[int, int]] = None,
     draw_ids_largest_k: int = 0,
+    write_overlay: bool = True,
+    timers: Optional[StageTimers] = None,
 ):
+    timers = timers or StageTimers()
     os.makedirs(out_dir, exist_ok=True)
     fps, _, _ = VideoLoader.get_video_info(video_path)
-    frames = VideoLoader.load_mp4_frames(video_path, stride=stride, max_frames=max_frames, resize=resize)
+    frames = VideoLoader.load_mp4_frames(
+        video_path, stride=stride, max_frames=max_frames, resize=resize, timers=timers
+    )
     if not frames:
         raise RuntimeError("No frames loaded.")
     frame_indices = list(range(0, len(frames) * stride, stride))
@@ -1265,6 +1450,9 @@ def run_pipeline(
     mask_gen = MaskGenerator(cfg)
     tracker = TrackerClassic(cfg)
     part_segments: Dict[int, Dict[int, np.ndarray]] = {}
+    total_dets = 0
+    total_tracks = 0
+    total_candidate_pairs = 0
 
     for t, pil_frame in enumerate(frames):
         rgb = np.array(pil_frame)
@@ -1275,8 +1463,13 @@ def run_pipeline(
             seeds=seeds,
             use_marker_split=cfg.marker_split,
             seed_radius=cfg.seed_radius,
+            timers=timers,
         )
-        masks_by_track = tracker.update(frame_indices[t], detections, seeded)
+        total_dets += len(detections) + len(seeded)
+        prev_pairs = tracker.candidate_pairs_evaluated
+        masks_by_track = tracker.update(frame_indices[t], detections, seeded, timers=timers)
+        total_candidate_pairs += tracker.candidate_pairs_evaluated - prev_pairs
+        total_tracks += len(masks_by_track)
         part_segments[frame_indices[t]] = masks_by_track
     tracker.finalize_meta()
 
@@ -1302,45 +1495,49 @@ def run_pipeline(
     stitched_ids = len(set(id_remap.values())) if id_remap else initial_ids
 
     part_tracks = compute_tracks_from_segments(part_segments, v_per_frame)
-    org_groups_initial, part_to_org_initial = group_parts_into_organisms(
-        part_tracks,
-        window=cfg.group_window,
-        tau_sigma=cfg.tau_sigma,
-        tau_dist=cfg.tau_dist,
-    )
-    organism_segments_initial = build_organism_segments(part_segments, part_to_org_initial)
+    with timers.timeit("group_eater"):
+        org_groups_initial, part_to_org_initial = group_parts_into_organisms(
+            part_tracks,
+            window=cfg.group_window,
+            tau_sigma=cfg.tau_sigma,
+            tau_dist=cfg.tau_dist,
+        )
+        organism_segments_initial = build_organism_segments(part_segments, part_to_org_initial)
 
-    eater = EaterPolicy(cfg)
-    org_groups_final, part_to_org_final = eater.apply(organism_segments_initial, org_groups_initial)
+        eater = EaterPolicy(cfg)
+        org_groups_final, part_to_org_final = eater.apply(organism_segments_initial, org_groups_initial)
 
-    organism_segments = build_organism_segments(part_segments, part_to_org_final)
+        organism_segments = build_organism_segments(part_segments, part_to_org_final)
 
-    organism_tracks = compute_tracks_from_segments(organism_segments, v_per_frame)
+        organism_tracks = compute_tracks_from_segments(organism_segments, v_per_frame)
 
-    overlay_org = os.path.join(out_dir, "overlay_organisms.mp4")
-    Visualizer.write_overlay_video(
-        frames,
-        organism_segments,
-        overlay_org,
-        out_fps,
-        alpha=0.45,
-        draw_contours=True,
-        draw_ids=True,
-        frame_indices=frame_indices,
-        draw_ids_largest_k=draw_ids_largest_k,
-    )
-    overlay_parts = os.path.join(out_dir, "overlay_parts.mp4")
-    Visualizer.write_overlay_video(
-        frames,
-        part_segments,
-        overlay_parts,
-        out_fps,
-        alpha=0.45,
-        draw_contours=True,
-        draw_ids=True,
-        frame_indices=frame_indices,
-        draw_ids_largest_k=draw_ids_largest_k,
-    )
+    overlay_org = os.path.join(out_dir, "overlay_organisms.mp4") if write_overlay else None
+    overlay_parts = os.path.join(out_dir, "overlay_parts.mp4") if write_overlay else None
+    if write_overlay:
+        with timers.timeit("overlay"):
+            Visualizer.write_overlay_video(
+                frames,
+                organism_segments,
+                overlay_org,
+                out_fps,
+                alpha=0.45,
+                draw_contours=True,
+                draw_ids=True,
+                frame_indices=frame_indices,
+                draw_ids_largest_k=draw_ids_largest_k,
+            )
+        with timers.timeit("overlay"):
+            Visualizer.write_overlay_video(
+                frames,
+                part_segments,
+                overlay_parts,
+                out_fps,
+                alpha=0.45,
+                draw_contours=True,
+                draw_ids=True,
+                frame_indices=frame_indices,
+                draw_ids_largest_k=draw_ids_largest_k,
+            )
 
     tracks_parts_json = {
         "tracks": {
@@ -1424,6 +1621,26 @@ def run_pipeline(
     with open(os.path.join(out_dir, "tracks_organisms.json"), "w", encoding="utf-8") as f:
         json.dump(tracks_org_json, f, indent=2)
 
+    frames_total = len(frames) if frames else 1
+    avg_dets = total_dets / frames_total
+    avg_tracks = total_tracks / frames_total
+    avg_candidates = total_candidate_pairs / frames_total
+    marker_calls = mask_gen.marker_split_calls
+    avg_marker_roi = (mask_gen.marker_split_area_sum / marker_calls) if marker_calls else 0.0
+    stage_order = ["decode", "hsv", "cc", "marker_split", "track_assoc", "mask_warp", "group_eater", "overlay"]
+    print("[timing] stage stats (sum / mean / p95 in ms)")
+    for name, cnt, total, mean, p95 in timers.summary(stage_order):
+        print(f"  {name:15s} n={cnt:4d} sum={total*1000:.1f}  mean={mean*1000:.2f}  p95={p95*1000:.2f}")
+    print(
+        f"[debug] avg dets/frame={avg_dets:.2f}, avg tracks/frame={avg_tracks:.2f}, "
+        f"candidate pairs/frame={avg_candidates:.2f}, marker_split calls={marker_calls}, "
+        f"mean marker ROI={avg_marker_roi:.1f}px"
+    )
+    print(
+        f"[debug] merge_events={tracker.merge_events}, split_reacquire={tracker.split_reacquire_events}, "
+        f"teleports={tracker.teleport_events}"
+    )
+
     print(
         f"[tracker] track_ids before stitching: {initial_ids}, after stitching: {stitched_ids}, "
         f"merge_events: {tracker.merge_events}, split_reacquire: {tracker.split_reacquire_events}"
@@ -1490,6 +1707,9 @@ def main():
     parser.add_argument("--teleport_thr_mult", type=float, default=Config.teleport_thr_mult)
     parser.add_argument("--fragmentation_len_thr", type=int, default=Config.fragmentation_len_thr)
     parser.add_argument("--min_track_len_for_stitch", type=int, default=Config.min_track_len_for_stitch)
+    parser.add_argument("--no_overlay", action="store_true", help="Skip overlay mp4 writing for speed")
+    parser.add_argument("--profile", action="store_true", help="Enable cProfile and save profile.pstats")
+    parser.add_argument("--line_profile", action="store_true", help="Enable line_profiler if installed")
     args = parser.parse_args()
 
     cfg = Config(
@@ -1532,7 +1752,9 @@ def main():
         min_track_len_for_stitch=args.min_track_len_for_stitch,
     )
     resize = _parse_resize(args.resize)
-    run_pipeline(
+    timers = StageTimers()
+
+    run_kwargs = dict(
         video_path=args.video,
         out_dir=args.out_dir,
         cfg=cfg,
@@ -1540,7 +1762,50 @@ def main():
         max_frames=args.max_frames,
         resize=resize,
         draw_ids_largest_k=args.draw_ids_largest_k,
+        write_overlay=not args.no_overlay,
+        timers=timers,
     )
+
+    run_fn = run_pipeline
+    line_prof = None
+    if args.line_profile:
+        try:
+            from line_profiler import LineProfiler
+        except Exception:
+            print("[line_profile] line_profiler not available; skipping line profile.")
+        else:
+            line_prof = LineProfiler()
+            line_prof.add_function(MaskGenerator.generate_detections)
+            line_prof.add_function(MaskGenerator._marker_split_component)
+            line_prof.add_function(TrackerClassic.update)
+            line_prof.add_function(Visualizer.write_overlay_video)
+            run_fn = line_prof(run_pipeline)
+
+    if args.profile:
+        import cProfile
+        import pstats
+        import io
+
+        pr = cProfile.Profile()
+        result = pr.runcall(run_fn, **run_kwargs)
+        profile_path = os.path.join(args.out_dir, "profile.pstats")
+        pr.dump_stats(profile_path)
+        s = io.StringIO()
+        pstats.Stats(pr, stream=s).sort_stats("cumulative").print_stats(30)
+        print("[profile] top-30 cumulative time (cProfile):")
+        print(s.getvalue())
+    else:
+        result = run_fn(**run_kwargs)
+
+    if line_prof is not None:
+        import io as _io
+
+        lp_path = os.path.join(args.out_dir, "line_profile.txt")
+        buf = _io.StringIO()
+        line_prof.print_stats(stream=buf)
+        with open(lp_path, "w", encoding="utf-8") as f:
+            f.write(buf.getvalue())
+        print(f"[line_profile] saved to {lp_path}")
 
 
 if __name__ == "__main__":
