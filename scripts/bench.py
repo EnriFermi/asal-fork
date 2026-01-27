@@ -115,6 +115,11 @@ def main():
     resize = _parse_resize(args.resize)
     os.makedirs(args.out_dir, exist_ok=True)
     methods: List[str] = [m.strip() for m in args.methods.split(",") if m.strip()]
+    # default btrack config from repo if not provided
+    if not args.btrack_config:
+        repo_cfg = os.path.join("configs", "btrack_cell_config.json")
+        if os.path.exists(repo_cfg):
+            args.btrack_config = repo_cfg
 
     for method in methods:
         mdir = os.path.join(args.out_dir, method)
@@ -141,15 +146,18 @@ def main():
                 search_range_override=args.max_dist,  # can be overridden via CLI if needed
             )
         elif method == "ultrack":
-            run_ultrack(
-                video_path=args.video,
-                out_dir=mdir,
-                cfg=cfg,
-                stride=max(1, args.stride),
-                max_frames=args.max_frames,
-                resize=resize,
-                draw_ids_largest_k=args.draw_ids_largest_k,
-            )
+            try:
+                run_ultrack(
+                    video_path=args.video,
+                    out_dir=mdir,
+                    cfg=cfg,
+                    stride=max(1, args.stride),
+                    max_frames=args.max_frames,
+                    resize=resize,
+                    draw_ids_largest_k=args.draw_ids_largest_k,
+                )
+            except Exception as e:
+                print(f"[bench] ultrack failed, skipping: {e}")
         elif method == "btrack":
             run_btrack(
                 video_path=args.video,
@@ -183,6 +191,8 @@ def main():
                     resize=resize,
                     draw_ids_largest_k=args.draw_ids_largest_k,
                 )
+            else:
+                print("[bench] trackmate fallback overlays already written (per-frame IDs) in", mdir)
         else:
             print(f"[bench] Unknown method '{method}', skipping.")
 

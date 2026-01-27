@@ -1,0 +1,24 @@
+{
+  "MotionModel": {
+    "name": "Cell",
+    "dt": 1.0,
+    "process_noise": [150.0, 150.0, 0.05],
+    "measurement_noise": [1.0, 1.0, 1.0],
+    "acceleration": 200.0,
+    "max_speed": 80.0,
+    "prob_not_assign": 0.05,
+    "prob_detection": 0.98,
+    "prob_init": 0.0005
+  },
+  "HypothesisModel": {
+    "name": "Cell",
+    "lambda_birth": 0.2,
+    "lambda_death": 0.2,
+    "lambda_branch": 0.02,
+    "lambda_fusion": 0.0,
+    "P_D": 0.98,
+    "P_F": 0.01,
+    "min_length": 2,
+    "max_length": 50
+  }
+}

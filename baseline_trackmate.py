@@ -8,6 +8,7 @@ TrackMate (Fiji) baseline helper.
 import argparse
 import os
 import subprocess
+import shutil
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -29,9 +30,16 @@ def export_for_trackmate(video_path: str, out_dir: str, cfg: Config, stride: int
     frame_indices = list(range(0, len(frames) * stride, stride))
     mask_gen = MaskGenerator(cfg)
 
+    part_segments: Dict[int, Dict[int, np.ndarray]] = {}
+    v_per_frame: Dict[int, np.ndarray] = {}
+    next_id = 1
+
     for idx, pil_frame in enumerate(frames):
         frame_key = frame_indices[idx]
         rgb = np.array(pil_frame)
+        v_per_frame[frame_key] = (
+            np.array(pil_frame.convert("HSV"))[:, :, 2] if pil_frame.mode != "HSV" else np.array(pil_frame)[:, :, 2]
+        )
         detections, _ = mask_gen.generate_detections(
             rgb,
             cfg.det_v_thr_hi,
@@ -42,6 +50,10 @@ def export_for_trackmate(video_path: str, out_dir: str, cfg: Config, stride: int
         label_img = np.zeros(rgb.shape[:2], dtype=np.uint16)
         for lab, det in enumerate(detections, start=1):
             label_img[det.mask_u8.astype(bool)] = lab
+            pid = next_id
+            next_id += 1
+            part_segments.setdefault(frame_key, {})
+            part_segments[frame_key][pid] = det.mask_u8.astype(np.uint8)
         # write RGB frame
         Image.fromarray(np.array(pil_frame)).save(os.path.join(frames_dir, f"frame_{frame_key:05d}.png"))
         # write label stack scaled for visibility and a binary mask helper
@@ -75,6 +87,71 @@ run("TrackMate", "open=[] detector=[Downsampled LoG detector] radius=3 threshold
 """
         )
     print(f"[trackmate] Exported frames/labels to {export_dir}")
+
+    # immediate fallback overlay using per-frame IDs (before CSV exists)
+    part_tracks = compute_tracks_from_segments(part_segments, v_per_frame)
+    fps, _, _ = VideoLoader.get_video_info(video_path)
+    out_fps = fps / float(stride)
+    overlay_parts = os.path.join(out_dir, "overlay_parts.mp4")
+    Visualizer.write_overlay_video(
+        frames,
+        part_segments,
+        overlay_parts,
+        out_fps,
+        alpha=0.45,
+        draw_contours=True,
+        draw_ids=True,
+        frame_indices=frame_indices,
+        draw_ids_largest_k=0,
+    )
+    overlay_org = os.path.join(out_dir, "overlay_organisms.mp4")
+    Visualizer.write_overlay_video(
+        frames,
+        part_segments,
+        overlay_org,
+        out_fps,
+        alpha=0.45,
+        draw_contours=True,
+        draw_ids=True,
+        frame_indices=frame_indices,
+        draw_ids_largest_k=0,
+    )
+    # duplicate fallbacks into export_dir for convenience
+    try:
+        shutil.copyfile(overlay_parts, os.path.join(export_dir, "overlay_parts_fallback.mp4"))
+        shutil.copyfile(overlay_org, os.path.join(export_dir, "overlay_organisms_fallback.mp4"))
+    except Exception:
+        pass
+    tracks_parts_json = {
+        "tracks": {
+            str(pid): [
+                {
+                    "t": int(t),
+                    "cx": float(cx),
+                    "cy": float(cy),
+                    "mass": float(mass),
+                    "area": float(area),
+                    "rg": float(rg),
+                }
+                for t, cx, cy, mass, area, rg in seq
+            ]
+            for pid, seq in part_tracks.items()
+        }
+    }
+    with open(os.path.join(out_dir, "tracks_parts.json"), "w", encoding="utf-8") as f:
+        json.dump(tracks_parts_json, f, indent=2)
+
+    tracks_org_json = {
+        "tracks": tracks_parts_json["tracks"],
+        "debug": {
+            "backend": "trackmate_fallback",
+            "det_v_thr_hi": cfg.det_v_thr_hi,
+            "note": "Fallback per-frame IDs; run Fiji macro + import_trackmate_csv.py for real tracking.",
+        },
+    }
+    with open(os.path.join(out_dir, "tracks_organisms.json"), "w", encoding="utf-8") as f:
+        json.dump(tracks_org_json, f, indent=2)
+
     return export_dir
 
 

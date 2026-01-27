@@ -78,6 +78,9 @@ def _label_stack(video_path, stride, max_frames, resize, cfg: Config):
 
 
 def _find_default_config():
+    repo_cfg = Path("configs") / "btrack_cell_config.json"
+    if repo_cfg.exists():
+        return str(repo_cfg.resolve())
     try:
         import btrack  # type: ignore
     except Exception:
@@ -101,12 +104,13 @@ def run_btrack(
     config_path: Optional[str] = None,
 ):
     os.makedirs(out_dir, exist_ok=True)
+    btrack_available = True
     try:
         import btrack  # type: ignore
         from btrack import utils as bt_utils  # type: ignore
     except Exception:
-        print("[btrack] btrack not installed; exported labels for manual run.")
-        return {"label_stack": None}
+        print("[btrack] btrack not installed; will use fallback per-frame labels.")
+        btrack_available = False
 
     frames, frame_indices, labels, frame_label_maps, v_per_frame = _label_stack(
         video_path, stride, max_frames, resize, cfg
@@ -116,52 +120,62 @@ def run_btrack(
 
     cfg_path = config_path or _find_default_config()
     if not cfg_path or not Path(cfg_path).exists():
-        print(f"[btrack] config not found (passed={config_path}), saved labels at {label_path}.")
-        return {"label_stack": label_path}
-
-    objects = bt_utils.segmentation_to_objects(labels)
-
-    with btrack.BayesianTracker() as tracker:  # type: ignore
-        tracker.configure(cfg_path)
-        tracker.append(objects)
-        h, w = labels.shape[1:]
-        tracker.volume = ((0, w), (0, h))
-        tracker.track()
-        tracker.optimize()
-        tracks = tracker.tracks
-
-    if hasattr(bt_utils, "tracks_to_dataframe"):
-        tracks_df = bt_utils.tracks_to_dataframe(tracks)
-    else:
-        # fallback: build minimal dataframe
-        import pandas as pd
-
-        rows = []
-        for tr in tracks:
-            for obs in tr:
-                rows.append({"ID": tr.ID, "t": obs.t, "x": obs.x, "y": obs.y})
-        tracks_df = pd.DataFrame(rows)
+        print(f"[btrack] config not found (passed={config_path}), using fallback per-frame IDs.")
+        btrack_available = False
 
     part_segments: Dict[int, Dict[int, np.ndarray]] = {}
-    for _, row in tracks_df.iterrows():
-        t_idx = int(row.get("t") if "t" in row else row.get("frame", 0))
-        if t_idx < 0 or t_idx >= len(frame_indices):
-            continue
-        frame_key = frame_indices[t_idx]
-        x = int(round(row.get("x", row.get("X", 0))))
-        y = int(round(row.get("y", row.get("Y", 0))))
-        h, w = labels.shape[1:]
-        if x < 0 or x >= w or y < 0 or y >= h:
-            continue
-        lbl = int(labels[t_idx, y, x])
-        if lbl <= 0:
-            continue
-        mask = frame_label_maps[frame_key].get(lbl)
-        if mask is None:
-            continue
-        tid = int(row.get("ID", row.get("track_id", 0)))
-        part_segments.setdefault(frame_key, {})
-        part_segments[frame_key][tid] = mask.astype(np.uint8)
+    if btrack_available:
+        objects = bt_utils.segmentation_to_objects(labels)
+
+        with btrack.BayesianTracker() as tracker:  # type: ignore
+            tracker.configure(cfg_path)
+            tracker.append(objects)
+            h, w = labels.shape[1:]
+            tracker.volume = ((0, w), (0, h))
+            tracker.track()
+            tracker.optimize()
+            tracks = tracker.tracks
+
+        if hasattr(bt_utils, "tracks_to_dataframe"):
+            tracks_df = bt_utils.tracks_to_dataframe(tracks)
+        else:
+            import pandas as pd
+
+            rows = []
+            for tr in tracks:
+                for obs in tr:
+                    rows.append({"ID": tr.ID, "t": obs.t, "x": obs.x, "y": obs.y})
+            tracks_df = pd.DataFrame(rows)
+
+        for _, row in tracks_df.iterrows():
+            t_idx = int(row.get("t") if "t" in row else row.get("frame", 0))
+            if t_idx < 0 or t_idx >= len(frame_indices):
+                continue
+            frame_key = frame_indices[t_idx]
+            x = int(round(row.get("x", row.get("X", 0))))
+            y = int(round(row.get("y", row.get("Y", 0))))
+            h, w = labels.shape[1:]
+            if x < 0 or x >= w or y < 0 or y >= h:
+                continue
+            lbl = int(labels[t_idx, y, x])
+            if lbl <= 0:
+                continue
+            mask = frame_label_maps[frame_key].get(lbl)
+            if mask is None:
+                continue
+            tid = int(row.get("ID", row.get("track_id", 0)))
+            part_segments.setdefault(frame_key, {})
+            part_segments[frame_key][tid] = mask.astype(np.uint8)
+    else:
+        # fallback: assign unique IDs per label across stack
+        next_id = 1
+        for idx, frame_key in enumerate(frame_indices):
+            fmap = frame_label_maps[frame_key]
+            for _, mask in fmap.items():
+                tid = next_id
+                next_id += 1
+                part_segments.setdefault(frame_key, {})
+                part_segments[frame_key][tid] = mask.astype(np.uint8)
 
     part_tracks = compute_tracks_from_segments(part_segments, v_per_frame)
 
@@ -213,7 +227,12 @@ def run_btrack(
 
     tracks_org_json = {
         "tracks": tracks_parts_json["tracks"],
-        "debug": {"backend": "btrack", "config_path": cfg_path, "labels_file": label_path},
+        "debug": {
+            "backend": "btrack",
+            "config_path": cfg_path if btrack_available else None,
+            "labels_file": label_path,
+            "fallback_per_frame": not btrack_available,
+        },
     }
     with open(os.path.join(out_dir, "tracks_organisms.json"), "w", encoding="utf-8") as f:
         json.dump(tracks_org_json, f, indent=2)

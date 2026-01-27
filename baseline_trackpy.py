@@ -32,12 +32,13 @@ def run_trackpy(
     draw_ids_largest_k: int = 0,
     search_range_override: Optional[float] = None,
 ):
+    tp_available = True
     try:
-        import pandas as pd
-        import trackpy as tp
+        import pandas as pd  # type: ignore
+        import trackpy as tp  # type: ignore
     except Exception:
-        print("[trackpy] trackpy or pandas not installed, skipping.")
-        return None
+        tp_available = False
+        import pandas as pd  # type: ignore
 
     os.makedirs(out_dir, exist_ok=True)
     fps, _, _ = VideoLoader.get_video_info(video_path)
@@ -88,33 +89,44 @@ def run_trackpy(
     # trackpy can explode if search_range is too large; adaptively shrink on failure
     sr_try = search_range_override if search_range_override is not None else cfg.max_dist
     linked = None
-    while sr_try >= 2.0:
-        try:
-            linked = tp.link_df(
-                df,
-                search_range=sr_try,
-                memory=cfg.max_missed,
-                t_column="frame",
-                pos_columns=["x", "y"],
-            )
-            break
-        except Exception as exc:  # narrow down to SubnetOversizeException if available
-            print(f"[trackpy] link_df failed at search_range={sr_try}: {exc}")
-            sr_try *= 0.5
-    if linked is None:
-        raise RuntimeError("trackpy linking failed even after reducing search_range")
+    if tp_available:
+        while sr_try >= 2.0:
+            try:
+                linked = tp.link_df(
+                    df,
+                    search_range=sr_try,
+                    memory=cfg.max_missed,
+                    t_column="frame",
+                    pos_columns=["x", "y"],
+                )
+                break
+            except Exception as exc:  # narrow down to SubnetOversizeException if available
+                print(f"[trackpy] link_df failed at search_range={sr_try}: {exc}")
+                sr_try *= 0.5
+    else:
+        print("[trackpy] trackpy not available; using fallback per-frame IDs.")
 
-    for _, row in linked.iterrows():
-        frame_key = int(row["frame"])
-        track_id = int(row["particle"])
-        mask = mask_store[int(row["mask_idx"])]
-        part_segments.setdefault(frame_key, {})
-        if track_id in part_segments[frame_key]:
-            part_segments[frame_key][track_id] = np.clip(
-                part_segments[frame_key][track_id].astype(np.uint8) + mask.astype(np.uint8), 0, 1
-            )
-        else:
+    part_segments: Dict[int, Dict[int, np.ndarray]] = {}
+    if linked is None:
+        print("[trackpy] linking failed after retries; using per-frame IDs as fallback.")
+        for ridx, rec in enumerate(records):
+            frame_key = int(rec["frame"])
+            track_id = ridx + 1
+            mask = mask_store[rec["mask_idx"]]
+            part_segments.setdefault(frame_key, {})
             part_segments[frame_key][track_id] = mask.astype(np.uint8)
+    else:
+        for _, row in linked.iterrows():
+            frame_key = int(row["frame"])
+            track_id = int(row["particle"])
+            mask = mask_store[int(row["mask_idx"])]
+            part_segments.setdefault(frame_key, {})
+            if track_id in part_segments[frame_key]:
+                part_segments[frame_key][track_id] = np.clip(
+                    part_segments[frame_key][track_id].astype(np.uint8) + mask.astype(np.uint8), 0, 1
+                )
+            else:
+                part_segments[frame_key][track_id] = mask.astype(np.uint8)
 
     part_tracks = compute_tracks_from_segments(part_segments, v_per_frame)
 
@@ -168,9 +180,11 @@ def run_trackpy(
         "tracks": tracks_parts_json["tracks"],
         "debug": {
             "backend": "trackpy",
-            "search_range": cfg.max_dist,
+            "search_range": sr_try,
             "memory": cfg.max_missed,
             "det_v_thr_hi": cfg.det_v_thr_hi,
+            "fallback_per_frame": (linked is None),
+            "tp_available": tp_available,
         },
     }
     with open(os.path.join(out_dir, "tracks_organisms.json"), "w", encoding="utf-8") as f:
