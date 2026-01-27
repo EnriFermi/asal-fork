@@ -121,15 +121,24 @@ def run_ultrack(
 
     # run ultrack
     ucfg = MainConfig()
-    ucfg.data_path = os.path.join(out_dir, "ultrack_db")
-    os.makedirs(ucfg.data_path, exist_ok=True)
-    ucfg.sqlite_filename = os.path.join(ucfg.data_path, "tracks.sqlite")
-    if os.path.exists(ucfg.sqlite_filename):
-        os.remove(ucfg.sqlite_filename)
-    # clear previous memmaps if any
-    mm_dir = os.path.join(ucfg.data_path, "memmaps")
+    # handle versions without data_path/sqlite fields; use environment-based path overrides
+    db_dir = os.path.join(out_dir, "ultrack_db")
+    os.makedirs(db_dir, exist_ok=True)
+    sqlite_path = os.path.join(db_dir, "tracks.sqlite")
+    if os.path.exists(sqlite_path):
+        os.remove(sqlite_path)
+    mm_dir = os.path.join(db_dir, "memmaps")
     if os.path.isdir(mm_dir):
         shutil.rmtree(mm_dir, ignore_errors=True)
+
+    # some versions look at env vars for paths
+    os.environ["ULTRACK_DATA_PATH"] = db_dir
+    os.environ["ULTRACK_SQLITE_FILENAME"] = sqlite_path
+    try:
+        ucfg.sqlite_filename = sqlite_path  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
     tracker = Tracker(ucfg)
     tracker.track(labels=label_stack)
 
