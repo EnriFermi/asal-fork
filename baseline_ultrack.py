@@ -140,7 +140,11 @@ def run_ultrack(
         pass
 
     tracker = Tracker(ucfg)
-    tracker.track(labels=label_stack)
+    try:
+        tracker.track(labels=label_stack)
+    except Exception as e:
+        print(f"[ultrack] tracking failed: {e}")
+        return {"label_stack": label_path, "error": str(e)}
 
     tracks_df = None
     if hasattr(tracker, "to_tracks_layer"):
