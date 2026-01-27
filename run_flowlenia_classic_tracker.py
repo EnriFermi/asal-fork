@@ -190,6 +190,7 @@ class MaskGenerator:
         self.cfg = cfg
         self.marker_split_calls = 0
         self.marker_split_area_sum = 0.0
+        self.coverage_samples: List[float] = []
 
     def generate_detections(
         self,
@@ -253,7 +254,8 @@ class MaskGenerator:
                 continue
 
             seeds_here = seeds_by_comp.get(comp_id)
-            if use_marker_split and seeds_here:
+            # marker split only if at least two seeds inside the component
+            if use_marker_split and seeds_here and len(seeds_here) >= 2:
                 with timers.timeit("marker_split") if timers is not None else _nullcontext():
                     dets_split, seeded_split = self._marker_split_component(
                         roi_mask,
@@ -269,26 +271,48 @@ class MaskGenerator:
                 seeded_out.update(seeded_split)
                 continue
 
-            hue_bin = -1
-            if use_bins and h_bins_map is not None:
-                vals = h_bins_map[y0 : y1 + 1, x0 : x1 + 1][roi_mask]
-                if vals.size > 0:
-                    hue_bin = int(np.bincount(vals, minlength=self.cfg.h_bins).argmax())
-            cx = float(centroids[comp_id, 0])
-            cy = float(centroids[comp_id, 1])
-            mask_full = np.zeros_like(strong, dtype=np.uint8)
-            mask_full[y0 : y1 + 1, x0 : x1 + 1][roi_mask] = 1
-            detections.append(
-                Detection(
-                    mask_u8=mask_full,
-                    hue_bin=hue_bin,
-                    area=area,
-                    mass=mass,
-                    cx=cx,
-                    cy=cy,
-                    bbox=(x0, y0, x1, y1),
+            roi_hbin = h_bins_map[y0 : y1 + 1, x0 : x1 + 1] if use_bins and h_bins_map is not None else None
+            if use_bins and roi_hbin is not None:
+                bins_present = np.unique(roi_hbin[roi_mask])
+            else:
+                bins_present = np.array([-1], dtype=np.int32)
+
+            for b in bins_present:
+                if b < 0 and use_bins:
+                    continue
+                if roi_hbin is not None:
+                    sub_mask = roi_mask & (roi_hbin == b)
+                else:
+                    sub_mask = roi_mask
+                if not np.any(sub_mask):
+                    continue
+                num_sub, sub_labels, _, _ = cv2.connectedComponentsWithStats(
+                    sub_mask.astype(np.uint8), connectivity=8
                 )
-            )
+                for sub_id in range(1, num_sub):
+                    sub_roi = sub_labels == sub_id
+                    det = self._detection_from_roi(
+                        sub_roi,
+                        x0,
+                        y0,
+                        v,
+                        h,
+                        h_bins_map,
+                        hue_bin_override=int(b) if b >= 0 else None,
+                    )
+                    if det is not None:
+                        detections.append(det)
+
+        # coverage check (union of detections over strong)
+        if strong.any():
+            union_mask = np.zeros_like(strong, dtype=np.uint8)
+            for det in detections:
+                union_mask |= det.mask_u8.astype(np.uint8)
+            for det in seeded_out.values():
+                union_mask |= det.mask_u8.astype(np.uint8)
+            covered = union_mask.sum()
+            if covered > 0:
+                self.coverage_samples.append(float(covered) / float(strong.sum()))
         return detections, seeded_out
 
     def _marker_split_component(
@@ -324,6 +348,7 @@ class MaskGenerator:
         elevation_color = cv2.cvtColor(elevation, cv2.COLOR_GRAY2BGR)
         markers_ws = markers.copy()
         cv2.watershed(elevation_color, markers_ws)
+        markers_ws[markers_ws == -1] = 0
         markers_ws[~roi_mask] = 0
 
         detections: List[Detection] = []
@@ -341,6 +366,12 @@ class MaskGenerator:
                 seeded[int(lbl)] = det
             else:
                 detections.append(det)
+        # leftover region with label 0 inside roi_mask
+        rest = roi_mask & (markers_ws == 0)
+        if np.any(rest):
+            det_rest = self._detection_from_roi(rest, x0, y0, v, h, h_bins_map, hue_bin_override=None)
+            if det_rest is not None:
+                detections.append(det_rest)
         return detections, seeded
 
     def _detection_from_roi(
@@ -762,15 +793,6 @@ class TrackerClassic:
                             merge_clusters[det_idx] = overlaps
                             self.merge_events += 1
 
-                for det_idx, tids in merge_clusters.items():
-                    if det_idx not in unmatched_dets:
-                        continue
-                    rep_tid = max(tids, key=lambda tid: _pair_iou(tid, det_idx))
-                    merge_repr[det_idx] = rep_tid
-                    self._update_track_from_det(rep_tid, detections[det_idx], frame_idx)
-                    unmatched_tracks.discard(rep_tid)
-                    unmatched_dets.discard(det_idx)
-
                 for row, tid in enumerate(track_list):
                     if tid not in unmatched_tracks:
                         continue
@@ -796,9 +818,13 @@ class TrackerClassic:
                                 continue
                         elif dist > self.cfg.max_dist:
                             continue
-                        iou_val = _pair_iou(tid, det_idx)
-                        if iou_val <= 0.0 and tr.state != "merged":
+                        tb = expand_bbox(tr.bbox, self.cfg.bbox_pad, tr.mask_u8.shape)
+                        db = expand_bbox(det.bbox, self.cfg.bbox_pad, tr.mask_u8.shape)
+                        if not bboxes_intersect(tb, db) and not (
+                            tr.state == "merged" and dist <= self.cfg.split_reacquire_dist
+                        ):
                             continue
+                        iou_val = _pair_iou(tid, det_idx)
 
                         hue_bonus = 0.0
                         hue_pen = 0.0
@@ -880,8 +906,6 @@ class TrackerClassic:
         for det_idx, tids in merge_clusters.items():
             for tid in tids:
                 if tid not in self.tracks:
-                    continue
-                if det_idx in merge_repr and tid == merge_repr[det_idx]:
                     continue
                 tr = self.tracks[tid]
                 tr.state = "merged"
@@ -1627,6 +1651,7 @@ def run_pipeline(
     avg_candidates = total_candidate_pairs / frames_total
     marker_calls = mask_gen.marker_split_calls
     avg_marker_roi = (mask_gen.marker_split_area_sum / marker_calls) if marker_calls else 0.0
+    coverage_mean = float(np.mean(mask_gen.coverage_samples)) if mask_gen.coverage_samples else 0.0
     stage_order = ["decode", "hsv", "cc", "marker_split", "track_assoc", "mask_warp", "group_eater", "overlay"]
     print("[timing] stage stats (sum / mean / p95 in ms)")
     for name, cnt, total, mean, p95 in timers.summary(stage_order):
@@ -1636,6 +1661,7 @@ def run_pipeline(
         f"candidate pairs/frame={avg_candidates:.2f}, marker_split calls={marker_calls}, "
         f"mean marker ROI={avg_marker_roi:.1f}px"
     )
+    print(f"[sanity] mean coverage strong->dets: {coverage_mean*100:.2f}%")
     print(
         f"[debug] merge_events={tracker.merge_events}, split_reacquire={tracker.split_reacquire_events}, "
         f"teleports={tracker.teleport_events}"
