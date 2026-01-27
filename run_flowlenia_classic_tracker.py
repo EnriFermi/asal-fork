@@ -222,7 +222,7 @@ class MaskGenerator:
             timers.record("cc", time.perf_counter() - t_cc)
 
         seeds_by_comp: Dict[int, List[Tuple[int, float, float]]] = {}
-        if use_marker_split and seeds:
+        if seeds:
             hgt, wdt = strong.shape
             for tid, cx, cy in seeds:
                 xi = int(round(cx))
@@ -254,7 +254,6 @@ class MaskGenerator:
                 continue
 
             seeds_here = seeds_by_comp.get(comp_id)
-            # marker split only if at least two seeds inside the component
             if use_marker_split and seeds_here and len(seeds_here) >= 2:
                 with timers.timeit("marker_split") if timers is not None else _nullcontext():
                     dets_split, seeded_split = self._marker_split_component(
@@ -270,38 +269,45 @@ class MaskGenerator:
                 detections.extend(dets_split)
                 seeded_out.update(seeded_split)
                 continue
-
-            roi_hbin = h_bins_map[y0 : y1 + 1, x0 : x1 + 1] if use_bins and h_bins_map is not None else None
-            if use_bins and roi_hbin is not None:
-                bins_present = np.unique(roi_hbin[roi_mask])
-            else:
-                bins_present = np.array([-1], dtype=np.int32)
-
-            for b in bins_present:
-                if b < 0 and use_bins:
-                    continue
-                if roi_hbin is not None:
-                    sub_mask = roi_mask & (roi_hbin == b)
-                else:
-                    sub_mask = roi_mask
-                if not np.any(sub_mask):
-                    continue
-                num_sub, sub_labels, _, _ = cv2.connectedComponentsWithStats(
-                    sub_mask.astype(np.uint8), connectivity=8
+            # single-seed: whole component becomes seeded detection
+            if seeds_here and len(seeds_here) == 1:
+                tid_seed, _, _ = seeds_here[0]
+                hue_bin = -1
+                if use_bins and h_bins_map is not None:
+                    vals = h_bins_map[y0 : y1 + 1, x0 : x1 + 1][roi_mask]
+                    if vals.size > 0:
+                        hue_bin = int(np.bincount(vals, minlength=self.cfg.h_bins).argmax())
+                det_seed = self._detection_from_roi(
+                    roi_mask,
+                    x0,
+                    y0,
+                    v,
+                    h,
+                    h_bins_map,
+                    hue_bin_override=hue_bin if hue_bin >= 0 else None,
                 )
-                for sub_id in range(1, num_sub):
-                    sub_roi = sub_labels == sub_id
-                    det = self._detection_from_roi(
-                        sub_roi,
-                        x0,
-                        y0,
-                        v,
-                        h,
-                        h_bins_map,
-                        hue_bin_override=int(b) if b >= 0 else None,
-                    )
-                    if det is not None:
-                        detections.append(det)
+                if det_seed is not None:
+                    det_seed.seed_track_id = int(tid_seed)
+                    seeded_out[int(tid_seed)] = det_seed
+                continue
+
+            # default: one detection per component with modal hue
+            hue_bin = -1
+            if use_bins and h_bins_map is not None:
+                vals = h_bins_map[y0 : y1 + 1, x0 : x1 + 1][roi_mask]
+                if vals.size > 0:
+                    hue_bin = int(np.bincount(vals, minlength=self.cfg.h_bins).argmax())
+            det_full = self._detection_from_roi(
+                roi_mask,
+                x0,
+                y0,
+                v,
+                h,
+                h_bins_map,
+                hue_bin_override=hue_bin if hue_bin >= 0 else None,
+            )
+            if det_full is not None:
+                detections.append(det_full)
 
         # coverage check (union of detections over strong)
         if strong.any():
@@ -329,7 +335,7 @@ class MaskGenerator:
         self.marker_split_calls += 1
         self.marker_split_area_sum += float(roi_mask.size)
         markers = np.zeros_like(roi_mask, dtype=np.int32)
-        seed_ids: List[int] = []
+        seed_ids: Set[int] = set()
         for tid, cx, cy in seeds:
             xi = int(round(cx)) - x0
             yi = int(round(cy)) - y0
@@ -337,8 +343,10 @@ class MaskGenerator:
                 continue
             if not roi_mask[yi, xi]:
                 continue
-            cv2.circle(markers, (xi, yi), max(1, seed_radius), int(tid), -1)
-            seed_ids.append(int(tid))
+            if markers[yi, xi] != 0:
+                continue
+            markers[yi, xi] = int(tid)
+            seed_ids.add(int(tid))
 
         if not seed_ids:
             return [], {}
@@ -471,6 +479,20 @@ def bboxes_intersect(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int])
 
 def bbox_union(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
     return min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])
+
+
+def shift_bbox(b: Tuple[int, int, int, int], dx: int, dy: int, shape: Tuple[int, int]) -> Tuple[int, int, int, int]:
+    x0, y0, x1, y1 = b
+    x0 += dx
+    x1 += dx
+    y0 += dy
+    y1 += dy
+    h, w = shape
+    x0 = max(0, min(w - 1, x0))
+    x1 = max(0, min(w - 1, x1))
+    y0 = max(0, min(h - 1, y0))
+    y1 = max(0, min(h - 1, y1))
+    return x0, y0, x1, y1
 
 
 def roi_iou(
@@ -619,6 +641,9 @@ class TrackerClassic:
         self.track_obs_count: Dict[int, int] = {}
         self.teleport_thr: float = cfg.max_dist * cfg.teleport_thr_mult
         self.candidate_pairs_evaluated: int = 0
+        self.match_iou_sum: float = 0.0
+        self.match_dist_sum: float = 0.0
+        self.match_count: int = 0
 
     def predict_seeds(self, frame_idx: int) -> List[Tuple[int, float, float]]:
         seeds: List[Tuple[int, float, float]] = []
@@ -738,6 +763,7 @@ class TrackerClassic:
             tid_to_row = {tid: idx for idx, tid in enumerate(track_list)}
             merge_repr: Dict[int, int] = {}
             iou_cache: Dict[Tuple[int, int], float] = {}
+            pred_cache: Dict[int, Tuple[np.ndarray, Tuple[int, int, int, int], float, float]] = {}
 
             def _det_mask(idx: int) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
                 det = detections[idx]
@@ -758,11 +784,34 @@ class TrackerClassic:
                 bbox = tr.dilated_bbox if tr.dilated_bbox is not None else tr.bbox
                 return mask, bbox
 
+            def _ensure_pred(tid: int) -> Tuple[np.ndarray, Tuple[int, int, int, int], float, float]:
+                if tid in pred_cache:
+                    return pred_cache[tid]
+                tr = self.tracks[tid]
+                dt_pred = max(1, frame_idx - tr.last_frame)
+                cx_pred = tr.cx + tr.vx * dt_pred
+                cy_pred = tr.cy + tr.vy * dt_pred
+                dx_pred = int(round(tr.vx * dt_pred))
+                dy_pred = int(round(tr.vy * dt_pred))
+                base_mask, _ = _track_mask(tid)
+                # Use predicted mask (warp) for IoU to reduce ID switches when motion is large.
+                M = np.float32([[1, 0, dx_pred], [0, 1, dy_pred]])
+                pred_mask = cv2.warpAffine(
+                    base_mask.astype(np.uint8),
+                    M,
+                    (base_mask.shape[1], base_mask.shape[0]),
+                    flags=cv2.INTER_NEAREST,
+                    borderValue=0,
+                )
+                pred_bbox = bbox_from_mask(pred_mask)
+                pred_cache[tid] = (pred_mask, pred_bbox, cx_pred, cy_pred)
+                return pred_cache[tid]
+
             def _pair_iou(tid: int, det_idx: int) -> float:
                 key = (tid, det_idx)
                 if key in iou_cache:
                     return iou_cache[key]
-                t_mask, t_bbox = _track_mask(tid)
+                t_mask, t_bbox, _, _ = _ensure_pred(tid)
                 d_mask, d_bbox = _det_mask(det_idx)
                 tb = expand_bbox(t_bbox, self.cfg.bbox_pad, t_mask.shape)
                 db = expand_bbox(d_bbox, self.cfg.bbox_pad, t_mask.shape)
@@ -778,9 +827,9 @@ class TrackerClassic:
                     gx = int(det.cx // cell)
                     gy = int(det.cy // cell)
                     cand_t: List[int] = []
-                    for dx in (-1, 0, 1):
-                        for dy in (-1, 0, 1):
-                            cand_t.extend(track_grid.get((gx + dx, gy + dy), []))
+                    for ddx in (-1, 0, 1):
+                        for ddy in (-1, 0, 1):
+                            cand_t.extend(track_grid.get((gx + ddx, gy + ddy), []))
                     overlaps: List[int] = []
                     for tid in cand_t:
                         iou_val = _pair_iou(tid, det_idx)
@@ -797,29 +846,28 @@ class TrackerClassic:
                     if tid not in unmatched_tracks:
                         continue
                     tr = self.tracks[tid]
-                    dt_pred = max(1, frame_idx - tr.last_frame)
-                    cx_pred = tr.cx + tr.vx * dt_pred
-                    cy_pred = tr.cy + tr.vy * dt_pred
+                    pred_mask, pred_bbox, cx_pred, cy_pred = _ensure_pred(tid)
                     cell_x = int(cx_pred // cell)
                     cell_y = int(cy_pred // cell)
                     candidates: List[int] = []
-                    for dx in (-1, 0, 1):
-                        for dy in (-1, 0, 1):
-                            candidates.extend(det_grid.get((cell_x + dx, cell_y + dy), []))
+                    for ddx in (-1, 0, 1):
+                        for ddy in (-1, 0, 1):
+                            candidates.extend(det_grid.get((cell_x + ddx, cell_y + ddy), []))
                     seen: Set[int] = set()
                     for det_idx in candidates:
                         if det_idx in seen or det_idx in merge_clusters:
                             continue
                         seen.add(det_idx)
                         det = detections[det_idx]
+                        _, det_bbox = _det_mask(det_idx)
                         dist = math.hypot(cx_pred - det.cx, cy_pred - det.cy)
                         if tr.state == "merged":
                             if dist > self.cfg.split_reacquire_dist:
                                 continue
                         elif dist > self.cfg.max_dist:
                             continue
-                        tb = expand_bbox(tr.bbox, self.cfg.bbox_pad, tr.mask_u8.shape)
-                        db = expand_bbox(det.bbox, self.cfg.bbox_pad, tr.mask_u8.shape)
+                        tb = expand_bbox(pred_bbox, self.cfg.bbox_pad, pred_mask.shape)
+                        db = expand_bbox(det_bbox, self.cfg.bbox_pad, pred_mask.shape)
                         if not bboxes_intersect(tb, db) and not (
                             tr.state == "merged" and dist <= self.cfg.split_reacquire_dist
                         ):
@@ -899,6 +947,11 @@ class TrackerClassic:
             tid = track_list[row]
             det = detections[col]
             self._update_track_from_det(tid, det, frame_idx)
+            self.match_count += 1
+            self.match_iou_sum += iou_cache.get((tid, col), 0.0)
+            cx_pred = pred_cache.get(tid, (None, None, self.tracks[tid].cx, self.tracks[tid].cy))[2]
+            cy_pred = pred_cache.get(tid, (None, None, self.tracks[tid].cx, self.tracks[tid].cy))[3]
+            self.match_dist_sum += math.hypot(cx_pred - det.cx, cy_pred - det.cy)
             unmatched_tracks.discard(tid)
             unmatched_dets.discard(col)
 
@@ -1652,6 +1705,8 @@ def run_pipeline(
     marker_calls = mask_gen.marker_split_calls
     avg_marker_roi = (mask_gen.marker_split_area_sum / marker_calls) if marker_calls else 0.0
     coverage_mean = float(np.mean(mask_gen.coverage_samples)) if mask_gen.coverage_samples else 0.0
+    mean_match_iou = (tracker.match_iou_sum / tracker.match_count) if tracker.match_count else 0.0
+    mean_match_dist = (tracker.match_dist_sum / tracker.match_count) if tracker.match_count else 0.0
     stage_order = ["decode", "hsv", "cc", "marker_split", "track_assoc", "mask_warp", "group_eater", "overlay"]
     print("[timing] stage stats (sum / mean / p95 in ms)")
     for name, cnt, total, mean, p95 in timers.summary(stage_order):
@@ -1664,7 +1719,9 @@ def run_pipeline(
     print(f"[sanity] mean coverage strong->dets: {coverage_mean*100:.2f}%")
     print(
         f"[debug] merge_events={tracker.merge_events}, split_reacquire={tracker.split_reacquire_events}, "
-        f"teleports={tracker.teleport_events}"
+        f"births={tracker.births}, deaths={tracker.deaths}, teleports={tracker.teleport_events}, "
+        f"frag_proxy={tracker.fragmentation_proxy():d}, matches={tracker.match_count}, "
+        f"mean_match_iou={mean_match_iou:.3f}, mean_match_dist={mean_match_dist:.2f}"
     )
 
     print(
