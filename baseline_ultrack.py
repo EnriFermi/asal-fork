@@ -8,6 +8,7 @@ Ultrack baseline wrapper.
 import argparse
 import json
 import os
+import shutil
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -120,6 +121,15 @@ def run_ultrack(
 
     # run ultrack
     ucfg = MainConfig()
+    ucfg.data_path = os.path.join(out_dir, "ultrack_db")
+    os.makedirs(ucfg.data_path, exist_ok=True)
+    ucfg.sqlite_filename = os.path.join(ucfg.data_path, "tracks.sqlite")
+    if os.path.exists(ucfg.sqlite_filename):
+        os.remove(ucfg.sqlite_filename)
+    # clear previous memmaps if any
+    mm_dir = os.path.join(ucfg.data_path, "memmaps")
+    if os.path.isdir(mm_dir):
+        shutil.rmtree(mm_dir, ignore_errors=True)
     tracker = Tracker(ucfg)
     tracker.track(labels=label_stack)
 
