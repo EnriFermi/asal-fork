@@ -58,7 +58,29 @@ def _build_labels_and_v(
             label_map[lab] = det.mask_u8.astype(np.uint8)
         label_stack.append(label_img)
         frame_labels[frame_key] = label_map
-    return np.stack(label_stack, axis=0), frame_labels, v_per_frame
+    stack = np.stack(label_stack, axis=0)
+
+    # global relabel to guarantee uniqueness & compact ids (avoids DB UNIQUE errors)
+    uniq = np.unique(stack)
+    uniq = uniq[uniq > 0]
+    if uniq.size:
+        max_id = int(uniq.max())
+        lut = np.zeros(max_id + 1, dtype=np.int32)
+        lut[uniq] = np.arange(1, uniq.size + 1, dtype=np.int32)
+        stack = lut[stack]
+
+    # rebuild frame label maps using relabeled stack
+    frame_labels_relabeled: Dict[int, Dict[int, np.ndarray]] = {}
+    for idx, frame_key in enumerate(frame_indices):
+        lab_img = stack[idx]
+        ids = np.unique(lab_img)
+        ids = ids[ids > 0]
+        fmap: Dict[int, np.ndarray] = {}
+        for lid in ids:
+            fmap[int(lid)] = (lab_img == lid).astype(np.uint8)
+        frame_labels_relabeled[frame_key] = fmap
+
+    return stack.astype(np.int32), frame_labels_relabeled, v_per_frame
 
 
 def run_ultrack(

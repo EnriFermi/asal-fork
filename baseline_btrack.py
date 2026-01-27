@@ -54,7 +54,27 @@ def _label_stack(video_path, stride, max_frames, resize, cfg: Config):
             label_map[lab] = det.mask_u8.astype(np.uint8)
         labels.append(label_img)
         frame_label_maps[frame_key] = label_map
-    return frames, frame_indices, np.stack(labels, axis=0), frame_label_maps, v_per_frame
+    stack = np.stack(labels, axis=0)
+
+    uniq = np.unique(stack)
+    uniq = uniq[uniq > 0]
+    if uniq.size:
+        max_id = int(uniq.max())
+        lut = np.zeros(max_id + 1, dtype=np.int32)
+        lut[uniq] = np.arange(1, uniq.size + 1, dtype=np.int32)
+        stack = lut[stack]
+
+    frame_label_maps_relabeled: Dict[int, Dict[int, np.ndarray]] = {}
+    for idx, frame_key in enumerate(frame_indices):
+        lab_img = stack[idx]
+        ids = np.unique(lab_img)
+        ids = ids[ids > 0]
+        fmap: Dict[int, np.ndarray] = {}
+        for lid in ids:
+            fmap[int(lid)] = (lab_img == lid).astype(np.uint8)
+        frame_label_maps_relabeled[frame_key] = fmap
+
+    return frames, frame_indices, stack.astype(np.int32), frame_label_maps_relabeled, v_per_frame
 
 
 def _find_default_config():
