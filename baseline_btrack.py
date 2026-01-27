@@ -31,7 +31,7 @@ def _label_stack(video_path, stride, max_frames, resize, cfg: Config):
     labels = []
     frame_label_maps: Dict[int, Dict[int, np.ndarray]] = {}
     v_per_frame: Dict[int, np.ndarray] = {}
-    next_label = 1
+    offset = 100_000
     for idx, pil_frame in enumerate(frames):
         frame_key = frame_indices[idx]
         rgb = np.array(pil_frame)
@@ -47,34 +47,14 @@ def _label_stack(video_path, stride, max_frames, resize, cfg: Config):
         )
         label_img = np.zeros(rgb.shape[:2], dtype=np.int32)
         label_map: Dict[int, np.ndarray] = {}
-        for det in detections:
-            lab = next_label
-            next_label += 1
+        for det_idx, det in enumerate(detections, start=1):
+            lab = idx * offset + det_idx
             label_img[det.mask_u8.astype(bool)] = lab
             label_map[lab] = det.mask_u8.astype(np.uint8)
         labels.append(label_img)
         frame_label_maps[frame_key] = label_map
     stack = np.stack(labels, axis=0)
-
-    uniq = np.unique(stack)
-    uniq = uniq[uniq > 0]
-    if uniq.size:
-        max_id = int(uniq.max())
-        lut = np.zeros(max_id + 1, dtype=np.int32)
-        lut[uniq] = np.arange(1, uniq.size + 1, dtype=np.int32)
-        stack = lut[stack]
-
-    frame_label_maps_relabeled: Dict[int, Dict[int, np.ndarray]] = {}
-    for idx, frame_key in enumerate(frame_indices):
-        lab_img = stack[idx]
-        ids = np.unique(lab_img)
-        ids = ids[ids > 0]
-        fmap: Dict[int, np.ndarray] = {}
-        for lid in ids:
-            fmap[int(lid)] = (lab_img == lid).astype(np.uint8)
-        frame_label_maps_relabeled[frame_key] = fmap
-
-    return frames, frame_indices, stack.astype(np.int32), frame_label_maps_relabeled, v_per_frame
+    return frames, frame_indices, stack.astype(np.int32), frame_label_maps, v_per_frame
 
 
 def _find_default_config():
@@ -125,47 +105,51 @@ def run_btrack(
 
     part_segments: Dict[int, Dict[int, np.ndarray]] = {}
     if btrack_available:
-        objects = bt_utils.segmentation_to_objects(labels)
+        try:
+            objects = bt_utils.segmentation_to_objects(labels)
 
-        with btrack.BayesianTracker() as tracker:  # type: ignore
-            tracker.configure(cfg_path)
-            tracker.append(objects)
-            h, w = labels.shape[1:]
-            tracker.volume = ((0, w), (0, h))
-            tracker.track()
-            tracker.optimize()
-            tracks = tracker.tracks
+            with btrack.BayesianTracker() as tracker:  # type: ignore
+                tracker.configure(cfg_path)
+                tracker.append(objects)
+                h, w = labels.shape[1:]
+                tracker.volume = ((0, w), (0, h))
+                tracker.track()
+                tracker.optimize()
+                tracks = tracker.tracks
 
-        if hasattr(bt_utils, "tracks_to_dataframe"):
-            tracks_df = bt_utils.tracks_to_dataframe(tracks)
-        else:
-            import pandas as pd
+            if hasattr(bt_utils, "tracks_to_dataframe"):
+                tracks_df = bt_utils.tracks_to_dataframe(tracks)
+            else:
+                import pandas as pd
 
-            rows = []
-            for tr in tracks:
-                for obs in tr:
-                    rows.append({"ID": tr.ID, "t": obs.t, "x": obs.x, "y": obs.y})
-            tracks_df = pd.DataFrame(rows)
+                rows = []
+                for tr in tracks:
+                    for obs in tr:
+                        rows.append({"ID": tr.ID, "t": obs.t, "x": obs.x, "y": obs.y})
+                tracks_df = pd.DataFrame(rows)
 
-        for _, row in tracks_df.iterrows():
-            t_idx = int(row.get("t") if "t" in row else row.get("frame", 0))
-            if t_idx < 0 or t_idx >= len(frame_indices):
-                continue
-            frame_key = frame_indices[t_idx]
-            x = int(round(row.get("x", row.get("X", 0))))
-            y = int(round(row.get("y", row.get("Y", 0))))
-            h, w = labels.shape[1:]
-            if x < 0 or x >= w or y < 0 or y >= h:
-                continue
-            lbl = int(labels[t_idx, y, x])
-            if lbl <= 0:
-                continue
-            mask = frame_label_maps[frame_key].get(lbl)
-            if mask is None:
-                continue
-            tid = int(row.get("ID", row.get("track_id", 0)))
-            part_segments.setdefault(frame_key, {})
-            part_segments[frame_key][tid] = mask.astype(np.uint8)
+            for _, row in tracks_df.iterrows():
+                t_idx = int(row.get("t") if "t" in row else row.get("frame", 0))
+                if t_idx < 0 or t_idx >= len(frame_indices):
+                    continue
+                frame_key = frame_indices[t_idx]
+                x = int(round(row.get("x", row.get("X", 0))))
+                y = int(round(row.get("y", row.get("Y", 0))))
+                h, w = labels.shape[1:]
+                if x < 0 or x >= w or y < 0 or y >= h:
+                    continue
+                lbl = int(labels[t_idx, y, x])
+                if lbl <= 0:
+                    continue
+                mask = frame_label_maps[frame_key].get(lbl)
+                if mask is None:
+                    continue
+                tid = int(row.get("ID", row.get("track_id", 0)))
+                part_segments.setdefault(frame_key, {})
+                part_segments[frame_key][tid] = mask.astype(np.uint8)
+        except Exception as e:
+            print(f"[btrack] tracking failed: {e}; using fallback per-frame IDs.")
+            btrack_available = False
     else:
         # fallback: assign unique IDs per label across stack
         next_id = 1

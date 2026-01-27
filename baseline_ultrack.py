@@ -35,7 +35,7 @@ def _build_labels_and_v(
     label_stack: List[np.ndarray] = []
     frame_labels: Dict[int, Dict[int, np.ndarray]] = {}
     v_per_frame: Dict[int, np.ndarray] = {}
-    next_label = 1
+    offset = 100_000  # large enough to guarantee global uniqueness across frames
     for idx, pil_frame in enumerate(frames):
         frame_key = frame_indices[idx]
         rgb = np.array(pil_frame)
@@ -52,36 +52,14 @@ def _build_labels_and_v(
         )
         label_img = np.zeros(rgb.shape[:2], dtype=np.int32)
         label_map: Dict[int, np.ndarray] = {}
-        for det in detections:
-            lab = next_label
-            next_label += 1
+        for det_idx, det in enumerate(detections, start=1):
+            lab = idx * offset + det_idx  # unique per frame+object
             label_img[det.mask_u8.astype(bool)] = lab
             label_map[lab] = det.mask_u8.astype(np.uint8)
         label_stack.append(label_img)
         frame_labels[frame_key] = label_map
     stack = np.stack(label_stack, axis=0)
-
-    # global relabel to guarantee uniqueness & compact ids (avoids DB UNIQUE errors)
-    uniq = np.unique(stack)
-    uniq = uniq[uniq > 0]
-    if uniq.size:
-        max_id = int(uniq.max())
-        lut = np.zeros(max_id + 1, dtype=np.int32)
-        lut[uniq] = np.arange(1, uniq.size + 1, dtype=np.int32)
-        stack = lut[stack]
-
-    # rebuild frame label maps using relabeled stack
-    frame_labels_relabeled: Dict[int, Dict[int, np.ndarray]] = {}
-    for idx, frame_key in enumerate(frame_indices):
-        lab_img = stack[idx]
-        ids = np.unique(lab_img)
-        ids = ids[ids > 0]
-        fmap: Dict[int, np.ndarray] = {}
-        for lid in ids:
-            fmap[int(lid)] = (lab_img == lid).astype(np.uint8)
-        frame_labels_relabeled[frame_key] = fmap
-
-    return stack.astype(np.int32), frame_labels_relabeled, v_per_frame
+    return stack.astype(np.int32), frame_labels, v_per_frame
 
 
 def run_ultrack(
