@@ -31,6 +31,7 @@ def _label_stack(video_path, stride, max_frames, resize, cfg: Config):
     labels = []
     frame_label_maps: Dict[int, Dict[int, np.ndarray]] = {}
     v_per_frame: Dict[int, np.ndarray] = {}
+    next_label = 1
     for idx, pil_frame in enumerate(frames):
         frame_key = frame_indices[idx]
         rgb = np.array(pil_frame)
@@ -46,7 +47,9 @@ def _label_stack(video_path, stride, max_frames, resize, cfg: Config):
         )
         label_img = np.zeros(rgb.shape[:2], dtype=np.int32)
         label_map: Dict[int, np.ndarray] = {}
-        for lab, det in enumerate(detections, start=1):
+        for det in detections:
+            lab = next_label
+            next_label += 1
             label_img[det.mask_u8.astype(bool)] = lab
             label_map[lab] = det.mask_u8.astype(np.uint8)
         labels.append(label_img)
