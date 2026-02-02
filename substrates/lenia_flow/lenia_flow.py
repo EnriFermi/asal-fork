@@ -114,6 +114,8 @@ class FlowLenia:
         food_vis_color=(0.6, 0.3, 0.0),  # RGB overlay for food
         food_diffusion_alpha: float = 0.0,  # blend factor for food diffusion (0=off)
         mass_clip_eps: float = 0.0,  # zero-out tiny masses below this per-pixel sum
+        # debugging / logging
+        debug_return_F: bool = False,  # include the reintegration flow field F in the returned state
     ):
         self.grid_size = grid_size
         self.C = C
@@ -162,6 +164,7 @@ class FlowLenia:
         self.food_vis_color = tuple(food_vis_color)
         self.food_diffusion_alpha = float(food_diffusion_alpha)
         self.mass_clip_eps = float(mass_clip_eps)
+        self.debug_return_F = bool(debug_return_F)
 
         # Connectivity: by default, all k kernels read from channel 0 and
         # contribute to channel 0 (for C=1). For C>1, still route all to ch 0.
@@ -368,6 +371,8 @@ class FlowLenia:
         # step counter for scheduled events (food spawn)
         t = jnp.array(0, dtype=jnp.int32)
         state = {"A": A, "P": P, "fK": fK, "m": m, "s": s, "fcr": fcr, "Food": Food, "t": t}
+        if self.debug_return_F:
+            state["F"] = jnp.zeros((self.cfg.X, self.cfg.Y, 2, self.cfg.C), dtype=A.dtype)
         # Step once to avoid trivial zero image, like Lenia
         return self.step_state(rng, state, params)
 
@@ -548,7 +553,10 @@ class FlowLenia:
 
             t = t + jnp.array(1, dtype=jnp.int32)
 
-        return {"A": nA, "P": nP, "fK": fK, "m": m, "s": s, "Food": Food, "t": t, "mass_cycle_start": mass_cycle_start}
+        out = {"A": nA, "P": nP, "fK": fK, "m": m, "s": s, "Food": Food, "t": t, "mass_cycle_start": mass_cycle_start}
+        if self.debug_return_F:
+            out["F"] = F
+        return out
 
     def render_state(self, state, params, img_size=None):
         mode = getattr(self, 'render_mode', 'A')
