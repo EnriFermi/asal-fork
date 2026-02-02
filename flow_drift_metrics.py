@@ -58,17 +58,6 @@ _NPZ_PATTERN = re.compile(
 )
 
 
-@dataclass(frozen=True)
-class DriftParams:
-    eps: float = 1e-6
-    r_pool: int = 3
-    beta_t: float = 0.01
-    q_top: float = 0.995
-    m_thr_frac: float = 0.02
-    mp_thr_frac: float = 0.01
-    kappa_thr: float = 0.2
-
-
 def resolve_device(device: Union[str, int, jax.Device, None] = "gpu") -> jax.Device:
     """
     Resolve a user-friendly device selector to a concrete JAX device.
@@ -151,30 +140,15 @@ def extract_AFP(state: Dict, *, t: Optional[int] = None) -> Tuple[np.ndarray, np
 # -----------------------------------------------------------------------------
 # Loader: chunked npz snapshots (simulate_save_apf.py compatible)
 # -----------------------------------------------------------------------------
-@dataclass(frozen=True)
-class _NpzChunk:
-    path: str
-    start_step: int
-    end_step: int
-    idx: int
-
-
-def _list_npz_chunks(base_dir: str) -> List[_NpzChunk]:
-    chunks: List[_NpzChunk] = []
+def _list_npz_chunks(base_dir: str) -> List[Tuple[str, int, int, int]]:
+    chunks: List[Tuple[str, int, int, int]] = []
     for fn in os.listdir(base_dir):
         m = _NPZ_PATTERN.match(fn)
         if not m:
             continue
         s0, s1, _t0, _t1, idx = m.groups()
-        chunks.append(
-            _NpzChunk(
-                path=os.path.join(base_dir, fn),
-                start_step=int(s0),
-                end_step=int(s1),
-                idx=int(idx),
-            )
-        )
-    chunks.sort(key=lambda d: (d.start_step, d.idx))
+        chunks.append((os.path.join(base_dir, fn), int(s0), int(s1), int(idx)))
+    chunks.sort(key=lambda d: (d[1], d[3]))
     return chunks
 
 
@@ -194,10 +168,10 @@ def iter_npz_snapshots(
     Each yield is (t, {"A":..., "F":..., "P":...}) depending on requested fields.
     """
     want = {str(k) for k in fields}
-    for chunk in _list_npz_chunks(base_dir):
-        if not _overlaps(chunk.start_step, chunk.end_step, int(t1), int(t2)):
+    for path, start_step, end_step, _idx in _list_npz_chunks(base_dir):
+        if not _overlaps(start_step, end_step, int(t1), int(t2)):
             continue
-        data = np.load(chunk.path)
+        data = np.load(path)
         steps = np.asarray(data["steps"], dtype=np.int64)
         mask = (steps >= int(t1)) & (steps <= int(t2))
         if not np.any(mask):
@@ -209,11 +183,11 @@ def iter_npz_snapshots(
             payload["P"] = np.asarray(data["P"])
         if "A" in want:
             if "A" not in data.files:
-                raise ValueError(f"A not found in npz chunk {chunk.path}. Re-run logging with save_A=true.")
+                raise ValueError(f"A not found in npz chunk {path}. Re-run logging with save_A=true.")
             payload["A"] = np.asarray(data["A"])
         if "F" in want:
             if "F" not in data.files:
-                raise ValueError(f"F not found in npz chunk {chunk.path}. Re-run logging with save_F=true.")
+                raise ValueError(f"F not found in npz chunk {path}. Re-run logging with save_F=true.")
             payload["F"] = np.asarray(data["F"])
 
         idxs = np.nonzero(mask)[0]
@@ -400,21 +374,29 @@ def _quantile_masked(vals: jax.Array, mask: jax.Array, q: float) -> jax.Array:
 
     return lax.cond(n_mask > 0, do_quantile, lambda _: jnp.array(0.0, dtype=flat.dtype), operand=None)
 
-
-def make_frame_step(params: DriftParams):
+def make_frame_step(
+    *,
+    eps: float = 1e-6,
+    r_pool: int = 3,
+    beta_t: float = 0.01,
+    q_top: float = 0.995,
+    m_thr_frac: float = 0.02,
+    mp_thr_frac: float = 0.01,
+    kappa_thr: float = 0.2,
+):
     """
     Create a jitted per-frame step function:
       (ema, metrics...) = step(A, F, ema)
 
     ema is EMA_Jp with shape (H,W,2).
     """
-    box_avg = _make_box_avg(params.r_pool)
-    eps = float(params.eps)
-    beta_t = float(params.beta_t)
-    q_top = float(params.q_top)
-    m_thr_frac = float(params.m_thr_frac)
-    mp_thr_frac = float(params.mp_thr_frac)
-    kappa_thr = float(params.kappa_thr)
+    box_avg = _make_box_avg(r_pool)
+    eps = float(eps)
+    beta_t = float(beta_t)
+    q_top = float(q_top)
+    m_thr_frac = float(m_thr_frac)
+    mp_thr_frac = float(mp_thr_frac)
+    kappa_thr = float(kappa_thr)
 
     @jax.jit
     def step(A: jax.Array, F: jax.Array, ema_Jp: jax.Array):
@@ -467,6 +449,34 @@ def make_frame_step(params: DriftParams):
     return step
 
 
+def make_jperp_fn(*, eps: float = 1e-6):
+    """
+    Create a jitted per-frame function that computes the normal-projected momentum.
+
+    Returns: (m, J, J_perp, q, n)
+      m:      (H, W)       total mass
+      J:      (H, W, 2)    momentum sum_c A_c * F_c
+      J_perp: (H, W, 2)    normal-projected momentum q*n
+      q:      (H, W)       normal scalar flux
+      n:      (H, W, 2)    unit normal from grad(m)
+    """
+    eps = float(eps)
+
+    @jax.jit
+    def fn(A: jax.Array, F: jax.Array):
+        A = A.astype(jnp.float32)
+        F = F.astype(jnp.float32)
+        m = jnp.sum(A, axis=-1)
+        J = jnp.sum(F * A[..., None, :], axis=-1)
+        g = _central_grad_periodic(m)
+        n = g / (jnp.sqrt(jnp.sum(g * g, axis=-1, keepdims=True)) + eps)
+        q = jnp.sum(J * n, axis=-1)
+        J_perp = q[..., None] * n
+        return m, J, J_perp, q, n
+
+    return fn
+
+
 # -----------------------------------------------------------------------------
 # Streaming timeseries + CSV
 # -----------------------------------------------------------------------------
@@ -478,8 +488,13 @@ def compute_drift_timeseries(
     device: Union[str, int, jax.Device, None] = "gpu",
     log_format: str = "auto",
     csv_path: Optional[str] = None,
-    params: Optional[DriftParams] = None,
-    **params_overrides,
+    eps: float = 1e-6,
+    r_pool: int = 3,
+    beta_t: float = 0.01,
+    q_top: float = 0.995,
+    m_thr_frac: float = 0.02,
+    mp_thr_frac: float = 0.01,
+    kappa_thr: float = 0.2,
 ) -> Dict[str, np.ndarray]:
     """
     Compute drift metrics for frames in [t1, t2] (inclusive).
@@ -487,13 +502,16 @@ def compute_drift_timeseries(
     Returns numpy arrays:
       t, drift_fast, drift_slow, dir_slow_y, dir_slow_x, n_mask, max_m, max_mp
     """
-    if params is None:
-        params = DriftParams(**params_overrides)
-    elif params_overrides:
-        raise ValueError("Pass either params=DriftParams(...) or individual overrides, not both.")
-
     dev = resolve_device(device)
-    step_fn = make_frame_step(params)
+    step_fn = make_frame_step(
+        eps=eps,
+        r_pool=r_pool,
+        beta_t=beta_t,
+        q_top=q_top,
+        m_thr_frac=m_thr_frac,
+        mp_thr_frac=mp_thr_frac,
+        kappa_thr=kappa_thr,
+    )
 
     fmt = log_format.strip().lower()
     if fmt == "auto":
