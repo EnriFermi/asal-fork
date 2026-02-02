@@ -386,9 +386,10 @@ def make_frame_step(
 ):
     """
     Create a jitted per-frame step function:
-      (ema, metrics...) = step(A, F, ema)
+      (ema_Jp, ema_Mp, metrics...) = step(A, F, ema_Jp, ema_Mp)
 
-    ema is EMA_Jp with shape (H,W,2).
+    ema_Jp is the EMA of Jp with shape (H,W,2).
+    ema_Mp is the EMA of Mp with shape (H,W).
     """
     box_avg = _make_box_avg(r_pool)
     eps = float(eps)
@@ -399,7 +400,7 @@ def make_frame_step(
     kappa_thr = float(kappa_thr)
 
     @jax.jit
-    def step(A: jax.Array, F: jax.Array, ema_Jp: jax.Array):
+    def step(A: jax.Array, F: jax.Array, ema_Jp: jax.Array, ema_Mp: jax.Array):
         A = A.astype(jnp.float32)
         F = F.astype(jnp.float32)
 
@@ -418,19 +419,35 @@ def make_frame_step(
         Mp = box_avg(mag_perp)
 
         norm_Jp = _norm2(Jp, eps)  # (H,W)
-        kappa = norm_Jp / (Mp + eps)
+        kappa_fast = norm_Jp / (Mp + eps)
 
-        S_fast = kappa * norm_Jp
+        # Slow EMA for both numerator and denominator.
+        ema_Jp_next = (1.0 - beta_t) * ema_Jp + beta_t * Jp
+        ema_Mp_next = (1.0 - beta_t) * ema_Mp + beta_t * Mp
 
-        ema_next = (1.0 - beta_t) * ema_Jp + beta_t * Jp
-        norm_ema = _norm2(ema_next, eps)
-        S_slow = kappa * norm_ema
+        norm_ema = _norm2(ema_Jp_next, eps)
+        kappa_slow = norm_ema / (ema_Mp_next + eps)
+
+        S_fast = kappa_fast * norm_Jp
+        S_slow = kappa_slow * norm_ema
+
+        # Robustness to transient intruders (gliders) / jitter:
+        #   persist ~ 1 for persistent drift, small for transient.
+        #   cosang gates direction flips.
+        persist = norm_ema / (norm_Jp + eps)
+        cosang = jnp.sum(Jp * ema_Jp_next, axis=-1) / (norm_Jp * norm_ema + eps)
 
         max_m = jnp.max(m)
         max_mp = jnp.max(Mp)
         m_thr = m_thr_frac * max_m
         mp_thr = mp_thr_frac * max_mp
-        mask = (m > m_thr) & (Mp > mp_thr) & (kappa > kappa_thr)
+        mask = (
+            (m > m_thr)
+            & (Mp > mp_thr)
+            & (kappa_slow > kappa_thr)
+            & (persist > 0.3)
+            & (cosang > 0.2)
+        )
         n_mask = jnp.sum(mask.astype(jnp.int32))
 
         drift_fast = _quantile_masked(S_fast, mask, q_top)
@@ -439,12 +456,12 @@ def make_frame_step(
         # Dominant direction from slow signal: mean EMA_Jp over top pixels
         top_mask = mask & (S_slow >= drift_slow)
         n_top = jnp.sum(top_mask.astype(jnp.int32))
-        mean_vec = jnp.sum(ema_next * top_mask[..., None], axis=(0, 1)) / (n_top.astype(jnp.float32) + eps)
+        mean_vec = jnp.sum(ema_Jp_next * top_mask[..., None], axis=(0, 1)) / (n_top.astype(jnp.float32) + eps)
         mean_norm = jnp.sqrt(jnp.sum(mean_vec * mean_vec)) + eps
         dir_slow = mean_vec / mean_norm
         dir_slow = lax.cond(n_top > 0, lambda v: v, lambda _: jnp.zeros_like(dir_slow), operand=dir_slow)
 
-        return ema_next, drift_fast, drift_slow, dir_slow, n_mask, max_m, max_mp
+        return ema_Jp_next, ema_Mp_next, drift_fast, drift_slow, dir_slow, n_mask, max_m, max_mp
 
     return step
 
@@ -549,7 +566,8 @@ def compute_drift_timeseries(
     max_m_list: List[float] = []
     max_mp_list: List[float] = []
 
-    ema: Optional[jax.Array] = None
+    ema_Jp: Optional[jax.Array] = None
+    ema_Mp: Optional[jax.Array] = None
     try:
         for t, sample in tqdm(iterator):
             A_np = np.asarray(sample["A"])
@@ -558,11 +576,12 @@ def compute_drift_timeseries(
             A = _to_jnp(A_np, dev, dtype=jnp.float32)
             F = _to_jnp(F_np, dev, dtype=jnp.float32)
 
-            if ema is None:
+            if ema_Jp is None or ema_Mp is None:
                 H, W = int(A_np.shape[0]), int(A_np.shape[1])
-                ema = jax.device_put(jnp.zeros((H, W, 2), dtype=jnp.float32), dev)
+                ema_Jp = jax.device_put(jnp.zeros((H, W, 2), dtype=jnp.float32), dev)
+                ema_Mp = jax.device_put(jnp.zeros((H, W), dtype=jnp.float32), dev)
 
-            ema, df, ds, dvec, nmask, mm, mp = step_fn(A, F, ema)
+            ema_Jp, ema_Mp, df, ds, dvec, nmask, mm, mp = step_fn(A, F, ema_Jp, ema_Mp)
 
             df_f = float(np.asarray(df))
             ds_f = float(np.asarray(ds))
