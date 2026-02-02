@@ -42,6 +42,7 @@ import gzip
 import os
 import pickle
 import re
+from tqdm import tqdm 
 from dataclasses import dataclass
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 
@@ -532,7 +533,7 @@ def compute_drift_timeseries(
 
     ema: Optional[jax.Array] = None
     try:
-        for t, sample in iterator:
+        for t, sample in tqdm(iterator):
             A_np = np.asarray(sample["A"])
             F_np = np.asarray(sample["F"])
 
