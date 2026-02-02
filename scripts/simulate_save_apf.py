@@ -81,6 +81,7 @@ def save_chunk(
     snaps_F: Optional[List[np.ndarray]] = None,
     use_fp16: bool = True,
     snaps_rgb: Optional[List[np.ndarray]] = None,
+    compress: bool = True,
 ) -> int:
     if not steps:
         return file_idx
@@ -90,7 +91,9 @@ def save_chunk(
     end_sec = end_step / fps
 
     dtype = np.float16 if use_fp16 else np.float32
-    arrP = np.stack(snaps_P, axis=0).astype(dtype)
+    arrP = np.stack(snaps_P, axis=0)
+    if arrP.dtype != dtype:
+        arrP = arrP.astype(dtype, copy=False)
     meta = {
         "steps": np.array(steps, dtype=np.int64),
         "fps": np.array(fps, dtype=np.float32),
@@ -100,13 +103,22 @@ def save_chunk(
 
     payload = {"P": arrP, **meta}
     if snaps_A is not None:
-        payload["A"] = np.stack(snaps_A, axis=0).astype(dtype)
+        arrA = np.stack(snaps_A, axis=0)
+        if arrA.dtype != dtype:
+            arrA = arrA.astype(dtype, copy=False)
+        payload["A"] = arrA
     if snaps_F is not None:
-        payload["F"] = np.stack(snaps_F, axis=0).astype(dtype)
+        arrF = np.stack(snaps_F, axis=0)
+        if arrF.dtype != dtype:
+            arrF = arrF.astype(dtype, copy=False)
+        payload["F"] = arrF
     if snaps_rgb is not None:
         payload["rgb"] = np.stack(snaps_rgb, axis=0).astype(np.uint8)
 
-    np.savez_compressed(path, **payload)
+    if compress:
+        np.savez_compressed(path, **payload)
+    else:
+        np.savez(path, **payload)
     saved = ["P"]
     if snaps_A is not None:
         saved.append("A")
@@ -206,6 +218,7 @@ def main(cfg, args):
     save_A = bool(getattr(args, "save_A", True))
     save_rgb = bool(getattr(args, "save_rgb", False))
     save_fp16 = bool(getattr(args, "save_fp16", True))
+    compress = bool(getattr(args, "compress", True))
 
     need_A = save_A or save_rgb
 
@@ -315,6 +328,7 @@ def main(cfg, args):
                             snaps_F_buf if save_F else None,
                             use_fp16=save_fp16,
                             snaps_rgb=snaps_rgb_buf if save_rgb else None,
+                            compress=compress,
                         )
                         steps_buf = []
                         snaps_P_buf = []
@@ -337,6 +351,7 @@ def main(cfg, args):
             snaps_F_buf if save_F else None,
             use_fp16=save_fp16,
             snaps_rgb=snaps_rgb_buf if save_rgb else None,
+            compress=compress,
         )
 
     print(f"Finished simulation. Saved {file_idx} chunk files to {out_dir}")
