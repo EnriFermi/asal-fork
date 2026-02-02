@@ -40,6 +40,8 @@ def _parse_log_step_range(args) -> Tuple[Optional[int], Optional[int]]:
     step_range = getattr(args, "log_step_range", None)
     if step_range is not None:
         vals = list(OmegaConf.to_container(step_range, resolve=True) if OmegaConf.is_config(step_range) else step_range)
+        if len(vals) == 0:
+            return None, None
         if len(vals) != 2:
             raise ValueError(f"log_step_range must be [start, end]; got {vals}")
         start, end = vals
@@ -55,6 +57,18 @@ def _in_step_range(step: int, start: Optional[int], end: Optional[int]) -> bool:
     if end is not None and step > end:
         return False
     return True
+
+
+def _project_root() -> str:
+    # scripts/.. -> repo root
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+
+
+def _resolve_path(path: str, base_dir: str) -> str:
+    path = str(path)
+    if os.path.isabs(path):
+        return path
+    return os.path.normpath(os.path.join(base_dir, path))
 
 
 def save_chunk(
@@ -105,11 +119,14 @@ def save_chunk(
 
 
 def main(cfg, args):
-    best_path = os.path.join(args.save_dir, "best.pkl")
-    if not os.path.exists(best_path):
-        raise FileNotFoundError(f"best.pkl not found in {args.save_dir}. Ensure main_opt.py saved results with --save_dir.")
+    proj_root = _project_root()
+    save_dir = _resolve_path(getattr(args, "save_dir"), proj_root)
 
-    best_obj = util.load_pkl(args.save_dir, "best")
+    best_path = os.path.join(save_dir, "best.pkl")
+    if not os.path.exists(best_path):
+        raise FileNotFoundError(f"best.pkl not found in {save_dir}. Ensure main_opt.py saved results with --save_dir.")
+
+    best_obj = util.load_pkl(save_dir, "best")
     if isinstance(best_obj, tuple) and len(best_obj) == 2:
         best_member, best_fitness = best_obj
     else:
@@ -120,13 +137,13 @@ def main(cfg, args):
     traj_iter = getattr(args, "traj_iter", None)
     if traj_iter is not None:
         traj_iter = int(traj_iter)
-        traj_path = os.path.join(args.save_dir, "best_traj.pkl")
+        traj_path = os.path.join(save_dir, "best_traj.pkl")
         if not os.path.exists(traj_path):
             raise FileNotFoundError(
                 f"traj_iter={traj_iter} requested but best_traj.pkl not found in {args.save_dir}. "
                 f"Re-run main_opt.py with code that saves best_traj.pkl."
             )
-        traj = util.load_pkl(args.save_dir, "best_traj")
+        traj = util.load_pkl(save_dir, "best_traj")
         params_arr = traj.get("params", None)
         if params_arr is None:
             raise ValueError(f"best_traj.pkl in {args.save_dir} does not contain 'params'.")
@@ -178,11 +195,12 @@ def main(cfg, args):
 
     log_start, log_end = _parse_log_step_range(args)
 
-    out_dir_cfg = getattr(args, "output_dir", "snapshots_P")
-    if out_dir_cfg is None or (isinstance(out_dir_cfg, str) and out_dir_cfg.strip().lower() == "none"):
-        out_dir_cfg = "snapshots_P"
-    out_dir_cfg = str(out_dir_cfg)
-    out_dir = out_dir_cfg if os.path.isabs(out_dir_cfg) else os.path.join(args.save_dir, out_dir_cfg)
+    out_dir_cfg = getattr(args, "output_dir", None)
+    if out_dir_cfg is None or (isinstance(out_dir_cfg, str) and out_dir_cfg.strip().lower() in ("none", "")):
+        out_dir = os.path.join(save_dir, "snapshots_P")
+    else:
+        out_dir_cfg = str(out_dir_cfg)
+        out_dir = _resolve_path(out_dir_cfg, proj_root)
     os.makedirs(out_dir, exist_ok=True)
 
     save_A = bool(getattr(args, "save_A", True))
@@ -308,7 +326,6 @@ def main(cfg, args):
             steps_done += mb
             pbar.update(mb)
     pbar.close()
-
     if snaps_P_buf:
         file_idx = save_chunk(
             out_dir,
