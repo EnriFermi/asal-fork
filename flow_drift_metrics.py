@@ -38,6 +38,7 @@ plt.tight_layout()
 from __future__ import annotations
 
 import csv
+import functools
 import gzip
 import os
 import pickle
@@ -374,35 +375,39 @@ def _quantile_masked(vals: jax.Array, mask: jax.Array, q: float) -> jax.Array:
 
     return lax.cond(n_mask > 0, do_quantile, lambda _: jnp.array(0.0, dtype=flat.dtype), operand=None)
 
-def make_frame_step(
+
+@functools.lru_cache(maxsize=None)
+def _make_frame_step_jit(
     *,
-    eps: float = 1e-6,
-    r_pool: int = 3,
-    beta_t: float = 0.01,
-    q_top: float = 0.995,
-    m_thr_frac: float = 0.02,
-    mp_thr_frac: float = 0.01,
-    kappa_thr: float = 0.2,
+    eps: float,
+    r_pool: int,
+    q_top: float,
+    m_thr_frac: float,
+    mp_thr_frac: float,
+    kappa_thr: float,
 ):
     """
-    Create a jitted per-frame step function:
-      (ema_Jp, ema_Mp, metrics...) = step(A, F, ema_Jp, ema_Mp)
-
-    ema_Jp is the EMA of Jp with shape (H,W,2).
-    ema_Mp is the EMA of Mp with shape (H,W).
+    Cached builder for the heavy jitted step. Caching avoids repeated GPU recompiles
+    when you call compute_drift_timeseries() many times (e.g. sweeping beta_t).
     """
-    box_avg = _make_box_avg(r_pool)
+    box_avg = _make_box_avg(int(r_pool))
     eps = float(eps)
-    beta_t = float(beta_t)
     q_top = float(q_top)
     m_thr_frac = float(m_thr_frac)
     mp_thr_frac = float(mp_thr_frac)
     kappa_thr = float(kappa_thr)
 
     @jax.jit
-    def step(A: jax.Array, F: jax.Array, ema_Jp: jax.Array, ema_Mp: jax.Array):
+    def step(
+        A: jax.Array,
+        F: jax.Array,
+        ema_Jp: jax.Array,
+        ema_Mp: jax.Array,
+        beta_t: jax.Array,  # scalar
+    ):
         A = A.astype(jnp.float32)
         F = F.astype(jnp.float32)
+        beta_t = beta_t.astype(jnp.float32)
 
         # m: (H,W), J: (H,W,2)
         m = jnp.sum(A, axis=-1)
@@ -466,6 +471,39 @@ def make_frame_step(
     return step
 
 
+def make_frame_step(
+    *,
+    eps: float = 1e-6,
+    r_pool: int = 3,
+    beta_t: float = 0.01,
+    q_top: float = 0.995,
+    m_thr_frac: float = 0.02,
+    mp_thr_frac: float = 0.01,
+    kappa_thr: float = 0.2,
+):
+    """
+    Create a jitted per-frame step function:
+      (ema_Jp, ema_Mp, metrics...) = step(A, F, ema_Jp, ema_Mp)
+
+    ema_Jp is the EMA of Jp with shape (H,W,2).
+    ema_Mp is the EMA of Mp with shape (H,W).
+    """
+    step_jit = _make_frame_step_jit(
+        eps=float(eps),
+        r_pool=int(r_pool),
+        q_top=float(q_top),
+        m_thr_frac=float(m_thr_frac),
+        mp_thr_frac=float(mp_thr_frac),
+        kappa_thr=float(kappa_thr),
+    )
+    beta_const = np.float32(beta_t)
+
+    def step(A: jax.Array, F: jax.Array, ema_Jp: jax.Array, ema_Mp: jax.Array):
+        return step_jit(A, F, ema_Jp, ema_Mp, beta_const)
+
+    return step
+
+
 def make_jperp_fn(*, eps: float = 1e-6):
     """
     Create a jitted per-frame function that computes the normal-projected momentum.
@@ -520,15 +558,15 @@ def compute_drift_timeseries(
       t, drift_fast, drift_slow, dir_slow_y, dir_slow_x, n_mask, max_m, max_mp
     """
     dev = resolve_device(device)
-    step_fn = make_frame_step(
-        eps=eps,
-        r_pool=r_pool,
-        beta_t=beta_t,
-        q_top=q_top,
-        m_thr_frac=m_thr_frac,
-        mp_thr_frac=mp_thr_frac,
-        kappa_thr=kappa_thr,
+    step_fn = _make_frame_step_jit(
+        eps=float(eps),
+        r_pool=int(r_pool),
+        q_top=float(q_top),
+        m_thr_frac=float(m_thr_frac),
+        mp_thr_frac=float(mp_thr_frac),
+        kappa_thr=float(kappa_thr),
     )
+    beta = _to_jnp(np.asarray(beta_t, dtype=np.float32), dev, dtype=jnp.float32)
 
     fmt = log_format.strip().lower()
     if fmt == "auto":
@@ -581,7 +619,7 @@ def compute_drift_timeseries(
                 ema_Jp = jax.device_put(jnp.zeros((H, W, 2), dtype=jnp.float32), dev)
                 ema_Mp = jax.device_put(jnp.zeros((H, W), dtype=jnp.float32), dev)
 
-            ema_Jp, ema_Mp, df, ds, dvec, nmask, mm, mp = step_fn(A, F, ema_Jp, ema_Mp)
+            ema_Jp, ema_Mp, df, ds, dvec, nmask, mm, mp = step_fn(A, F, ema_Jp, ema_Mp, beta)
 
             df_f = float(np.asarray(df))
             ds_f = float(np.asarray(ds))
