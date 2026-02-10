@@ -1,5 +1,6 @@
 import os
 import sys
+from collections import deque
 from typing import List, Optional, Tuple
 
 import jax
@@ -219,6 +220,22 @@ def main(cfg, args):
     save_rgb = bool(getattr(args, "save_rgb", False))
     save_fp16 = bool(getattr(args, "save_fp16", True))
     compress = bool(getattr(args, "compress", True))
+    save_dtype = np.float16 if save_fp16 else np.float32
+
+    smooth_F = bool(getattr(args, "smooth_F", False))
+    smooth_F_window = int(getattr(args, "smooth_F_window", 1))
+    if smooth_F_window < 1:
+        raise ValueError(f"smooth_F_window must be >= 1, got {smooth_F_window}.")
+    if smooth_F_window % 2 == 0:
+        raise ValueError(f"smooth_F_window must be odd for centered smoothing, got {smooth_F_window}.")
+    smooth_F_enabled = bool(save_F and smooth_F and smooth_F_window > 1)
+    if smooth_F and not save_F:
+        print("smooth_F=true ignored because save_F=false.")
+    if smooth_F_enabled:
+        print(
+            f"Enabled centered F smoothing: window={smooth_F_window} snapshots "
+            f"(radius={smooth_F_window // 2}), snapshot_interval={snapshot_interval}"
+        )
 
     need_A = save_A or save_rgb
 
@@ -266,6 +283,96 @@ def main(cfg, args):
     snaps_rgb_buf: List[np.ndarray] = []
     file_idx = 0
 
+    # Streaming state for centered smoothing over snapshot index.
+    smooth_radius = smooth_F_window // 2
+    smooth_items = deque()
+    smooth_start_idx = 0
+    smooth_next_emit_idx = 0
+    smooth_seen = 0
+
+    def flush_chunk_if_needed():
+        nonlocal file_idx, steps_buf, snaps_P_buf, snaps_A_buf, snaps_F_buf, snaps_rgb_buf
+        if len(snaps_P_buf) < chunk_size:
+            return
+        file_idx = save_chunk(
+            out_dir,
+            fps,
+            steps_buf,
+            snaps_P_buf,
+            file_idx,
+            snaps_A_buf if save_A else None,
+            snaps_F_buf if save_F else None,
+            use_fp16=save_fp16,
+            snaps_rgb=snaps_rgb_buf if save_rgb else None,
+            compress=compress,
+        )
+        steps_buf = []
+        snaps_P_buf = []
+        snaps_A_buf = []
+        snaps_F_buf = []
+        snaps_rgb_buf = []
+
+    def emit_snapshot(step: int, p_frame: np.ndarray, a_frame: Optional[np.ndarray], f_frame: Optional[np.ndarray], rgb_frame: Optional[np.ndarray]):
+        steps_buf.append(step)
+        snaps_P_buf.append(p_frame.astype(save_dtype, copy=False))
+        if save_A:
+            assert a_frame is not None
+            snaps_A_buf.append(a_frame.astype(save_dtype, copy=False))
+        if save_F:
+            assert f_frame is not None
+            snaps_F_buf.append(f_frame.astype(save_dtype, copy=False))
+        if save_rgb:
+            assert rgb_frame is not None
+            snaps_rgb_buf.append(rgb_frame)
+        flush_chunk_if_needed()
+
+    def emit_smoothed_at_index(snapshot_idx: int, max_available_idx: int):
+        nonlocal smooth_next_emit_idx, smooth_start_idx
+        win_start = max(0, snapshot_idx - smooth_radius)
+        win_end = min(max_available_idx, snapshot_idx + smooth_radius)
+        center_off = snapshot_idx - smooth_start_idx
+        start_off = win_start - smooth_start_idx
+        end_off = win_end - smooth_start_idx
+        if center_off < 0 or end_off >= len(smooth_items):
+            raise RuntimeError(
+                "F smoothing buffer underflow/overflow. "
+                f"snapshot_idx={snapshot_idx}, smooth_start_idx={smooth_start_idx}, "
+                f"len={len(smooth_items)}, win=[{win_start},{win_end}], max={max_available_idx}"
+            )
+
+        step, p_frame, a_frame, f_center, rgb_frame = smooth_items[center_off]
+        assert f_center is not None
+        f_mean = np.zeros_like(f_center, dtype=np.float32)
+        n_acc = 0
+        for off in range(start_off, end_off + 1):
+            f_raw = smooth_items[off][3]
+            assert f_raw is not None
+            f_mean += f_raw.astype(np.float32, copy=False)
+            n_acc += 1
+        f_mean /= max(1, n_acc)
+
+        emit_snapshot(step, p_frame, a_frame, f_mean, rgb_frame)
+        smooth_next_emit_idx += 1
+
+        min_needed_idx = max(0, smooth_next_emit_idx - smooth_radius)
+        while smooth_start_idx < min_needed_idx and smooth_items:
+            smooth_items.popleft()
+            smooth_start_idx += 1
+
+    def process_snapshot(step: int, p_frame: np.ndarray, a_frame: Optional[np.ndarray], f_frame: Optional[np.ndarray], rgb_frame: Optional[np.ndarray]):
+        nonlocal smooth_seen
+        if not smooth_F_enabled:
+            emit_snapshot(step, p_frame, a_frame, f_frame, rgb_frame)
+            return
+
+        snapshot_idx = smooth_seen
+        smooth_seen += 1
+        smooth_items.append((step, p_frame, a_frame, f_frame, rgb_frame))
+
+        # Emit any index that already has enough future snapshots for centered window.
+        while smooth_next_emit_idx <= snapshot_idx - smooth_radius:
+            emit_smoothed_at_index(smooth_next_emit_idx, snapshot_idx)
+
     steps_done = 0
     pbar = tqdm(total=total_steps, desc="Simulating")
     while steps_done < total_steps:
@@ -302,44 +409,23 @@ def main(cfg, args):
                     rgb = np.clip(a_sum * p3, 0.0, 1.0)
                     selRGB = (rgb * 255).astype(np.uint8)
 
-                dtype = np.float16 if save_fp16 else np.float32
                 for i_local, i_global in enumerate(idxs):
                     global_step = base_step + i_global
-                    steps_buf.append(global_step)
-                    snaps_P_buf.append(selP[i_local].astype(dtype))
-                    if save_A:
-                        assert selA is not None
-                        snaps_A_buf.append(selA[i_local].astype(dtype))
-                    if save_F:
-                        assert selF is not None
-                        snaps_F_buf.append(selF[i_local].astype(dtype))
-                    if save_rgb:
-                        assert selRGB is not None
-                        snaps_rgb_buf.append(selRGB[i_local])
-
-                    if len(snaps_P_buf) >= chunk_size:
-                        file_idx = save_chunk(
-                            out_dir,
-                            fps,
-                            steps_buf,
-                            snaps_P_buf,
-                            file_idx,
-                            snaps_A_buf if save_A else None,
-                            snaps_F_buf if save_F else None,
-                            use_fp16=save_fp16,
-                            snaps_rgb=snaps_rgb_buf if save_rgb else None,
-                            compress=compress,
-                        )
-                        steps_buf = []
-                        snaps_P_buf = []
-                        snaps_A_buf = []
-                        snaps_F_buf = []
-                        snaps_rgb_buf = []
+                    a_frame = selA[i_local] if save_A else None
+                    f_frame = selF[i_local] if save_F else None
+                    rgb_frame = selRGB[i_local] if save_rgb else None
+                    process_snapshot(global_step, selP[i_local], a_frame, f_frame, rgb_frame)
 
             remaining -= mb
             steps_done += mb
             pbar.update(mb)
     pbar.close()
+    if smooth_F_enabled and smooth_seen > 0:
+        tail_last_idx = smooth_seen - 1
+        # Tail frames: use truncated centered window because future snapshots are unavailable.
+        while smooth_next_emit_idx < smooth_seen:
+            emit_smoothed_at_index(smooth_next_emit_idx, tail_last_idx)
+
     if snaps_P_buf:
         file_idx = save_chunk(
             out_dir,
