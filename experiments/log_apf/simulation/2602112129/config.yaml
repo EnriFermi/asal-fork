@@ -1,0 +1,74 @@
+meta:
+  save_dir: data/interp_supervised_0_1/interp_6
+  output_dir: experiments/log_apf/checkpoints/2602101525/interp_6  # куда писать .npz чанки
+
+substrate:
+  substrate: lenia_flow
+  grid_size: 384
+  C: 3
+  k: 9
+  kernel_components: 3
+  M: "2,1,0;0,2,1;1,0,2"
+  dd: 5
+  dt: 0.2
+  sigma: 0.65
+  border: wall
+  mix_rule: stoch
+  seed_patch_size: 20
+  seed_n_patches: 16
+  seed_mode: random_patches
+  p_constant_per_patch: 1
+  render_mode: Pcolor
+  clip1: .inf
+  clip2: .inf
+  mutations: true
+  mutation_sz: 40
+  mutation_p: 0.05
+  mutation_scale: 1.0
+  optimize_mutation_scale: false
+  volcano: false
+  volcano_sz: 30
+  volcano_p: 0.01
+  volcano_delta: 5.0
+  food: false
+  food_interval: 128
+  food_n: 3
+  food_sz: 16
+  food_amount: 1.0
+  food_consume_rate: 0.05
+  food_bonus: 1.0
+  mass_decay: 0.0
+  food_channel: 1
+  food_auto_size: false
+  food_auto_scale: 1.0
+  food_conv_mode: scalar
+  food_vis_scale: 1.0
+  food_vis_color: "0.6,0.3,0.0"
+  food_diffusion_alpha: 0.0
+  mass_clip_eps: 0.0
+
+simulation:
+  rollout_steps: 1000000
+  max_steps: 1000000
+  seed: 0
+  batch_steps: 768
+  jit_microbatch: 64
+  fps: 250
+
+logging:
+  compress: false
+  snapshot_interval: 50
+  snapshots_per_file: 250
+  save_A: true
+  save_F: true
+  save_lagrangian: true
+  lagrangian_n_particles: 256
+  lagrangian_seed: 0
+  lagrangian_init_mode: mass
+  lagrangian_flow_reduce: mass_weighted
+  lagrangian_flow_channel: -1
+  smooth_F: true
+  smooth_F_window: 5
+  save_rgb: false
+  save_fp16: true
+  log_step_range: [null, null]  # или, например: [10000, 20000]

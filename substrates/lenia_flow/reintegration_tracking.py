@@ -28,6 +28,108 @@ class ReintegrationTracking:
 
     #-------------------------------------------------------------------
 
+    def _to_flow_2d(self, F: jax.Array, A: jax.Array | None = None, channel: int = -1, reduce: str = "mass_weighted") -> jax.Array:
+        """
+        Convert F to a 2D vector field (SX,SY,2) for point advection.
+        F can be (SX,SY,2) or (SX,SY,2,C).
+        """
+        if F.ndim == 3:
+            return F
+        if F.ndim != 4:
+            raise ValueError(f"Expected F with ndim 3 or 4, got shape={F.shape}.")
+
+        if channel is not None and int(channel) >= 0:
+            c = jnp.clip(jnp.asarray(channel, dtype=jnp.int32), 0, F.shape[-1] - 1)
+            return F[..., c]
+
+        if reduce == "mean":
+            return jnp.mean(F, axis=-1)
+
+        if reduce == "mass_weighted" and A is not None:
+            w = jnp.clip(A, 0.0, jnp.inf)
+            den = jnp.sum(w, axis=-1, keepdims=True)
+            return jnp.sum(F * w[:, :, None, :], axis=-1) / (den + 1e-8)
+
+        return jnp.mean(F, axis=-1)
+
+    #-------------------------------------------------------------------
+
+    def _sample_flow_bilinear(self, flow: jax.Array, points: jax.Array) -> jax.Array:
+        """
+        Bilinear sample of (SX,SY,2) flow at point coordinates (N,2), where
+        points use FlowLenia coordinates with cell centers at i+0.5.
+        """
+        fy = points[:, 0] - 0.5
+        fx = points[:, 1] - 0.5
+
+        if self.border == "torus":
+            fy = jnp.mod(fy, self.SX)
+            fx = jnp.mod(fx, self.SY)
+            i0 = jnp.floor(fy).astype(jnp.int32)
+            j0 = jnp.floor(fx).astype(jnp.int32)
+            i1 = (i0 + 1) % self.SX
+            j1 = (j0 + 1) % self.SY
+        else:
+            fy = jnp.clip(fy, 0.0, self.SX - 1.0)
+            fx = jnp.clip(fx, 0.0, self.SY - 1.0)
+            i0 = jnp.floor(fy).astype(jnp.int32)
+            j0 = jnp.floor(fx).astype(jnp.int32)
+            i1 = jnp.clip(i0 + 1, 0, self.SX - 1)
+            j1 = jnp.clip(j0 + 1, 0, self.SY - 1)
+
+        wy = (fy - i0.astype(fy.dtype))[:, None]
+        wx = (fx - j0.astype(fx.dtype))[:, None]
+
+        f00 = flow[i0, j0]
+        f10 = flow[i1, j0]
+        f01 = flow[i0, j1]
+        f11 = flow[i1, j1]
+
+        return (
+            (1.0 - wy) * (1.0 - wx) * f00
+            + wy * (1.0 - wx) * f10
+            + (1.0 - wy) * wx * f01
+            + wy * wx * f11
+        )
+
+    #-------------------------------------------------------------------
+
+    def advect_points(
+        self,
+        points: jax.Array,
+        F: jax.Array,
+        A: jax.Array | None = None,
+        channel: int = -1,
+        reduce: str = "mass_weighted",
+    ) -> jax.Array:
+        """
+        Advect explicit Lagrangian points by one FlowLenia step using the same
+        dt/dd/sigma/border constraints as reintegration.
+
+        Args:
+            points: (N,2) in FlowLenia coordinates (cell centers are i+0.5).
+            F: (SX,SY,2) or (SX,SY,2,C) flow field.
+            A: optional (SX,SY,C) activations for mass-weighted channel mixing.
+            channel: if >=0, use this F channel directly.
+            reduce: "mass_weighted" or "mean" when channel < 0.
+        """
+        flow = self._to_flow_2d(F, A=A, channel=channel, reduce=reduce)
+        v = self._sample_flow_bilinear(flow, points)
+        ma = self.dd - self.sigma
+        delta = jnp.clip(self.dt * v, -ma, ma)
+        pts = points + delta
+
+        if self.border == "torus":
+            yy = jnp.mod(pts[:, 0] - 0.5, self.SX) + 0.5
+            xx = jnp.mod(pts[:, 1] - 0.5, self.SY) + 0.5
+            return jnp.stack((yy, xx), axis=-1)
+
+        lo = jnp.array([self.sigma, self.sigma], dtype=pts.dtype)
+        hi = jnp.array([self.SX - self.sigma, self.SY - self.sigma], dtype=pts.dtype)
+        return jnp.clip(pts, lo, hi)
+
+    #-------------------------------------------------------------------
+
     def _apply_without_hidden(self, A: jax.Array, F: jax.Array)->jax.Array:
 
         x, y = jnp.arange(self.SX), jnp.arange(self.SY)
@@ -148,4 +250,3 @@ class ReintegrationTracking:
         return nA, nH
 
     #-------------------------------------------------------------------
-
