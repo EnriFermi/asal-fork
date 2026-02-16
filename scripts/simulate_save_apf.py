@@ -128,6 +128,7 @@ def save_chunk(
     use_fp16: bool = True,
     snaps_rgb: Optional[List[np.ndarray]] = None,
     snaps_lagrangian: Optional[List[np.ndarray]] = None,
+    snaps_lagrangian_c: Optional[List[np.ndarray]] = None,
     compress: bool = True,
 ) -> int:
     if not steps:
@@ -163,6 +164,8 @@ def save_chunk(
         payload["rgb"] = np.stack(snaps_rgb, axis=0).astype(np.uint8)
     if snaps_lagrangian is not None:
         payload["lagrangian_xy"] = np.stack(snaps_lagrangian, axis=0).astype(np.float32, copy=False)
+    if snaps_lagrangian_c is not None:
+        payload["lagrangian_c"] = np.stack(snaps_lagrangian_c, axis=0).astype(np.int32, copy=False)
 
     if compress:
         np.savez_compressed(path, **payload)
@@ -177,6 +180,8 @@ def save_chunk(
         saved.append("rgb")
     if snaps_lagrangian is not None:
         saved.append("lagrangian_xy")
+    if snaps_lagrangian_c is not None:
+        saved.append("lagrangian_c")
     print(f"Saved {len(steps)} snapshots ({','.join(saved)}) to {path}")
     return file_idx + 1
 
@@ -279,15 +284,34 @@ def main(cfg, args):
     lagrangian_init_mode = str(getattr(args, "lagrangian_init_mode", "mass")).strip().lower()
     lagrangian_flow_reduce = str(getattr(args, "lagrangian_flow_reduce", "mass_weighted")).strip().lower()
     lagrangian_flow_channel = _parse_optional_int(getattr(args, "lagrangian_flow_channel", -1))
+    lagrangian_channel_mode = str(getattr(args, "lagrangian_channel_mode", "mix")).strip().lower()
+    lagrangian_noise_model = str(getattr(args, "lagrangian_noise_model", "none")).strip().lower()
+    lagrangian_diffusion_scale = float(getattr(args, "lagrangian_diffusion_scale", 1.0))
+    save_lagrangian_channels = bool(getattr(args, "save_lagrangian_channels", False))
+    lagrangian_unique_check_every_steps = int(getattr(args, "lagrangian_unique_check_every_steps", 0))
     if lagrangian_flow_channel is None:
         lagrangian_flow_channel = -1
     if lagrangian_flow_channel < -1:
         raise ValueError(
             f"lagrangian_flow_channel must be >= -1 or null, got {lagrangian_flow_channel}."
         )
+    if lagrangian_channel_mode not in ("mix", "fixed", "resample"):
+        raise ValueError(
+            f"lagrangian_channel_mode must be one of ('mix','fixed','resample'), got {lagrangian_channel_mode!r}."
+        )
     if lagrangian_flow_reduce not in ("mass_weighted", "mean"):
         raise ValueError(
             f"lagrangian_flow_reduce must be 'mass_weighted' or 'mean', got {lagrangian_flow_reduce!r}."
+        )
+    if lagrangian_noise_model not in ("none", "rt_box", "gaussian"):
+        raise ValueError(
+            f"lagrangian_noise_model must be one of ('none','rt_box','gaussian'), got {lagrangian_noise_model!r}."
+        )
+    if lagrangian_diffusion_scale < 0:
+        raise ValueError(f"lagrangian_diffusion_scale must be >= 0, got {lagrangian_diffusion_scale}.")
+    if lagrangian_unique_check_every_steps < 0:
+        raise ValueError(
+            f"lagrangian_unique_check_every_steps must be >= 0, got {lagrangian_unique_check_every_steps}."
         )
 
     smooth_F = bool(getattr(args, "smooth_F", False))
@@ -308,13 +332,16 @@ def main(cfg, args):
     need_A = save_A or save_rgb
 
     lag_xy = jnp.zeros((1, 2), dtype=jnp.float32)
+    lag_ch = jnp.zeros((1,), dtype=jnp.int32)
+    lag_unique_initial = 0
+    lag_unique_next_check_step = lagrangian_unique_check_every_steps
     rt = None
     if save_lagrangian:
         base_substrate = substrate.substrate if hasattr(substrate, "substrate") else substrate
         rt = getattr(base_substrate, "RT", None)
-        if rt is None or not hasattr(rt, "advect_points"):
+        if rt is None or not hasattr(rt, "advect_particles"):
             raise RuntimeError(
-                "Lagrangian tracking requires ReintegrationTracking.advect_points, "
+                "Lagrangian tracking requires ReintegrationTracking.advect_particles, "
                 "but substrate RT is unavailable."
             )
         lag_xy0 = _init_lagrangian_points(
@@ -325,29 +352,52 @@ def main(cfg, args):
             rt=rt,
         )
         lag_xy = jnp.asarray(lag_xy0, dtype=jnp.float32)
+        lag_unique_initial = int(np.unique(lag_xy0, axis=0).shape[0])
+        lag_ch0 = np.zeros((lagrangian_n_particles,), dtype=np.int32)
+        if lagrangian_channel_mode in ("fixed", "resample") and int(s["F"].shape[-1]) > 1:
+            lag_ch_key = jax.random.PRNGKey(lagrangian_seed + 7919)
+            lag_ch = rt.sample_point_channels(lag_xy, s["A"], lag_ch_key)
+            lag_ch0 = np.asarray(lag_ch, dtype=np.int32)
+        else:
+            lag_ch = jnp.zeros((lagrangian_n_particles,), dtype=jnp.int32)
 
         meta_path = os.path.join(out_dir, "lagrangian_meta.npz")
         np.savez(
             meta_path,
             initial_xy=lag_xy0,
             particle_ids=np.arange(lagrangian_n_particles, dtype=np.int32),
+            initial_channels=lag_ch0,
             init_mode=np.array(lagrangian_init_mode),
             flow_reduce=np.array(lagrangian_flow_reduce),
             flow_channel=np.array(lagrangian_flow_channel, dtype=np.int32),
+            channel_mode=np.array(lagrangian_channel_mode),
+            noise_model=np.array(lagrangian_noise_model),
+            diffusion_scale=np.array(lagrangian_diffusion_scale, dtype=np.float32),
             seed=np.array(lagrangian_seed, dtype=np.int64),
             snapshot_interval=np.array(snapshot_interval, dtype=np.int32),
         )
         print(
             f"Enabled explicit Lagrangian tracking: n={lagrangian_n_particles}, "
-            f"init={lagrangian_init_mode}, reduce={lagrangian_flow_reduce}, "
-            f"channel={lagrangian_flow_channel}, meta={meta_path}"
+            f"init={lagrangian_init_mode}, channel_mode={lagrangian_channel_mode}, "
+            f"reduce={lagrangian_flow_reduce}, channel={lagrangian_flow_channel}, "
+            f"noise={lagrangian_noise_model}, dscale={lagrangian_diffusion_scale}, "
+            f"meta={meta_path}"
         )
+        if lagrangian_unique_check_every_steps > 0:
+            print(
+                f"Enabled lagrangian uniqueness monitor: every {lagrangian_unique_check_every_steps} steps."
+            )
 
     # Jitted microbatch stepper:
-    # returns (state_next, lag_xy_next, Pbuf, Abuf_or_dummy, Fbuf_or_dummy, Lbuf_or_dummy)
+    # returns (
+    #   state_next, lag_xy_next, lag_ch_next,
+    #   Pbuf, Abuf_or_dummy, Fbuf_or_dummy, Lbuf_or_dummy, Cbuf_or_dummy
+    # )
     def build_batch_stepper(mb: int):
-        def run_batch(state, lag_points, rng_in):
-            rngs = jax.random.split(rng_in, mb)
+        def run_batch(state, lag_points, lag_channels, rng_in):
+            rng_sim, rng_lag = jax.random.split(rng_in)
+            rngs = jax.random.split(rng_sim, mb)
+            lag_rngs = jax.random.split(rng_lag, mb)
             P0 = jnp.zeros((mb, *state["P"].shape), dtype=state["P"].dtype)
             if need_A:
                 A0 = jnp.zeros((mb, *state["A"].shape), dtype=state["A"].dtype)
@@ -361,9 +411,13 @@ def main(cfg, args):
                 L0 = jnp.zeros((mb, lag_points.shape[0], 2), dtype=lag_points.dtype)
             else:
                 L0 = jnp.zeros((1,), dtype=jnp.float32)
+            if save_lagrangian and save_lagrangian_channels:
+                C0 = jnp.zeros((mb, lag_channels.shape[0]), dtype=lag_channels.dtype)
+            else:
+                C0 = jnp.zeros((1,), dtype=jnp.int32)
 
             def body(i, carry):
-                st, lag_xy_i, Pbuf, Abuf, Fbuf, Lbuf = carry
+                st, lag_xy_i, lag_ch_i, Pbuf, Abuf, Fbuf, Lbuf, Cbuf = carry
                 st = substrate.step_state(rngs[i], st, best_member)
                 Pbuf = Pbuf.at[i].set(st["P"])
                 if need_A:
@@ -371,20 +425,27 @@ def main(cfg, args):
                 if need_F_from_state:
                     Fbuf = Fbuf.at[i].set(st["F"])
                 if save_lagrangian:
-                    lag_xy_i = rt.advect_points(
-                        lag_xy_i,
-                        st["F"],
+                    lag_xy_i, lag_ch_i = rt.advect_particles(
+                        points=lag_xy_i,
+                        F=st["F"],
                         A=st["A"],
                         channel=lagrangian_flow_channel,
                         reduce=lagrangian_flow_reduce,
+                        point_channels=lag_ch_i,
+                        channel_mode=lagrangian_channel_mode,
+                        key=lag_rngs[i],
+                        noise_model=lagrangian_noise_model,
+                        diffusion_scale=lagrangian_diffusion_scale,
                     )
                     Lbuf = Lbuf.at[i].set(lag_xy_i)
-                return (st, lag_xy_i, Pbuf, Abuf, Fbuf, Lbuf)
+                    if save_lagrangian_channels:
+                        Cbuf = Cbuf.at[i].set(lag_ch_i)
+                return (st, lag_xy_i, lag_ch_i, Pbuf, Abuf, Fbuf, Lbuf, Cbuf)
 
-            state_next, lag_next, Pbuf, Abuf, Fbuf, Lbuf = jax.lax.fori_loop(
-                0, mb, body, (state, lag_points, P0, A0, F0, L0)
+            state_next, lag_next, lag_ch_next, Pbuf, Abuf, Fbuf, Lbuf, Cbuf = jax.lax.fori_loop(
+                0, mb, body, (state, lag_points, lag_channels, P0, A0, F0, L0, C0)
             )
-            return state_next, lag_next, Pbuf, Abuf, Fbuf, Lbuf
+            return state_next, lag_next, lag_ch_next, Pbuf, Abuf, Fbuf, Lbuf, Cbuf
 
         return jax.jit(run_batch)
 
@@ -402,6 +463,7 @@ def main(cfg, args):
     snaps_F_buf: List[np.ndarray] = []
     snaps_rgb_buf: List[np.ndarray] = []
     snaps_lagrangian_buf: List[np.ndarray] = []
+    snaps_lagrangian_c_buf: List[np.ndarray] = []
     file_idx = 0
 
     # Streaming state for centered smoothing over snapshot index.
@@ -412,7 +474,7 @@ def main(cfg, args):
     smooth_seen = 0
 
     def flush_chunk_if_needed():
-        nonlocal file_idx, steps_buf, snaps_P_buf, snaps_A_buf, snaps_F_buf, snaps_rgb_buf, snaps_lagrangian_buf
+        nonlocal file_idx, steps_buf, snaps_P_buf, snaps_A_buf, snaps_F_buf, snaps_rgb_buf, snaps_lagrangian_buf, snaps_lagrangian_c_buf
         if len(snaps_P_buf) < chunk_size:
             return
         file_idx = save_chunk(
@@ -426,6 +488,7 @@ def main(cfg, args):
             use_fp16=save_fp16,
             snaps_rgb=snaps_rgb_buf if save_rgb else None,
             snaps_lagrangian=snaps_lagrangian_buf if save_lagrangian else None,
+            snaps_lagrangian_c=snaps_lagrangian_c_buf if (save_lagrangian and save_lagrangian_channels) else None,
             compress=compress,
         )
         steps_buf = []
@@ -434,6 +497,7 @@ def main(cfg, args):
         snaps_F_buf = []
         snaps_rgb_buf = []
         snaps_lagrangian_buf = []
+        snaps_lagrangian_c_buf = []
 
     def emit_snapshot(
         step: int,
@@ -442,6 +506,7 @@ def main(cfg, args):
         f_frame: Optional[np.ndarray],
         rgb_frame: Optional[np.ndarray],
         lag_frame: Optional[np.ndarray],
+        lag_c_frame: Optional[np.ndarray],
     ):
         steps_buf.append(step)
         snaps_P_buf.append(p_frame.astype(save_dtype, copy=False))
@@ -457,6 +522,9 @@ def main(cfg, args):
         if save_lagrangian:
             assert lag_frame is not None
             snaps_lagrangian_buf.append(lag_frame.astype(np.float32, copy=False))
+            if save_lagrangian_channels:
+                assert lag_c_frame is not None
+                snaps_lagrangian_c_buf.append(lag_c_frame.astype(np.int32, copy=False))
         flush_chunk_if_needed()
 
     def emit_smoothed_at_index(snapshot_idx: int, max_available_idx: int):
@@ -473,7 +541,7 @@ def main(cfg, args):
                 f"len={len(smooth_items)}, win=[{win_start},{win_end}], max={max_available_idx}"
             )
 
-        step, p_frame, a_frame, f_center, rgb_frame, lag_frame = smooth_items[center_off]
+        step, p_frame, a_frame, f_center, rgb_frame, lag_frame, lag_c_frame = smooth_items[center_off]
         assert f_center is not None
         f_mean = np.zeros_like(f_center, dtype=np.float32)
         n_acc = 0
@@ -484,7 +552,7 @@ def main(cfg, args):
             n_acc += 1
         f_mean /= max(1, n_acc)
 
-        emit_snapshot(step, p_frame, a_frame, f_mean, rgb_frame, lag_frame)
+        emit_snapshot(step, p_frame, a_frame, f_mean, rgb_frame, lag_frame, lag_c_frame)
         smooth_next_emit_idx += 1
 
         min_needed_idx = max(0, smooth_next_emit_idx - smooth_radius)
@@ -499,15 +567,16 @@ def main(cfg, args):
         f_frame: Optional[np.ndarray],
         rgb_frame: Optional[np.ndarray],
         lag_frame: Optional[np.ndarray],
+        lag_c_frame: Optional[np.ndarray],
     ):
         nonlocal smooth_seen
         if not smooth_F_enabled:
-            emit_snapshot(step, p_frame, a_frame, f_frame, rgb_frame, lag_frame)
+            emit_snapshot(step, p_frame, a_frame, f_frame, rgb_frame, lag_frame, lag_c_frame)
             return
 
         snapshot_idx = smooth_seen
         smooth_seen += 1
-        smooth_items.append((step, p_frame, a_frame, f_frame, rgb_frame, lag_frame))
+        smooth_items.append((step, p_frame, a_frame, f_frame, rgb_frame, lag_frame, lag_c_frame))
 
         # Emit any index that already has enough future snapshots for centered window.
         while smooth_next_emit_idx <= snapshot_idx - smooth_radius:
@@ -515,6 +584,8 @@ def main(cfg, args):
 
     steps_done = 0
     pbar = tqdm(total=total_steps, desc="Simulating")
+    if save_lagrangian and lagrangian_unique_check_every_steps > 0 and lag_unique_initial > 0:
+        pbar.set_postfix_str(f"Luniq={lag_unique_initial}")
     while steps_done < total_steps:
         outer_b = min(batch_steps, total_steps - steps_done)
         remaining = outer_b
@@ -522,7 +593,7 @@ def main(cfg, args):
             mb = jit_microbatch if remaining >= jit_microbatch else remaining
             rng, _rng = split(rng)
             step_micro = get_stepper(mb)
-            s, lag_xy, batch_P, batch_A, batch_F, batch_L = step_micro(s, lag_xy, _rng)
+            s, lag_xy, lag_ch, batch_P, batch_A, batch_F, batch_L, batch_C = step_micro(s, lag_xy, lag_ch, _rng)
 
             base_step = steps_done
             idxs = [
@@ -537,6 +608,11 @@ def main(cfg, args):
                 selA = np.asarray(jnp.take(batch_A, sel_idx, axis=0)) if need_A else None
                 selF = np.asarray(jnp.take(batch_F, sel_idx, axis=0)) if save_F else None
                 selL = np.asarray(jnp.take(batch_L, sel_idx, axis=0)) if save_lagrangian else None
+                selC = (
+                    np.asarray(jnp.take(batch_C, sel_idx, axis=0))
+                    if (save_lagrangian and save_lagrangian_channels)
+                    else None
+                )
 
                 selRGB = None
                 if save_rgb:
@@ -556,11 +632,24 @@ def main(cfg, args):
                     f_frame = selF[i_local] if save_F else None
                     rgb_frame = selRGB[i_local] if save_rgb else None
                     lag_frame = selL[i_local] if save_lagrangian else None
-                    process_snapshot(global_step, selP[i_local], a_frame, f_frame, rgb_frame, lag_frame)
+                    lag_c_frame = selC[i_local] if (save_lagrangian and save_lagrangian_channels) else None
+                    process_snapshot(global_step, selP[i_local], a_frame, f_frame, rgb_frame, lag_frame, lag_c_frame)
 
             remaining -= mb
             steps_done += mb
             pbar.update(mb)
+
+            if (
+                save_lagrangian
+                and lagrangian_unique_check_every_steps > 0
+                and lag_unique_initial > 0
+                and steps_done >= lag_unique_next_check_step
+            ):
+                lag_now = np.asarray(lag_xy)
+                lag_unique_now = int(np.unique(lag_now, axis=0).shape[0])
+                pbar.set_postfix_str(f"Luniq={lag_unique_now}")
+                while lag_unique_next_check_step <= steps_done:
+                    lag_unique_next_check_step += lagrangian_unique_check_every_steps
     pbar.close()
     if smooth_F_enabled and smooth_seen > 0:
         tail_last_idx = smooth_seen - 1
@@ -580,6 +669,7 @@ def main(cfg, args):
             use_fp16=save_fp16,
             snaps_rgb=snaps_rgb_buf if save_rgb else None,
             snaps_lagrangian=snaps_lagrangian_buf if save_lagrangian else None,
+            snaps_lagrangian_c=snaps_lagrangian_c_buf if (save_lagrangian and save_lagrangian_channels) else None,
             compress=compress,
         )
 
