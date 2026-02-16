@@ -1,6 +1,6 @@
 meta:
   save_dir: data/interp_supervised_0_1/interp_6
-  output_dir: experiments/log_apf/checkpoints/2602101525/interp_6  # куда писать .npz чанки
+  output_dir: experiments/log_apf/checkpoints/2602112129/interp_6  # куда писать .npz чанки
 
 substrate:
   substrate: lenia_flow
@@ -62,12 +62,12 @@ logging:
   save_A: true
   save_F: true
   save_lagrangian: true
-  lagrangian_n_particles: 256
+  lagrangian_n_particles: 4096
   lagrangian_seed: 0
   lagrangian_init_mode: mass
   lagrangian_flow_reduce: mass_weighted
   lagrangian_flow_channel: -1
-  smooth_F: true
+  smooth_F: false
   smooth_F_window: 5
   save_rgb: false
   save_fp16: true
