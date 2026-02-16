@@ -1,6 +1,8 @@
 import os
+import signal
 import sys
 from collections import deque
+import colorsys
 from typing import Any, List, Optional, Tuple
 
 import jax
@@ -117,6 +119,55 @@ def _init_lagrangian_points(
     return pts.astype(np.float32, copy=False)
 
 
+def _make_distinct_colors_bgr(n: int) -> np.ndarray:
+    if n <= 0:
+        return np.zeros((0, 3), dtype=np.uint8)
+    cols = []
+    for i in range(n):
+        h = (i / float(max(1, n))) % 1.0
+        r, g, b = colorsys.hsv_to_rgb(h, 0.85, 1.0)
+        cols.append((int(b * 255), int(g * 255), int(r * 255)))  # BGR for cv2 drawing
+    return np.asarray(cols, dtype=np.uint8)
+
+
+def _lagrangian_to_xy_pixels(points_yx: np.ndarray, h: int, w: int) -> np.ndarray:
+    y = np.clip(np.rint(points_yx[:, 0] - 0.5), 0, h - 1).astype(np.int32)
+    x = np.clip(np.rint(points_yx[:, 1] - 0.5), 0, w - 1).astype(np.int32)
+    return np.stack([x, y], axis=-1)
+
+
+def _frame_u8_from_snapshot(
+    p_frame: np.ndarray,
+    a_frame: Optional[np.ndarray],
+    rgb_frame: Optional[np.ndarray],
+) -> np.ndarray:
+    if rgb_frame is not None:
+        frame = np.asarray(rgb_frame)
+        if frame.dtype != np.uint8:
+            frame = (np.clip(frame, 0.0, 1.0) * 255).astype(np.uint8)
+        return frame
+
+    p = np.asarray(p_frame, dtype=np.float32)
+    if p.shape[-1] >= 3:
+        p3 = p[..., :3]
+    else:
+        reps = int(np.ceil(3 / p.shape[-1]))
+        p3 = np.tile(p, (1, 1, reps))[..., :3]
+
+    if a_frame is not None:
+        a = np.asarray(a_frame, dtype=np.float32)
+        inten = np.sum(a, axis=-1, keepdims=True)
+        rgb = np.clip(inten * p3, 0.0, 1.0)
+    else:
+        mn = float(np.min(p3))
+        mx = float(np.max(p3))
+        if mx <= mn:
+            rgb = np.zeros_like(p3, dtype=np.float32)
+        else:
+            rgb = (p3 - mn) / (mx - mn + 1e-8)
+    return (np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8)
+
+
 def save_chunk(
     out_dir: str,
     fps: float,
@@ -128,6 +179,7 @@ def save_chunk(
     use_fp16: bool = True,
     snaps_rgb: Optional[List[np.ndarray]] = None,
     snaps_lagrangian: Optional[List[np.ndarray]] = None,
+    snaps_lagrangian_c: Optional[List[np.ndarray]] = None,
     compress: bool = True,
 ) -> int:
     if not steps:
@@ -163,6 +215,8 @@ def save_chunk(
         payload["rgb"] = np.stack(snaps_rgb, axis=0).astype(np.uint8)
     if snaps_lagrangian is not None:
         payload["lagrangian_xy"] = np.stack(snaps_lagrangian, axis=0).astype(np.float32, copy=False)
+    if snaps_lagrangian_c is not None:
+        payload["lagrangian_c"] = np.stack(snaps_lagrangian_c, axis=0).astype(np.int32, copy=False)
 
     if compress:
         np.savez_compressed(path, **payload)
@@ -177,6 +231,8 @@ def save_chunk(
         saved.append("rgb")
     if snaps_lagrangian is not None:
         saved.append("lagrangian_xy")
+    if snaps_lagrangian_c is not None:
+        saved.append("lagrangian_c")
     print(f"Saved {len(steps)} snapshots ({','.join(saved)}) to {path}")
     return file_idx + 1
 
@@ -274,21 +330,80 @@ def main(cfg, args):
     compress = bool(getattr(args, "compress", True))
     save_dtype = np.float16 if save_fp16 else np.float32
 
+    save_lagrangian_video = bool(getattr(args, "save_lagrangian_video", False))
+    lagrangian_video_output = getattr(args, "lagrangian_video_output", None)
+    lagrangian_video_codec = str(getattr(args, "lagrangian_video_codec", "libx264"))
+    lagrangian_video_macro_block_size = int(getattr(args, "lagrangian_video_macro_block_size", 1))
+    lagrangian_video_trail_length = int(getattr(args, "lagrangian_video_trail_length", 40))
+    lagrangian_video_line_thickness = int(getattr(args, "lagrangian_video_line_thickness", 1))
+    lagrangian_video_draw_points = bool(getattr(args, "lagrangian_video_draw_points", True))
+    lagrangian_video_point_radius = int(getattr(args, "lagrangian_video_point_radius", 2))
+    lagrangian_video_draw_step_text = bool(getattr(args, "lagrangian_video_draw_step_text", False))
+    lagrangian_video_particle_stride = int(getattr(args, "lagrangian_video_particle_stride", 1))
+    lagrangian_video_max_particles = _parse_optional_int(getattr(args, "lagrangian_video_max_particles", None))
+    lagrangian_video_fps_raw = getattr(args, "lagrangian_video_fps", None)
+    if isinstance(lagrangian_video_fps_raw, str) and lagrangian_video_fps_raw.strip().lower() in ("none", ""):
+        lagrangian_video_fps_raw = None
+    lagrangian_video_fps = (
+        float(lagrangian_video_fps_raw)
+        if lagrangian_video_fps_raw is not None
+        else float(fps) / float(max(1, snapshot_interval))
+    )
+
     lagrangian_n_particles = int(getattr(args, "lagrangian_n_particles", 256))
     lagrangian_seed = int(getattr(args, "lagrangian_seed", seed))
     lagrangian_init_mode = str(getattr(args, "lagrangian_init_mode", "mass")).strip().lower()
     lagrangian_flow_reduce = str(getattr(args, "lagrangian_flow_reduce", "mass_weighted")).strip().lower()
     lagrangian_flow_channel = _parse_optional_int(getattr(args, "lagrangian_flow_channel", -1))
+    lagrangian_channel_mode = str(getattr(args, "lagrangian_channel_mode", "mix")).strip().lower()
+    lagrangian_noise_model = str(getattr(args, "lagrangian_noise_model", "none")).strip().lower()
+    lagrangian_diffusion_scale = float(getattr(args, "lagrangian_diffusion_scale", 1.0))
+    save_lagrangian_channels = bool(getattr(args, "save_lagrangian_channels", False))
+    lagrangian_unique_check_every_steps = int(getattr(args, "lagrangian_unique_check_every_steps", 0))
     if lagrangian_flow_channel is None:
         lagrangian_flow_channel = -1
     if lagrangian_flow_channel < -1:
         raise ValueError(
             f"lagrangian_flow_channel must be >= -1 or null, got {lagrangian_flow_channel}."
         )
+    if lagrangian_channel_mode not in ("mix", "fixed", "resample"):
+        raise ValueError(
+            f"lagrangian_channel_mode must be one of ('mix','fixed','resample'), got {lagrangian_channel_mode!r}."
+        )
     if lagrangian_flow_reduce not in ("mass_weighted", "mean"):
         raise ValueError(
             f"lagrangian_flow_reduce must be 'mass_weighted' or 'mean', got {lagrangian_flow_reduce!r}."
         )
+    if lagrangian_noise_model not in ("none", "rt_box", "gaussian"):
+        raise ValueError(
+            f"lagrangian_noise_model must be one of ('none','rt_box','gaussian'), got {lagrangian_noise_model!r}."
+        )
+    if lagrangian_diffusion_scale < 0:
+        raise ValueError(f"lagrangian_diffusion_scale must be >= 0, got {lagrangian_diffusion_scale}.")
+    if lagrangian_unique_check_every_steps < 0:
+        raise ValueError(
+            f"lagrangian_unique_check_every_steps must be >= 0, got {lagrangian_unique_check_every_steps}."
+        )
+    if save_lagrangian_video and not save_lagrangian:
+        raise ValueError("save_lagrangian_video=true requires save_lagrangian=true.")
+    if lagrangian_video_trail_length < 1:
+        raise ValueError(
+            f"lagrangian_video_trail_length must be >= 1, got {lagrangian_video_trail_length}."
+        )
+    if lagrangian_video_line_thickness < 1:
+        raise ValueError(
+            f"lagrangian_video_line_thickness must be >= 1, got {lagrangian_video_line_thickness}."
+        )
+    if lagrangian_video_point_radius < 1:
+        raise ValueError(
+            f"lagrangian_video_point_radius must be >= 1, got {lagrangian_video_point_radius}."
+        )
+    if lagrangian_video_particle_stride < 1:
+        raise ValueError(
+            f"lagrangian_video_particle_stride must be >= 1, got {lagrangian_video_particle_stride}."
+        )
+    if lagrangian_video_fps <= 0:
+        raise ValueError(f"lagrangian_video_fps must be > 0, got {lagrangian_video_fps}.")
 
     smooth_F = bool(getattr(args, "smooth_F", False))
     smooth_F_window = int(getattr(args, "smooth_F_window", 1))
@@ -308,13 +423,16 @@ def main(cfg, args):
     need_A = save_A or save_rgb
 
     lag_xy = jnp.zeros((1, 2), dtype=jnp.float32)
+    lag_ch = jnp.zeros((1,), dtype=jnp.int32)
+    lag_unique_initial = 0
+    lag_unique_next_check_step = lagrangian_unique_check_every_steps
     rt = None
     if save_lagrangian:
         base_substrate = substrate.substrate if hasattr(substrate, "substrate") else substrate
         rt = getattr(base_substrate, "RT", None)
-        if rt is None or not hasattr(rt, "advect_points"):
+        if rt is None or not hasattr(rt, "advect_particles"):
             raise RuntimeError(
-                "Lagrangian tracking requires ReintegrationTracking.advect_points, "
+                "Lagrangian tracking requires ReintegrationTracking.advect_particles, "
                 "but substrate RT is unavailable."
             )
         lag_xy0 = _init_lagrangian_points(
@@ -325,29 +443,100 @@ def main(cfg, args):
             rt=rt,
         )
         lag_xy = jnp.asarray(lag_xy0, dtype=jnp.float32)
+        lag_unique_initial = int(np.unique(lag_xy0, axis=0).shape[0])
+        lag_ch0 = np.zeros((lagrangian_n_particles,), dtype=np.int32)
+        if lagrangian_channel_mode in ("fixed", "resample") and int(s["F"].shape[-1]) > 1:
+            lag_ch_key = jax.random.PRNGKey(lagrangian_seed + 7919)
+            lag_ch = rt.sample_point_channels(lag_xy, s["A"], lag_ch_key)
+            lag_ch0 = np.asarray(lag_ch, dtype=np.int32)
+        else:
+            lag_ch = jnp.zeros((lagrangian_n_particles,), dtype=jnp.int32)
 
         meta_path = os.path.join(out_dir, "lagrangian_meta.npz")
         np.savez(
             meta_path,
             initial_xy=lag_xy0,
             particle_ids=np.arange(lagrangian_n_particles, dtype=np.int32),
+            initial_channels=lag_ch0,
             init_mode=np.array(lagrangian_init_mode),
             flow_reduce=np.array(lagrangian_flow_reduce),
             flow_channel=np.array(lagrangian_flow_channel, dtype=np.int32),
+            channel_mode=np.array(lagrangian_channel_mode),
+            noise_model=np.array(lagrangian_noise_model),
+            diffusion_scale=np.array(lagrangian_diffusion_scale, dtype=np.float32),
             seed=np.array(lagrangian_seed, dtype=np.int64),
             snapshot_interval=np.array(snapshot_interval, dtype=np.int32),
         )
         print(
             f"Enabled explicit Lagrangian tracking: n={lagrangian_n_particles}, "
-            f"init={lagrangian_init_mode}, reduce={lagrangian_flow_reduce}, "
-            f"channel={lagrangian_flow_channel}, meta={meta_path}"
+            f"init={lagrangian_init_mode}, channel_mode={lagrangian_channel_mode}, "
+            f"reduce={lagrangian_flow_reduce}, channel={lagrangian_flow_channel}, "
+            f"noise={lagrangian_noise_model}, dscale={lagrangian_diffusion_scale}, "
+            f"meta={meta_path}"
+        )
+        if lagrangian_unique_check_every_steps > 0:
+            print(
+                f"Enabled lagrangian uniqueness monitor: every {lagrangian_unique_check_every_steps} steps."
+            )
+
+    video_writer = None
+    video_cv2 = None
+    video_history: List[np.ndarray] = []
+    video_keep_ids = np.zeros((0,), dtype=np.int32)
+    video_colors_bgr = np.zeros((0, 3), dtype=np.uint8)
+    video_out_path = None
+    video_frames_written = 0
+    if save_lagrangian_video:
+        try:
+            import imageio  # type: ignore
+        except Exception as e:
+            raise ImportError(
+                "save_lagrangian_video=true requires imageio. Install with `pip install imageio`."
+            ) from e
+        try:
+            import cv2  # type: ignore
+        except Exception as e:
+            raise ImportError(
+                "save_lagrangian_video=true requires opencv-python for overlay drawing."
+            ) from e
+
+        if lagrangian_video_output is None or (
+            isinstance(lagrangian_video_output, str) and lagrangian_video_output.strip().lower() in ("none", "")
+        ):
+            video_out_path = os.path.join(out_dir, "lagrangian_overlay.mp4")
+        else:
+            video_out_path = _resolve_path(str(lagrangian_video_output), proj_root)
+        os.makedirs(os.path.dirname(video_out_path), exist_ok=True)
+
+        video_keep_ids = np.arange(lagrangian_n_particles, dtype=np.int32)[::lagrangian_video_particle_stride]
+        if lagrangian_video_max_particles is not None:
+            video_keep_ids = video_keep_ids[: max(0, int(lagrangian_video_max_particles))]
+        if video_keep_ids.size == 0:
+            raise ValueError("No particles selected for lagrangian video. Check stride/max_particles settings.")
+
+        video_colors_bgr = _make_distinct_colors_bgr(int(video_keep_ids.size))
+        video_cv2 = cv2
+        video_writer = imageio.get_writer(
+            video_out_path,
+            fps=lagrangian_video_fps,
+            codec=lagrangian_video_codec,
+            macro_block_size=lagrangian_video_macro_block_size,
+        )
+        print(
+            f"Enabled lagrangian overlay video: {video_out_path}, fps={lagrangian_video_fps:.3f}, "
+            f"trail={lagrangian_video_trail_length}, draw={video_keep_ids.size}/{lagrangian_n_particles} particles."
         )
 
     # Jitted microbatch stepper:
-    # returns (state_next, lag_xy_next, Pbuf, Abuf_or_dummy, Fbuf_or_dummy, Lbuf_or_dummy)
+    # returns (
+    #   state_next, lag_xy_next, lag_ch_next,
+    #   Pbuf, Abuf_or_dummy, Fbuf_or_dummy, Lbuf_or_dummy, Cbuf_or_dummy
+    # )
     def build_batch_stepper(mb: int):
-        def run_batch(state, lag_points, rng_in):
-            rngs = jax.random.split(rng_in, mb)
+        def run_batch(state, lag_points, lag_channels, rng_in):
+            rng_sim, rng_lag = jax.random.split(rng_in)
+            rngs = jax.random.split(rng_sim, mb)
+            lag_rngs = jax.random.split(rng_lag, mb)
             P0 = jnp.zeros((mb, *state["P"].shape), dtype=state["P"].dtype)
             if need_A:
                 A0 = jnp.zeros((mb, *state["A"].shape), dtype=state["A"].dtype)
@@ -361,9 +550,13 @@ def main(cfg, args):
                 L0 = jnp.zeros((mb, lag_points.shape[0], 2), dtype=lag_points.dtype)
             else:
                 L0 = jnp.zeros((1,), dtype=jnp.float32)
+            if save_lagrangian and save_lagrangian_channels:
+                C0 = jnp.zeros((mb, lag_channels.shape[0]), dtype=lag_channels.dtype)
+            else:
+                C0 = jnp.zeros((1,), dtype=jnp.int32)
 
             def body(i, carry):
-                st, lag_xy_i, Pbuf, Abuf, Fbuf, Lbuf = carry
+                st, lag_xy_i, lag_ch_i, Pbuf, Abuf, Fbuf, Lbuf, Cbuf = carry
                 st = substrate.step_state(rngs[i], st, best_member)
                 Pbuf = Pbuf.at[i].set(st["P"])
                 if need_A:
@@ -371,20 +564,27 @@ def main(cfg, args):
                 if need_F_from_state:
                     Fbuf = Fbuf.at[i].set(st["F"])
                 if save_lagrangian:
-                    lag_xy_i = rt.advect_points(
-                        lag_xy_i,
-                        st["F"],
+                    lag_xy_i, lag_ch_i = rt.advect_particles(
+                        points=lag_xy_i,
+                        F=st["F"],
                         A=st["A"],
                         channel=lagrangian_flow_channel,
                         reduce=lagrangian_flow_reduce,
+                        point_channels=lag_ch_i,
+                        channel_mode=lagrangian_channel_mode,
+                        key=lag_rngs[i],
+                        noise_model=lagrangian_noise_model,
+                        diffusion_scale=lagrangian_diffusion_scale,
                     )
                     Lbuf = Lbuf.at[i].set(lag_xy_i)
-                return (st, lag_xy_i, Pbuf, Abuf, Fbuf, Lbuf)
+                    if save_lagrangian_channels:
+                        Cbuf = Cbuf.at[i].set(lag_ch_i)
+                return (st, lag_xy_i, lag_ch_i, Pbuf, Abuf, Fbuf, Lbuf, Cbuf)
 
-            state_next, lag_next, Pbuf, Abuf, Fbuf, Lbuf = jax.lax.fori_loop(
-                0, mb, body, (state, lag_points, P0, A0, F0, L0)
+            state_next, lag_next, lag_ch_next, Pbuf, Abuf, Fbuf, Lbuf, Cbuf = jax.lax.fori_loop(
+                0, mb, body, (state, lag_points, lag_channels, P0, A0, F0, L0, C0)
             )
-            return state_next, lag_next, Pbuf, Abuf, Fbuf, Lbuf
+            return state_next, lag_next, lag_ch_next, Pbuf, Abuf, Fbuf, Lbuf, Cbuf
 
         return jax.jit(run_batch)
 
@@ -402,6 +602,7 @@ def main(cfg, args):
     snaps_F_buf: List[np.ndarray] = []
     snaps_rgb_buf: List[np.ndarray] = []
     snaps_lagrangian_buf: List[np.ndarray] = []
+    snaps_lagrangian_c_buf: List[np.ndarray] = []
     file_idx = 0
 
     # Streaming state for centered smoothing over snapshot index.
@@ -412,7 +613,7 @@ def main(cfg, args):
     smooth_seen = 0
 
     def flush_chunk_if_needed():
-        nonlocal file_idx, steps_buf, snaps_P_buf, snaps_A_buf, snaps_F_buf, snaps_rgb_buf, snaps_lagrangian_buf
+        nonlocal file_idx, steps_buf, snaps_P_buf, snaps_A_buf, snaps_F_buf, snaps_rgb_buf, snaps_lagrangian_buf, snaps_lagrangian_c_buf
         if len(snaps_P_buf) < chunk_size:
             return
         file_idx = save_chunk(
@@ -426,6 +627,7 @@ def main(cfg, args):
             use_fp16=save_fp16,
             snaps_rgb=snaps_rgb_buf if save_rgb else None,
             snaps_lagrangian=snaps_lagrangian_buf if save_lagrangian else None,
+            snaps_lagrangian_c=snaps_lagrangian_c_buf if (save_lagrangian and save_lagrangian_channels) else None,
             compress=compress,
         )
         steps_buf = []
@@ -434,6 +636,7 @@ def main(cfg, args):
         snaps_F_buf = []
         snaps_rgb_buf = []
         snaps_lagrangian_buf = []
+        snaps_lagrangian_c_buf = []
 
     def emit_snapshot(
         step: int,
@@ -442,7 +645,9 @@ def main(cfg, args):
         f_frame: Optional[np.ndarray],
         rgb_frame: Optional[np.ndarray],
         lag_frame: Optional[np.ndarray],
+        lag_c_frame: Optional[np.ndarray],
     ):
+        nonlocal video_frames_written
         steps_buf.append(step)
         snaps_P_buf.append(p_frame.astype(save_dtype, copy=False))
         if save_A:
@@ -457,6 +662,61 @@ def main(cfg, args):
         if save_lagrangian:
             assert lag_frame is not None
             snaps_lagrangian_buf.append(lag_frame.astype(np.float32, copy=False))
+            if save_lagrangian_channels:
+                assert lag_c_frame is not None
+                snaps_lagrangian_c_buf.append(lag_c_frame.astype(np.int32, copy=False))
+
+        if video_writer is not None:
+            assert lag_frame is not None
+            assert video_cv2 is not None
+            frame_u8 = _frame_u8_from_snapshot(p_frame, a_frame, rgb_frame)
+            h, w = frame_u8.shape[:2]
+            canvas = video_cv2.cvtColor(frame_u8, video_cv2.COLOR_RGB2BGR)
+
+            lag_now = np.asarray(lag_frame, dtype=np.float32)
+            lag_sel = lag_now[video_keep_ids]
+            video_history.append(lag_sel)
+            if len(video_history) > lagrangian_video_trail_length:
+                del video_history[0]
+
+            if len(video_history) > 1:
+                hist = np.stack(video_history, axis=0)  # (L, Ndraw, 2)
+                for i in range(hist.shape[1]):
+                    poly = _lagrangian_to_xy_pixels(hist[:, i, :], h, w).reshape(-1, 1, 2)
+                    video_cv2.polylines(
+                        canvas,
+                        [poly],
+                        isClosed=False,
+                        color=tuple(int(c) for c in video_colors_bgr[i]),
+                        thickness=lagrangian_video_line_thickness,
+                    )
+
+            if lagrangian_video_draw_points:
+                pts = _lagrangian_to_xy_pixels(lag_sel, h, w)
+                for i, pt in enumerate(pts):
+                    video_cv2.circle(
+                        canvas,
+                        (int(pt[0]), int(pt[1])),
+                        lagrangian_video_point_radius,
+                        tuple(int(c) for c in video_colors_bgr[i]),
+                        -1,
+                    )
+
+            if lagrangian_video_draw_step_text:
+                video_cv2.putText(
+                    canvas,
+                    f"step={int(step)}",
+                    (12, 26),
+                    video_cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 255, 255),
+                    2,
+                    video_cv2.LINE_AA,
+                )
+
+            frame_rgb = video_cv2.cvtColor(canvas, video_cv2.COLOR_BGR2RGB)
+            video_writer.append_data(frame_rgb)
+            video_frames_written += 1
         flush_chunk_if_needed()
 
     def emit_smoothed_at_index(snapshot_idx: int, max_available_idx: int):
@@ -473,7 +733,7 @@ def main(cfg, args):
                 f"len={len(smooth_items)}, win=[{win_start},{win_end}], max={max_available_idx}"
             )
 
-        step, p_frame, a_frame, f_center, rgb_frame, lag_frame = smooth_items[center_off]
+        step, p_frame, a_frame, f_center, rgb_frame, lag_frame, lag_c_frame = smooth_items[center_off]
         assert f_center is not None
         f_mean = np.zeros_like(f_center, dtype=np.float32)
         n_acc = 0
@@ -484,7 +744,7 @@ def main(cfg, args):
             n_acc += 1
         f_mean /= max(1, n_acc)
 
-        emit_snapshot(step, p_frame, a_frame, f_mean, rgb_frame, lag_frame)
+        emit_snapshot(step, p_frame, a_frame, f_mean, rgb_frame, lag_frame, lag_c_frame)
         smooth_next_emit_idx += 1
 
         min_needed_idx = max(0, smooth_next_emit_idx - smooth_radius)
@@ -499,90 +759,150 @@ def main(cfg, args):
         f_frame: Optional[np.ndarray],
         rgb_frame: Optional[np.ndarray],
         lag_frame: Optional[np.ndarray],
+        lag_c_frame: Optional[np.ndarray],
     ):
         nonlocal smooth_seen
         if not smooth_F_enabled:
-            emit_snapshot(step, p_frame, a_frame, f_frame, rgb_frame, lag_frame)
+            emit_snapshot(step, p_frame, a_frame, f_frame, rgb_frame, lag_frame, lag_c_frame)
             return
 
         snapshot_idx = smooth_seen
         smooth_seen += 1
-        smooth_items.append((step, p_frame, a_frame, f_frame, rgb_frame, lag_frame))
+        smooth_items.append((step, p_frame, a_frame, f_frame, rgb_frame, lag_frame, lag_c_frame))
 
         # Emit any index that already has enough future snapshots for centered window.
         while smooth_next_emit_idx <= snapshot_idx - smooth_radius:
             emit_smoothed_at_index(smooth_next_emit_idx, snapshot_idx)
 
-    steps_done = 0
-    pbar = tqdm(total=total_steps, desc="Simulating")
-    while steps_done < total_steps:
-        outer_b = min(batch_steps, total_steps - steps_done)
-        remaining = outer_b
-        while remaining > 0:
-            mb = jit_microbatch if remaining >= jit_microbatch else remaining
-            rng, _rng = split(rng)
-            step_micro = get_stepper(mb)
-            s, lag_xy, batch_P, batch_A, batch_F, batch_L = step_micro(s, lag_xy, _rng)
+    outputs_flushed = False
 
-            base_step = steps_done
-            idxs = [
-                i
-                for i in range(mb)
-                if (base_step + i) % snapshot_interval == 0
-                and _in_step_range(base_step + i, log_start, log_end)
-            ]
-            if idxs:
-                sel_idx = jnp.array(idxs)
-                selP = np.asarray(jnp.take(batch_P, sel_idx, axis=0))
-                selA = np.asarray(jnp.take(batch_A, sel_idx, axis=0)) if need_A else None
-                selF = np.asarray(jnp.take(batch_F, sel_idx, axis=0)) if save_F else None
-                selL = np.asarray(jnp.take(batch_L, sel_idx, axis=0)) if save_lagrangian else None
+    def flush_pending_outputs():
+        nonlocal file_idx, outputs_flushed
+        if outputs_flushed:
+            return
+        outputs_flushed = True
 
-                selRGB = None
-                if save_rgb:
-                    assert selA is not None
-                    a_sum = np.sum(selA, axis=-1, keepdims=True)
-                    if selP.shape[-1] >= 3:
-                        p3 = selP[..., :3]
-                    else:
-                        reps = int(np.ceil(3 / selP.shape[-1]))
-                        p3 = np.tile(selP, (1, 1, 1, reps))[..., :3]
-                    rgb = np.clip(a_sum * p3, 0.0, 1.0)
-                    selRGB = (rgb * 255).astype(np.uint8)
+        if smooth_F_enabled and smooth_seen > 0:
+            tail_last_idx = smooth_seen - 1
+            # Tail frames: use truncated centered window because future snapshots are unavailable.
+            while smooth_next_emit_idx < smooth_seen:
+                emit_smoothed_at_index(smooth_next_emit_idx, tail_last_idx)
 
-                for i_local, i_global in enumerate(idxs):
-                    global_step = base_step + i_global
-                    a_frame = selA[i_local] if save_A else None
-                    f_frame = selF[i_local] if save_F else None
-                    rgb_frame = selRGB[i_local] if save_rgb else None
-                    lag_frame = selL[i_local] if save_lagrangian else None
-                    process_snapshot(global_step, selP[i_local], a_frame, f_frame, rgb_frame, lag_frame)
+        if snaps_P_buf:
+            file_idx = save_chunk(
+                out_dir,
+                fps,
+                steps_buf,
+                snaps_P_buf,
+                file_idx,
+                snaps_A_buf if save_A else None,
+                snaps_F_buf if save_F else None,
+                use_fp16=save_fp16,
+                snaps_rgb=snaps_rgb_buf if save_rgb else None,
+                snaps_lagrangian=snaps_lagrangian_buf if save_lagrangian else None,
+                snaps_lagrangian_c=snaps_lagrangian_c_buf if (save_lagrangian and save_lagrangian_channels) else None,
+                compress=compress,
+            )
 
-            remaining -= mb
-            steps_done += mb
-            pbar.update(mb)
-    pbar.close()
-    if smooth_F_enabled and smooth_seen > 0:
-        tail_last_idx = smooth_seen - 1
-        # Tail frames: use truncated centered window because future snapshots are unavailable.
-        while smooth_next_emit_idx < smooth_seen:
-            emit_smoothed_at_index(smooth_next_emit_idx, tail_last_idx)
+    old_sigterm = signal.getsignal(signal.SIGTERM)
 
-    if snaps_P_buf:
-        file_idx = save_chunk(
-            out_dir,
-            fps,
-            steps_buf,
-            snaps_P_buf,
-            file_idx,
-            snaps_A_buf if save_A else None,
-            snaps_F_buf if save_F else None,
-            use_fp16=save_fp16,
-            snaps_rgb=snaps_rgb_buf if save_rgb else None,
-            snaps_lagrangian=snaps_lagrangian_buf if save_lagrangian else None,
-            compress=compress,
-        )
+    def _interrupt_handler(signum, _frame):
+        raise KeyboardInterrupt(f"Received signal {signum}")
 
+    signal.signal(signal.SIGTERM, _interrupt_handler)
+
+    interrupted = False
+    pbar = None
+    try:
+        steps_done = 0
+        pbar = tqdm(total=total_steps, desc="Simulating")
+        if save_lagrangian and lagrangian_unique_check_every_steps > 0 and lag_unique_initial > 0:
+            pbar.set_postfix_str(f"Luniq={lag_unique_initial}")
+
+        while steps_done < total_steps:
+            outer_b = min(batch_steps, total_steps - steps_done)
+            remaining = outer_b
+            while remaining > 0:
+                mb = jit_microbatch if remaining >= jit_microbatch else remaining
+                rng, _rng = split(rng)
+                step_micro = get_stepper(mb)
+                s, lag_xy, lag_ch, batch_P, batch_A, batch_F, batch_L, batch_C = step_micro(s, lag_xy, lag_ch, _rng)
+
+                base_step = steps_done
+                idxs = [
+                    i
+                    for i in range(mb)
+                    if (base_step + i) % snapshot_interval == 0
+                    and _in_step_range(base_step + i, log_start, log_end)
+                ]
+                if idxs:
+                    sel_idx = jnp.array(idxs)
+                    selP = np.asarray(jnp.take(batch_P, sel_idx, axis=0))
+                    selA = np.asarray(jnp.take(batch_A, sel_idx, axis=0)) if need_A else None
+                    selF = np.asarray(jnp.take(batch_F, sel_idx, axis=0)) if save_F else None
+                    selL = np.asarray(jnp.take(batch_L, sel_idx, axis=0)) if save_lagrangian else None
+                    selC = (
+                        np.asarray(jnp.take(batch_C, sel_idx, axis=0))
+                        if (save_lagrangian and save_lagrangian_channels)
+                        else None
+                    )
+
+                    selRGB = None
+                    if save_rgb:
+                        assert selA is not None
+                        a_sum = np.sum(selA, axis=-1, keepdims=True)
+                        if selP.shape[-1] >= 3:
+                            p3 = selP[..., :3]
+                        else:
+                            reps = int(np.ceil(3 / selP.shape[-1]))
+                            p3 = np.tile(selP, (1, 1, 1, reps))[..., :3]
+                        rgb = np.clip(a_sum * p3, 0.0, 1.0)
+                        selRGB = (rgb * 255).astype(np.uint8)
+
+                    for i_local, i_global in enumerate(idxs):
+                        global_step = base_step + i_global
+                        a_frame = selA[i_local] if save_A else None
+                        f_frame = selF[i_local] if save_F else None
+                        rgb_frame = selRGB[i_local] if save_rgb else None
+                        lag_frame = selL[i_local] if save_lagrangian else None
+                        lag_c_frame = selC[i_local] if (save_lagrangian and save_lagrangian_channels) else None
+                        process_snapshot(global_step, selP[i_local], a_frame, f_frame, rgb_frame, lag_frame, lag_c_frame)
+
+                remaining -= mb
+                steps_done += mb
+                pbar.update(mb)
+
+                if (
+                    save_lagrangian
+                    and lagrangian_unique_check_every_steps > 0
+                    and lag_unique_initial > 0
+                    and steps_done >= lag_unique_next_check_step
+                ):
+                    lag_now = np.asarray(lag_xy)
+                    lag_unique_now = int(np.unique(lag_now, axis=0).shape[0])
+                    pbar.set_postfix_str(f"Luniq={lag_unique_now}")
+                    while lag_unique_next_check_step <= steps_done:
+                        lag_unique_next_check_step += lagrangian_unique_check_every_steps
+
+        flush_pending_outputs()
+
+    except KeyboardInterrupt as e:
+        interrupted = True
+        print(f"Interrupted early ({e}); finalizing partial logs/video...")
+        flush_pending_outputs()
+    finally:
+        if pbar is not None:
+            pbar.close()
+        signal.signal(signal.SIGTERM, old_sigterm)
+        if video_writer is not None:
+            try:
+                video_writer.close()
+                print(f"Saved lagrangian overlay video ({video_frames_written} frames) to {video_out_path}")
+            except Exception as e:
+                print(f"Failed to close lagrangian video writer: {e}")
+
+    if interrupted:
+        print("Simulation interrupted before requested total_steps.")
     print(f"Finished simulation. Saved {file_idx} chunk files to {out_dir}")
     print(f"Best fitness: {np.array(best_fitness).item() if best_fitness is not None else None}")
 

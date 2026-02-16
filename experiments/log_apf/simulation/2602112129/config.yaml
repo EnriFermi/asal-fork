@@ -65,9 +65,26 @@ logging:
   lagrangian_n_particles: 4096
   lagrangian_seed: 0
   lagrangian_init_mode: mass
+  lagrangian_channel_mode: resample
   lagrangian_flow_reduce: mass_weighted
   lagrangian_flow_channel: -1
-  smooth_F: false
+  lagrangian_noise_model: rt_box
+  lagrangian_diffusion_scale: 1.0
+  save_lagrangian_channels: true
+  lagrangian_unique_check_every_steps: 64
+  save_lagrangian_video: true
+  lagrangian_video_output: null
+  lagrangian_video_fps: null
+  lagrangian_video_codec: libx264
+  lagrangian_video_macro_block_size: 1
+  lagrangian_video_trail_length: 60
+  lagrangian_video_line_thickness: 1
+  lagrangian_video_draw_points: true
+  lagrangian_video_point_radius: 1
+  lagrangian_video_draw_step_text: false
+  lagrangian_video_particle_stride: 1
+  lagrangian_video_max_particles: null
+  smooth_F: False
   smooth_F_window: 5
   save_rgb: false
   save_fp16: true
