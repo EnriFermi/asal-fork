@@ -534,9 +534,11 @@ def main(cfg, args):
     # )
     def build_batch_stepper(mb: int):
         def run_batch(state, lag_points, lag_channels, rng_in):
-            rng_sim, rng_lag = jax.random.split(rng_in)
-            rngs = jax.random.split(rng_sim, mb)
-            lag_rngs = jax.random.split(rng_lag, mb)
+            # Keep simulation RNG stream identical to pre-lagrangian implementation.
+            rngs = jax.random.split(rng_in, mb)
+            # Derive an independent stream for lagrangian stochastic updates.
+            lag_root = jax.random.fold_in(rng_in, jnp.uint32(0x4C4147))
+            lag_rngs = jax.random.split(lag_root, mb)
             P0 = jnp.zeros((mb, *state["P"].shape), dtype=state["P"].dtype)
             if need_A:
                 A0 = jnp.zeros((mb, *state["A"].shape), dtype=state["A"].dtype)
