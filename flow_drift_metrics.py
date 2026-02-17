@@ -166,9 +166,9 @@ def iter_npz_snapshots(
 ) -> Iterator[Tuple[int, Dict[str, np.ndarray]]]:
     """
     Yield per-snapshot dicts from chunked npz logs for steps in [t1, t2].
-    Each yield is (t, {"A":..., "F":..., "P":...}) depending on requested fields.
+    Each yield is (t, {field: ...}) for requested fields available in the chunk.
     """
-    want = {str(k) for k in fields}
+    want = [str(k) for k in fields]
     for path, start_step, end_step, _idx in _list_npz_chunks(base_dir):
         if not _overlaps(start_step, end_step, int(t1), int(t2)):
             continue
@@ -180,26 +180,19 @@ def iter_npz_snapshots(
 
         # Keep arrays on host, per-frame extraction below.
         payload: Dict[str, np.ndarray] = {}
-        if "P" in want:
-            payload["P"] = np.asarray(data["P"])
-        if "A" in want:
-            if "A" not in data.files:
+        for name in want:
+            if name in data.files:
+                payload[name] = np.asarray(data[name])
+                continue
+            if name == "A":
                 raise ValueError(f"A not found in npz chunk {path}. Re-run logging with save_A=true.")
-            payload["A"] = np.asarray(data["A"])
-        if "F" in want:
-            if "F" not in data.files:
+            if name == "F":
                 raise ValueError(f"F not found in npz chunk {path}. Re-run logging with save_F=true.")
-            payload["F"] = np.asarray(data["F"])
+            raise ValueError(f"{name!r} not found in npz chunk {path}. Available keys: {list(data.files)}")
 
         idxs = np.nonzero(mask)[0]
         for i in idxs:
-            out: Dict[str, np.ndarray] = {}
-            if "A" in payload:
-                out["A"] = payload["A"][i]
-            if "F" in payload:
-                out["F"] = payload["F"][i]
-            if "P" in payload:
-                out["P"] = payload["P"][i]
+            out: Dict[str, np.ndarray] = {name: arr[i] for name, arr in payload.items()}
             yield int(steps[i]), out
 
 
