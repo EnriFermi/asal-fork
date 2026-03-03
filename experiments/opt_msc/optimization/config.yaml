@@ -1,0 +1,91 @@
+meta:
+  seed: 1
+  save_dir: experiments/opt_msc/checkpoints/test_run
+
+substrate:
+  substrate: lenia_flow
+  rollout_steps: 131072
+  grid_size: 128
+  C: 3
+  k: 9
+  kernel_components: 3
+  M: "2,1,0;0,2,1;1,0,2"
+  dd: 5
+  dt: 0.2
+  sigma: 0.65
+  border: wall
+  mix_rule: stoch
+  seed_patch_size: 20
+  seed_n_patches: 4
+  seed_mode: random_patches
+  p_constant_per_patch: 1
+  render_mode: PcolorMix
+  clip1: .inf
+  clip2: .inf
+  mutations: true
+  mutation_sz: 40
+  mutation_p: 0.2
+  mutation_scale: 2.0
+  optimize_mutation_scale: true
+  volcano: false
+  volcano_sz: 30
+  volcano_p: 0.01
+  volcano_delta: 5.0
+  food: false
+  food_interval: 128
+  food_n: 3
+  food_sz: 16
+  food_amount: 1.0
+  food_consume_rate: 0.05
+  food_bonus: 1.0
+  mass_decay: 0.0
+  food_channel: 1
+  food_auto_size: false
+  food_auto_scale: 1.0
+  food_conv_mode: scalar
+  food_vis_scale: 1.0
+  food_vis_color: "0.6,0.3,0.0"
+  food_diffusion_alpha: 0.0
+  mass_clip_eps: 0.0
+
+evaluation:
+  foundation_model: clip
+  time_sampling: 128
+
+optimization:
+  bs: 2
+  pop_batch: 8
+  pop_size: 12
+  n_iters: 100
+  sigma: 0.2
+
+logging:
+  wandb_project: asal
+  pca_every: 25
+  pca_history: 100
+
+metric:
+  # Windowing and lag (physical steps). If *_frames are set, they override *_steps.
+  metric_window_size_steps: 20000
+  metric_window_step_steps: 20000
+  metric_tau_steps: 3000
+  metric_window_size_frames: null
+  metric_window_step_frames: null
+  metric_tau_frames: null
+
+  # DeltaH_s settings
+  metric_m_samples: 48
+  metric_m_min: 4
+  metric_n_proj: 16
+  metric_null_reps: 6
+  metric_dirs_seed: 123
+
+  # MSC_t settings
+  metric_preprocess_mode: clip   # clip | shift | none
+  metric_scales: null            # auto dyadic if null
+  metric_scale_weights: null     # default all 1.0 if null
+
+  # Final scalar objective: loss = -(alpha * A + beta * MSC_t)
+  metric_alpha: 1.0
+  metric_beta: 1.0
+  metric_eps: 1.0e-12
