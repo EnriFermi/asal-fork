@@ -427,9 +427,13 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
             U_2r = W // (2 * r)
             g_r = jnp.mean(h_pos[: U_r * r].reshape(U_r, r), axis=1)
             g_2r = jnp.mean(h_pos[: U_2r * (2 * r)].reshape(U_2r, 2 * r), axis=1)
-            up = jnp.repeat(g_2r, 2)[:U_r]
-            overlap = jnp.sum(g_r * up)
-            power = jnp.sum(g_r * g_r)
+            # Compare only on common support: if U_r is odd, the last fine block
+            # has no paired coarse block from level 2r and is dropped.
+            U_cmp = min(U_r, 2 * U_2r)
+            g_r_cmp = g_r[:U_cmp]
+            up = jnp.repeat(g_2r, 2)[:U_cmp]
+            overlap = jnp.sum(g_r_cmp * up)
+            power = jnp.sum(g_r_cmp * g_r_cmp)
             d_r = 1.0 - overlap / (power + eps)
             msc = msc + (wr * d_r)
 
