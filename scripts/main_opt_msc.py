@@ -117,11 +117,8 @@ def main(cfg, args):
                 run.summary[f"metric_cfg/{k}"] = v
         metric_loss_fn = make_metric_loss_fn(metric_cfg)
 
-        if int(args.rollout_steps) % int(args.time_sampling) != 0:
-            raise ValueError(
-                "rollout_steps must be divisible by time_sampling for lagrangian sampling."
-            )
-        chunk_steps = int(args.rollout_steps) // int(args.time_sampling)
+        chunk_steps = int(metric_cfg["sample_every_steps"])
+        time_sampling = int(metric_cfg["time_sampling"])
 
         lag_n_particles = int(getattr(args, "metric_lagrangian_n_particles", 256))
         lag_init_mode = str(getattr(args, "metric_lagrangian_init_mode", "mass"))
@@ -181,7 +178,7 @@ def main(cfg, args):
             (_, _, _), xy_seq = jax.lax.scan(
                 chunk_fn,
                 (s0, pts0, ch0),
-                split(k_scan, int(args.time_sampling)),
+                split(k_scan, time_sampling),
             )
             return xy_seq  # (time_sampling, N_particles, 2)
 

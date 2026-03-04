@@ -49,7 +49,8 @@ substrate:
   mass_clip_eps: 0.0
 
 evaluation:
-  time_sampling: 2600
+  sample_every_steps: 50   # рекомендуемый способ задать частоту сэмплирования
+  # time_sampling: 2560     # legacy fallback, если sample_every_steps не задан
 
 optimization:
   bs: 2

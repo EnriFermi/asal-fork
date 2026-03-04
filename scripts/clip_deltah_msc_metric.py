@@ -104,13 +104,41 @@ def _resolve_scales(
 
 
 def resolve_metric_config(args: Any) -> dict[str, Any]:
-    if int(args.rollout_steps) % int(args.time_sampling) != 0:
+    rollout_steps = int(args.rollout_steps)
+    sample_every_raw = getattr(args, "sample_every_steps", None)
+    time_sampling_raw = getattr(args, "time_sampling", None)
+
+    if sample_every_raw is None and time_sampling_raw is None:
         raise ValueError(
-            "rollout_steps must be divisible by time_sampling for "
-            "window/tau conversion in metric."
+            "Specify either sample_every_steps (recommended) or time_sampling."
         )
 
-    sample_stride_steps = int(args.rollout_steps) // int(args.time_sampling)
+    if sample_every_raw is not None:
+        sample_stride_steps = int(sample_every_raw)
+        if sample_stride_steps < 1:
+            raise ValueError(f"sample_every_steps must be >= 1, got {sample_stride_steps}.")
+        if rollout_steps % sample_stride_steps != 0:
+            raise ValueError(
+                "rollout_steps must be divisible by sample_every_steps. "
+                f"Got rollout_steps={rollout_steps}, sample_every_steps={sample_stride_steps}."
+            )
+        time_sampling = rollout_steps // sample_stride_steps
+        if time_sampling_raw is not None and int(time_sampling_raw) != time_sampling:
+            raise ValueError(
+                "time_sampling conflicts with sample_every_steps: "
+                f"time_sampling={int(time_sampling_raw)} but expected {time_sampling} "
+                f"for rollout_steps={rollout_steps} and sample_every_steps={sample_stride_steps}."
+            )
+    else:
+        time_sampling = int(time_sampling_raw)
+        if time_sampling < 1:
+            raise ValueError(f"time_sampling must be >= 1, got {time_sampling}.")
+        if rollout_steps % time_sampling != 0:
+            raise ValueError(
+                "rollout_steps must be divisible by time_sampling for "
+                "window/tau conversion in metric."
+            )
+        sample_stride_steps = rollout_steps // time_sampling
 
     win_size_frames = _resolve_frames(
         frames=getattr(args, "metric_window_size_frames", None),
@@ -136,7 +164,7 @@ def resolve_metric_config(args: Any) -> dict[str, Any]:
             f"metric_tau_frames ({tau_frames}) must be < metric_window_size_frames ({win_size_frames})."
         )
 
-    T = int(args.time_sampling)
+    T = int(time_sampling)
     if T < win_size_frames:
         raise ValueError(
             f"time_sampling ({T}) is too small for metric_window_size_frames ({win_size_frames})."
@@ -153,7 +181,7 @@ def resolve_metric_config(args: Any) -> dict[str, Any]:
     if range_start_steps is None:
         range_start_steps = 0
     if range_end_steps is None:
-        range_end_steps = int(args.rollout_steps)
+        range_end_steps = int(rollout_steps)
     if range_end_steps <= range_start_steps:
         raise ValueError(
             "metric_range_end_steps must be > metric_range_start_steps, got "
@@ -218,6 +246,9 @@ def resolve_metric_config(args: Any) -> dict[str, Any]:
     domain_x_raw = getattr(args, "metric_domain_x", 0.0)
 
     cfg = dict(
+        rollout_steps=rollout_steps,
+        time_sampling=int(time_sampling),
+        sample_every_steps=int(sample_stride_steps),
         sample_stride_steps=sample_stride_steps,
         window_size_frames=win_size_frames,
         window_step_frames=win_step_frames,
@@ -248,6 +279,9 @@ def resolve_metric_config(args: Any) -> dict[str, Any]:
 
 def metric_summary(cfg: dict[str, Any]) -> dict[str, Any]:
     return dict(
+        rollout_steps=int(cfg["rollout_steps"]),
+        time_sampling=int(cfg["time_sampling"]),
+        sample_every_steps=int(cfg["sample_every_steps"]),
         sample_stride_steps=int(cfg["sample_stride_steps"]),
         window_size_frames=int(cfg["window_size_frames"]),
         window_step_frames=int(cfg["window_step_frames"]),
