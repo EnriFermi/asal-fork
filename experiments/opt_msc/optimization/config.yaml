@@ -49,7 +49,7 @@ substrate:
   mass_clip_eps: 0.0
 
 evaluation:
-  time_sampling: 2560
+  time_sampling: 128
 
 optimization:
   bs: 2
@@ -77,7 +77,20 @@ metric:
   metric_m_min: 4
   metric_n_proj: 16
   metric_null_reps: 6
+  metric_particle_samples: 64
   metric_dirs_seed: 123
+  metric_periodic: null
+  metric_domain_y: null
+  metric_domain_x: null
+
+  # Lagrangian rollout settings (источник траекторий для DeltaH)
+  metric_lagrangian_n_particles: 256
+  metric_lagrangian_init_mode: mass     # mass | uniform
+  metric_lagrangian_flow_channel: -1    # -1 = mix by reduce
+  metric_lagrangian_flow_reduce: mass_weighted  # mass_weighted | mean
+  metric_lagrangian_channel_mode: mix   # mix | fixed | resample
+  metric_lagrangian_noise_model: none   # none | rt_box | gaussian
+  metric_lagrangian_diffusion_scale: 1.0
 
   # MSC_t settings
   metric_preprocess_mode: clip   # clip | shift | none
