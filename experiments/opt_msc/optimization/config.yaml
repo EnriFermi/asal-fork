@@ -4,7 +4,7 @@ meta:
 
 substrate:
   substrate: lenia_flow
-  rollout_steps: 128000
+  rollout_steps: 130000
   grid_size: 384
   C: 3
   k: 9
@@ -49,7 +49,7 @@ substrate:
   mass_clip_eps: 0.0
 
 evaluation:
-  time_sampling: 2560
+  time_sampling: 2600
 
 optimization:
   bs: 2
@@ -68,8 +68,8 @@ metric:
   metric_window_size_steps: 20000
   metric_window_step_steps: 5000
   metric_tau_steps: 3000
-  metric_range_start_steps: 0
-  metric_range_end_steps: null
+  metric_range_start_steps: 50000
+  metric_range_end_steps: 130000
   metric_window_size_frames: null
   metric_window_step_frames: null
   metric_tau_frames: null
@@ -86,12 +86,12 @@ metric:
   metric_domain_x: null
 
   # Lagrangian rollout settings (источник траекторий для DeltaH)
-  metric_lagrangian_n_particles: 256
+  metric_lagrangian_n_particles: 8192
   metric_lagrangian_init_mode: mass     # mass | uniform
   metric_lagrangian_flow_channel: -1    # -1 = mix by reduce
   metric_lagrangian_flow_reduce: mass_weighted  # mass_weighted | mean
-  metric_lagrangian_channel_mode: mix   # mix | fixed | resample
-  metric_lagrangian_noise_model: none   # none | rt_box | gaussian
+  metric_lagrangian_channel_mode: resample   # mix | fixed | resample
+  metric_lagrangian_noise_model: rt_box   # none | rt_box | gaussian
   metric_lagrangian_diffusion_scale: 1.0
 
   # MSC_t settings
@@ -100,6 +100,6 @@ metric:
   metric_scale_weights: null     # default all 1.0 if null
 
   # Final scalar objective: loss = -(alpha * A + beta * MSC_t)
-  metric_alpha: 1.0
+  metric_alpha: 0.0
   metric_beta: 1.0
   metric_eps: 1.0e-12
