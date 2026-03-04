@@ -41,6 +41,15 @@ def _resolve_frames(
     return val
 
 
+def _resolve_optional_steps(x: Any, *, name: str) -> int | None:
+    if x is None:
+        return None
+    val = int(x)
+    if val < 0:
+        raise ValueError(f"{name} must be >= 0, got {val}.")
+    return val
+
+
 def _resolve_scales(
     *,
     W: int,
@@ -133,12 +142,35 @@ def resolve_metric_config(args: Any) -> dict[str, Any]:
             f"time_sampling ({T}) is too small for metric_window_size_frames ({win_size_frames})."
         )
 
-    starts = np.arange(0, T - win_size_frames + 1, win_step_frames, dtype=np.int32)
+    range_start_steps = _resolve_optional_steps(
+        getattr(args, "metric_range_start_steps", None),
+        name="metric_range_start_steps",
+    )
+    range_end_steps = _resolve_optional_steps(
+        getattr(args, "metric_range_end_steps", None),
+        name="metric_range_end_steps",
+    )
+    if range_start_steps is None:
+        range_start_steps = 0
+    if range_end_steps is None:
+        range_end_steps = int(args.rollout_steps)
+    if range_end_steps <= range_start_steps:
+        raise ValueError(
+            "metric_range_end_steps must be > metric_range_start_steps, got "
+            f"{range_end_steps} <= {range_start_steps}."
+        )
+
+    starts_all = np.arange(0, T - win_size_frames + 1, win_step_frames, dtype=np.int32)
+    starts_steps = starts_all.astype(np.int64) * int(sample_stride_steps)
+    win_size_steps_eff = int(win_size_frames) * int(sample_stride_steps)
+    ends_steps = starts_steps + win_size_steps_eff
+    mask = (starts_steps >= range_start_steps) & (ends_steps <= range_end_steps)
+    starts = starts_all[mask]
     W = int(starts.size)
     if W < 1:
         raise ValueError(
-            "No valid windows produced for metric; "
-            "check metric_window_size/metric_window_step/time_sampling."
+            "No valid windows produced for metric after range filtering; check "
+            "window/tau/time_sampling or metric_range_start_steps/metric_range_end_steps."
         )
 
     tseg = win_size_frames - tau_frames
@@ -191,6 +223,8 @@ def resolve_metric_config(args: Any) -> dict[str, Any]:
         window_step_frames=win_step_frames,
         tau_frames=tau_frames,
         starts=starts,
+        range_start_steps=int(range_start_steps),
+        range_end_steps=int(range_end_steps),
         W=W,
         tseg=tseg,
         m_count=int(m_count),
@@ -218,6 +252,8 @@ def metric_summary(cfg: dict[str, Any]) -> dict[str, Any]:
         window_size_frames=int(cfg["window_size_frames"]),
         window_step_frames=int(cfg["window_step_frames"]),
         tau_frames=int(cfg["tau_frames"]),
+        range_start_steps=int(cfg["range_start_steps"]),
+        range_end_steps=int(cfg["range_end_steps"]),
         n_windows=int(cfg["W"]),
         tseg=int(cfg["tseg"]),
         m_count=int(cfg["m_count"]),

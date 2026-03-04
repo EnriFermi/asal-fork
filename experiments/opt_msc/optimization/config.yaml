@@ -68,6 +68,8 @@ metric:
   metric_window_size_steps: 20000
   metric_window_step_steps: 5000
   metric_tau_steps: 3000
+  metric_range_start_steps: 0
+  metric_range_end_steps: null
   metric_window_size_frames: null
   metric_window_step_frames: null
   metric_tau_frames: null
