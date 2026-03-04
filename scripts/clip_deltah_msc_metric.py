@@ -163,6 +163,11 @@ def resolve_metric_config(args: Any) -> dict[str, Any]:
     null_reps = int(getattr(args, "metric_null_reps", 6))
     if null_reps < 0:
         raise ValueError(f"metric_null_reps must be >= 0, got {null_reps}.")
+    particle_samples = int(
+        getattr(args, "metric_particle_samples", getattr(args, "metric_spatial_samples", 64))
+    )
+    if particle_samples < 2:
+        raise ValueError(f"metric_particle_samples must be >= 2, got {particle_samples}.")
 
     mode = str(getattr(args, "metric_preprocess_mode", "clip")).strip().lower()
     if mode not in {"clip", "shift", "none"}:
@@ -176,6 +181,10 @@ def resolve_metric_config(args: Any) -> dict[str, Any]:
         weights_raw=getattr(args, "metric_scale_weights", None),
     )
 
+    periodic_raw = getattr(args, "metric_periodic", False)
+    domain_y_raw = getattr(args, "metric_domain_y", 0.0)
+    domain_x_raw = getattr(args, "metric_domain_x", 0.0)
+
     cfg = dict(
         sample_stride_steps=sample_stride_steps,
         window_size_frames=win_size_frames,
@@ -187,6 +196,7 @@ def resolve_metric_config(args: Any) -> dict[str, Any]:
         m_count=int(m_count),
         n_proj=n_proj,
         null_reps=null_reps,
+        particle_samples=particle_samples,
         preprocess_mode=mode,
         scales=scales,
         scale_weights={int(k): float(v) for k, v in weight_map.items()},
@@ -195,6 +205,9 @@ def resolve_metric_config(args: Any) -> dict[str, Any]:
         beta=float(getattr(args, "metric_beta", 1.0)),
         eps=float(getattr(args, "metric_eps", 1e-12)),
         dirs_seed=int(getattr(args, "metric_dirs_seed", 123)),
+        periodic=bool(periodic_raw) if periodic_raw is not None else False,
+        domain_y=0.0 if domain_y_raw is None else float(domain_y_raw),
+        domain_x=0.0 if domain_x_raw is None else float(domain_x_raw),
     )
     return cfg
 
@@ -210,6 +223,10 @@ def metric_summary(cfg: dict[str, Any]) -> dict[str, Any]:
         m_count=int(cfg["m_count"]),
         n_proj=int(cfg["n_proj"]),
         null_reps=int(cfg["null_reps"]),
+        particle_samples=int(cfg["particle_samples"]),
+        periodic=bool(cfg["periodic"]),
+        domain_y=float(cfg["domain_y"]),
+        domain_x=float(cfg["domain_x"]),
         preprocess_mode=str(cfg["preprocess_mode"]),
         scales=list(cfg["scales"]),
         scale_pairs=[(int(r), float(w)) for r, w in cfg["scale_pairs"]],
@@ -237,12 +254,16 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
     m_count = int(cfg["m_count"])
     n_proj = int(cfg["n_proj"])
     null_reps = int(cfg["null_reps"])
+    particle_samples = int(cfg["particle_samples"])
     mode = str(cfg["preprocess_mode"])
     scale_pairs = [(int(r), float(w)) for r, w in cfg["scale_pairs"]]
     alpha = float(cfg["alpha"])
     beta = float(cfg["beta"])
     eps = float(cfg["eps"])
     dirs_seed = int(cfg["dirs_seed"])
+    periodic = bool(cfg["periodic"])
+    domain_y = float(cfg["domain_y"])
+    domain_x = float(cfg["domain_x"])
     use_all_lags = (m_count >= tseg)
     base_k_idx = jnp.arange(m_count, dtype=jnp.int32)
     dir_key = jax.random.PRNGKey(dirs_seed)
@@ -254,34 +275,68 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
             return h - jnp.min(h)
         return h
 
-    def _delta_h_window(z: jnp.ndarray, start: jnp.ndarray, key: jax.Array) -> jnp.ndarray:
-        key_k, key_null = jax.random.split(key)
-        z_w = jax.lax.dynamic_slice(z, (start, 0), (win, z.shape[-1]))  # (win, D)
+    def _signature_from_increments(v_s: jnp.ndarray, dirs: jnp.ndarray) -> jnp.ndarray:
+        # v_s: (m_count, S, 2)
+        proj = jnp.einsum("msd,ld->msl", v_s, dirs)  # (m_count, S, L)
+        proj = jnp.sort(proj, axis=0)  # (m_count, S, L)
+        sig = jnp.transpose(proj, (1, 2, 0)).reshape(v_s.shape[1], -1)  # (S, L*m_count)
+        return sig
 
+    def _delta_periodic(dx: jnp.ndarray) -> jnp.ndarray:
+        if periodic:
+            if domain_y > 0:
+                dy = (dx[..., 0] + 0.5 * domain_y) % domain_y - 0.5 * domain_y
+                dx = dx.at[..., 0].set(dy)
+            if domain_x > 0:
+                ddx = (dx[..., 1] + 0.5 * domain_x) % domain_x - 0.5 * domain_x
+                dx = dx.at[..., 1].set(ddx)
+        return dx
+
+    def _delta_h_window(xy_seq: jnp.ndarray, start: jnp.ndarray, key: jax.Array) -> jnp.ndarray:
+        key_k, key_p, key_null = jax.random.split(key, 3)
+        X_w = jax.lax.dynamic_slice(
+            xy_seq,
+            (start, 0, 0),
+            (win, xy_seq.shape[1], 2),
+        )  # (win, N, 2)
+        n_particles = X_w.shape[1]
+        s_count = min(particle_samples, n_particles)
         if use_all_lags:
             k_idx = base_k_idx
         else:
             k_idx = jax.random.choice(key_k, tseg, shape=(m_count,), replace=False)
             k_idx = jnp.sort(k_idx)
 
-        v = z_w[k_idx + tau] - z_w[k_idx]  # (m_count, D)
+        if s_count >= n_particles:
+            p_idx = jnp.arange(n_particles, dtype=jnp.int32)
+        else:
+            p_idx = jax.random.choice(key_p, n_particles, shape=(s_count,), replace=False)
+            p_idx = jnp.sort(p_idx)
 
-        dirs = jax.random.normal(dir_key, (n_proj, z.shape[-1]), dtype=z.dtype)
+        X0 = X_w[k_idx][:, p_idx, :]
+        X1 = X_w[k_idx + tau][:, p_idx, :]
+        dx = _delta_periodic(X1 - X0)
+        dt = jnp.maximum(
+            jnp.asarray(float(tau) * float(cfg["sample_stride_steps"]), dtype=xy_seq.dtype),
+            jnp.asarray(1e-12, dtype=xy_seq.dtype),
+        )
+        v_s = dx / dt  # (m_count, S, 2)
+
+        dirs = jax.random.normal(dir_key, (n_proj, 2), dtype=xy_seq.dtype)
         dirs = dirs / jnp.maximum(jnp.linalg.norm(dirs, axis=1, keepdims=True), 1e-12)
-        proj = v @ dirs.T  # (m_count, n_proj)
-        sig = jnp.transpose(jnp.sort(proj, axis=0), (1, 0))  # (n_proj, m_count)
+        sig = _signature_from_increments(v_s, dirs)
         h_real = _mean_pairwise_l1(sig)
 
         if null_reps <= 0:
-            h_null = jnp.array(0.0, dtype=z.dtype)
+            h_null = jnp.array(0.0, dtype=xy_seq.dtype)
         else:
-            pool = proj.reshape(-1)
+            pool = v_s.reshape((-1, 2))
             pool_n = pool.shape[0]
 
             def _one_null(k: jax.Array) -> jnp.ndarray:
-                idx = jax.random.randint(k, (m_count, n_proj), 0, pool_n)
-                proj0 = pool[idx]
-                sig0 = jnp.transpose(jnp.sort(proj0, axis=0), (1, 0))
+                idx = jax.random.randint(k, (m_count, s_count), 0, pool_n)
+                v0 = pool[idx]  # (m_count, S, 2)
+                sig0 = _signature_from_increments(v0, dirs)
                 return _mean_pairwise_l1(sig0)
 
             null_keys = jax.random.split(key_null, null_reps)
@@ -290,13 +345,13 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
 
         return h_real - h_null
 
-    def metric_loss_fn(rng_metric: jax.Array, z: jnp.ndarray):
+    def metric_loss_fn(rng_metric: jax.Array, xy_seq: jnp.ndarray):
         keys_w = jax.random.split(rng_metric, W)
-        h = jax.vmap(lambda s, k: _delta_h_window(z, s, k))(starts, keys_w)  # (W,)
+        h = jax.vmap(lambda s, k: _delta_h_window(xy_seq, s, k))(starts, keys_w)  # (W,)
         h_pos = _preprocess(h)
 
         amp = jnp.mean(h_pos)
-        msc = jnp.array(0.0, dtype=z.dtype)
+        msc = jnp.array(0.0, dtype=xy_seq.dtype)
         for r, wr in scale_pairs:
             U_r = W // r
             U_2r = W // (2 * r)

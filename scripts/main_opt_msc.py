@@ -2,7 +2,6 @@ import os
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import sys
-from functools import partial
 
 import evosax
 import jax
@@ -13,15 +12,58 @@ from jax.random import split
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
 
-import foundation_models
 import substrates
 import util
 from clip_deltah_msc_metric import make_metric_loss_fn, metric_summary, resolve_metric_config
-from rollout import rollout_simulation
 
 
 print(jax.devices())
 print(jax.default_backend())
+
+
+def _init_lagrangian_points_jax(
+    A0: jax.Array,
+    *,
+    n_particles: int,
+    init_mode: str,
+    border: str,
+    sigma: float,
+    key: jax.Array,
+) -> jax.Array:
+    sx = int(A0.shape[0])
+    sy = int(A0.shape[1])
+    init_mode = str(init_mode).strip().lower()
+    if init_mode == "uniform":
+        k0, k1 = split(key)
+        y = jax.random.uniform(k0, (n_particles,), minval=0.5, maxval=sx - 0.5)
+        x = jax.random.uniform(k1, (n_particles,), minval=0.5, maxval=sy - 0.5)
+        pts = jnp.stack((y, x), axis=-1)
+    elif init_mode == "mass":
+        mass = jnp.clip(jnp.asarray(A0, dtype=jnp.float32).sum(axis=-1), 0.0, jnp.inf)
+        flat = mass.reshape(-1)
+        total = jnp.sum(flat)
+        probs = jnp.where(total > 0.0, flat / jnp.maximum(total, 1e-12), jnp.ones_like(flat) / flat.size)
+        k_idx, k_jit = split(key)
+        idx = jax.random.choice(k_idx, flat.size, shape=(n_particles,), replace=True, p=probs)
+        iy = idx // sy
+        ix = idx % sy
+        jitter = jax.random.uniform(k_jit, (n_particles, 2), minval=-0.49, maxval=0.49)
+        pts = jnp.stack((iy.astype(jnp.float32) + 0.5, ix.astype(jnp.float32) + 0.5), axis=-1) + jitter
+    else:
+        raise ValueError(f"Unknown metric_lagrangian_init_mode={init_mode!r}. Use 'mass' or 'uniform'.")
+
+    if border == "torus":
+        y = jnp.mod(pts[:, 0] - 0.5, sx) + 0.5
+        x = jnp.mod(pts[:, 1] - 0.5, sy) + 0.5
+        pts = jnp.stack((y, x), axis=-1)
+    else:
+        lo = float(sigma)
+        hi_y = float(sx - sigma)
+        hi_x = float(sy - sigma)
+        y = jnp.clip(pts[:, 0], lo, hi_y)
+        x = jnp.clip(pts[:, 1], lo, hi_x)
+        pts = jnp.stack((y, x), axis=-1)
+    return pts.astype(jnp.float32)
 
 
 def load_config():
@@ -43,18 +85,27 @@ def main(cfg, args):
     wandb_project = str(getattr(args, "wandb_project", "asal"))
     run = wandb.init(project=wandb_project, config=OmegaConf.to_container(cfg, resolve=True))
     try:
-        fm = foundation_models.create_foundation_model(args.foundation_model)
         if args.substrate == "lenia_flow":
-            substrate = substrates.create_substrate(
+            base_substrate = substrates.create_substrate(
                 args.substrate,
                 **util.flow_lenia_kwargs_from_args(args),
             )
         else:
-            substrate = substrates.create_substrate(args.substrate)
-        substrate = substrates.FlattenSubstrateParameters(substrate)
+            base_substrate = substrates.create_substrate(args.substrate)
+        if hasattr(base_substrate, "debug_return_F"):
+            base_substrate.debug_return_F = True
+        substrate = substrates.FlattenSubstrateParameters(base_substrate)
 
         if args.rollout_steps is None:
             args.rollout_steps = substrate.rollout_steps
+
+        # Auto-fill periodic settings for lagrangian displacement unwrapping.
+        if (not hasattr(args, "metric_periodic")) or (getattr(args, "metric_periodic", None) is None):
+            args.metric_periodic = str(getattr(substrate, "border", "wall")) == "torus"
+        if (not hasattr(args, "metric_domain_y")) or (getattr(args, "metric_domain_y", None) is None):
+            args.metric_domain_y = float(getattr(getattr(substrate, "cfg", None), "X", getattr(substrate, "grid_size", 0)))
+        if (not hasattr(args, "metric_domain_x")) or (getattr(args, "metric_domain_x", None) is None):
+            args.metric_domain_x = float(getattr(getattr(substrate, "cfg", None), "Y", getattr(substrate, "grid_size", 0)))
 
         metric_cfg = resolve_metric_config(args)
         metric_info = metric_summary(metric_cfg)
@@ -66,21 +117,78 @@ def main(cfg, args):
                 run.summary[f"metric_cfg/{k}"] = v
         metric_loss_fn = make_metric_loss_fn(metric_cfg)
 
-        rollout_fn = partial(
-            rollout_simulation,
-            substrate=substrate,
-            fm=fm,
-            rollout_steps=args.rollout_steps,
-            time_sampling=(args.time_sampling, True),
-            img_size=224,
-            return_state=False,
-        )
+        if int(args.rollout_steps) % int(args.time_sampling) != 0:
+            raise ValueError(
+                "rollout_steps must be divisible by time_sampling for lagrangian sampling."
+            )
+        chunk_steps = int(args.rollout_steps) // int(args.time_sampling)
+
+        lag_n_particles = int(getattr(args, "metric_lagrangian_n_particles", 256))
+        lag_init_mode = str(getattr(args, "metric_lagrangian_init_mode", "mass"))
+        lag_flow_channel = int(getattr(args, "metric_lagrangian_flow_channel", -1))
+        lag_flow_reduce = str(getattr(args, "metric_lagrangian_flow_reduce", "mass_weighted"))
+        lag_channel_mode = str(getattr(args, "metric_lagrangian_channel_mode", "mix"))
+        lag_noise_model = str(getattr(args, "metric_lagrangian_noise_model", "none"))
+        lag_diffusion_scale = float(getattr(args, "metric_lagrangian_diffusion_scale", 1.0))
+
+        def rollout_lagrangian_xy(rng, params):
+            k_state, k_pts, k_ch, k_scan = jax.random.split(rng, 4)
+            s0 = substrate.init_state(k_state, params)
+            if "F" not in s0:
+                raise ValueError(
+                    "State does not contain flow field F. "
+                    "For FlowLenia set debug_return_F=true before optimization."
+                )
+            if not hasattr(substrate, "RT"):
+                raise ValueError("Substrate does not provide RT for lagrangian advection.")
+
+            rt = substrate.RT
+            pts0 = _init_lagrangian_points_jax(
+                s0["A"],
+                n_particles=lag_n_particles,
+                init_mode=lag_init_mode,
+                border=str(getattr(rt, "border", "wall")),
+                sigma=float(getattr(rt, "sigma", 0.0)),
+                key=k_pts,
+            )
+            if lag_channel_mode in ("fixed", "resample"):
+                ch0 = rt.sample_point_channels(pts0, s0["A"], k_ch)
+            else:
+                ch0 = jnp.zeros((lag_n_particles,), dtype=jnp.int32)
+
+            def step_fn(state, key_step):
+                st, pts, ch = state
+                st = substrate.step_state(key_step, st, params)
+                lag_key = jax.random.fold_in(key_step, jnp.uint32(0x4C4147))
+                pts, ch = rt.advect_particles(
+                    points=pts,
+                    F=st["F"],
+                    A=st["A"],
+                    channel=lag_flow_channel,
+                    reduce=lag_flow_reduce,
+                    point_channels=ch,
+                    channel_mode=lag_channel_mode,
+                    key=lag_key,
+                    noise_model=lag_noise_model,
+                    diffusion_scale=lag_diffusion_scale,
+                )
+                return (st, pts, ch), None
+
+            def chunk_fn(state, key_chunk):
+                state_next, _ = jax.lax.scan(step_fn, state, split(key_chunk, chunk_steps))
+                return state_next, state_next[1]
+
+            (_, _, _), xy_seq = jax.lax.scan(
+                chunk_fn,
+                (s0, pts0, ch0),
+                split(k_scan, int(args.time_sampling)),
+            )
+            return xy_seq  # (time_sampling, N_particles, 2)
 
         def calc_loss(rng, params):
             rng_roll, rng_metric = split(rng)
-            out = rollout_fn(rng=rng_roll, params=params)
-            z = out["z"]  # (time_sampling, D)
-            return metric_loss_fn(rng_metric, z)
+            xy_seq = rollout_lagrangian_xy(rng_roll, params)
+            return metric_loss_fn(rng_metric, xy_seq)
 
         calc_loss_vv = jax.vmap(jax.vmap(calc_loss, in_axes=(0, None)), in_axes=(None, 0))
 
