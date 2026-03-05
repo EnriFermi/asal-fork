@@ -12,13 +12,41 @@ from jax.random import split
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
 
+import asal_metrics
+import foundation_models
 import substrates
 import util
 from clip_deltah_msc_metric import make_metric_loss_fn, metric_summary, resolve_metric_config
+from rollout import rollout_simulation
 
 
 print(jax.devices())
 print(jax.default_backend())
+
+
+def _patch_wandb_pandas_check() -> None:
+    """
+    Work around environments where pandas cannot be imported due to numpy ABI mismatch.
+    wandb checks every logged value via util.is_pandas_data_frame, which may crash.
+    """
+    try:
+        import wandb.util as wandb_util
+    except Exception:
+        return
+    orig = getattr(wandb_util, "is_pandas_data_frame", None)
+    if orig is None:
+        return
+
+    def _safe_is_pandas_data_frame(val):
+        try:
+            return orig(val)
+        except Exception:
+            return False
+
+    wandb_util.is_pandas_data_frame = _safe_is_pandas_data_frame
+
+
+_patch_wandb_pandas_check()
 
 
 def _init_lagrangian_points_jax(
@@ -120,6 +148,75 @@ def main(cfg, args):
         chunk_steps = int(metric_cfg["sample_every_steps"])
         time_sampling = int(metric_cfg["time_sampling"])
 
+        # Optional CLIP-based evolution loss logging (does NOT affect optimization target).
+        log_clip_evolution = bool(getattr(args, "log_clip_evolution", True))
+        clip_loss_from_z = None
+        rollout_clip = None
+        if log_clip_evolution:
+            prompts_raw = getattr(args, "prompts", "a biological cell;two biological cells")
+            if isinstance(prompts_raw, str):
+                prompts = [p for p in prompts_raw.split(";") if p]
+            else:
+                prompts = OmegaConf.to_container(prompts_raw, resolve=True)
+            if len(prompts) == 0:
+                raise ValueError("prompts must not be empty when log_clip_evolution=true.")
+
+            clip_time_sampling = int(getattr(args, "clip_time_sampling", min(16, time_sampling)))
+            if clip_time_sampling < len(prompts):
+                clip_time_sampling = len(prompts)
+            if int(args.rollout_steps) % clip_time_sampling != 0:
+                raise ValueError(
+                    "rollout_steps must be divisible by clip_time_sampling. "
+                    f"Got rollout_steps={int(args.rollout_steps)}, clip_time_sampling={clip_time_sampling}."
+                )
+
+            fm = foundation_models.create_foundation_model(getattr(args, "foundation_model", "clip"))
+            z_txt = fm.embed_txt(prompts)
+
+            coef_prompt = float(getattr(args, "coef_prompt", 0.0))
+            coef_softmax = float(getattr(args, "coef_softmax", 0.0))
+            coef_oe = float(getattr(args, "coef_oe", 1.0))
+            coef_smooth = float(getattr(args, "coef_smooth", 0.2))
+
+            def clip_loss_from_z(z):
+                loss_prompt = asal_metrics.calc_supervised_target_score(z, z_txt)
+                loss_softmax = asal_metrics.calc_supervised_target_softmax_score(z, z_txt)
+                loss_oe = asal_metrics.calc_open_endedness_score(z)
+                loss_smooth = asal_metrics.calc_gradient_score(z)
+                loss_total = (
+                    loss_prompt * coef_prompt
+                    + loss_softmax * coef_softmax
+                    + loss_oe * coef_oe
+                    + loss_smooth * coef_smooth
+                )
+                return dict(
+                    clip_evolution_loss=loss_total,
+                    clip_loss_prompt=loss_prompt,
+                    clip_loss_softmax=loss_softmax,
+                    clip_loss_oe=loss_oe,
+                    clip_loss_smooth=loss_smooth,
+                )
+
+            rollout_clip = jax.jit(
+                lambda rng, params: rollout_simulation(
+                    rng=rng,
+                    params=params,
+                    s0=None,
+                    substrate=substrate,
+                    fm=fm,
+                    rollout_steps=int(args.rollout_steps),
+                    time_sampling=(clip_time_sampling, True),
+                    img_size=224,
+                    return_state=False,
+                )
+            )
+            run.summary["clip_logging/enabled"] = True
+            run.summary["clip_logging/foundation_model"] = str(getattr(args, "foundation_model", "clip"))
+            run.summary["clip_logging/time_sampling"] = int(clip_time_sampling)
+            run.summary["clip_logging/prompts"] = str(prompts)
+        else:
+            run.summary["clip_logging/enabled"] = False
+
         lag_n_particles = int(getattr(args, "metric_lagrangian_n_particles", 256))
         lag_init_mode = str(getattr(args, "metric_lagrangian_init_mode", "mass"))
         lag_flow_channel = int(getattr(args, "metric_lagrangian_flow_channel", -1))
@@ -183,9 +280,19 @@ def main(cfg, args):
             return xy_seq  # (time_sampling, N_particles, 2)
 
         def calc_loss(rng, params):
-            rng_roll, rng_metric = split(rng)
+            if log_clip_evolution:
+                rng_roll, rng_metric, rng_clip = split(rng, 3)
+            else:
+                rng_roll, rng_metric = split(rng)
             xy_seq = rollout_lagrangian_xy(rng_roll, params)
-            return metric_loss_fn(rng_metric, xy_seq)
+            msc_loss, msc_dict = metric_loss_fn(rng_metric, xy_seq)
+            if not log_clip_evolution:
+                return msc_loss, msc_dict
+            clip_out = rollout_clip(rng_clip, params)
+            z_clip = clip_out["z"]
+            clip_dict = clip_loss_from_z(z_clip)
+            merged = dict(msc_dict, **clip_dict)
+            return msc_loss, merged
 
         calc_loss_vv = jax.vmap(jax.vmap(calc_loss, in_axes=(0, None)), in_axes=(None, 0))
 
@@ -290,6 +397,18 @@ def main(cfg, args):
                 v_np = np.array(v)
                 log_dict[f"metric/{k}_pop_mean"] = float(v_np.mean())
                 log_dict[f"metric/{k}_pop_var"] = float(v_np.var())
+            if "clip_evolution_loss" in loss_dict_all:
+                clip_np = np.array(loss_dict_all["clip_evolution_loss"])
+                if clip_np.size > 0:
+                    log_dict["metric/clip_evolution_loss_pop_best"] = float(clip_np.min())
+                if clip_np.shape == loss_np.shape and clip_np.size >= 2:
+                    a = loss_np.astype(np.float64)
+                    b = clip_np.astype(np.float64)
+                    da = a - a.mean()
+                    db = b - b.mean()
+                    denom = np.sqrt((da * da).sum() * (db * db).sum())
+                    corr = np.nan if denom <= 0 else float((da * db).sum() / denom)
+                    log_dict["metric/corr_msc_loss_vs_clip_evolution"] = corr
 
             palette_stats = util.flow_lenia_palette_stats(np.array(params_full[best_idx]), substrate)
             if palette_stats is not None:
