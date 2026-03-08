@@ -1,10 +1,10 @@
 meta:
-  save_dir: experiments/opt_msc/checkpoints/test_run
+  save_dir: experiments/opt_msc/checkpoints/test_run_2
 
 substrate:
   substrate: lenia_flow
-  rollout_steps: 131072
-  grid_size: 128
+  rollout_steps: 150000
+  grid_size: 384
   C: 3
   k: 9
   kernel_components: 3
@@ -15,7 +15,7 @@ substrate:
   border: wall
   mix_rule: stoch
   seed_patch_size: 20
-  seed_n_patches: 4
+  seed_n_patches: 8
   seed_mode: random_patches
   p_constant_per_patch: 1
   render_mode: Pcolor
@@ -23,9 +23,9 @@ substrate:
   clip2: .inf
   mutations: true
   mutation_sz: 40
-  mutation_p: 0.2
-  mutation_scale: 2.0
-  optimize_mutation_scale: true
+  mutation_p: 0.05
+  mutation_scale: 1.0
+  optimize_mutation_scale: false
   volcano: false
   volcano_sz: 30
   volcano_p: 0.01
@@ -51,23 +51,23 @@ simulation:
   time_sampling: video
   img_size: 224
   seed: 0
-  n_seeds: 4
+  n_seeds: 8
   seed_mode: random_patches
   p_constant_per_patch: 1
   render_mode: Pcolor
-  output: experiments/opt_msc/figures/best_simulation.mp4
+  output: experiments/opt_msc/figures/best_simulation_2.mp4
   fps: 120
   codec: libx264
   macro_block_size: null
   batch_steps: 256
   jit_microbatch: 64
   max_steps: null
-  mass_plot: experiments/opt_msc/figures/best_mass.png
+  mass_plot: experiments/opt_msc/figures/best_mass_2.png
   log_mass_every: 1000
   traj_iter: null
   compute_oe: false
   oe_every: 100
-  oe_plot: experiments/opt_msc/figures/best_oe.png
+  oe_plot: experiments/opt_msc/figures/best_oe_2.png
 
 logging:
   wandb_project: asal

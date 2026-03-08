@@ -1,10 +1,10 @@
 meta:
   seed: 1
-  save_dir: experiments/opt_msc/checkpoints/test_run
+  save_dir: experiments/opt_msc/checkpoints/test_run_2
 
 substrate:
   substrate: lenia_flow
-  rollout_steps: 130000
+  rollout_steps: 155000
   grid_size: 384
   C: 3
   k: 9
@@ -19,7 +19,7 @@ substrate:
   seed_n_patches: 16
   seed_mode: random_patches
   p_constant_per_patch: 1
-  render_mode: PcolorMix
+  render_mode: Pcolor
   clip1: .inf
   clip2: .inf
   mutations: true
@@ -50,13 +50,14 @@ substrate:
 
 evaluation:
   sample_every_steps: 50   # рекомендуемый способ задать частоту сэмплирования
+  clip_time_sampling: 50
   # time_sampling: 2560     # legacy fallback, если sample_every_steps не задан
 
 optimization:
-  bs: 2
-  pop_batch: 4
-  pop_size: 12
-  n_iters: 100
+  bs: 1
+  pop_batch: 8
+  pop_size: 8
+  n_iters: 50
   sigma: 0.2
 
 logging:
@@ -69,8 +70,8 @@ metric:
   metric_window_size_steps: 20000
   metric_window_step_steps: 5000
   metric_tau_steps: 3000
-  metric_range_start_steps: 50000
-  metric_range_end_steps: 130000
+  metric_range_start_steps: 40000
+  metric_range_end_steps: 155000
   metric_window_size_frames: null
   metric_window_step_frames: null
   metric_tau_frames: null
@@ -104,3 +105,4 @@ metric:
   metric_alpha: 0.0
   metric_beta: 1.0
   metric_eps: 1.0e-12
+
