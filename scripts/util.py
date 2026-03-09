@@ -63,6 +63,7 @@ def flow_lenia_kwargs_from_args(args: Any) -> Dict[str, Any]:
         sigma=float(args.sigma),
         border=str(args.border),
         mix_rule=str(args.mix_rule),
+        base_seed=int(getattr(args, "base_seed", 0)),
         seed_patch_size=int(args.seed_patch_size),
         seed_n_patches=int(seed_n),
         seed_mode=str(args.seed_mode),
