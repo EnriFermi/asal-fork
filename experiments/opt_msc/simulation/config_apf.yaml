@@ -64,12 +64,11 @@ logging:
   save_F: true
   save_lagrangian: true
   lagrangian_n_particles: 8192
-  lagrangian_seed: 0
-  lagrangian_init_mode: mass
-  lagrangian_channel_mode: mix
-  lagrangian_flow_reduce: mass_weighted
-  lagrangian_flow_channel: -1
-  lagrangian_noise_model: none
+  lagrangian_init_mode: mass     # mass | uniform
+  lagrangian_flow_channel: -1    # -1 = mix by reduce
+  lagrangian_flow_reduce: mass_weighted  # mass_weighted | mean
+  lagrangian_channel_mode: resample   # mix | fixed | resample
+  lagrangian_noise_model: rt_box   # none | rt_box | gaussian
   lagrangian_diffusion_scale: 1.0
   save_lagrangian_channels: true
   lagrangian_unique_check_every_steps: 64
@@ -90,3 +89,6 @@ logging:
   save_rgb: false
   save_fp16: true
   log_step_range: [null, null]
+
+
+
