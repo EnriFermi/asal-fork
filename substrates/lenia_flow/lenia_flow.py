@@ -79,6 +79,7 @@ class FlowLenia:
         sigma: float = 0.65,
         border: str = "wall",
         mix_rule: str = "stoch",
+        base_seed: int = 0,
         seed_patch_size: int = 20,
         seed_n_patches: int = 1,
         seed_mode: str = "notebook_centers",  # 'center' | 'random_patches' | 'notebook_centers'
@@ -127,6 +128,7 @@ class FlowLenia:
         self.sigma = sigma
         self.border = border
         self.mix_rule = mix_rule
+        self.base_seed = int(base_seed)
         self.seed_patch_size = seed_patch_size
         self.seed_n_patches = seed_n_patches
         self.seed_mode = seed_mode
@@ -196,8 +198,9 @@ class FlowLenia:
             "fcr": (0.0, 0.5),
         }
 
-        # Sample a deterministic base set of parameters following the same ranges
-        kR, kr, km, ks, ka, kb, kw = jr.split(jr.key(0), 7)
+        # Sample a deterministic base set of parameters following the same ranges.
+        # Backward compatibility: base_seed=0 reproduces the previous behavior.
+        kR, kr, km, ks, ka, kb, kw = jr.split(jr.key(self.base_seed), 7)
         base_R = jr.uniform(kR, (), minval=2.0, maxval=25.0)
         base_r = jr.uniform(kr, (self.k,), minval=0.2, maxval=1.0)
         base_m = jr.uniform(km, (self.k,), minval=0.05, maxval=0.5)

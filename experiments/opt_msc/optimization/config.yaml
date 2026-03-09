@@ -15,6 +15,7 @@ substrate:
   sigma: 0.65
   border: wall
   mix_rule: stoch
+  base_seed: 0
   seed_patch_size: 20
   seed_n_patches: 16
   seed_mode: random_patches
@@ -105,4 +106,3 @@ metric:
   metric_alpha: 0.0
   metric_beta: 1.0
   metric_eps: 1.0e-12
-
