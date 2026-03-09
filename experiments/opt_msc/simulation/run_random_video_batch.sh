@@ -16,15 +16,30 @@ param_seed_start="${PARAM_SEED_START:-3}"
 sim_seed_start="${SIM_SEED_START:-2}"
 overwrite="${OVERWRITE:-0}"
 wandb_mode="${WANDB_MODE:-disabled}"
+jax_platforms="${JAX_PLATFORMS:-}"
+xla_preallocate="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
 
-set -- \
-  "${python_bin}" "scripts/simulate_random_flowlenia_video_batch.py" "${cfg}" \
-  --n-inits "${n_inits}" \
-  --rollout-steps "${rollout_steps}" \
-  --output-root "${output_root}" \
-  --param-seed-start "${param_seed_start}" \
-  --sim-seed-start "${sim_seed_start}" \
-  --wandb-mode "${wandb_mode}"
+if [ -n "${jax_platforms}" ]; then
+  set -- \
+    env JAX_PLATFORMS="${jax_platforms}" XLA_PYTHON_CLIENT_PREALLOCATE="${xla_preallocate}" \
+    "${python_bin}" "scripts/simulate_random_flowlenia_video_batch.py" "${cfg}" \
+    --n-inits "${n_inits}" \
+    --rollout-steps "${rollout_steps}" \
+    --output-root "${output_root}" \
+    --param-seed-start "${param_seed_start}" \
+    --sim-seed-start "${sim_seed_start}" \
+    --wandb-mode "${wandb_mode}"
+else
+  set -- \
+    env XLA_PYTHON_CLIENT_PREALLOCATE="${xla_preallocate}" \
+    "${python_bin}" "scripts/simulate_random_flowlenia_video_batch.py" "${cfg}" \
+    --n-inits "${n_inits}" \
+    --rollout-steps "${rollout_steps}" \
+    --output-root "${output_root}" \
+    --param-seed-start "${param_seed_start}" \
+    --sim-seed-start "${sim_seed_start}" \
+    --wandb-mode "${wandb_mode}"
+fi
 
 if [ "${overwrite}" = "1" ]; then
   set -- "$@" --overwrite
