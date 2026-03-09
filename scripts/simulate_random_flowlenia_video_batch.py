@@ -5,6 +5,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Avoid large upfront GPU preallocation in the parent process.
+# This script spawns child JAX processes; without this, parent may hold most VRAM.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 import jax
 import numpy as np
 from omegaconf import OmegaConf
@@ -143,6 +147,8 @@ def _run_one(
     cmd = [python_bin, str(project_root / "scripts" / "simulate_after_training.py"), str(cfg_path)]
     env = os.environ.copy()
     env["WANDB_MODE"] = str(wandb_mode)
+    # Keep child JAX process from grabbing ~75% VRAM by default.
+    env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
     print(f"Running: {' '.join(cmd)}")
     subprocess.run(cmd, cwd=str(project_root), env=env, check=True)
 
