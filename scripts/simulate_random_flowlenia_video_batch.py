@@ -51,6 +51,36 @@ def _make_substrate(flat_args):
     return substrates.FlattenSubstrateParameters(substrate)
 
 
+def _ensure_video_defaults(cfg_i, run_root: Path):
+    if "logging" not in cfg_i:
+        cfg_i.logging = {}
+    if "simulation" not in cfg_i:
+        cfg_i.simulation = {}
+
+    if not hasattr(cfg_i.logging, "wandb_project"):
+        cfg_i.logging.wandb_project = "asal"
+
+    sim = cfg_i.simulation
+    sim.time_sampling = getattr(sim, "time_sampling", "video")
+    sim.img_size = int(getattr(sim, "img_size", 224))
+    sim.n_seeds = int(getattr(sim, "n_seeds", 1))
+    sim.seed_mode = getattr(sim, "seed_mode", "random_patches")
+    sim.p_constant_per_patch = int(getattr(sim, "p_constant_per_patch", 1))
+    sim.render_mode = getattr(sim, "render_mode", "Pcolor")
+    sim.fps = int(getattr(sim, "fps", 120))
+    sim.codec = getattr(sim, "codec", "libx264")
+    sim.macro_block_size = getattr(sim, "macro_block_size", None)
+    sim.batch_steps = int(getattr(sim, "batch_steps", 256))
+    sim.jit_microbatch = int(getattr(sim, "jit_microbatch", 64))
+    sim.log_mass_every = int(getattr(sim, "log_mass_every", 1000))
+    sim.traj_iter = getattr(sim, "traj_iter", None)
+    sim.compute_oe = bool(getattr(sim, "compute_oe", False))
+    sim.oe_every = int(getattr(sim, "oe_every", 100))
+    sim.output = str(run_root / "simulation.mp4")
+    sim.mass_plot = str(run_root / "mass.png")
+    sim.oe_plot = str(run_root / "oe_loss.png")
+
+
 def _run_one(
     *,
     project_root: Path,
@@ -60,17 +90,13 @@ def _run_one(
     rollout_steps: int,
     param_seed: int,
     sim_seed: int,
-    lag_seed: int | None,
     wandb_mode: str,
 ):
     run_root.mkdir(parents=True, exist_ok=True)
     save_dir = run_root / "checkpoint"
-    output_dir = run_root / "apf_logs"
     save_dir.mkdir(parents=True, exist_ok=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     cfg_i = OmegaConf.create(OmegaConf.to_container(base_cfg, resolve=True))
-
     if "meta" not in cfg_i:
         cfg_i.meta = {}
     if "substrate" not in cfg_i:
@@ -81,19 +107,16 @@ def _run_one(
         cfg_i.logging = {}
 
     cfg_i.meta.save_dir = str(save_dir)
-    cfg_i.meta.output_dir = str(output_dir)
     cfg_i.substrate.rollout_steps = int(rollout_steps)
     cfg_i.simulation.rollout_steps = int(rollout_steps)
     cfg_i.simulation.max_steps = int(rollout_steps)
     cfg_i.simulation.seed = int(sim_seed)
 
-    if "lagrangian_seed" in cfg_i.logging or lag_seed is not None:
-        cfg_i.logging.lagrangian_seed = int(sim_seed if lag_seed is None else lag_seed)
+    _ensure_video_defaults(cfg_i, run_root)
 
-    cfg_path = run_root / "config_apf.yaml"
+    cfg_path = run_root / "config_video.yaml"
     OmegaConf.save(config=cfg_i, f=str(cfg_path))
 
-    # Generate random parameter vector and save compatible best.pkl
     flat_i = OmegaConf.merge(
         cfg_i.get("meta", {}),
         cfg_i.get("substrate", {}),
@@ -111,14 +134,13 @@ def _run_one(
         dict(
             param_seed=int(param_seed),
             sim_seed=int(sim_seed),
-            lagrangian_seed=int(sim_seed if lag_seed is None else lag_seed),
             n_params=int(params.size),
             rollout_steps=int(rollout_steps),
-            output_dir=str(output_dir),
+            video_output=str(cfg_i.simulation.output),
         ),
     )
 
-    cmd = [python_bin, str(project_root / "scripts" / "simulate_save_apf.py"), str(cfg_path)]
+    cmd = [python_bin, str(project_root / "scripts" / "simulate_after_training.py"), str(cfg_path)]
     env = os.environ.copy()
     env["WANDB_MODE"] = str(wandb_mode)
     print(f"Running: {' '.join(cmd)}")
@@ -127,9 +149,12 @@ def _run_one(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Sample random FlowLenia parameter initializations and run APF simulations in batch."
+        description="Sample random FlowLenia initializations and render video for each run."
     )
-    parser.add_argument("config", help="Base config YAML compatible with scripts/simulate_save_apf.py")
+    parser.add_argument(
+        "config",
+        help="Base config YAML compatible with scripts/simulate_after_training.py",
+    )
     parser.add_argument("--n-inits", type=int, default=10, help="Number of random initializations.")
     parser.add_argument(
         "--rollout-steps",
@@ -141,7 +166,7 @@ def main():
         "--output-root",
         type=str,
         default=None,
-        help="Where to store init_XX folders. Default: <config.meta.save_dir>/random_batch_200k.",
+        help="Where to store init_XX folders. Default: <config.meta.save_dir>/random_video_batch_200k.",
     )
     parser.add_argument(
         "--param-seed-start",
@@ -154,12 +179,6 @@ def main():
         type=int,
         default=0,
         help="First simulation seed (incremented by init index).",
-    )
-    parser.add_argument(
-        "--lagrangian-seed-start",
-        type=int,
-        default=None,
-        help="Optional first lagrangian seed (incremented by init index). Default: use sim seed.",
     )
     parser.add_argument(
         "--overwrite",
@@ -191,7 +210,7 @@ def main():
             "Provide --output-root explicitly."
         )
     if args.output_root is None:
-        output_root = _resolve_path(str(meta_save_dir), project_root) / "random_batch_200k"
+        output_root = _resolve_path(str(meta_save_dir), project_root) / "random_video_batch_200k"
     else:
         output_root = _resolve_path(args.output_root, project_root)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -212,10 +231,9 @@ def main():
 
         pseed = int(args.param_seed_start) + i
         sseed = int(args.sim_seed_start) + i
-        lseed = None if args.lagrangian_seed_start is None else (int(args.lagrangian_seed_start) + i)
         print(
             f"[{i+1}/{n_inits}] run_root={run_root} | "
-            f"param_seed={pseed}, sim_seed={sseed}, lag_seed={sseed if lseed is None else lseed}"
+            f"param_seed={pseed}, sim_seed={sseed}"
         )
 
         _run_one(
@@ -226,7 +244,6 @@ def main():
             rollout_steps=int(args.rollout_steps),
             param_seed=pseed,
             sim_seed=sseed,
-            lag_seed=lseed,
             wandb_mode=str(args.wandb_mode),
         )
 
