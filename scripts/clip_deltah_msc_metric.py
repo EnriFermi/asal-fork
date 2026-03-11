@@ -50,6 +50,36 @@ def _resolve_optional_steps(x: Any, *, name: str) -> int | None:
     return val
 
 
+def _resolve_tau_grid_frames(
+    *,
+    sample_stride_steps: int,
+    tau_grid_frames_raw: Any,
+    tau_grid_steps_raw: Any,
+) -> list[int]:
+    if tau_grid_frames_raw is not None:
+        vals = _maybe_list(tau_grid_frames_raw)
+        if vals is None:
+            vals = [tau_grid_frames_raw]
+        frames = [int(v) for v in vals]
+    elif tau_grid_steps_raw is not None:
+        vals = _maybe_list(tau_grid_steps_raw)
+        if vals is None:
+            vals = [tau_grid_steps_raw]
+        frames = [int(max(1, round(float(v) / float(sample_stride_steps)))) for v in vals]
+    else:
+        return []
+
+    out: list[int] = []
+    seen: set[int] = set()
+    for v in frames:
+        if v < 1:
+            raise ValueError(f"All tau grid values must be >= 1, got {v}.")
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
 def _resolve_scales(
     *,
     W: int,
@@ -152,17 +182,9 @@ def resolve_metric_config(args: Any) -> dict[str, Any]:
         sample_stride_steps=sample_stride_steps,
         name="metric_window_step",
     )
-    tau_frames = _resolve_frames(
-        frames=getattr(args, "metric_tau_frames", None),
-        steps=getattr(args, "metric_tau_steps", 3_000),
-        sample_stride_steps=sample_stride_steps,
-        name="metric_tau",
-    )
-
-    if tau_frames >= win_size_frames:
-        raise ValueError(
-            f"metric_tau_frames ({tau_frames}) must be < metric_window_size_frames ({win_size_frames})."
-        )
+    tau_mode = str(getattr(args, "metric_tau_mode", "fixed")).strip().lower()
+    if tau_mode not in {"fixed", "max_grid"}:
+        raise ValueError(f"metric_tau_mode must be one of ['fixed','max_grid'], got {tau_mode!r}.")
 
     T = int(time_sampling)
     if T < win_size_frames:
@@ -201,20 +223,47 @@ def resolve_metric_config(args: Any) -> dict[str, Any]:
             "window/tau/time_sampling or metric_range_start_steps/metric_range_end_steps."
         )
 
-    tseg = win_size_frames - tau_frames
-    if tseg < 1:
-        raise ValueError(
-            f"metric_window_size_frames ({win_size_frames}) - metric_tau_frames ({tau_frames}) must be >= 1."
-        )
-
     m_samples_raw = int(getattr(args, "metric_m_samples", 48))
-    m_count = tseg if m_samples_raw <= 0 else min(tseg, m_samples_raw)
     m_min = int(getattr(args, "metric_m_min", 4))
-    if m_count < m_min:
-        raise ValueError(
-            f"Too few lagged samples per window for DeltaH: m_count={m_count}, m_min={m_min}. "
-            "Increase window size / decrease tau / increase time_sampling."
-        )
+    tau_frames_fixed = _resolve_frames(
+        frames=getattr(args, "metric_tau_frames", None),
+        steps=getattr(args, "metric_tau_steps", 3_000),
+        sample_stride_steps=sample_stride_steps,
+        name="metric_tau",
+    )
+    tau_frames_grid = _resolve_tau_grid_frames(
+        sample_stride_steps=sample_stride_steps,
+        tau_grid_frames_raw=getattr(args, "metric_tau_grid_frames", None),
+        tau_grid_steps_raw=getattr(args, "metric_tau_grid_steps", None),
+    )
+    if tau_mode == "fixed":
+        tau_frames_list = [int(tau_frames_fixed)]
+    else:
+        tau_frames_list = tau_frames_grid if tau_frames_grid else [int(tau_frames_fixed)]
+
+    for tau_frames in tau_frames_list:
+        if tau_frames >= win_size_frames:
+            raise ValueError(
+                f"metric tau ({tau_frames}) must be < metric_window_size_frames ({win_size_frames})."
+            )
+
+    tseg_list: list[int] = []
+    m_count_list: list[int] = []
+    for tau_frames in tau_frames_list:
+        tseg = win_size_frames - tau_frames
+        if tseg < 1:
+            raise ValueError(
+                f"metric_window_size_frames ({win_size_frames}) - tau ({tau_frames}) must be >= 1."
+            )
+        m_count = tseg if m_samples_raw <= 0 else min(tseg, m_samples_raw)
+        if m_count < m_min:
+            raise ValueError(
+                f"Too few lagged samples per window for tau={tau_frames}: "
+                f"m_count={m_count}, m_min={m_min}. "
+                "Increase window size / decrease tau / increase time_sampling."
+            )
+        tseg_list.append(int(tseg))
+        m_count_list.append(int(m_count))
 
     n_proj = int(getattr(args, "metric_n_proj", 16))
     if n_proj < 2:
@@ -245,6 +294,10 @@ def resolve_metric_config(args: Any) -> dict[str, Any]:
     domain_y_raw = getattr(args, "metric_domain_y", 0.0)
     domain_x_raw = getattr(args, "metric_domain_x", 0.0)
 
+    tau_frames = int(tau_frames_list[0])
+    tseg = int(tseg_list[0])
+    m_count = int(m_count_list[0])
+
     cfg = dict(
         rollout_steps=rollout_steps,
         time_sampling=int(time_sampling),
@@ -252,13 +305,19 @@ def resolve_metric_config(args: Any) -> dict[str, Any]:
         sample_stride_steps=sample_stride_steps,
         window_size_frames=win_size_frames,
         window_step_frames=win_step_frames,
+        tau_mode=tau_mode,
         tau_frames=tau_frames,
+        tau_steps=int(tau_frames * sample_stride_steps),
+        tau_frames_list=[int(x) for x in tau_frames_list],
+        tau_steps_list=[int(x) * int(sample_stride_steps) for x in tau_frames_list],
         starts=starts,
         range_start_steps=int(range_start_steps),
         range_end_steps=int(range_end_steps),
         W=W,
         tseg=tseg,
+        tseg_list=[int(x) for x in tseg_list],
         m_count=int(m_count),
+        m_count_list=[int(x) for x in m_count_list],
         n_proj=n_proj,
         null_reps=null_reps,
         particle_samples=particle_samples,
@@ -285,12 +344,24 @@ def metric_summary(cfg: dict[str, Any]) -> dict[str, Any]:
         sample_stride_steps=int(cfg["sample_stride_steps"]),
         window_size_frames=int(cfg["window_size_frames"]),
         window_step_frames=int(cfg["window_step_frames"]),
+        tau_mode=str(cfg.get("tau_mode", "fixed")),
         tau_frames=int(cfg["tau_frames"]),
+        tau_steps=int(cfg.get("tau_steps", int(cfg["tau_frames"]) * int(cfg["sample_stride_steps"]))),
+        tau_frames_list=[int(x) for x in cfg.get("tau_frames_list", [cfg["tau_frames"]])],
+        tau_steps_list=[
+            int(x)
+            for x in cfg.get(
+                "tau_steps_list",
+                [int(cfg["tau_frames"]) * int(cfg["sample_stride_steps"])],
+            )
+        ],
         range_start_steps=int(cfg["range_start_steps"]),
         range_end_steps=int(cfg["range_end_steps"]),
         n_windows=int(cfg["W"]),
         tseg=int(cfg["tseg"]),
+        tseg_list=[int(x) for x in cfg.get("tseg_list", [cfg["tseg"]])],
         m_count=int(cfg["m_count"]),
+        m_count_list=[int(x) for x in cfg.get("m_count_list", [cfg["m_count"]])],
         n_proj=int(cfg["n_proj"]),
         null_reps=int(cfg["null_reps"]),
         particle_samples=int(cfg["particle_samples"]),
@@ -319,9 +390,19 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
     starts = jnp.asarray(cfg["starts"], dtype=jnp.int32)
     W = int(cfg["W"])
     win = int(cfg["window_size_frames"])
-    tau = int(cfg["tau_frames"])
-    tseg = int(cfg["tseg"])
-    m_count = int(cfg["m_count"])
+    tau_mode = str(cfg.get("tau_mode", "fixed"))
+    tau_frames_list = [int(x) for x in cfg.get("tau_frames_list", [cfg["tau_frames"]])]
+    tau_steps_list = [
+        int(x)
+        for x in cfg.get(
+            "tau_steps_list",
+            [int(t) * int(cfg["sample_stride_steps"]) for t in tau_frames_list],
+        )
+    ]
+    tseg_list = [int(x) for x in cfg.get("tseg_list", [cfg["tseg"]])]
+    m_count_list = [int(x) for x in cfg.get("m_count_list", [cfg["m_count"]])]
+    if not (len(tau_frames_list) == len(tseg_list) == len(m_count_list) == len(tau_steps_list)):
+        raise ValueError("Tau list config mismatch: tau/tseg/m_count lengths must match.")
     n_proj = int(cfg["n_proj"])
     null_reps = int(cfg["null_reps"])
     particle_samples = int(cfg["particle_samples"])
@@ -334,8 +415,7 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
     periodic = bool(cfg["periodic"])
     domain_y = float(cfg["domain_y"])
     domain_x = float(cfg["domain_x"])
-    use_all_lags = (m_count >= tseg)
-    base_k_idx = jnp.arange(m_count, dtype=jnp.int32)
+    sample_stride_steps = float(cfg["sample_stride_steps"])
     dir_key = jax.random.PRNGKey(dirs_seed)
 
     def _preprocess(h: jnp.ndarray) -> jnp.ndarray:
@@ -362,7 +442,15 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
                 dx = dx.at[..., 1].set(ddx)
         return dx
 
-    def _delta_h_window(xy_seq: jnp.ndarray, start: jnp.ndarray, key: jax.Array) -> jnp.ndarray:
+    def _delta_h_window(
+        xy_seq: jnp.ndarray,
+        start: jnp.ndarray,
+        key: jax.Array,
+        *,
+        tau: int,
+        tseg: int,
+        m_count: int,
+    ) -> jnp.ndarray:
         key_k, key_p, key_null = jax.random.split(key, 3)
         X_w = jax.lax.dynamic_slice(
             xy_seq,
@@ -371,6 +459,8 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
         )  # (win, N, 2)
         n_particles = X_w.shape[1]
         s_count = min(particle_samples, n_particles)
+        use_all_lags = (m_count >= tseg)
+        base_k_idx = jnp.arange(m_count, dtype=jnp.int32)
         if use_all_lags:
             k_idx = base_k_idx
         else:
@@ -387,7 +477,7 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
         X1 = X_w[k_idx + tau][:, p_idx, :]
         dx = _delta_periodic(X1 - X0)
         dt = jnp.maximum(
-            jnp.asarray(float(tau) * float(cfg["sample_stride_steps"]), dtype=xy_seq.dtype),
+            jnp.asarray(float(tau) * sample_stride_steps, dtype=xy_seq.dtype),
             jnp.asarray(1e-12, dtype=xy_seq.dtype),
         )
         v_s = dx / dt  # (m_count, S, 2)
@@ -415,13 +505,10 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
 
         return h_real - h_null
 
-    def metric_loss_fn(rng_metric: jax.Array, xy_seq: jnp.ndarray):
-        keys_w = jax.random.split(rng_metric, W)
-        h = jax.vmap(lambda s, k: _delta_h_window(xy_seq, s, k))(starts, keys_w)  # (W,)
+    def _score_from_h(h: jnp.ndarray, dtype: jnp.dtype) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         h_pos = _preprocess(h)
-
         amp = jnp.mean(h_pos)
-        msc = jnp.array(0.0, dtype=xy_seq.dtype)
+        msc = jnp.array(0.0, dtype=dtype)
         for r, wr in scale_pairs:
             U_r = W // r
             U_2r = W // (2 * r)
@@ -436,17 +523,78 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
             power = jnp.sum(g_r_cmp * g_r_cmp)
             d_r = 1.0 - overlap / (power + eps)
             msc = msc + (wr * d_r)
-
         score = alpha * amp + beta * msc
+        return score, amp, msc
+
+    def metric_loss_fn(rng_metric: jax.Array, xy_seq: jnp.ndarray):
+        tau_count = len(tau_frames_list)
+        keys_tau = jax.random.split(rng_metric, tau_count)
+
+        h_list = []
+        score_list = []
+        amp_list = []
+        msc_list = []
+        for i in range(tau_count):
+            tau = int(tau_frames_list[i])
+            tseg = int(tseg_list[i])
+            m_count = int(m_count_list[i])
+            keys_w = jax.random.split(keys_tau[i], W)
+            h = jax.vmap(
+                lambda s, k: _delta_h_window(
+                    xy_seq,
+                    s,
+                    k,
+                    tau=tau,
+                    tseg=tseg,
+                    m_count=m_count,
+                )
+            )(starts, keys_w)
+            score, amp, msc = _score_from_h(h, xy_seq.dtype)
+            h_list.append(h)
+            score_list.append(score)
+            amp_list.append(amp)
+            msc_list.append(msc)
+
+        h_all = jnp.stack(h_list, axis=0)  # (Ktau, W)
+        score_all = jnp.stack(score_list, axis=0)  # (Ktau,)
+        amp_all = jnp.stack(amp_list, axis=0)
+        msc_all = jnp.stack(msc_list, axis=0)
+
+        if tau_mode == "max_grid":
+            best_idx = jnp.argmax(score_all)
+        else:
+            best_idx = jnp.array(0, dtype=jnp.int32)
+
+        score = score_all[best_idx]
+        amp = amp_all[best_idx]
+        msc = msc_all[best_idx]
+        h_best = h_all[best_idx]
+
+        tau_frames_arr = jnp.asarray(tau_frames_list, dtype=jnp.int32)
+        tau_steps_arr = jnp.asarray(tau_steps_list, dtype=jnp.int32)
+        tau_best_frames = tau_frames_arr[best_idx]
+        tau_best_steps = tau_steps_arr[best_idx]
+
         loss = -score
         return loss, dict(
             score=score,
             amp=amp,
             msc=msc,
-            delta_h_mean=jnp.mean(h),
-            delta_h_std=jnp.std(h),
-            delta_h_min=jnp.min(h),
-            delta_h_max=jnp.max(h),
+            delta_h_mean=jnp.mean(h_best),
+            delta_h_std=jnp.std(h_best),
+            delta_h_min=jnp.min(h_best),
+            delta_h_max=jnp.max(h_best),
+            tau_best_frames=tau_best_frames.astype(xy_seq.dtype),
+            tau_best_steps=tau_best_steps.astype(xy_seq.dtype),
+            score_tau_max=jnp.max(score_all),
+            score_tau_min=jnp.min(score_all),
+            score_tau_mean=jnp.mean(score_all),
+            msc_tau_max=jnp.max(msc_all),
+            msc_tau_min=jnp.min(msc_all),
+            msc_tau_mean=jnp.mean(msc_all),
+            amp_tau_max=jnp.max(amp_all),
+            amp_tau_min=jnp.min(amp_all),
+            amp_tau_mean=jnp.mean(amp_all),
         )
 
     return metric_loss_fn
