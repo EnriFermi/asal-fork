@@ -68,14 +68,20 @@ logging:
 
 metric:
   # Windowing and lag (physical steps). If *_frames are set, they override *_steps.
+  # Tau mode:
+  #   fixed    -> use single tau (metric_tau_* below)
+  #   max_grid -> compute score for each tau in metric_tau_grid_* and take max over tau
+  metric_tau_mode: fixed            # fixed | max_grid
   metric_window_size_steps: 20000
   metric_window_step_steps: 5000
   metric_tau_steps: 3000
+  metric_tau_grid_steps: null       # e.g. [1000, 2000, 3000, 4000]
   metric_range_start_steps: 40000
   metric_range_end_steps: 155000
   metric_window_size_frames: null
   metric_window_step_frames: null
   metric_tau_frames: null
+  metric_tau_grid_frames: null      # optional frame-based grid (overrides *_steps grid if set)
 
   # DeltaH_s settings
   metric_m_samples: 48
