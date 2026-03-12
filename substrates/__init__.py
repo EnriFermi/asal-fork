@@ -60,7 +60,7 @@ def create_substrate(substrate_name, **kwargs):
         rollout_steps = 256
     elif substrate_name=='lenia_flow':
         params = dict(
-            grid_size=384,
+            grid_size=64,
             C=3,
             dd=5,
             dt=0.2,

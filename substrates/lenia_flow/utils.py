@@ -1,6 +1,7 @@
 import numpy as np
 import jax
 import jax.numpy as jnp
+import jax.scipy as jsp
 
 def sigmoid(x):
     return 0.5 * (jnp.tanh(x / 2) + 1)
@@ -12,39 +13,28 @@ bell = lambda x, m, s: jnp.exp(-((x-m)/s)**2 / 2)
 def growth(U, m, s):
     return bell(U, m, s)*2-1
 
-# Per-channel Sobel via lax.conv (safer than scipy.signal on large grids / GPU)
-SOBEL_KX = jnp.array(
-    [[1.0, 0.0, -1.0],
-     [2.0, 0.0, -2.0],
-     [1.0, 0.0, -1.0]], dtype=jnp.float32)
-SOBEL_KY = jnp.transpose(SOBEL_KX)
+kx = jnp.array([
+                [1., 0., -1.],
+                [2., 0., -2.],
+                [1., 0., -1.]
+])
+ky = jnp.transpose(kx)
 
-
-def _sobel_conv(A, kernel):
+def sobel_x(A):
     """
-    Depthwise 2D conv of A (H,W,C) with a 3x3 kernel shared across channels.
-    Returns (H,W,C).
+    A : (x, y, c)
+    ret : (x, y, c)
     """
-    H, W, C = A.shape
-    lhs = A[jnp.newaxis, ...]  # (1,H,W,C)
-    # Depthwise: in_channels_per_group=1, out_channels_per_group=1 -> total OC=C
-    ker = jnp.tile(kernel[:, :, None, None], (1, 1, 1, C))  # (3,3,1,C)
-    out = jax.lax.conv_general_dilated(
-        lhs,
-        ker,
-        window_strides=(1, 1),
-        padding="SAME",
-        dimension_numbers=("NHWC", "HWIO", "NHWC"),
-        feature_group_count=C,
-    )
-    return out[0]
-
-
+    return jnp.dstack([jsp.signal.convolve2d(A[:, :, c], kx, mode = 'same') 
+                    for c in range(A.shape[-1])])
+def sobel_y(A):
+    return jnp.dstack([jsp.signal.convolve2d(A[:, :, c], ky, mode = 'same') 
+                    for c in range(A.shape[-1])])
+  
 @jax.jit
 def sobel(A):
-    sx = _sobel_conv(A, SOBEL_KX)
-    sy = _sobel_conv(A, SOBEL_KY)
-    return jnp.concatenate((sy[:, :, None, :], sx[:, :, None, :]), axis=2)
+    return jnp.concatenate((sobel_y(A)[:, :, None, :], sobel_x(A)[:, :, None, :]),
+                            axis = 2)
 
 
 

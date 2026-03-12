@@ -15,7 +15,7 @@ substrate:
   sigma: 0.65
   border: wall
   mix_rule: stoch
-  base_seed: 0
+  base_seed: 42
   seed_patch_size: 20
   seed_n_patches: 16
   seed_mode: random_patches
@@ -93,5 +93,5 @@ logging:
   log_step_range: [null, null]
 
 random_best:
-  seed: 0
+  seed: 42
   fitness: 0.0

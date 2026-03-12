@@ -8,8 +8,8 @@ if ! command -v "${python_bin}" >/dev/null 2>&1; then
   python_bin="python"
 fi
 
-input_dir="${INPUT_DIR:-experiments/opt_msc/checkpoints/random_baseline/apf_logs}"
-output="${OUTPUT:-experiments/opt_msc/figures/random_apf_from_logs.mp4}"
+input_dir="${INPUT_DIR:-experiments/opt_msc/checkpoints/test_run_longer/apf_logs}"
+output="${OUTPUT:-experiments/opt_msc/figures/test_run_longer.mp4}"
 start_step="${START_STEP:-}"
 end_step="${END_STEP:-}"
 snapshot_stride="${SNAPSHOT_STRIDE:-1}"

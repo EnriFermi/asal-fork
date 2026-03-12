@@ -62,7 +62,7 @@ logging:
   save_A: true
   save_F: true
   smooth_F: true
-  smooth_F_window: 5
+  smooth_F_window: 49
   save_rgb: false
   save_fp16: true
   log_step_range: [null, null]  # или, например: [10000, 20000]

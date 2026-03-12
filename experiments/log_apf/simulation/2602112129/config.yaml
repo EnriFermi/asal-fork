@@ -48,7 +48,7 @@ substrate:
   mass_clip_eps: 0.0
 
 simulation:
-  rollout_steps: 1000000
+  rollout_steps: 1000000 
   max_steps: 1000000
   seed: 0
   batch_steps: 768
@@ -62,7 +62,7 @@ logging:
   save_A: true
   save_F: true
   save_lagrangian: true
-  lagrangian_n_particles: 4096
+  lagrangian_n_particles: 8192
   lagrangian_seed: 0
   lagrangian_init_mode: mass
   lagrangian_channel_mode: resample

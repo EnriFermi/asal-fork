@@ -1,6 +1,6 @@
 meta:
-  save_dir: experiments/opt_msc/checkpoints/test_run_2
-  output_dir: experiments/opt_msc/checkpoints/test_run_2/apf_logs
+  save_dir: experiments/opt_msc/checkpoints/test_run_longer
+  output_dir: experiments/opt_msc/checkpoints/test_run_longer/apf_logs
 
 substrate:
   substrate: lenia_flow
