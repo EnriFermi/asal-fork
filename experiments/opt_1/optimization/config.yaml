@@ -51,7 +51,6 @@ substrate:
 
 evaluation:
   foundation_model: clip
-  chunk_steps: 5000
   time_sampling: 32
   prompts: "a biological cell"
   coef_prompt: 0.0
@@ -61,12 +60,7 @@ evaluation:
 
 optimization:
   bs: 2
-  pop_batch: 8
   pop_size: 16
   n_iters: 200
   sigma: 0.2
-
-logging:
-  wandb_project: asal
-  pca_every: 25
-  pca_history: 100
+  eval_splits: 1
