@@ -5,6 +5,7 @@ from typing import Iterator, Optional, Tuple
 
 import imageio
 import numpy as np
+from tqdm import tqdm
 
 
 _NPZ_PATTERN = re.compile(
@@ -149,7 +150,7 @@ def main():
     )
     written = 0
     try:
-        for frame in frame_iter:
+        for frame in tqdm(frame_iter):
             writer.append_data(frame)
             written += 1
     finally:

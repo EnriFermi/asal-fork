@@ -54,3 +54,10 @@ conda install -c conda-forge cuda-nvcc=12.1 -y
 
 
 
+conda remove --all -n torchjax
+
+#run before each launch
+unset PYTHONPATH PYTHONHOME LD_LIBRARY_PATH
+export PYTHONNOUSERSITE=1
+hash -r
+export PYTHONPATH="/home/coder/project:$PYTHONPATH"

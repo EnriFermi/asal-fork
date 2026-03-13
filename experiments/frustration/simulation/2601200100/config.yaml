@@ -16,7 +16,7 @@ substrate:
   border: wall
   mix_rule: stoch
   seed_patch_size: 20
-  seed_n_patches: 16
+  seed_n_patches: 30
   seed_mode: random_patches
   p_constant_per_patch: 1
   render_mode: Pcolor
@@ -50,15 +50,17 @@ substrate:
 
 simulation:
   grid_split: ${env:GRID_SPLIT,2}
-  warmup_steps: 5000
-  max_steps: 10000
+  warmup_steps: 1000000
+  max_steps: 2000000
   img_size: 154
   seed: 0
   output: experiments/frustration/figures/2601200100_simulation.mp4
   fps: 250
   codec: libx264
   macro_block_size: null
-  batch_steps: 256
+  batch_steps: 768
   jit_microbatch: 64
+  multi_device: true
 
 logging: {}
+ 

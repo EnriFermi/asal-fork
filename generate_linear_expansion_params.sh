@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-set -euo pipefail
 
 BASE_DIR="./data/linear_expansion"
-SEED=0
+SEED=69
 
 python - << 'PY'
 import os
@@ -16,8 +15,8 @@ import substrates
 
 
 BASE_DIR = "./data/linear_expansion"
-SEED = 0
-LAMBDAS = [1.0, 1.25, 1.5, 2.0, 2.5, 3.0]
+SEED = 610
+LAMBDAS = [0.8, 0.95, 1.1, 1.2, 1.4, 1.6]
 
 
 def logit(x: np.ndarray) -> np.ndarray:

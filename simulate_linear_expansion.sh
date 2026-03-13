@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-set -euo pipefail
 
 BASE_DIR="./data/linear_expansion"
 OUT_DIR="./data/linear_expansion/videos"
 SUBSTRATE="lenia_flow"
 FPS=250
-MAX_STEPS=1200000
-ROLLOUT_STEPS=1200000
+MAX_STEPS=500000
+ROLLOUT_STEPS=500000
 
 mkdir -p "$OUT_DIR"
 
@@ -16,7 +15,7 @@ for DIR in "$BASE_DIR"/scale_*; do
   fi
   NAME="$(basename "$DIR")"
   echo "Running simulation for $NAME ..."
-  python simulate_after_training.py \
+  python scripts/simulate_after_training.py \
     --save_dir "$DIR" \
     --substrate "$SUBSTRATE" \
     --rollout_steps "$ROLLOUT_STEPS" \

@@ -1,4 +1,4 @@
-python simulate_after_training.py \
+python scripts/simulate_after_training.py \
   --save_dir ./data/supervised_2_food_notauto \
   --substrate lenia_flow \
   --traj_iter 70 \

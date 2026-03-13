@@ -16,7 +16,7 @@ substrate:
   mix_rule: stoch
   base_seed: 0
   seed_patch_size: 20
-  seed_n_patches: 8
+  seed_n_patches: 16
   seed_mode: random_patches
   p_constant_per_patch: 1
   render_mode: Pcolor
@@ -52,7 +52,7 @@ simulation:
   time_sampling: video
   img_size: 224
   seed: 0
-  n_seeds: 8
+  n_seeds: 16
   seed_mode: random_patches
   p_constant_per_patch: 1
   render_mode: Pcolor

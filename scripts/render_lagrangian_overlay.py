@@ -240,13 +240,16 @@ def main():
             )
         return canvas
 
+    from tqdm import tqdm
     written = 0
     try:
         writer.write(draw_frame(first_step, first_frame, first_xy))
         written += 1
-        for step, frame, xy in frame_iter:
+        for step, frame, xy in tqdm(frame_iter):
             writer.write(draw_frame(step, frame, xy))
             written += 1
+            if written > 1000:
+                break
     finally:
         writer.release()
 

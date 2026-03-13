@@ -1,5 +1,5 @@
-python simulate_after_training.py \
-  --save_dir ./data/supervised_porcupine \
+python scripts/simulate_after_training.py \
+  --save_dir ./data/interp_supervised_0_1/interp_6 \
   --substrate lenia_flow \
   --rollout_steps 8192 \
   --seed 0 \
@@ -13,4 +13,4 @@ python simulate_after_training.py \
   --mass_decay 0.002 --food_conv_mode scalar \
   --food_diffusion_alpha 0.05 \
   --mass_clip_eps 0.0005 \
-  --output porcupine.mp4 --fps 8
+  --output p1.mp4 --fps 8
