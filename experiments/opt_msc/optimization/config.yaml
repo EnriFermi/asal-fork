@@ -69,9 +69,10 @@ logging:
 metric:
   # Windowing and lag (physical steps). If *_frames are set, they override *_steps.
   # Tau mode:
-  #   fixed    -> use single tau (metric_tau_* below)
-  #   max_grid -> compute score for each tau in metric_tau_grid_* and take max over tau
-  metric_tau_mode: fixed            # fixed | max_grid
+  #   fixed          -> use single tau (metric_tau_* below)
+  #   max_grid       -> compute score for each tau in metric_tau_grid_* and take max over tau
+  #   trainable_grid -> tau is optimized jointly with substrate params as a separate CMA-ES variable
+  metric_tau_mode: fixed            # fixed | max_grid | trainable_grid
   metric_window_size_steps: 20000
   metric_window_step_steps: 5000
   metric_tau_steps: 3000

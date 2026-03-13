@@ -80,6 +80,42 @@ def _resolve_tau_grid_frames(
     return out
 
 
+def _tau_index_from_latent_jax(raw_tau: jax.Array | None, n_tau: int) -> jax.Array:
+    if n_tau <= 1:
+        return jnp.array(0, dtype=jnp.int32)
+    if raw_tau is None:
+        return jnp.array(0, dtype=jnp.int32)
+    raw = jnp.ravel(jnp.asarray(raw_tau, dtype=jnp.float32))[0]
+    u = jax.nn.sigmoid(raw)
+    idx = jnp.rint(u * float(n_tau - 1)).astype(jnp.int32)
+    return jnp.clip(idx, 0, n_tau - 1)
+
+
+def tau_selection_from_latent(cfg: dict[str, Any], raw_tau: float | np.ndarray | None) -> dict[str, Any]:
+    tau_frames_list = [int(x) for x in cfg.get("tau_frames_list", [cfg["tau_frames"]])]
+    tau_steps_list = [
+        int(x)
+        for x in cfg.get(
+            "tau_steps_list",
+            [int(t) * int(cfg["sample_stride_steps"]) for t in tau_frames_list],
+        )
+    ]
+    n_tau = len(tau_frames_list)
+    if n_tau <= 1:
+        idx = 0
+        raw_val = 0.0 if raw_tau is None else float(np.ravel(np.asarray(raw_tau, dtype=np.float64))[0])
+    else:
+        raw_val = 0.0 if raw_tau is None else float(np.ravel(np.asarray(raw_tau, dtype=np.float64))[0])
+        u = 1.0 / (1.0 + np.exp(-raw_val))
+        idx = int(np.clip(np.rint(u * float(n_tau - 1)), 0, n_tau - 1))
+    return dict(
+        tau_selector_raw=float(raw_val),
+        tau_idx=int(idx),
+        tau_frames=int(tau_frames_list[idx]),
+        tau_steps=int(tau_steps_list[idx]),
+    )
+
+
 def _resolve_scales(
     *,
     W: int,
@@ -183,8 +219,10 @@ def resolve_metric_config(args: Any) -> dict[str, Any]:
         name="metric_window_step",
     )
     tau_mode = str(getattr(args, "metric_tau_mode", "fixed")).strip().lower()
-    if tau_mode not in {"fixed", "max_grid"}:
-        raise ValueError(f"metric_tau_mode must be one of ['fixed','max_grid'], got {tau_mode!r}.")
+    if tau_mode not in {"fixed", "max_grid", "trainable_grid"}:
+        raise ValueError(
+            f"metric_tau_mode must be one of ['fixed','max_grid','trainable_grid'], got {tau_mode!r}."
+        )
 
     T = int(time_sampling)
     if T < win_size_frames:
@@ -240,6 +278,11 @@ def resolve_metric_config(args: Any) -> dict[str, Any]:
         tau_frames_list = [int(tau_frames_fixed)]
     else:
         tau_frames_list = tau_frames_grid if tau_frames_grid else [int(tau_frames_fixed)]
+    if tau_mode == "trainable_grid" and len(tau_frames_list) < 2:
+        raise ValueError(
+            "metric_tau_mode='trainable_grid' requires at least 2 tau values in "
+            "metric_tau_grid_steps or metric_tau_grid_frames."
+        )
 
     for tau_frames in tau_frames_list:
         if tau_frames >= win_size_frames:
@@ -526,7 +569,7 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
         score = alpha * amp + beta * msc
         return score, amp, msc
 
-    def metric_loss_fn(rng_metric: jax.Array, xy_seq: jnp.ndarray):
+    def metric_loss_fn(rng_metric: jax.Array, xy_seq: jnp.ndarray, tau_selector: jax.Array | None = None):
         tau_count = len(tau_frames_list)
         keys_tau = jax.random.split(rng_metric, tau_count)
 
@@ -562,6 +605,8 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
 
         if tau_mode == "max_grid":
             best_idx = jnp.argmax(score_all)
+        elif tau_mode == "trainable_grid":
+            best_idx = _tau_index_from_latent_jax(tau_selector, tau_count)
         else:
             best_idx = jnp.array(0, dtype=jnp.int32)
 
@@ -574,6 +619,12 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
         tau_steps_arr = jnp.asarray(tau_steps_list, dtype=jnp.int32)
         tau_best_frames = tau_frames_arr[best_idx]
         tau_best_steps = tau_steps_arr[best_idx]
+        tau_selector_raw = (
+            jnp.asarray(jnp.ravel(jnp.asarray(tau_selector, dtype=xy_seq.dtype))[0], dtype=xy_seq.dtype)
+            if tau_selector is not None
+            else jnp.asarray(0.0, dtype=xy_seq.dtype)
+        )
+        tau_selected_idx = best_idx.astype(xy_seq.dtype)
 
         loss = -score
         return loss, dict(
@@ -584,8 +635,10 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
             delta_h_std=jnp.std(h_best),
             delta_h_min=jnp.min(h_best),
             delta_h_max=jnp.max(h_best),
+            tau_selected_idx=tau_selected_idx,
             tau_best_frames=tau_best_frames.astype(xy_seq.dtype),
             tau_best_steps=tau_best_steps.astype(xy_seq.dtype),
+            tau_selector_raw=tau_selector_raw,
             score_tau_max=jnp.max(score_all),
             score_tau_min=jnp.min(score_all),
             score_tau_mean=jnp.mean(score_all),

@@ -16,7 +16,12 @@ import asal_metrics
 import foundation_models
 import substrates
 import util
-from clip_deltah_msc_metric import make_metric_loss_fn, metric_summary, resolve_metric_config
+from clip_deltah_msc_metric import (
+    make_metric_loss_fn,
+    metric_summary,
+    resolve_metric_config,
+    tau_selection_from_latent,
+)
 from rollout import rollout_simulation
 
 
@@ -144,9 +149,28 @@ def main(cfg, args):
             else:
                 run.summary[f"metric_cfg/{k}"] = v
         metric_loss_fn = make_metric_loss_fn(metric_cfg)
+        optimize_tau = str(metric_cfg.get("tau_mode", "fixed")) == "trainable_grid"
+        tau_extra_dims = 1 if optimize_tau else 0
+        run.summary["metric_cfg/trainable_tau"] = bool(optimize_tau)
+        if optimize_tau:
+            run.summary["metric_cfg/tau_grid_steps"] = str(metric_cfg.get("tau_steps_list", []))
 
         chunk_steps = int(metric_cfg["sample_every_steps"])
         time_sampling = int(metric_cfg["time_sampling"])
+        substrate_param_dims = int(substrate.n_params)
+
+        def split_candidate_params(params_full):
+            params_sub = params_full[:substrate_param_dims]
+            tau_selector = params_full[substrate_param_dims] if optimize_tau else None
+            return params_sub, tau_selector
+
+        def split_population_params_np(params_full_np: np.ndarray):
+            params_sub_np = params_full_np[:, :substrate_param_dims]
+            tau_latent_np = params_full_np[:, substrate_param_dims] if optimize_tau else None
+            return params_sub_np, tau_latent_np
+
+        def tau_info_from_latent(raw_tau):
+            return tau_selection_from_latent(metric_cfg, raw_tau)
 
         # Optional CLIP-based evolution loss logging (does NOT affect optimization target).
         log_clip_evolution = bool(getattr(args, "log_clip_evolution", True))
@@ -279,13 +303,17 @@ def main(cfg, args):
             )
             return xy_seq  # (time_sampling, N_particles, 2)
 
-        def calc_loss(rng, params):
+        def calc_loss(rng, params_full):
+            params, tau_selector = split_candidate_params(params_full)
             if log_clip_evolution:
                 rng_roll, rng_metric, rng_clip = split(rng, 3)
             else:
                 rng_roll, rng_metric = split(rng)
             xy_seq = rollout_lagrangian_xy(rng_roll, params)
-            msc_loss, msc_dict = metric_loss_fn(rng_metric, xy_seq)
+            if optimize_tau:
+                msc_loss, msc_dict = metric_loss_fn(rng_metric, xy_seq, tau_selector=tau_selector)
+            else:
+                msc_loss, msc_dict = metric_loss_fn(rng_metric, xy_seq)
             if not log_clip_evolution:
                 return msc_loss, msc_dict
             clip_out = rollout_clip(rng_clip, params)
@@ -307,7 +335,7 @@ def main(cfg, args):
         rng = jax.random.PRNGKey(args.seed)
         strategy = evosax.Sep_CMA_ES(
             popsize=args.pop_size,
-            num_dims=substrate.n_params,
+            num_dims=substrate_param_dims + tau_extra_dims,
             sigma_init=args.sigma,
         )
         es_params = strategy.default_params
@@ -323,8 +351,10 @@ def main(cfg, args):
 
         data = []
         best_params_traj = []
+        best_tau_traj = []
         best_loss_traj = []
         pop_params_traj = []
+        pop_tau_traj = []
         pop_loss_traj = []
         palette_traj = []
         pbar = tqdm(range(args.n_iters))
@@ -348,9 +378,32 @@ def main(cfg, args):
 
             es_state = strategy.tell(params_full, loss_all, es_state, es_params)
 
-            best_params_traj.append(np.array(es_state.best_member))
+            best_member_full_np = np.array(es_state.best_member)
+            best_member_np = np.array(best_member_full_np[:substrate_param_dims])
+            best_params_traj.append(best_member_np)
+            if optimize_tau:
+                best_tau_traj.append(tau_info_from_latent(best_member_full_np[substrate_param_dims]))
             best_loss_traj.append(float(es_state.best_fitness))
-            pop_params_traj.append(np.array(params_full))
+            params_full_np = np.array(params_full)
+            pop_params_np, pop_tau_latent_np = split_population_params_np(params_full_np)
+            pop_params_traj.append(pop_params_np)
+            if optimize_tau:
+                tau_idx = []
+                tau_steps = []
+                tau_frames = []
+                for raw_tau in np.asarray(pop_tau_latent_np):
+                    info = tau_info_from_latent(raw_tau)
+                    tau_idx.append(info["tau_idx"])
+                    tau_steps.append(info["tau_steps"])
+                    tau_frames.append(info["tau_frames"])
+                pop_tau_traj.append(
+                    dict(
+                        latent=np.asarray(pop_tau_latent_np, dtype=np.float32),
+                        idx=np.asarray(tau_idx, dtype=np.int32),
+                        steps=np.asarray(tau_steps, dtype=np.int32),
+                        frames=np.asarray(tau_frames, dtype=np.int32),
+                    )
+                )
             pop_loss_traj.append(np.array(loss_all))
 
             loss_np = np.array(loss_all)
@@ -410,7 +463,14 @@ def main(cfg, args):
                     corr = np.nan if denom <= 0 else float((da * db).sum() / denom)
                     log_dict["metric/corr_msc_loss_vs_clip_evolution"] = corr
 
-            palette_stats = util.flow_lenia_palette_stats(np.array(params_full[best_idx]), substrate)
+            if optimize_tau:
+                tau_best_pop = tau_info_from_latent(np.asarray(pop_tau_latent_np)[best_idx])
+                log_dict["metric/tau_trainable_idx_pop_best"] = float(tau_best_pop["tau_idx"])
+                log_dict["metric/tau_trainable_steps_pop_best"] = float(tau_best_pop["tau_steps"])
+                log_dict["metric/tau_trainable_frames_pop_best"] = float(tau_best_pop["tau_frames"])
+                log_dict["metric/tau_trainable_raw_pop_best"] = float(tau_best_pop["tau_selector_raw"])
+
+            palette_stats = util.flow_lenia_palette_stats(pop_params_np[best_idx], substrate)
             if palette_stats is not None:
                 try:
                     import matplotlib.pyplot as plt
@@ -433,7 +493,7 @@ def main(cfg, args):
                 base = substrate.substrate if hasattr(substrate, "substrate") else substrate
                 n_dyn = int(base.base_dyn_raw.size)
                 k = int(base.k)
-                params_np = np.array(params_full)
+                params_np = pop_params_np
                 w_raw_pop = params_np[:, n_dyn:n_dyn + 3 * k].reshape(params_np.shape[0], 3, k)
                 w_raw_pop = w_raw_pop - w_raw_pop.max(axis=2, keepdims=True)
                 w_soft_pop = np.exp(w_raw_pop)
@@ -456,19 +516,33 @@ def main(cfg, args):
             if args.save_dir is not None and (i_iter % max(1, args.n_iters // 10) == 0 or i_iter == args.n_iters - 1):
                 data_save = jax.tree.map(lambda *x: np.array(jnp.stack(x, axis=0)), *data)
                 util.save_pkl(args.save_dir, "data", data_save)
-                best = jax.tree.map(lambda x: np.array(x), (es_state.best_member, es_state.best_fitness))
+                best = (best_member_np, np.array(es_state.best_fitness))
                 util.save_pkl(args.save_dir, "best", best)
+                if optimize_tau:
+                    util.save_json(args.save_dir, "best_tau", best_tau_traj[-1])
                 if len(best_params_traj) > 0:
                     traj = dict(
                         params=np.stack(best_params_traj, axis=0),
                         loss=np.array(best_loss_traj),
                     )
+                    if optimize_tau and len(best_tau_traj) > 0:
+                        traj["tau_idx"] = np.asarray([x["tau_idx"] for x in best_tau_traj], dtype=np.int32)
+                        traj["tau_steps"] = np.asarray([x["tau_steps"] for x in best_tau_traj], dtype=np.int32)
+                        traj["tau_frames"] = np.asarray([x["tau_frames"] for x in best_tau_traj], dtype=np.int32)
+                        traj["tau_selector_raw"] = np.asarray(
+                            [x["tau_selector_raw"] for x in best_tau_traj], dtype=np.float32
+                        )
                     util.save_pkl(args.save_dir, "best_traj", traj)
                 if len(pop_params_traj) > 0:
                     pop_traj = dict(
                         params=np.stack(pop_params_traj, axis=0),
                         loss=np.stack(pop_loss_traj, axis=0),
                     )
+                    if optimize_tau and len(pop_tau_traj) > 0:
+                        pop_traj["tau_selector_raw"] = np.stack([x["latent"] for x in pop_tau_traj], axis=0)
+                        pop_traj["tau_idx"] = np.stack([x["idx"] for x in pop_tau_traj], axis=0)
+                        pop_traj["tau_steps"] = np.stack([x["steps"] for x in pop_tau_traj], axis=0)
+                        pop_traj["tau_frames"] = np.stack([x["frames"] for x in pop_tau_traj], axis=0)
                     util.save_pkl(args.save_dir, "pop_traj", pop_traj)
                 if len(palette_traj) > 0:
                     util.save_pkl(args.save_dir, "palette_traj", palette_traj)
