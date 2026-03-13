@@ -52,6 +52,9 @@ def flow_lenia_kwargs_from_args(args: Any) -> Dict[str, Any]:
     seed_n = getattr(args, "n_seeds", getattr(args, "seed_n_patches"))
     mutation_scale = getattr(args, "mutation_scale", 1.0)
     optimize_mutation_scale = getattr(args, "optimize_mutation_scale", False)
+    flow_sigma = getattr(args, "flow_sigma", None)
+    if flow_sigma is None:
+        flow_sigma = getattr(args, "sigma")
     return dict(
         grid_size=int(args.grid_size),
         C=int(args.C),
@@ -60,7 +63,7 @@ def flow_lenia_kwargs_from_args(args: Any) -> Dict[str, Any]:
         M=parse_matrix_str(args.M),
         dd=int(args.dd),
         dt=float(args.dt),
-        sigma=float(args.sigma),
+        sigma=float(flow_sigma),
         border=str(args.border),
         mix_rule=str(args.mix_rule),
         base_seed=int(getattr(args, "base_seed", 0)),
