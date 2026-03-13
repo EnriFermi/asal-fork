@@ -59,8 +59,8 @@ evaluation:
   coef_smooth: 0.0
 
 optimization:
-  bs: 4
-  pop_size: 16
+  bs: 1
+  pop_size: 32
   n_iters: 1000
   sigma: 0.2
-  eval_splits: 4
+  eval_splits: 8
