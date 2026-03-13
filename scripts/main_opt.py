@@ -96,9 +96,13 @@ group.add_argument("--n_iters", type=int, default=1000, help="number of iteratio
 group.add_argument("--sigma", type=float, default=0.1, help="mutation rate")
 group.add_argument("--eval_splits", type=int, default=1, help="number of splits of CMA-ES population for loss evaluation (1 = no split)")
 
-# #wandb logging
-# group = parser.add_argument_group("logging")
-# group = pa
+group = parser.add_argument_group("logging")
+group.add_argument("--wandb_project", type=str, default="asal", help="Weights & Biases project name")
+group.add_argument("--pca_every", type=int, default=1, help="Log population PCA every N iters; <=0 disables")
+group.add_argument("--pca_history", type=int, default=100, help="History length for PCA trajectory logging")
+group.add_argument("--full_video_interval", type=int, default=1, help="Log best-member full video every N iters; <=0 disables")
+group.add_argument("--full_video_rollout_steps", type=int, default=None, help="Optional cap on rollout steps for full video logging")
+group.add_argument("--full_video_img_size", type=int, default=140, help="Image size for full video logging")
 
 
 def parse_args(*args, **kwargs):
@@ -120,7 +124,7 @@ def show_video(x, fps=25, path="tmp.gif"):
     # display(Image(path))
 
 def main(args):
-    run = wandb.init( project="asal", config={**vars(args)})
+    run = wandb.init(project=args.wandb_project, config={**vars(args)})
     try:
         prompts = args.prompts.split(";")
         if args.time_sampling < len(prompts): # doing multiple prompts
@@ -323,12 +327,13 @@ def main(args):
 
             # 3D PCA over all population samples seen so far (x,y=PCs, z=time)
             pca_img = None
-            if len(pop_params_traj) > 1:
+            if args.pca_every > 0 and (i_iter % args.pca_every == 0) and len(pop_params_traj) > 1:
                 try:
                     import matplotlib.pyplot as plt
                     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
-                    pop_hist = np.stack(pop_params_traj, axis=0)  # (T, P, D)
+                    hist = pop_params_traj[-args.pca_history:]
+                    pop_hist = np.stack(hist, axis=0)  # (T, P, D)
                     T_hist, P_hist, D_hist = pop_hist.shape
                     X = pop_hist.reshape(T_hist * P_hist, D_hist)
                     times = np.repeat(np.arange(T_hist), P_hist)
@@ -383,38 +388,51 @@ def main(args):
             # run.log({'train_sample': wandb.Video((np.asarray(rgb) * 255).astype(np.uint8).transpose(0, 3, 1, 2), fps=4, format="gif")})
 
             # After step: run a full rollout (all frames) for W&B logging using best-so-far params
-            try:
-                rng, _rng_vid = split(rng)
-                best_params = es_state.best_member
-                vid_data = rollout_simulation(_rng_vid, best_params, s0=None, substrate=substrate, fm=None,
-                                              rollout_steps=args.rollout_steps, time_sampling='video', img_size=140,
-                                              return_state=False, return_mass=True)
-                vid = (np.asarray(vid_data['rgb']) * 255).astype(np.uint8).transpose(0, 3, 1, 2)
-                log_payload = {'train_video': wandb.Video(vid, fps=24, format='gif')}
-
-                # Log mass trajectory over the rollout to check stability (sum over grid and channels)
-                mass_traj = vid_data.get('mass', None)
-                food_traj = vid_data.get('food_mass', None)
-                if mass_traj is not None:
-                    mass_traj = np.asarray(mass_traj)
-                    ys = [mass_traj.tolist()]
-                    keys = ["mass_total"]
-                    if food_traj is not None:
-                        food_traj = np.asarray(food_traj)
-                        ys.append(food_traj.tolist())
-                        keys.append("food_total")
-                    line = wandb.plot.line_series(
-                        xs=list(range(mass_traj.shape[0])),
-                        ys=ys,
-                        keys=keys,
-                        title="Mass trajectory (best member rollout)",
-                        xname="step",
+            if args.full_video_interval > 0 and (i_iter % args.full_video_interval == 0):
+                try:
+                    rng, _rng_vid = split(rng)
+                    best_params = es_state.best_member
+                    video_rollout_steps = args.rollout_steps
+                    if args.full_video_rollout_steps is not None:
+                        video_rollout_steps = min(int(video_rollout_steps), int(args.full_video_rollout_steps))
+                    vid_data = rollout_simulation(
+                        _rng_vid,
+                        best_params,
+                        s0=None,
+                        substrate=substrate,
+                        fm=None,
+                        rollout_steps=video_rollout_steps,
+                        time_sampling='video',
+                        img_size=int(args.full_video_img_size),
+                        return_state=False,
+                        return_mass=True,
                     )
-                    log_payload['train_mass_total_traj'] = line
+                    vid = (np.asarray(vid_data['rgb']) * 255).astype(np.uint8).transpose(0, 3, 1, 2)
+                    log_payload = {'train_video': wandb.Video(vid, fps=24, format='gif')}
 
-                run.log(log_payload)
-            except Exception as e:
-                print(f"Full video logging failed: {e}")
+                    # Log mass trajectory over the rollout to check stability (sum over grid and channels)
+                    mass_traj = vid_data.get('mass', None)
+                    food_traj = vid_data.get('food_mass', None)
+                    if mass_traj is not None:
+                        mass_traj = np.asarray(mass_traj)
+                        ys = [mass_traj.tolist()]
+                        keys = ["mass_total"]
+                        if food_traj is not None:
+                            food_traj = np.asarray(food_traj)
+                            ys.append(food_traj.tolist())
+                            keys.append("food_total")
+                        line = wandb.plot.line_series(
+                            xs=list(range(mass_traj.shape[0])),
+                            ys=ys,
+                            keys=keys,
+                            title="Mass trajectory (best member rollout)",
+                            xname="step",
+                        )
+                        log_payload['train_mass_total_traj'] = line
+
+                    run.log(log_payload)
+                except Exception as e:
+                    print(f"Full video logging failed: {e}")
 
             data.append(di)
             if palette_stats is not None:

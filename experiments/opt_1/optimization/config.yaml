@@ -64,3 +64,11 @@ optimization:
   n_iters: 200
   sigma: 0.2
   eval_splits: 1
+
+logging:
+  wandb_project: asal
+  pca_every: 25
+  pca_history: 100
+  full_video_interval: 0
+  full_video_rollout_steps: 4000
+  full_video_img_size: 140

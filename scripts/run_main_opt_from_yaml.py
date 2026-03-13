@@ -77,6 +77,15 @@ OPTIMIZATION_FLAGS = {
     "eval_splits": "eval_splits",
 }
 
+LOGGING_FLAGS = {
+    "wandb_project": "wandb_project",
+    "pca_every": "pca_every",
+    "pca_history": "pca_history",
+    "full_video_interval": "full_video_interval",
+    "full_video_rollout_steps": "full_video_rollout_steps",
+    "full_video_img_size": "full_video_img_size",
+}
+
 BOOL_SOURCE_KEYS = {
     "mutations",
     "optimize_mutation_scale",
@@ -118,6 +127,7 @@ def _build_argv(cfg) -> list[str]:
     _append_section_args(argv, cfg.get("substrate", {}), SUBSTRATE_FLAGS)
     _append_section_args(argv, cfg.get("evaluation", {}), EVALUATION_FLAGS)
     _append_section_args(argv, cfg.get("optimization", {}), OPTIMIZATION_FLAGS)
+    _append_section_args(argv, cfg.get("logging", {}), LOGGING_FLAGS)
     return argv
 
 
