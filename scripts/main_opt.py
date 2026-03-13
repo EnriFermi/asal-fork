@@ -44,6 +44,7 @@ group.add_argument("--dt", type=float, default=0.2, help="for lenia_flow: dt par
 group.add_argument("--sigma", type=float, default=0.65, help="for lenia_flow: sigma parameter")
 group.add_argument("--border", type=str, default="wall", help="for lenia_flow: border mode")
 group.add_argument("--mix_rule", type=str, default="stoch", help="for lenia_flow: mix rule")
+group.add_argument("--base_seed", type=int, default=0, help="for lenia_flow: base random seed for default params")
 group.add_argument("--seed_patch_size", type=int, default=20, help="for lenia_flow: size of seed patch")
 group.add_argument("--seed_n_patches", type=int, default=1, help="for lenia_flow: number of random non-overlapping seed patches")
 group.add_argument("--mutations", action='store_true', help="for lenia_flow: enable parameter patch mutations during rollout")

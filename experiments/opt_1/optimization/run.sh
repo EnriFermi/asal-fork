@@ -8,4 +8,4 @@ if ! command -v "${python_bin}" >/dev/null 2>&1; then
   python_bin="python"
 fi
 
-"${python_bin}" "scripts/main_opt_online.py" "${exp_dir}/config.yaml"
+"${python_bin}" "scripts/run_main_opt_from_yaml.py" "${exp_dir}/config.yaml"
