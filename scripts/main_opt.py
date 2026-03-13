@@ -41,7 +41,7 @@ group.add_argument("--kernel_components", type=int, default=3, help="for lenia_f
 group.add_argument("--M", type=str, default="2,1,0;0,2,1;1,0,2", help="for lenia_flow: connectivity matrix as 'a,b,c;d,e,f;g,h,i'")
 group.add_argument("--dd", type=int, default=5, help="for lenia_flow: dd parameter")
 group.add_argument("--dt", type=float, default=0.2, help="for lenia_flow: dt parameter")
-group.add_argument("--sigma", type=float, default=0.65, help="for lenia_flow: sigma parameter")
+group.add_argument("--flow_sigma", type=float, default=0.65, help="for lenia_flow: sigma parameter")
 group.add_argument("--border", type=str, default="wall", help="for lenia_flow: border mode")
 group.add_argument("--mix_rule", type=str, default="stoch", help="for lenia_flow: mix rule")
 group.add_argument("--base_seed", type=int, default=0, help="for lenia_flow: base random seed for default params")
