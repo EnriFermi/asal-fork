@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+exp_dir="$(cd "$(dirname "$0")" && pwd)"
+python_bin="${PYTHON_BIN:-python3}"
+
+if ! command -v "${python_bin}" >/dev/null 2>&1; then
+  python_bin="python"
+fi
+
+"${python_bin}" "scripts/run_main_opt_from_yaml.py" "${exp_dir}/config.yaml"
