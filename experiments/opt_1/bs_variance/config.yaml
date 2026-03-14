@@ -1,10 +1,10 @@
 meta:
   seed: 1
-  save_dir: experiments/opt_msc/checkpoints/test_run_longer_opt
+  save_dir: experiments/opt_1/checkpoints/clip_ot
 
 source:
   run_save_dirs:
-    - experiments/opt_1/checkpoints/clip_oe_run
+    - experiments/opt_msc/checkpoints/test_run_longer_opt
   run_labels: null
   generation_fractions: [0.1, 0.5, 0.9]
   generation_indices: null
@@ -100,8 +100,8 @@ metric:
 experiment:
   bs_ref: 32
   bs_values: [1, 2, 4, 8]
-  n_repeats: 32
-  eval_batch_size: 2
+  n_repeats: 16
+  eval_batch_size: 16
   recommendation:
     min_mean_spearman_rho: 0.9
     min_mean_top1_match: 0.75
