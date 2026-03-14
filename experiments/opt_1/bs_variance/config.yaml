@@ -101,7 +101,9 @@ experiment:
   bs_ref: 32
   bs_values: [1, 2, 4, 8]
   n_repeats: 16
+  max_candidates_per_generation: null
   eval_batch_size: 16
+
   recommendation:
     min_mean_spearman_rho: 0.9
     min_mean_top1_match: 0.75
