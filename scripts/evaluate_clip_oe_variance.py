@@ -131,6 +131,91 @@ def _select_generation_indices(n_iters: int, fractions, indices) -> list[int]:
     return chosen
 
 
+def _take_evenly_from_ranked(order: np.ndarray, n_take: int) -> list[int]:
+    order = np.asarray(order, dtype=np.int32)
+    if n_take <= 0 or order.size == 0:
+        return []
+    if n_take >= order.size:
+        return [int(x) for x in order.tolist()]
+    pos = np.linspace(0, order.size - 1, n_take)
+    chosen = []
+    seen = set()
+    for p in pos:
+        idx = int(order[int(round(float(p)))])
+        if idx not in seen:
+            chosen.append(idx)
+            seen.add(idx)
+    if len(chosen) < n_take:
+        for idx in order.tolist():
+            ii = int(idx)
+            if ii not in seen:
+                chosen.append(ii)
+                seen.add(ii)
+                if len(chosen) >= n_take:
+                    break
+    return chosen[:n_take]
+
+
+def _select_candidate_indices(
+    *,
+    training_losses: np.ndarray | None,
+    max_candidates: int | None,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if training_losses is None:
+        raise ValueError("training_losses must be provided for candidate subsampling.")
+    losses = np.asarray(training_losses, dtype=np.float64)
+    pop_size = int(losses.size)
+    if max_candidates is None or max_candidates >= pop_size:
+        idx = np.arange(pop_size, dtype=np.int32)
+        labels = np.asarray(["all"] * pop_size, dtype="<U8")
+        return idx, labels
+    if max_candidates < 2:
+        order = np.argsort(losses, kind="mergesort")
+        return np.asarray([int(order[0])], dtype=np.int32), np.asarray(["top"], dtype="<U8")
+
+    rank_order = np.argsort(losses, kind="mergesort")
+    k = int(max_candidates)
+    top_n = max(1, int(np.ceil(k / 3.0)))
+    mid_n = max(1, int(np.floor(k / 3.0)))
+    rem_n = max(0, k - top_n - mid_n)
+
+    selected: list[int] = [int(x) for x in rank_order[:top_n].tolist()]
+    selected_labels: list[str] = ["top"] * len(selected)
+    selected_set = set(selected)
+
+    mid_center = pop_size // 2
+    mid_half_width = max(mid_n, pop_size // 6)
+    mid_lo = max(0, mid_center - mid_half_width)
+    mid_hi = min(pop_size, mid_center + mid_half_width + 1)
+    mid_band = np.asarray([int(x) for x in rank_order[mid_lo:mid_hi].tolist() if int(x) not in selected_set], dtype=np.int32)
+    mid_take = _take_evenly_from_ranked(mid_band, mid_n)
+    selected.extend(mid_take)
+    selected_labels.extend(["mid"] * len(mid_take))
+    selected_set.update(mid_take)
+
+    remaining_ranked = np.asarray([int(x) for x in rank_order.tolist() if int(x) not in selected_set], dtype=np.int32)
+    rem_take = _take_evenly_from_ranked(remaining_ranked, rem_n)
+    selected.extend(rem_take)
+    selected_labels.extend(["spread"] * len(rem_take))
+    selected_set.update(rem_take)
+
+    if len(selected) < k:
+        rng = np.random.default_rng(seed)
+        remaining = np.asarray([int(x) for x in rank_order.tolist() if int(x) not in selected_set], dtype=np.int32)
+        if remaining.size > 0:
+            extra = remaining[rng.permutation(remaining.size)[: k - len(selected)]]
+            selected.extend([int(x) for x in extra.tolist()])
+            selected_labels.extend(["extra"] * int(extra.size))
+
+    selected = selected[:k]
+    selected_labels = selected_labels[:k]
+    paired = sorted(zip(selected, selected_labels), key=lambda x: losses[x[0]])
+    idx = np.asarray([int(i) for i, _ in paired], dtype=np.int32)
+    labels = np.asarray([str(lbl) for _, lbl in paired], dtype="<U8")
+    return idx, labels
+
+
 def _rank_ordinal(x: np.ndarray) -> np.ndarray:
     order = np.argsort(x, kind="mergesort")
     ranks = np.empty_like(order, dtype=np.float64)
@@ -398,12 +483,19 @@ def _save_raw_population_scores(
     bs_values: list[int],
     n_repeats: int,
     bs_ref: int,
+    candidate_indices: np.ndarray,
+    candidate_labels: np.ndarray,
+    training_losses: np.ndarray | None,
 ) -> None:
     payload: dict[str, np.ndarray] = {
         "meta__bs_values": np.asarray(bs_values, dtype=np.int32),
         "meta__bs_ref": np.asarray(bs_ref, dtype=np.int32),
         "meta__n_repeats": np.asarray(n_repeats, dtype=np.int32),
+        "meta__candidate_indices": np.asarray(candidate_indices, dtype=np.int32),
+        "meta__candidate_labels": np.asarray(candidate_labels),
     }
+    if training_losses is not None:
+        payload["meta__training_losses_selected"] = np.asarray(training_losses, dtype=np.float32)
     for metric_name, score_matrix in score_matrices.items():
         ref_block = np.asarray(score_matrix[:, :bs_ref], dtype=np.float32)
         ref_scores = ref_block.mean(axis=1).astype(np.float32)
@@ -615,6 +707,10 @@ def main(cfg, args):
         eval_batch_size = int(getattr(args, "eval_batch_size", 1))
         if eval_batch_size < 1:
             raise ValueError("experiment.eval_batch_size must be >= 1.")
+        max_candidates_per_generation = getattr(args, "max_candidates_per_generation", None)
+        max_candidates_per_generation = None if max_candidates_per_generation is None else int(max_candidates_per_generation)
+        if max_candidates_per_generation is not None and max_candidates_per_generation < 1:
+            raise ValueError("experiment.max_candidates_per_generation must be >= 1 or null.")
 
         total_single_scores = bs_ref + n_repeats * sum(bs_values)
         all_repeat_rows = []
@@ -640,8 +736,14 @@ def main(cfg, args):
                 raise FileNotFoundError(f"pop_traj.pkl not found in {run_path}.")
             pop_traj = util.load_pkl(str(run_path), "pop_traj")
             params_traj = np.asarray(pop_traj["params"], dtype=np.float32)
+            loss_traj = np.asarray(pop_traj["loss"], dtype=np.float32) if "loss" in pop_traj else None
             if params_traj.ndim != 3:
                 raise ValueError(f"Expected pop_traj['params'] to have shape (T, pop, D), got {params_traj.shape}.")
+            if loss_traj is None or loss_traj.shape[:2] != params_traj.shape[:2]:
+                raise ValueError(
+                    f"Expected pop_traj['loss'] to have shape {params_traj.shape[:2]}, got "
+                    f"{None if loss_traj is None else loss_traj.shape}."
+                )
             _validate_param_dim(substrate, params_traj[0])
             n_iters, pop_size, n_params = params_traj.shape
             gen_indices = _select_generation_indices(n_iters, generation_fractions, generation_indices)
@@ -653,17 +755,31 @@ def main(cfg, args):
                     "n_iters_available": int(n_iters),
                     "pop_size": int(pop_size),
                     "n_params": int(n_params),
+                    "max_candidates_per_generation": None if max_candidates_per_generation is None else int(max_candidates_per_generation),
                     "selected_generation_indices": [int(x) for x in gen_indices],
                 }
             )
 
             for gen_idx in gen_indices:
-                params_gen = np.asarray(params_traj[gen_idx], dtype=np.float32)
-                candidate_ids = np.repeat(np.arange(pop_size, dtype=np.int32), total_single_scores)
+                params_gen_full = np.asarray(params_traj[gen_idx], dtype=np.float32)
+                train_loss_gen_full = np.asarray(loss_traj[gen_idx], dtype=np.float32)
+                candidate_indices, candidate_labels = _select_candidate_indices(
+                    training_losses=train_loss_gen_full,
+                    max_candidates=max_candidates_per_generation,
+                    seed=int(getattr(args, "seed", 0)) + 10007 * idx + 997 * int(gen_idx),
+                )
+                params_gen = np.asarray(params_gen_full[candidate_indices], dtype=np.float32)
+                train_loss_gen = np.asarray(train_loss_gen_full[candidate_indices], dtype=np.float32)
+                selected_pop_size = int(params_gen.shape[0])
+                candidate_ids = np.repeat(np.arange(selected_pop_size, dtype=np.int32), total_single_scores)
                 scores_flat_by_metric = {
                     metric_name: np.empty((candidate_ids.size,), dtype=np.float32) for metric_name in metric_names
                 }
-                pbar = tqdm(total=candidate_ids.size, desc=f"{run_label} iter={gen_idx}", leave=False)
+                pbar = tqdm(
+                    total=candidate_ids.size,
+                    desc=f"{run_label} iter={gen_idx} cand={selected_pop_size}/{pop_size}",
+                    leave=False,
+                )
                 start = 0
                 while start < candidate_ids.size:
                     batch = min(eval_batch_size, candidate_ids.size - start)
@@ -679,7 +795,7 @@ def main(cfg, args):
                 pbar.close()
 
                 score_matrices = {
-                    metric_name: scores_flat_by_metric[metric_name].reshape(pop_size, total_single_scores)
+                    metric_name: scores_flat_by_metric[metric_name].reshape(selected_pop_size, total_single_scores)
                     for metric_name in metric_names
                 }
                 raw_scores_path = raw_scores_dir / f"{_slugify(run_label)}__iter_{int(gen_idx):05d}.npz"
@@ -689,6 +805,9 @@ def main(cfg, args):
                     bs_values=bs_values,
                     n_repeats=n_repeats,
                     bs_ref=bs_ref,
+                    candidate_indices=candidate_indices,
+                    candidate_labels=candidate_labels,
+                    training_losses=train_loss_gen,
                 )
 
                 for metric_name in metric_names:
@@ -703,11 +822,18 @@ def main(cfg, args):
                             "run_save_dir": str(run_path),
                             "generation_idx": int(gen_idx),
                             "pop_size": int(pop_size),
+                            "selected_pop_size": int(selected_pop_size),
+                            "candidate_indices": [int(x) for x in candidate_indices.tolist()],
+                            "candidate_labels": [str(x) for x in candidate_labels.tolist()],
                             "bs_ref": int(bs_ref),
                             "ref_mean_mean": float(ref_scores.mean()),
-                            "ref_score_std": float(ref_scores.std(ddof=1) if pop_size > 1 else 0.0),
+                            "ref_score_std": float(ref_scores.std(ddof=1) if selected_pop_size > 1 else 0.0),
                             "ref_best_candidate": int(ref_rank[0]),
-                            "ref_rank_order": [int(x) for x in ref_rank.tolist()],
+                            "ref_best_candidate_global": int(candidate_indices[ref_rank[0]]),
+                            "ref_best_candidate_label": str(candidate_labels[ref_rank[0]]),
+                            "ref_rank_order_local": [int(x) for x in ref_rank.tolist()],
+                            "ref_rank_order_global": [int(candidate_indices[x]) for x in ref_rank.tolist()],
+                            "ref_rank_order_labels": [str(candidate_labels[x]) for x in ref_rank.tolist()],
                             "raw_scores_path": str(raw_scores_path),
                         }
                     )
@@ -716,7 +842,7 @@ def main(cfg, args):
                     for bs in bs_values:
                         block = score_matrix[:, offset:offset + n_repeats * bs]
                         offset += n_repeats * bs
-                        est_scores = block.reshape(pop_size, n_repeats, bs).mean(axis=2).T
+                        est_scores = block.reshape(selected_pop_size, n_repeats, bs).mean(axis=2).T
                         for rep_idx in range(n_repeats):
                             metrics, topk_curve = _ranking_metrics(ref_scores, est_scores[rep_idx])
                             all_repeat_rows.append(
@@ -726,6 +852,7 @@ def main(cfg, args):
                                     "run_save_dir": str(run_path),
                                     "generation_idx": int(gen_idx),
                                     "pop_size": int(pop_size),
+                                    "selected_pop_size": int(selected_pop_size),
                                     "bs_ref": int(bs_ref),
                                     "bs": int(bs),
                                     "repeat_idx": int(rep_idx),
@@ -741,6 +868,7 @@ def main(cfg, args):
                                         "run_save_dir": str(run_path),
                                         "generation_idx": int(gen_idx),
                                         "pop_size": int(pop_size),
+                                        "selected_pop_size": int(selected_pop_size),
                                         "bs_ref": int(bs_ref),
                                         "bs": int(bs),
                                         "repeat_idx": int(rep_idx),

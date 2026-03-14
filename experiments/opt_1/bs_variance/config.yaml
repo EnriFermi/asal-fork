@@ -101,6 +101,7 @@ experiment:
   bs_ref: 32
   bs_values: [1, 2, 4, 8]
   n_repeats: 32
+  max_candidates_per_generation: null   # null = use full population; otherwise stratified subset by training loss
   eval_batch_size: 2
   recommendation:
     min_mean_spearman_rho: 0.9
