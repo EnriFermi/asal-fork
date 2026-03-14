@@ -1,0 +1,116 @@
+meta:
+  seed: 1
+  save_dir: experiments/opt_msc/checkpoints/test_run_longer_opt
+
+source:
+  run_save_dirs:
+    - experiments/opt_1/checkpoints/clip_oe_run
+  run_labels: null
+  generation_fractions: [0.1, 0.5, 0.9]
+  generation_indices: null
+
+substrate:
+  substrate: lenia_flow
+  rollout_steps: 300000
+  grid_size: 128
+  C: 3
+  k: 9
+  kernel_components: 3
+  M: "2,1,0;0,2,1;1,0,2"
+  dd: 5
+  dt: 0.2
+  sigma: 0.65
+  border: wall
+  mix_rule: stoch
+  base_seed: 0
+  seed_patch_size: 20
+  seed_n_patches: 4
+  seed_mode: random_patches
+  p_constant_per_patch: 1
+  render_mode: Pcolor
+  clip1: .inf
+  clip2: .inf
+  mutations: true
+  mutation_sz: 40
+  mutation_p: 0.05
+  mutation_scale: 1.0
+  optimize_mutation_scale: false
+  volcano: false
+  volcano_sz: 30
+  volcano_p: 0.01
+  volcano_delta: 5.0
+  food: false
+  food_interval: 128
+  food_n: 3
+  food_sz: 16
+  food_amount: 1.0
+  food_consume_rate: 0.05
+  food_bonus: 1.0
+  mass_decay: 0.0
+  food_channel: 1
+  food_auto_size: false
+  food_auto_scale: 1.0
+  food_conv_mode: scalar
+  food_vis_scale: 1.0
+  food_vis_color: "0.6,0.3,0.0"
+  food_diffusion_alpha: 0.0
+  mass_clip_eps: 0.0
+
+evaluation:
+  foundation_model: clip
+  time_sampling: 16
+  enable_clip_loss: true
+  clip_img_size: 224
+
+metric:
+  enable_msc_loss: true
+  sample_every_steps: 50
+  metric_window_size_steps: 20000
+  metric_window_step_steps: 5000
+  metric_tau_mode: fixed
+  metric_tau_steps: 3000
+  metric_range_start_steps: 50000
+  metric_range_end_steps: 300000
+  metric_window_size_frames: null
+  metric_window_step_frames: null
+  metric_tau_frames: null
+  metric_m_samples: 48
+  metric_m_min: 4
+  metric_n_proj: 16
+  metric_null_reps: 6
+  metric_particle_samples: 64
+  metric_dirs_seed: 123
+  metric_periodic: null
+  metric_domain_y: null
+  metric_domain_x: null
+  metric_lagrangian_n_particles: 8192
+  metric_lagrangian_init_mode: mass
+  metric_lagrangian_flow_channel: -1
+  metric_lagrangian_flow_reduce: mass_weighted
+  metric_lagrangian_channel_mode: resample
+  metric_lagrangian_noise_model: rt_box
+  metric_lagrangian_diffusion_scale: 1.0
+  metric_preprocess_mode: clip
+  metric_scales: null
+  metric_scale_weights: null
+  metric_alpha: 0.0
+  metric_beta: 1.0
+  metric_eps: 1.0e-12
+
+experiment:
+  bs_ref: 32
+  bs_values: [1, 2, 4, 8]
+  n_repeats: 32
+  eval_batch_size: 2
+  recommendation:
+    min_mean_spearman_rho: 0.9
+    min_mean_top1_match: 0.75
+    min_mean_topk_overlap_allk: 0.8
+    min_mean_pairwise_agreement: 0.9
+    min_p10_spearman_rho: 0.6
+    min_p10_topk_overlap_allk: 0.65
+    min_p10_pairwise_agreement: 0.75
+
+logging:
+  wandb_project: asal
+  wandb_mode: online
