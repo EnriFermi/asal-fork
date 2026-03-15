@@ -101,7 +101,8 @@ experiment:
   bs_ref: 32
   bs_values: [1, 2, 4, 8]
   n_repeats: 16
-  max_candidates_per_generation: null
+  candidate_sampling_mode: top_mid_spread
+  max_candidates_per_generation: 8
   eval_batch_size: 16
 
   recommendation:
