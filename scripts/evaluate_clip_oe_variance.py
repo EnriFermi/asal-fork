@@ -1076,13 +1076,15 @@ def main(cfg, args):
                                 f"[resume] continuing partial raw scores: {run_label} iter={int(gen_idx)} "
                                 f"from {start}/{total_size} singles ({selected_pop_size}/{pop_size} candidates)"
                             )
+                    remaining_size = int(total_size - start)
+                    desc = f"{run_label} iter={gen_idx} cand={selected_pop_size}/{pop_size}"
+                    if start > 0:
+                        desc += f" resume={start}/{total_size}"
                     pbar = tqdm(
-                        total=total_size,
-                        desc=f"{run_label} iter={gen_idx} cand={selected_pop_size}/{pop_size}",
+                        total=remaining_size,
+                        desc=desc,
                         leave=False,
                     )
-                    if start > 0:
-                        pbar.update(start)
                     while start < total_size:
                         batch = min(eval_batch_size, total_size - start)
                         ids_chunk = candidate_ids[start:start + batch]
