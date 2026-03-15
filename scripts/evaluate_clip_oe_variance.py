@@ -64,6 +64,14 @@ def _write_json(path: Path, payload) -> None:
         json.dump(payload, f, indent=2)
 
 
+def _save_npz_atomic(path: Path, **payload) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    with tmp_path.open("wb") as f:
+        np.savez_compressed(f, **payload)
+    os.replace(tmp_path, path)
+
+
 def _slugify(text: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(text).strip())
     slug = slug.strip("._-")
@@ -355,8 +363,8 @@ def _plot_topk_heatmap(rows: list[dict], metric_name: str, out_path: Path):
     bs_to_i = {bs: i for i, bs in enumerate(bs_vals)}
     k_to_j = {k: j for j, k in enumerate(k_vals)}
     for row in rows:
-        mean_grid[bs_to_i[int(row["bs"])], k_to_j[int(row["k"])] ] = float(row["mean_topk_overlap"])
-        p10_grid[bs_to_i[int(row["bs"])], k_to_j[int(row["k"])] ] = float(row["p10_topk_overlap"])
+        mean_grid[bs_to_i[int(row["bs"])], k_to_j[int(row["k"])]] = float(row["mean_topk_overlap"])
+        p10_grid[bs_to_i[int(row["bs"])], k_to_j[int(row["k"])]] = float(row["p10_topk_overlap"])
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
     for ax, grid, title in zip(
@@ -493,6 +501,7 @@ def _save_raw_population_scores(
         "meta__n_repeats": np.asarray(n_repeats, dtype=np.int32),
         "meta__candidate_indices": np.asarray(candidate_indices, dtype=np.int32),
         "meta__candidate_labels": np.asarray(candidate_labels),
+        "meta__metric_names": np.asarray(sorted(score_matrices.keys())),
     }
     if training_losses is not None:
         payload["meta__training_losses_selected"] = np.asarray(training_losses, dtype=np.float32)
@@ -509,8 +518,224 @@ def _save_raw_population_scores(
             payload[f"{metric_name}__bs_{bs}_single_scores"] = block
             payload[f"{metric_name}__bs_{bs}_mean_scores"] = block.mean(axis=2).T.astype(np.float32)
             offset += n_repeats * bs
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(out_path, **payload)
+    _save_npz_atomic(out_path, **payload)
+
+
+def _load_raw_population_scores(
+    in_path: Path,
+    *,
+    metric_names: list[str],
+    bs_values: list[int],
+    n_repeats: int,
+    bs_ref: int,
+) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray | None]:
+    with np.load(in_path, allow_pickle=False) as data:
+        stored_bs_values = np.asarray(data["meta__bs_values"], dtype=np.int32).tolist()
+        stored_bs_ref = int(np.asarray(data["meta__bs_ref"]).reshape(()))
+        stored_n_repeats = int(np.asarray(data["meta__n_repeats"]).reshape(()))
+        if stored_bs_values != [int(x) for x in bs_values] or stored_bs_ref != int(bs_ref) or stored_n_repeats != int(n_repeats):
+            raise ValueError(
+                f"Raw cache mismatch in {in_path}: expected bs_ref={bs_ref}, bs_values={bs_values}, n_repeats={n_repeats}; "
+                f"got bs_ref={stored_bs_ref}, bs_values={stored_bs_values}, n_repeats={stored_n_repeats}."
+            )
+        stored_metric_names = None
+        if "meta__metric_names" in data.files:
+            stored_metric_names = sorted(str(x) for x in np.asarray(data["meta__metric_names"]).tolist())
+            if stored_metric_names != sorted(metric_names):
+                raise ValueError(
+                    f"Raw cache mismatch in {in_path}: expected metrics {sorted(metric_names)}, got {stored_metric_names}."
+                )
+        candidate_indices = np.asarray(data["meta__candidate_indices"], dtype=np.int32)
+        candidate_labels = np.asarray(data["meta__candidate_labels"]).astype(str)
+        training_losses = None
+        if "meta__training_losses_selected" in data.files:
+            training_losses = np.asarray(data["meta__training_losses_selected"], dtype=np.float32)
+        score_matrices = {}
+        for metric_name in metric_names:
+            key = f"{metric_name}__score_matrix_single"
+            if key not in data.files:
+                raise ValueError(f"Raw cache {in_path} missing required array {key}.")
+            score_matrices[metric_name] = np.asarray(data[key], dtype=np.float32)
+    return score_matrices, candidate_indices, candidate_labels, training_losses
+
+
+def _save_partial_population_scores(
+    out_path: Path,
+    *,
+    scores_flat_by_metric: dict[str, np.ndarray],
+    completed: int,
+    total_single_scores: int,
+    bs_values: list[int],
+    n_repeats: int,
+    bs_ref: int,
+    candidate_indices: np.ndarray,
+    candidate_labels: np.ndarray,
+    training_losses: np.ndarray | None,
+) -> None:
+    payload: dict[str, np.ndarray] = {
+        "meta__bs_values": np.asarray(bs_values, dtype=np.int32),
+        "meta__bs_ref": np.asarray(bs_ref, dtype=np.int32),
+        "meta__n_repeats": np.asarray(n_repeats, dtype=np.int32),
+        "meta__completed": np.asarray(int(completed), dtype=np.int32),
+        "meta__total_single_scores": np.asarray(int(total_single_scores), dtype=np.int32),
+        "meta__candidate_indices": np.asarray(candidate_indices, dtype=np.int32),
+        "meta__candidate_labels": np.asarray(candidate_labels),
+        "meta__metric_names": np.asarray(sorted(scores_flat_by_metric.keys())),
+    }
+    if training_losses is not None:
+        payload["meta__training_losses_selected"] = np.asarray(training_losses, dtype=np.float32)
+    for metric_name, flat_scores in scores_flat_by_metric.items():
+        payload[f"{metric_name}__scores_flat"] = np.asarray(flat_scores, dtype=np.float32)
+    _save_npz_atomic(out_path, **payload)
+
+
+def _load_partial_population_scores(
+    in_path: Path,
+    *,
+    metric_names: list[str],
+    bs_values: list[int],
+    n_repeats: int,
+    bs_ref: int,
+    total_size: int,
+    total_single_scores: int,
+) -> tuple[dict[str, np.ndarray], int, np.ndarray, np.ndarray, np.ndarray | None]:
+    with np.load(in_path, allow_pickle=False) as data:
+        stored_bs_values = np.asarray(data["meta__bs_values"], dtype=np.int32).tolist()
+        stored_bs_ref = int(np.asarray(data["meta__bs_ref"]).reshape(()))
+        stored_n_repeats = int(np.asarray(data["meta__n_repeats"]).reshape(()))
+        stored_completed = int(np.asarray(data["meta__completed"]).reshape(()))
+        stored_total_single_scores = int(np.asarray(data["meta__total_single_scores"]).reshape(()))
+        if stored_bs_values != [int(x) for x in bs_values] or stored_bs_ref != int(bs_ref) or stored_n_repeats != int(n_repeats):
+            raise ValueError(
+                f"Partial cache mismatch in {in_path}: expected bs_ref={bs_ref}, bs_values={bs_values}, n_repeats={n_repeats}; "
+                f"got bs_ref={stored_bs_ref}, bs_values={stored_bs_values}, n_repeats={stored_n_repeats}."
+            )
+        if stored_total_single_scores != int(total_single_scores):
+            raise ValueError(
+                f"Partial cache mismatch in {in_path}: expected total_single_scores={total_single_scores}, "
+                f"got {stored_total_single_scores}."
+            )
+        stored_metric_names = sorted(str(x) for x in np.asarray(data["meta__metric_names"]).tolist())
+        if stored_metric_names != sorted(metric_names):
+            raise ValueError(
+                f"Partial cache mismatch in {in_path}: expected metrics {sorted(metric_names)}, got {stored_metric_names}."
+            )
+        if not (0 <= stored_completed <= total_size):
+            raise ValueError(
+                f"Partial cache mismatch in {in_path}: completed={stored_completed} outside [0, {total_size}]."
+            )
+        candidate_indices = np.asarray(data["meta__candidate_indices"], dtype=np.int32)
+        candidate_labels = np.asarray(data["meta__candidate_labels"]).astype(str)
+        training_losses = None
+        if "meta__training_losses_selected" in data.files:
+            training_losses = np.asarray(data["meta__training_losses_selected"], dtype=np.float32)
+        scores_flat_by_metric = {}
+        for metric_name in metric_names:
+            key = f"{metric_name}__scores_flat"
+            if key not in data.files:
+                raise ValueError(f"Partial cache {in_path} missing required array {key}.")
+            flat = np.asarray(data[key], dtype=np.float32)
+            if flat.size != total_size:
+                raise ValueError(
+                    f"Partial cache {in_path} array {key} has size {flat.size}, expected {total_size}."
+                )
+            scores_flat_by_metric[metric_name] = flat
+    return scores_flat_by_metric, stored_completed, candidate_indices, candidate_labels, training_losses
+
+
+def _accumulate_population_rows(
+    *,
+    metric_names: list[str],
+    score_matrices: dict[str, np.ndarray],
+    bs_values: list[int],
+    n_repeats: int,
+    bs_ref: int,
+    run_label: str,
+    run_path: Path,
+    gen_idx: int,
+    pop_size: int,
+    candidate_indices: np.ndarray,
+    candidate_labels: np.ndarray,
+    raw_scores_path: Path,
+    reference_rows: list[dict],
+    all_repeat_rows: list[dict],
+    topk_repeat_rows: list[dict],
+    summary_by_metric: dict,
+    topk_summary_by_metric: dict,
+) -> None:
+    selected_pop_size = int(candidate_indices.size)
+    for metric_name in metric_names:
+        score_matrix = np.asarray(score_matrices[metric_name], dtype=np.float32)
+        if score_matrix.shape[0] != selected_pop_size:
+            raise ValueError(
+                f"Score matrix for {metric_name} has first dim {score_matrix.shape[0]}, expected {selected_pop_size}."
+            )
+        ref_block = score_matrix[:, :bs_ref]
+        ref_scores = ref_block.mean(axis=1)
+        ref_rank = np.argsort(ref_scores)
+        reference_rows.append(
+            {
+                "metric": metric_name,
+                "run_label": run_label,
+                "run_save_dir": str(run_path),
+                "generation_idx": int(gen_idx),
+                "pop_size": int(pop_size),
+                "selected_pop_size": int(selected_pop_size),
+                "candidate_indices": [int(x) for x in candidate_indices.tolist()],
+                "candidate_labels": [str(x) for x in candidate_labels.tolist()],
+                "bs_ref": int(bs_ref),
+                "ref_mean_mean": float(ref_scores.mean()),
+                "ref_score_std": float(ref_scores.std(ddof=1) if selected_pop_size > 1 else 0.0),
+                "ref_best_candidate": int(ref_rank[0]),
+                "ref_best_candidate_global": int(candidate_indices[ref_rank[0]]),
+                "ref_best_candidate_label": str(candidate_labels[ref_rank[0]]),
+                "ref_rank_order_local": [int(x) for x in ref_rank.tolist()],
+                "ref_rank_order_global": [int(candidate_indices[x]) for x in ref_rank.tolist()],
+                "ref_rank_order_labels": [str(candidate_labels[x]) for x in ref_rank.tolist()],
+                "raw_scores_path": str(raw_scores_path),
+            }
+        )
+
+        offset = bs_ref
+        for bs in bs_values:
+            block = score_matrix[:, offset:offset + n_repeats * bs]
+            offset += n_repeats * bs
+            est_scores = block.reshape(selected_pop_size, n_repeats, bs).mean(axis=2).T
+            for rep_idx in range(n_repeats):
+                metrics, topk_curve = _ranking_metrics(ref_scores, est_scores[rep_idx])
+                all_repeat_rows.append(
+                    {
+                        "metric": metric_name,
+                        "run_label": run_label,
+                        "run_save_dir": str(run_path),
+                        "generation_idx": int(gen_idx),
+                        "pop_size": int(pop_size),
+                        "selected_pop_size": int(selected_pop_size),
+                        "bs_ref": int(bs_ref),
+                        "bs": int(bs),
+                        "repeat_idx": int(rep_idx),
+                        **{k: float(v) for k, v in metrics.items()},
+                    }
+                )
+                summary_by_metric[metric_name][bs].append(metrics)
+                for k_idx, overlap in enumerate(topk_curve, start=1):
+                    topk_repeat_rows.append(
+                        {
+                            "metric": metric_name,
+                            "run_label": run_label,
+                            "run_save_dir": str(run_path),
+                            "generation_idx": int(gen_idx),
+                            "pop_size": int(pop_size),
+                            "selected_pop_size": int(selected_pop_size),
+                            "bs_ref": int(bs_ref),
+                            "bs": int(bs),
+                            "repeat_idx": int(rep_idx),
+                            "k": int(k_idx),
+                            "k_frac": float(k_idx / pop_size),
+                            "topk_overlap": float(overlap),
+                        }
+                    )
+                    topk_summary_by_metric[metric_name][bs].setdefault(k_idx, []).append(float(overlap))
 
 
 def _create_base_substrate(args, enable_msc: bool):
@@ -543,6 +768,7 @@ def main(cfg, args):
     try:
         enable_clip = bool(getattr(args, "enable_clip_loss", True))
         enable_msc = bool(getattr(args, "enable_msc_loss", True))
+        resume = bool(getattr(args, "resume", True))
         if not enable_clip and not enable_msc:
             raise ValueError("At least one of enable_clip_loss / enable_msc_loss must be true.")
 
@@ -723,6 +949,9 @@ def main(cfg, args):
         }
         raw_scores_dir = save_dir / "raw_scores"
         rng = jax.random.PRNGKey(int(getattr(args, "seed", 0)))
+        resumed_generations = 0
+        resumed_partial_generations = 0
+        computed_generations = 0
 
         run_label_list = []
         for idx, run_dir_raw in enumerate(run_dirs):
@@ -771,113 +1000,152 @@ def main(cfg, args):
                 params_gen = np.asarray(params_gen_full[candidate_indices], dtype=np.float32)
                 train_loss_gen = np.asarray(train_loss_gen_full[candidate_indices], dtype=np.float32)
                 selected_pop_size = int(params_gen.shape[0])
-                candidate_ids = np.repeat(np.arange(selected_pop_size, dtype=np.int32), total_single_scores)
-                scores_flat_by_metric = {
-                    metric_name: np.empty((candidate_ids.size,), dtype=np.float32) for metric_name in metric_names
-                }
-                pbar = tqdm(
-                    total=candidate_ids.size,
-                    desc=f"{run_label} iter={gen_idx} cand={selected_pop_size}/{pop_size}",
-                    leave=False,
-                )
-                start = 0
-                while start < candidate_ids.size:
-                    batch = min(eval_batch_size, candidate_ids.size - start)
-                    ids_chunk = candidate_ids[start:start + batch]
-                    params_chunk = jnp.asarray(params_gen[ids_chunk])
-                    rng, rng_batch = jax.random.split(rng)
-                    keys = jax.random.split(rng_batch, batch)
-                    for metric_name in metric_names:
-                        chunk_scores = np.asarray(jax.device_get(eval_fns[metric_name](keys, params_chunk)), dtype=np.float32)
-                        scores_flat_by_metric[metric_name][start:start + batch] = chunk_scores
-                    start += batch
-                    pbar.update(batch)
-                pbar.close()
-
-                score_matrices = {
-                    metric_name: scores_flat_by_metric[metric_name].reshape(selected_pop_size, total_single_scores)
-                    for metric_name in metric_names
-                }
                 raw_scores_path = raw_scores_dir / f"{_slugify(run_label)}__iter_{int(gen_idx):05d}.npz"
-                _save_raw_population_scores(
-                    raw_scores_path,
+                partial_scores_path = raw_scores_dir / f"{_slugify(run_label)}__iter_{int(gen_idx):05d}.partial.npz"
+
+                score_matrices = None
+                loaded_candidate_indices = candidate_indices
+                loaded_candidate_labels = candidate_labels
+                loaded_train_loss_gen = train_loss_gen
+                if resume and raw_scores_path.exists():
+                    score_matrices, loaded_candidate_indices, loaded_candidate_labels, loaded_train_loss_gen = _load_raw_population_scores(
+                        raw_scores_path,
+                        metric_names=metric_names,
+                        bs_values=bs_values,
+                        n_repeats=n_repeats,
+                        bs_ref=bs_ref,
+                    )
+                    if not np.array_equal(loaded_candidate_indices, candidate_indices):
+                        raise ValueError(
+                            f"Raw cache {raw_scores_path} candidate_indices do not match current selection. "
+                            "Delete the cache or keep subsampling config unchanged."
+                        )
+                    if not np.array_equal(loaded_candidate_labels.astype(str), candidate_labels.astype(str)):
+                        raise ValueError(
+                            f"Raw cache {raw_scores_path} candidate_labels do not match current selection. "
+                            "Delete the cache or keep subsampling config unchanged."
+                        )
+                    if loaded_train_loss_gen is not None and loaded_train_loss_gen.shape != train_loss_gen.shape:
+                        raise ValueError(
+                            f"Raw cache {raw_scores_path} selected training losses shape {loaded_train_loss_gen.shape} "
+                            f"does not match current selection {train_loss_gen.shape}."
+                        )
+                    resumed_generations += 1
+                    print(f"[resume] using cached raw scores: {run_label} iter={int(gen_idx)} ({selected_pop_size}/{pop_size} candidates)")
+                else:
+                    candidate_ids = np.repeat(np.arange(selected_pop_size, dtype=np.int32), total_single_scores)
+                    total_size = int(candidate_ids.size)
+                    scores_flat_by_metric = {
+                        metric_name: np.empty((total_size,), dtype=np.float32) for metric_name in metric_names
+                    }
+                    start = 0
+                    if resume and partial_scores_path.exists():
+                        (
+                            scores_flat_by_metric,
+                            start,
+                            loaded_candidate_indices,
+                            loaded_candidate_labels,
+                            loaded_train_loss_gen,
+                        ) = _load_partial_population_scores(
+                            partial_scores_path,
+                            metric_names=metric_names,
+                            bs_values=bs_values,
+                            n_repeats=n_repeats,
+                            bs_ref=bs_ref,
+                            total_size=total_size,
+                            total_single_scores=total_single_scores,
+                        )
+                        if not np.array_equal(loaded_candidate_indices, candidate_indices):
+                            raise ValueError(
+                                f"Partial cache {partial_scores_path} candidate_indices do not match current selection. "
+                                "Delete the cache or keep subsampling config unchanged."
+                            )
+                        if not np.array_equal(loaded_candidate_labels.astype(str), candidate_labels.astype(str)):
+                            raise ValueError(
+                                f"Partial cache {partial_scores_path} candidate_labels do not match current selection. "
+                                "Delete the cache or keep subsampling config unchanged."
+                            )
+                        if loaded_train_loss_gen is not None and loaded_train_loss_gen.shape != train_loss_gen.shape:
+                            raise ValueError(
+                                f"Partial cache {partial_scores_path} selected training losses shape {loaded_train_loss_gen.shape} "
+                                f"does not match current selection {train_loss_gen.shape}."
+                            )
+                        if start > 0:
+                            resumed_partial_generations += 1
+                            print(
+                                f"[resume] continuing partial raw scores: {run_label} iter={int(gen_idx)} "
+                                f"from {start}/{total_size} singles ({selected_pop_size}/{pop_size} candidates)"
+                            )
+                    pbar = tqdm(
+                        total=total_size,
+                        desc=f"{run_label} iter={gen_idx} cand={selected_pop_size}/{pop_size}",
+                        leave=False,
+                    )
+                    if start > 0:
+                        pbar.update(start)
+                    while start < total_size:
+                        batch = min(eval_batch_size, total_size - start)
+                        ids_chunk = candidate_ids[start:start + batch]
+                        params_chunk = jnp.asarray(params_gen[ids_chunk])
+                        rng, rng_batch = jax.random.split(rng)
+                        keys = jax.random.split(rng_batch, batch)
+                        for metric_name in metric_names:
+                            chunk_scores = np.asarray(jax.device_get(eval_fns[metric_name](keys, params_chunk)), dtype=np.float32)
+                            scores_flat_by_metric[metric_name][start:start + batch] = chunk_scores
+                        start += batch
+                        if resume:
+                            _save_partial_population_scores(
+                                partial_scores_path,
+                                scores_flat_by_metric=scores_flat_by_metric,
+                                completed=start,
+                                total_single_scores=total_single_scores,
+                                bs_values=bs_values,
+                                n_repeats=n_repeats,
+                                bs_ref=bs_ref,
+                                candidate_indices=candidate_indices,
+                                candidate_labels=candidate_labels,
+                                training_losses=train_loss_gen,
+                            )
+                        pbar.update(batch)
+                    pbar.close()
+
+                    score_matrices = {
+                        metric_name: scores_flat_by_metric[metric_name].reshape(selected_pop_size, total_single_scores)
+                        for metric_name in metric_names
+                    }
+                    _save_raw_population_scores(
+                        raw_scores_path,
+                        score_matrices=score_matrices,
+                        bs_values=bs_values,
+                        n_repeats=n_repeats,
+                        bs_ref=bs_ref,
+                        candidate_indices=candidate_indices,
+                        candidate_labels=candidate_labels,
+                        training_losses=train_loss_gen,
+                    )
+                    if partial_scores_path.exists():
+                        partial_scores_path.unlink()
+                    computed_generations += 1
+
+                _accumulate_population_rows(
+                    metric_names=metric_names,
                     score_matrices=score_matrices,
                     bs_values=bs_values,
                     n_repeats=n_repeats,
                     bs_ref=bs_ref,
-                    candidate_indices=candidate_indices,
-                    candidate_labels=candidate_labels,
-                    training_losses=train_loss_gen,
+                    run_label=run_label,
+                    run_path=run_path,
+                    gen_idx=int(gen_idx),
+                    pop_size=int(pop_size),
+                    candidate_indices=np.asarray(loaded_candidate_indices, dtype=np.int32),
+                    candidate_labels=np.asarray(loaded_candidate_labels).astype(str),
+                    raw_scores_path=raw_scores_path,
+                    reference_rows=reference_rows,
+                    all_repeat_rows=all_repeat_rows,
+                    topk_repeat_rows=topk_repeat_rows,
+                    summary_by_metric=summary_by_metric,
+                    topk_summary_by_metric=topk_summary_by_metric,
                 )
-
-                for metric_name in metric_names:
-                    score_matrix = score_matrices[metric_name]
-                    ref_block = score_matrix[:, :bs_ref]
-                    ref_scores = ref_block.mean(axis=1)
-                    ref_rank = np.argsort(ref_scores)
-                    reference_rows.append(
-                        {
-                            "metric": metric_name,
-                            "run_label": run_label,
-                            "run_save_dir": str(run_path),
-                            "generation_idx": int(gen_idx),
-                            "pop_size": int(pop_size),
-                            "selected_pop_size": int(selected_pop_size),
-                            "candidate_indices": [int(x) for x in candidate_indices.tolist()],
-                            "candidate_labels": [str(x) for x in candidate_labels.tolist()],
-                            "bs_ref": int(bs_ref),
-                            "ref_mean_mean": float(ref_scores.mean()),
-                            "ref_score_std": float(ref_scores.std(ddof=1) if selected_pop_size > 1 else 0.0),
-                            "ref_best_candidate": int(ref_rank[0]),
-                            "ref_best_candidate_global": int(candidate_indices[ref_rank[0]]),
-                            "ref_best_candidate_label": str(candidate_labels[ref_rank[0]]),
-                            "ref_rank_order_local": [int(x) for x in ref_rank.tolist()],
-                            "ref_rank_order_global": [int(candidate_indices[x]) for x in ref_rank.tolist()],
-                            "ref_rank_order_labels": [str(candidate_labels[x]) for x in ref_rank.tolist()],
-                            "raw_scores_path": str(raw_scores_path),
-                        }
-                    )
-
-                    offset = bs_ref
-                    for bs in bs_values:
-                        block = score_matrix[:, offset:offset + n_repeats * bs]
-                        offset += n_repeats * bs
-                        est_scores = block.reshape(selected_pop_size, n_repeats, bs).mean(axis=2).T
-                        for rep_idx in range(n_repeats):
-                            metrics, topk_curve = _ranking_metrics(ref_scores, est_scores[rep_idx])
-                            all_repeat_rows.append(
-                                {
-                                    "metric": metric_name,
-                                    "run_label": run_label,
-                                    "run_save_dir": str(run_path),
-                                    "generation_idx": int(gen_idx),
-                                    "pop_size": int(pop_size),
-                                    "selected_pop_size": int(selected_pop_size),
-                                    "bs_ref": int(bs_ref),
-                                    "bs": int(bs),
-                                    "repeat_idx": int(rep_idx),
-                                    **{k: float(v) for k, v in metrics.items()},
-                                }
-                            )
-                            summary_by_metric[metric_name][bs].append(metrics)
-                            for k_idx, overlap in enumerate(topk_curve, start=1):
-                                topk_repeat_rows.append(
-                                    {
-                                        "metric": metric_name,
-                                        "run_label": run_label,
-                                        "run_save_dir": str(run_path),
-                                        "generation_idx": int(gen_idx),
-                                        "pop_size": int(pop_size),
-                                        "selected_pop_size": int(selected_pop_size),
-                                        "bs_ref": int(bs_ref),
-                                        "bs": int(bs),
-                                        "repeat_idx": int(rep_idx),
-                                        "k": int(k_idx),
-                                        "k_frac": float(k_idx / pop_size),
-                                        "topk_overlap": float(overlap),
-                                    }
-                                )
-                                topk_summary_by_metric[metric_name][bs].setdefault(k_idx, []).append(float(overlap))
 
         summary_rows = []
         topk_summary_rows = []
@@ -951,6 +1219,10 @@ def main(cfg, args):
                 "rollout_steps": int(rollout_steps),
                 "recommended_bs": {k: v for k, v in recommended_bs.items()},
                 "eval_summaries": eval_summaries,
+                "resume_enabled": bool(resume),
+                "resumed_generations": int(resumed_generations),
+                "resumed_partial_generations": int(resumed_partial_generations),
+                "computed_generations": int(computed_generations),
             },
         )
 
@@ -1003,12 +1275,19 @@ def main(cfg, args):
         run.summary["stability/n_runs"] = int(len(run_label_list))
         run.summary["stability/n_selected_populations"] = int(len({(r['run_label'], r['generation_idx']) for r in reference_rows}))
         run.summary["stability/bs_ref"] = int(bs_ref)
+        run.summary["stability/resumed_generations"] = int(resumed_generations)
+        run.summary["stability/resumed_partial_generations"] = int(resumed_partial_generations)
+        run.summary["stability/computed_generations"] = int(computed_generations)
         for metric_name, rec in recommended_bs.items():
             if rec is not None:
                 run.summary[f"stability/recommended_bs_{metric_name}"] = int(rec)
 
         print(f"Selected populations: {len({(r['run_label'], r['generation_idx']) for r in reference_rows})} across {len(run_label_list)} runs")
         print(f"Reference bs_ref={bs_ref}, repeated evals per bs={n_repeats}")
+        print(
+            f"Resume: enabled={resume}, resumed_generations={resumed_generations}, "
+            f"resumed_partial_generations={resumed_partial_generations}, computed_generations={computed_generations}"
+        )
         for metric_name in metric_names:
             print(f"Metric: {metric_name}")
             print(f"{'bs':>4} {'spearman':>10} {'top1':>8} {'all-k':>8} {'pairwise':>10} {'flip':>8}")
