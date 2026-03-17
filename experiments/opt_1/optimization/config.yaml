@@ -50,7 +50,7 @@ substrate:
   mass_clip_eps: 0.0
 
 evaluation:
-  foundation_model: clip
+  foundation_model: clip   # clip | siglip2 | google/siglip2-so400m-patch16-384-jax
   time_sampling: 32
   prompts: "a biological cell"
   coef_prompt: 0.0
@@ -59,6 +59,8 @@ evaluation:
   coef_smooth: 0.0
 
 optimization:
+  optimizer: Sep-CMA-ES      # Sep-CMA-ES | LM_MA_ES
+  params_init: strategy_default  # strategy_default | substrate_default
   bs: 2
   pop_size: 16
   n_iters: 200

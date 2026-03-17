@@ -10,6 +10,7 @@ class CLIP():
     def __init__(self, clip_model="clip-vit-base-patch32"):
         self.processor = AutoProcessor.from_pretrained(f"openai/{clip_model}", use_fast=True)
         self.clip_model = FlaxCLIPModel.from_pretrained(f"openai/{clip_model}")
+        self.image_size = 224
 
         self.img_mean = jnp.array(self.processor.image_processor.image_mean)
         self.img_std = jnp.array(self.processor.image_processor.image_std)

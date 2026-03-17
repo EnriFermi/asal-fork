@@ -79,7 +79,12 @@ group.add_argument("--food_diffusion_alpha", type=float, default=0.0, help="for 
 group.add_argument("--mass_clip_eps", type=float, default=0.0, help="for lenia_flow: zero-out per-pixel mass below this sum")
 
 group = parser.add_argument_group("evaluation")
-group.add_argument("--foundation_model", type=str, default="clip", help="the foundation model to use (don't touch this)")
+group.add_argument(
+    "--foundation_model",
+    type=str,
+    default="clip",
+    help="image encoder to use. Supports 'clip', 'siglip2', or a google/siglip2* model id",
+)
 group.add_argument("--time_sampling", type=int, default=32, help="number of images to render during one simulation rollout")
 group.add_argument("--prompts", type=str, default="a biological cell;two biological cells", help="prompts to optimize for seperated by ';'")
 group.add_argument("--coef_prompt", type=float, default=0., help="coefficient for ASAL prompt loss")
@@ -91,7 +96,14 @@ group.add_argument("--coef_smooth", type=float, default=0.2, help="coefficient f
 
 group = parser.add_argument_group("optimization")
 group.add_argument("--bs", type=int, default=1, help="number of init states to average simulation over")
-group.add_argument("--pop_size", type=int, default=8, help="population size for Sep-CMA-ES")
+group.add_argument("--optimizer", type=str, default="Sep-CMA-ES", help="optimizer to use: Sep-CMA-ES or LM_MA_ES")
+group.add_argument(
+    "--params_init",
+    type=str,
+    default="strategy_default",
+    help="parameter initialization: strategy_default or substrate_default",
+)
+group.add_argument("--pop_size", type=int, default=8, help="population size for the selected ES strategy")
 group.add_argument("--n_iters", type=int, default=1000, help="number of iterations to run")
 group.add_argument("--sigma", type=float, default=0.1, help="mutation rate")
 group.add_argument("--eval_splits", type=int, default=1, help="number of splits of CMA-ES population for loss evaluation (1 = no split)")
@@ -113,6 +125,85 @@ def parse_args(*args, **kwargs):
     return args
 
 
+def _canonicalize_optimizer_name(name):
+    if name is None:
+        return "sep_cma_es"
+    normalized = str(name).strip().lower().replace("-", "_")
+    aliases = {
+        "sep_cma_es": "sep_cma_es",
+        "sepcmaes": "sep_cma_es",
+        "sep_cma": "sep_cma_es",
+        "lm_ma_es": "lm_ma_es",
+        "lmmaes": "lm_ma_es",
+        "lm_ma": "lm_ma_es",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            f"Unknown optimizer {name!r}. Use 'Sep-CMA-ES' or 'LM_MA_ES'."
+        )
+    return aliases[normalized]
+
+
+def _canonicalize_params_init(name):
+    if name is None:
+        return "strategy_default"
+    normalized = str(name).strip().lower().replace("-", "_")
+    aliases = {
+        "strategy_default": "strategy_default",
+        "optimizer_default": "strategy_default",
+        "default": "strategy_default",
+        "substrate_default": "substrate_default",
+        "default_params": "substrate_default",
+        "smart": "substrate_default",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            f"Unknown params_init {name!r}. Use 'strategy_default' or 'substrate_default'."
+        )
+    return aliases[normalized]
+
+
+def _replace_state_fields(state, **updates):
+    if hasattr(state, "replace"):
+        return state.replace(**updates)
+    if hasattr(state, "_replace"):
+        return state._replace(**updates)
+    for key, value in updates.items():
+        setattr(state, key, value)
+    return state
+
+
+def _build_strategy(optimizer_name, *, pop_size, num_dims, sigma_init):
+    if optimizer_name == "sep_cma_es":
+        strategy_cls = evosax.Sep_CMA_ES
+    elif optimizer_name == "lm_ma_es":
+        strategy_cls = getattr(evosax, "LM_MA_ES", None)
+        if strategy_cls is None:
+            raise ValueError(
+                "Requested optimizer 'LM_MA_ES', but evosax does not expose LM_MA_ES in this environment."
+            )
+    else:
+        raise ValueError(f"Unhandled optimizer {optimizer_name!r}.")
+    return strategy_cls(popsize=pop_size, num_dims=num_dims, sigma_init=sigma_init)
+
+
+def _initialize_strategy_with_mean(strategy, rng_init, es_params, init_mean):
+    try:
+        return strategy.initialize(rng_init, es_params, init_mean=init_mean)
+    except TypeError:
+        state = strategy.initialize(rng_init, es_params)
+        updates = {}
+        if hasattr(state, "mean"):
+            updates["mean"] = jnp.asarray(init_mean)
+        if hasattr(state, "best_member"):
+            updates["best_member"] = jnp.asarray(init_mean)
+        if not updates:
+            raise RuntimeError(
+                "Could not set a custom optimizer initialization mean on this evosax strategy/state."
+            )
+        return _replace_state_fields(state, **updates)
+
+
 
 import imageio.v3 as iio
 import numpy as np
@@ -130,8 +221,15 @@ def main(args):
         if args.time_sampling < len(prompts): # doing multiple prompts
             args.time_sampling = len(prompts)
         print(args)
-        
+
+        optimizer_name = _canonicalize_optimizer_name(getattr(args, "optimizer", "Sep-CMA-ES"))
+        params_init = _canonicalize_params_init(getattr(args, "params_init", "strategy_default"))
         fm = foundation_models.create_foundation_model(args.foundation_model)
+        rollout_img_size = int(getattr(fm, "image_size", 224))
+        run.summary["optimizer/name"] = optimizer_name
+        run.summary["optimizer/params_init"] = params_init
+        run.summary["encoder/name"] = str(args.foundation_model)
+        run.summary["encoder/img_size"] = int(rollout_img_size)
         if args.substrate == "lenia_flow":
             substrate = substrates.create_substrate(
                 args.substrate,
@@ -206,16 +304,37 @@ def main(args):
         substrate = substrates.FlattenSubstrateParameters(substrate)
         if args.rollout_steps is None:
             args.rollout_steps = substrate.rollout_steps
-        rollout_fn = partial(rollout_simulation, s0=None, substrate=substrate, fm=fm, rollout_steps=args.rollout_steps, time_sampling=(args.time_sampling, True), img_size=224, return_state=False)
+        rollout_fn = partial(
+            rollout_simulation,
+            s0=None,
+            substrate=substrate,
+            fm=fm,
+            rollout_steps=args.rollout_steps,
+            time_sampling=(args.time_sampling, True),
+            img_size=rollout_img_size,
+            return_state=False,
+        )
 
         z_txt = fm.embed_txt(prompts) # P D
 
         rng = jax.random.PRNGKey(args.seed)
         print(substrate.n_params)
-        strategy = evosax.Sep_CMA_ES(popsize=args.pop_size, num_dims=substrate.n_params, sigma_init=args.sigma)
+        strategy = _build_strategy(
+            optimizer_name,
+            pop_size=args.pop_size,
+            num_dims=substrate.n_params,
+            sigma_init=args.sigma,
+        )
         es_params = strategy.default_params
-        rng, _rng = split(rng)
-        es_state = strategy.initialize(_rng, es_params)
+        if params_init == "strategy_default":
+            rng, _rng = split(rng)
+            es_state = strategy.initialize(_rng, es_params)
+        elif params_init == "substrate_default":
+            rng, rng_mean, rng_init = jax.random.split(rng, 3)
+            init_mean = substrate.default_params(rng_mean)
+            es_state = _initialize_strategy_with_mean(strategy, rng_init, es_params, init_mean)
+        else:
+            raise ValueError(f"Unhandled params_init {params_init!r}.")
 
         def calc_loss(rng, params): # calculate the loss given the simulation parameters
             rollout_data = rollout_fn(rng, params)

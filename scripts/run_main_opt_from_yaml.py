@@ -71,6 +71,8 @@ EVALUATION_FLAGS = {
 
 OPTIMIZATION_FLAGS = {
     "bs": "bs",
+    "optimizer": "optimizer",
+    "params_init": "params_init",
     "pop_size": "pop_size",
     "n_iters": "n_iters",
     "sigma": "sigma",
