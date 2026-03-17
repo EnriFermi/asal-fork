@@ -4,7 +4,7 @@ meta:
 
 substrate:
   substrate: lenia_flow
-  rollout_steps: 300000
+  rollout_steps: 50000
   grid_size: 192
   C: 3
   k: 135
@@ -60,7 +60,7 @@ evaluation:
 
 optimization:
   bs: 1
-  pop_size: 32
+  pop_size: 1
   n_iters: 1000
   sigma: 0.2
   eval_splits: 1
