@@ -1,15 +1,20 @@
 meta:
-  seed: 1
-  save_dir: experiments/opt_1/checkpoints/clip_oe_run
+  seed: 0
+  save_dir: experiments/frustration/checkpoints/history_dependence_opt1_best
+
+source:
+  checkpoint_dir: experiments/opt_msc/checkpoints/test_run_longer_opt
+  params_name: best
+  params_path: null
 
 substrate:
   substrate: lenia_flow
-  rollout_steps: 50000
-  grid_size: 192
+  grid_size: 384
+  rollout_steps: 1000000
   C: 3
-  k: 135
+  k: 9
   kernel_components: 3
-  M: "15,15,15;15,15,15;15,15,15"
+  M: "2,1,0;0,2,1;1,0,2"
   dd: 5
   dt: 0.2
   sigma: 0.65
@@ -17,7 +22,7 @@ substrate:
   mix_rule: stoch
   base_seed: 0
   seed_patch_size: 20
-  seed_n_patches: 9
+  seed_n_patches: 16
   seed_mode: random_patches
   p_constant_per_patch: 1
   render_mode: Pcolor
@@ -49,29 +54,24 @@ substrate:
   food_diffusion_alpha: 0.0
   mass_clip_eps: 0.0
 
-evaluation:
-  foundation_model: clip   # clip | siglip2 | google/siglip2-so400m-patch16-384-jax
-  time_sampling: 32
-  prompts: "a biological cell"
-  coef_prompt: 0.0
-  coef_softmax: 0.0
-  coef_oe: 1.0
-  coef_smooth: 0.0
+protocol:
+  grid_split: 2
+  warmup_steps: 500000
+  total_steps: 1000000
+  wall_pad: 5
 
-optimization:
-  optimizer: Sep-CMA-ES      # Sep-CMA-ES | LM_MA_ES
-  params_init: strategy_default  # strategy_default | substrate_default
-  bs: 2
-  pop_size: 16
-  n_iters: 200
-  sigma: 0.2
-  eval_splits: 1
+evaluation:
+  n_initial_states: 16
+  foundation_model: clip
+  clip_img_size: 224
+  time_sampling: 8
+  late_window_start_steps: 800000
+  late_window_end_steps: 1000000
+  late_window_size_steps: null
+  distance_metric: cosine_mean
+  resume: true
+  save_embeddings: true
 
 logging:
   wandb_project: asal
-  pca_every: 25
-  pca_history: 100
-  full_video_interval: 0
-  full_video_rollout_steps: 4000
-  full_video_img_size: 140
-
+  wandb_mode: online
