@@ -689,6 +689,7 @@ def _iter_resume_cache_paths(
     expected_raw_path: Path,
     expected_partial_path: Path,
     save_dir: Path,
+    run_path: Path,
     project_root: Path,
     gen_idx: int,
 ) -> list[Path]:
@@ -708,7 +709,7 @@ def _iter_resume_cache_paths(
         f"*__iter_{int(gen_idx):05d}.npz",
         f"*__iter_{int(gen_idx):05d}.partial*.npz",
     ]
-    for base in (expected_raw_path.parent, save_dir, project_root):
+    for base in (expected_raw_path.parent, save_dir, run_path / "raw_scores", run_path, project_root):
         if not base.exists():
             continue
         for pattern in patterns:
@@ -1225,6 +1226,7 @@ def main(cfg, args):
                         expected_raw_path=raw_scores_path,
                         expected_partial_path=partial_scores_path,
                         save_dir=save_dir,
+                        run_path=run_path,
                         project_root=project_root,
                         gen_idx=int(gen_idx),
                     ):
