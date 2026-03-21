@@ -30,12 +30,9 @@ def parse_cli():
         action="store_true",
         help="Generate random best and immediately run APF simulation for all random_batch.n_runs entries.",
     )
-    parser.add_argument(
-        "overrides",
-        nargs="*",
-        help="Optional OmegaConf dotlist overrides, e.g. random_batch.n_runs=3",
-    )
-    return parser.parse_args()
+    args, overrides = parser.parse_known_args()
+    args.overrides = overrides
+    return args
 
 
 def load_config(config_path: str, overrides=None):
