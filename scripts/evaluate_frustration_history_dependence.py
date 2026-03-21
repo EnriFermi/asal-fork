@@ -4,6 +4,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
@@ -15,9 +16,11 @@ from omegaconf import OmegaConf
 from scipy import stats as scipy_stats
 from tqdm.auto import tqdm
 
+import asal_metrics
 import foundation_models
 import substrates
 import util
+from clip_deltah_msc_metric import make_metric_loss_fn, metric_summary, resolve_metric_config
 
 
 def _patch_wandb_pandas_check() -> None:
@@ -103,6 +106,7 @@ def load_config():
         cfg.get("substrate", {}),
         cfg.get("protocol", {}),
         cfg.get("evaluation", {}),
+        cfg.get("metric", {}),
         cfg.get("logging", {}),
     )
     return cfg, flat
@@ -139,11 +143,14 @@ def _load_params(args, project_root: Path) -> jax.Array:
     return jnp.asarray(np.asarray(params, dtype=np.float32))
 
 
-def _create_substrate(args):
+def _create_substrate(args, *, enable_msc: bool = False):
     if args.substrate == "lenia_flow":
+        kw = util.flow_lenia_kwargs_from_args(args)
+        if enable_msc:
+            kw["debug_return_F"] = True
         base = substrates.create_substrate(
             args.substrate,
-            **util.flow_lenia_kwargs_from_args(args),
+            **kw,
         )
     else:
         base = substrates.create_substrate(args.substrate)
@@ -178,6 +185,51 @@ def _resolve_window(args) -> tuple[int, int]:
             f"Got late_window_start_steps={start}, warmup_steps={warmup_steps}."
         )
     return start, end
+
+
+def _init_lagrangian_points_jax(
+    A0: jax.Array,
+    *,
+    n_particles: int,
+    init_mode: str,
+    border: str,
+    sigma: float,
+    key: jax.Array,
+) -> jax.Array:
+    sx = int(A0.shape[0])
+    sy = int(A0.shape[1])
+    init_mode = str(init_mode).strip().lower()
+    if init_mode == "uniform":
+        k0, k1 = jax.random.split(key)
+        y = jax.random.uniform(k0, (n_particles,), minval=0.5, maxval=sx - 0.5)
+        x = jax.random.uniform(k1, (n_particles,), minval=0.5, maxval=sy - 0.5)
+        pts = jnp.stack((y, x), axis=-1)
+    elif init_mode == "mass":
+        mass = jnp.clip(jnp.asarray(A0, dtype=jnp.float32).sum(axis=-1), 0.0, jnp.inf)
+        flat = mass.reshape(-1)
+        total = jnp.sum(flat)
+        probs = jnp.where(total > 0.0, flat / jnp.maximum(total, 1e-12), jnp.ones_like(flat) / flat.size)
+        k_idx, k_jit = jax.random.split(key)
+        idx = jax.random.choice(k_idx, flat.size, shape=(n_particles,), replace=True, p=probs)
+        iy = idx // sy
+        ix = idx % sy
+        jitter = jax.random.uniform(k_jit, (n_particles, 2), minval=-0.49, maxval=0.49)
+        pts = jnp.stack((iy.astype(jnp.float32) + 0.5, ix.astype(jnp.float32) + 0.5), axis=-1) + jitter
+    else:
+        raise ValueError(f"Unknown metric_lagrangian_init_mode={init_mode!r}. Use 'mass' or 'uniform'.")
+
+    if border == "torus":
+        y = jnp.mod(pts[:, 0] - 0.5, sx) + 0.5
+        x = jnp.mod(pts[:, 1] - 0.5, sy) + 0.5
+        pts = jnp.stack((y, x), axis=-1)
+    else:
+        lo = float(sigma)
+        hi_y = float(sx - sigma)
+        hi_x = float(sy - sigma)
+        y = jnp.clip(pts[:, 0], lo, hi_y)
+        x = jnp.clip(pts[:, 1], lo, hi_x)
+        pts = jnp.stack((y, x), axis=-1)
+    return pts.astype(jnp.float32)
 
 
 def _prepare_block_template_state(
@@ -339,6 +391,85 @@ def _build_embedding_rollout(substrate, fm, *, window_steps: int, time_sampling:
     return jax.jit(rollout_fn)
 
 
+def _build_lagrangian_rollout(
+    substrate,
+    *,
+    rollout_steps: int,
+    metric_cfg: dict,
+    lag_n_particles: int,
+    lag_init_mode: str,
+    lag_flow_channel: int,
+    lag_flow_reduce: str,
+    lag_channel_mode: str,
+    lag_noise_model: str,
+    lag_diffusion_scale: float,
+):
+    if rollout_steps <= 0:
+        raise ValueError("MSC rollout_steps must be >= 1.")
+    chunk_steps = int(metric_cfg["sample_every_steps"])
+    time_sampling = int(metric_cfg["time_sampling"])
+    if rollout_steps != chunk_steps * time_sampling:
+        raise ValueError(
+            f"MSC rollout mismatch: rollout_steps={rollout_steps}, "
+            f"sample_every_steps={chunk_steps}, time_sampling={time_sampling}."
+        )
+
+    def rollout_fn(rng_key, state0, params_in):
+        if "F" not in state0:
+            raise ValueError(
+                "State does not contain flow field F. "
+                "For FlowLenia set debug_return_F=true before MSC evaluation."
+            )
+        if not hasattr(substrate, "RT"):
+            raise ValueError("Substrate does not provide RT for lagrangian advection.")
+
+        rt = substrate.RT
+        k_pts, k_ch, k_scan = jax.random.split(rng_key, 3)
+        pts0 = _init_lagrangian_points_jax(
+            state0["A"],
+            n_particles=lag_n_particles,
+            init_mode=lag_init_mode,
+            border=str(getattr(rt, "border", "wall")),
+            sigma=float(getattr(rt, "sigma", 0.0)),
+            key=k_pts,
+        )
+        if lag_channel_mode in ("fixed", "resample"):
+            ch0 = rt.sample_point_channels(pts0, state0["A"], k_ch)
+        else:
+            ch0 = jnp.zeros((lag_n_particles,), dtype=jnp.int32)
+
+        def step_fn(state, key_step):
+            st, pts, ch = state
+            st = substrate.step_state(key_step, st, params_in)
+            lag_key = jax.random.fold_in(key_step, jnp.uint32(0x4C4147))
+            pts, ch = rt.advect_particles(
+                points=pts,
+                F=st["F"],
+                A=st["A"],
+                channel=lag_flow_channel,
+                reduce=lag_flow_reduce,
+                point_channels=ch,
+                channel_mode=lag_channel_mode,
+                key=lag_key,
+                noise_model=lag_noise_model,
+                diffusion_scale=lag_diffusion_scale,
+            )
+            return (st, pts, ch), None
+
+        def chunk_fn(state, key_chunk):
+            state_next, _ = jax.lax.scan(step_fn, state, jax.random.split(key_chunk, chunk_steps))
+            return state_next, state_next[1]
+
+        (_, _, _), xy_seq = jax.lax.scan(
+            chunk_fn,
+            (state0, pts0, ch0),
+            jax.random.split(k_scan, time_sampling),
+        )
+        return xy_seq
+
+    return jax.jit(rollout_fn)
+
+
 def _sequence_distance(z_a: np.ndarray, z_b: np.ndarray, metric: str) -> tuple[float, np.ndarray]:
     a = np.asarray(z_a, dtype=np.float32)
     b = np.asarray(z_b, dtype=np.float32)
@@ -363,15 +494,10 @@ def _sequence_distance(z_a: np.ndarray, z_b: np.ndarray, metric: str) -> tuple[f
     return float(np.mean(per_t)), np.asarray(per_t, dtype=np.float32)
 
 
-def _summarize_trials(rows: list[dict]) -> dict:
-    if not rows:
-        return {}
-
-    baseline = np.asarray([float(r["baseline_distance"]) for r in rows], dtype=np.float64)
-    effect = np.asarray([float(r["walls_effect_distance"]) for r in rows], dtype=np.float64)
+def _summarize_numeric_pairs(baseline: np.ndarray, effect: np.ndarray) -> dict:
     diff = effect - baseline
     ratio = effect / np.maximum(baseline, 1e-12)
-    n_trials = int(len(rows))
+    n_trials = int(baseline.shape[0])
 
     wilcoxon_greater = None
     wilcoxon_two_sided = None
@@ -396,10 +522,10 @@ def _summarize_trials(rows: list[dict]) -> dict:
 
     return {
         "n_trials": n_trials,
-        "mean_baseline_distance": float(np.mean(baseline)),
-        "std_baseline_distance": float(np.std(baseline, ddof=1) if n_trials > 1 else 0.0),
-        "mean_walls_effect_distance": float(np.mean(effect)),
-        "std_walls_effect_distance": float(np.std(effect, ddof=1) if n_trials > 1 else 0.0),
+        "mean_baseline": float(np.mean(baseline)),
+        "std_baseline": float(np.std(baseline, ddof=1) if n_trials > 1 else 0.0),
+        "mean_effect": float(np.mean(effect)),
+        "std_effect": float(np.std(effect, ddof=1) if n_trials > 1 else 0.0),
         "mean_effect_minus_baseline": float(np.mean(diff)),
         "median_effect_minus_baseline": float(np.median(diff)),
         "std_effect_minus_baseline": float(np.std(diff, ddof=1) if n_trials > 1 else 0.0),
@@ -413,6 +539,56 @@ def _summarize_trials(rows: list[dict]) -> dict:
         "wilcoxon_two_sided_pvalue": wilcoxon_two_sided,
         "sign_test_greater_pvalue": sign_test_greater,
     }
+
+
+def _summarize_trials(rows: list[dict]) -> dict:
+    if not rows:
+        return {}
+    baseline = np.asarray([float(r["baseline_distance"]) for r in rows], dtype=np.float64)
+    effect = np.asarray([float(r["walls_effect_distance"]) for r in rows], dtype=np.float64)
+    base = _summarize_numeric_pairs(baseline, effect)
+    return {
+        "n_trials": int(base["n_trials"]),
+        "mean_baseline_distance": float(base["mean_baseline"]),
+        "std_baseline_distance": float(base["std_baseline"]),
+        "mean_walls_effect_distance": float(base["mean_effect"]),
+        "std_walls_effect_distance": float(base["std_effect"]),
+        "mean_effect_minus_baseline": float(base["mean_effect_minus_baseline"]),
+        "median_effect_minus_baseline": float(base["median_effect_minus_baseline"]),
+        "std_effect_minus_baseline": float(base["std_effect_minus_baseline"]),
+        "mean_effect_over_baseline_ratio": float(base["mean_effect_over_baseline_ratio"]),
+        "median_effect_over_baseline_ratio": float(base["median_effect_over_baseline_ratio"]),
+        "fraction_effect_gt_baseline": float(base["fraction_effect_gt_baseline"]),
+        "fraction_effect_ge_baseline": float(base["fraction_effect_ge_baseline"]),
+        "gt_count": int(base["gt_count"]),
+        "ge_count": int(base["ge_count"]),
+        "wilcoxon_greater_pvalue": base["wilcoxon_greater_pvalue"],
+        "wilcoxon_two_sided_pvalue": base["wilcoxon_two_sided_pvalue"],
+        "sign_test_greater_pvalue": base["sign_test_greater_pvalue"],
+    }
+
+
+def _summarize_prefixed_rows(rows: list[dict], *, baseline_key: str, effect_key: str, prefix: str) -> dict:
+    filtered = [r for r in rows if baseline_key in r and effect_key in r]
+    if not filtered:
+        return {}
+    baseline = np.asarray([float(r[baseline_key]) for r in filtered], dtype=np.float64)
+    effect = np.asarray([float(r[effect_key]) for r in filtered], dtype=np.float64)
+    base = _summarize_numeric_pairs(baseline, effect)
+    return {f"{prefix}_{k}": v for k, v in base.items()}
+
+
+def _scalarize_dict(payload: dict) -> dict:
+    out = {}
+    for key, value in payload.items():
+        arr = np.asarray(jax.device_get(value))
+        out[key] = arr.item() if arr.shape == () else arr.tolist()
+    return out
+
+
+def _calc_oe_loss_np(z_seq: np.ndarray) -> float:
+    val = asal_metrics.calc_open_endedness_score(jnp.asarray(z_seq, dtype=jnp.float32))
+    return float(np.asarray(jax.device_get(val)))
 
 
 def main(cfg, args):
@@ -435,8 +611,13 @@ def main(cfg, args):
     )
 
     try:
+        enable_clip = bool(getattr(args, "enable_clip", True))
+        enable_msc = bool(getattr(args, "enable_msc", cfg.get("metric", None) is not None))
+        if not enable_clip and not enable_msc:
+            raise ValueError("At least one of evaluation.enable_clip / evaluation.enable_msc must be true.")
+
         params = _load_params(args, project_root)
-        substrate = _create_substrate(args)
+        substrate = _create_substrate(args, enable_msc=enable_msc)
         expected_len = int(np.asarray(substrate.default_params(jax.random.PRNGKey(0))).size)
         if int(params.shape[-1]) != expected_len:
             raise ValueError(
@@ -472,25 +653,77 @@ def main(cfg, args):
             substrates.create_substrate("lenia_flow", **block_kwargs)
         )
 
-        fm_name = str(getattr(args, "foundation_model", "clip"))
-        fm = foundation_models.create_foundation_model(fm_name)
-        clip_img_size = int(getattr(args, "clip_img_size", 224))
-        distance_metric = str(getattr(args, "distance_metric", "cosine_mean"))
         resume = bool(getattr(args, "resume", True))
         save_embeddings = bool(getattr(args, "save_embeddings", True))
+        save_lagrangian_tracks = bool(getattr(args, "save_lagrangian_tracks", enable_msc))
+
+        fm_name = None
+        fm = None
+        clip_img_size = None
+        distance_metric = None
+        embed_rollout = None
+        if enable_clip:
+            fm_name = str(getattr(args, "foundation_model", "clip"))
+            fm = foundation_models.create_foundation_model(fm_name)
+            clip_img_size = int(getattr(args, "clip_img_size", 224))
+            distance_metric = str(getattr(args, "distance_metric", "cosine_mean"))
+
+        metric_cfg = None
+        metric_info = None
+        metric_eval = None
+        lagrangian_rollout = None
+        if enable_msc:
+            metric_node = OmegaConf.merge(cfg.get("substrate", {}), cfg.get("metric", {}))
+            metric_dict = OmegaConf.to_container(metric_node, resolve=True)
+            metric_args = SimpleNamespace(**metric_dict)
+            metric_args.rollout_steps = int(late_window_steps)
+            if getattr(metric_args, "metric_periodic", None) is None:
+                metric_args.metric_periodic = str(getattr(substrate, "border", "wall")) == "torus"
+            if getattr(metric_args, "metric_domain_y", None) is None:
+                metric_args.metric_domain_y = float(
+                    getattr(getattr(substrate, "cfg", None), "X", getattr(substrate, "grid_size", 0))
+                )
+            if getattr(metric_args, "metric_domain_x", None) is None:
+                metric_args.metric_domain_x = float(
+                    getattr(getattr(substrate, "cfg", None), "Y", getattr(substrate, "grid_size", 0))
+                )
+            metric_cfg = resolve_metric_config(metric_args)
+            metric_info = metric_summary(metric_cfg)
+            metric_info = dict(
+                metric_info,
+                trajectory_start_steps=int(late_start),
+                trajectory_end_steps=int(late_end),
+                trajectory_window_steps=int(late_window_steps),
+            )
+            _write_json(save_dir / "msc_metric_summary.json", metric_info)
+            metric_loss_fn = make_metric_loss_fn(metric_cfg)
+            metric_eval = jax.jit(metric_loss_fn)
+            lagrangian_rollout = _build_lagrangian_rollout(
+                substrate,
+                rollout_steps=late_window_steps,
+                metric_cfg=metric_cfg,
+                lag_n_particles=int(getattr(metric_args, "metric_lagrangian_n_particles", 256)),
+                lag_init_mode=str(getattr(metric_args, "metric_lagrangian_init_mode", "mass")),
+                lag_flow_channel=int(getattr(metric_args, "metric_lagrangian_flow_channel", -1)),
+                lag_flow_reduce=str(getattr(metric_args, "metric_lagrangian_flow_reduce", "mass_weighted")),
+                lag_channel_mode=str(getattr(metric_args, "metric_lagrangian_channel_mode", "mix")),
+                lag_noise_model=str(getattr(metric_args, "metric_lagrangian_noise_model", "none")),
+                lag_diffusion_scale=float(getattr(metric_args, "metric_lagrangian_diffusion_scale", 1.0)),
+            )
 
         block_template = block_substrate.init_state(jax.random.PRNGKey(0), params)
 
         control_prefix_advancer = _build_state_advancer(substrate, late_start)
         walls_warmupper = _build_block_warmupper(block_substrate, n_blocks, warmup_steps)
         walls_post_advancer = _build_state_advancer(substrate, late_start - warmup_steps)
-        embed_rollout = _build_embedding_rollout(
-            substrate,
-            fm,
-            window_steps=late_window_steps,
-            time_sampling=time_sampling,
-            img_size=clip_img_size,
-        )
+        if enable_clip:
+            embed_rollout = _build_embedding_rollout(
+                substrate,
+                fm,
+                window_steps=late_window_steps,
+                time_sampling=time_sampling,
+                img_size=clip_img_size,
+            )
 
         trial_dir = save_dir / "trial_data"
         trial_dir.mkdir(parents=True, exist_ok=True)
@@ -510,11 +743,22 @@ def main(cfg, args):
                 k_walls_warm,
                 k_walls_post,
                 k_walls_window,
-            ) = jax.random.split(trial_key, 8)
+                k_ctrl_a_msc_roll,
+                k_ctrl_a_msc_metric,
+                k_ctrl_b_msc_roll,
+                k_ctrl_b_msc_metric,
+                k_walls_msc_roll,
+                k_walls_msc_metric,
+            ) = jax.random.split(trial_key, 14)
 
             trial_json = trial_dir / f"trial_{trial_idx:05d}.json"
             trial_npz = trial_dir / f"trial_{trial_idx:05d}_embeddings.npz"
-            trial_complete = trial_json.exists() and (not save_embeddings or trial_npz.exists())
+            trial_lag_npz = trial_dir / f"trial_{trial_idx:05d}_lagrangian.npz"
+            trial_complete = (
+                trial_json.exists()
+                and (not enable_clip or not save_embeddings or trial_npz.exists())
+                and (not save_lagrangian_tracks or not enable_msc or trial_lag_npz.exists())
+            )
             if resume and trial_complete:
                 with trial_json.open("r") as f:
                     row = json.load(f)
@@ -524,10 +768,7 @@ def main(cfg, args):
             initial_state = substrate.init_state(k_init, params)
 
             control_a_start = control_prefix_advancer(k_ctrl_a_prefix, initial_state, params)
-            z_control_a = np.asarray(jax.device_get(embed_rollout(k_ctrl_a_window, control_a_start, params)), dtype=np.float32)
-
             control_b_start = control_prefix_advancer(k_ctrl_b_prefix, initial_state, params)
-            z_control_b = np.asarray(jax.device_get(embed_rollout(k_ctrl_b_window, control_b_start, params)), dtype=np.float32)
 
             block_state0 = _prepare_block_template_state(
                 initial_state=initial_state,
@@ -547,58 +788,209 @@ def main(cfg, args):
                 pad=pad,
             )
             walls_start = walls_post_advancer(k_walls_post, merged_state, params)
-            z_walls = np.asarray(jax.device_get(embed_rollout(k_walls_window, walls_start, params)), dtype=np.float32)
-
-            baseline_distance, baseline_per_t = _sequence_distance(z_control_a, z_control_b, distance_metric)
-            walls_a_distance, walls_a_per_t = _sequence_distance(z_control_a, z_walls, distance_metric)
-            walls_b_distance, walls_b_per_t = _sequence_distance(z_control_b, z_walls, distance_metric)
-            walls_effect_distance = float(0.5 * (walls_a_distance + walls_b_distance))
 
             row = {
                 "trial_idx": int(trial_idx),
-                "baseline_distance": float(baseline_distance),
-                "walls_effect_distance": float(walls_effect_distance),
-                "walls_effect_distance_ctrl_a": float(walls_a_distance),
-                "walls_effect_distance_ctrl_b": float(walls_b_distance),
-                "effect_minus_baseline": float(walls_effect_distance - baseline_distance),
-                "effect_over_baseline_ratio": float(walls_effect_distance / max(baseline_distance, 1e-12)),
-                "embeddings_path": None if not save_embeddings else str(trial_npz),
+                "embeddings_path": None if not (enable_clip and save_embeddings) else str(trial_npz),
+                "lagrangian_path": None if not (enable_msc and save_lagrangian_tracks) else str(trial_lag_npz),
                 "late_window_start_steps": int(late_start),
                 "late_window_end_steps": int(late_end),
                 "late_window_steps": int(late_window_steps),
                 "warmup_steps": int(warmup_steps),
                 "total_steps": int(total_steps),
-                "time_sampling": int(time_sampling),
+                "clip_time_sampling": None if not enable_clip else int(time_sampling),
                 "distance_metric": distance_metric,
                 "foundation_model": fm_name,
             }
-            _write_json(trial_json, row)
-            if save_embeddings:
-                _save_npz_atomic(
-                    trial_npz,
-                    z_control_a=z_control_a,
-                    z_control_b=z_control_b,
-                    z_walls=z_walls,
-                    baseline_per_t=baseline_per_t,
-                    walls_ctrl_a_per_t=walls_a_per_t,
-                    walls_ctrl_b_per_t=walls_b_per_t,
-                )
-            rows.append(row)
+            pbar_stats = {}
 
-            pbar.set_postfix(
-                baseline=f"{baseline_distance:.4f}",
-                effect=f"{walls_effect_distance:.4f}",
-                delta=f"{(walls_effect_distance - baseline_distance):.4f}",
-            )
+            if enable_clip:
+                z_control_a = np.asarray(
+                    jax.device_get(embed_rollout(k_ctrl_a_window, control_a_start, params)),
+                    dtype=np.float32,
+                )
+                z_control_b = np.asarray(
+                    jax.device_get(embed_rollout(k_ctrl_b_window, control_b_start, params)),
+                    dtype=np.float32,
+                )
+                z_walls = np.asarray(
+                    jax.device_get(embed_rollout(k_walls_window, walls_start, params)),
+                    dtype=np.float32,
+                )
+
+                baseline_distance, baseline_per_t = _sequence_distance(z_control_a, z_control_b, distance_metric)
+                walls_a_distance, walls_a_per_t = _sequence_distance(z_control_a, z_walls, distance_metric)
+                walls_b_distance, walls_b_per_t = _sequence_distance(z_control_b, z_walls, distance_metric)
+                walls_effect_distance = float(0.5 * (walls_a_distance + walls_b_distance))
+                clip_oe_loss_control_a = _calc_oe_loss_np(z_control_a)
+                clip_oe_loss_control_b = _calc_oe_loss_np(z_control_b)
+                clip_oe_loss_walls = _calc_oe_loss_np(z_walls)
+                clip_oe_loss_control_mean = 0.5 * (clip_oe_loss_control_a + clip_oe_loss_control_b)
+
+                row.update(
+                    {
+                        "baseline_distance": float(baseline_distance),
+                        "walls_effect_distance": float(walls_effect_distance),
+                        "walls_effect_distance_ctrl_a": float(walls_a_distance),
+                        "walls_effect_distance_ctrl_b": float(walls_b_distance),
+                        "effect_minus_baseline": float(walls_effect_distance - baseline_distance),
+                        "effect_over_baseline_ratio": float(walls_effect_distance / max(baseline_distance, 1e-12)),
+                        "clip_oe_loss_control_a": float(clip_oe_loss_control_a),
+                        "clip_oe_loss_control_b": float(clip_oe_loss_control_b),
+                        "clip_oe_loss_control_mean": float(clip_oe_loss_control_mean),
+                        "clip_oe_loss_walls": float(clip_oe_loss_walls),
+                        "clip_oe_loss_walls_minus_control_mean": float(clip_oe_loss_walls - clip_oe_loss_control_mean),
+                    }
+                )
+                if save_embeddings:
+                    _save_npz_atomic(
+                        trial_npz,
+                        z_control_a=z_control_a,
+                        z_control_b=z_control_b,
+                        z_walls=z_walls,
+                        baseline_per_t=baseline_per_t,
+                        walls_ctrl_a_per_t=walls_a_per_t,
+                        walls_ctrl_b_per_t=walls_b_per_t,
+                    )
+                pbar_stats.update(
+                    {
+                        "clip_base": f"{baseline_distance:.4f}",
+                        "clip_delta": f"{(walls_effect_distance - baseline_distance):.4f}",
+                    }
+                )
+
+            if enable_msc:
+                xy_control_a = np.asarray(
+                    jax.device_get(lagrangian_rollout(k_ctrl_a_msc_roll, control_a_start, params)),
+                    dtype=np.float32,
+                )
+                xy_control_b = np.asarray(
+                    jax.device_get(lagrangian_rollout(k_ctrl_b_msc_roll, control_b_start, params)),
+                    dtype=np.float32,
+                )
+                xy_walls = np.asarray(
+                    jax.device_get(lagrangian_rollout(k_walls_msc_roll, walls_start, params)),
+                    dtype=np.float32,
+                )
+
+                msc_loss_control_a, msc_metrics_control_a = metric_eval(
+                    k_ctrl_a_msc_metric,
+                    jnp.asarray(xy_control_a),
+                )
+                msc_loss_control_b, msc_metrics_control_b = metric_eval(
+                    k_ctrl_b_msc_metric,
+                    jnp.asarray(xy_control_b),
+                )
+                msc_loss_walls, msc_metrics_walls = metric_eval(
+                    k_walls_msc_metric,
+                    jnp.asarray(xy_walls),
+                )
+                msc_loss_control_a = float(np.asarray(jax.device_get(msc_loss_control_a)))
+                msc_loss_control_b = float(np.asarray(jax.device_get(msc_loss_control_b)))
+                msc_loss_walls = float(np.asarray(jax.device_get(msc_loss_walls)))
+                msc_metrics_control_a = _scalarize_dict(msc_metrics_control_a)
+                msc_metrics_control_b = _scalarize_dict(msc_metrics_control_b)
+                msc_metrics_walls = _scalarize_dict(msc_metrics_walls)
+                msc_loss_control_mean = 0.5 * (msc_loss_control_a + msc_loss_control_b)
+                msc_score_control_mean = 0.5 * (
+                    float(msc_metrics_control_a["score"]) + float(msc_metrics_control_b["score"])
+                )
+
+                row.update(
+                    {
+                        "msc_loss_control_a": float(msc_loss_control_a),
+                        "msc_loss_control_b": float(msc_loss_control_b),
+                        "msc_loss_control_mean": float(msc_loss_control_mean),
+                        "msc_loss_walls": float(msc_loss_walls),
+                        "msc_loss_walls_minus_control_mean": float(msc_loss_walls - msc_loss_control_mean),
+                        "msc_score_control_a": float(msc_metrics_control_a["score"]),
+                        "msc_score_control_b": float(msc_metrics_control_b["score"]),
+                        "msc_score_control_mean": float(msc_score_control_mean),
+                        "msc_score_walls": float(msc_metrics_walls["score"]),
+                        "msc_score_walls_minus_control_mean": float(
+                            float(msc_metrics_walls["score"]) - msc_score_control_mean
+                        ),
+                        "msc_amp_control_a": float(msc_metrics_control_a["amp"]),
+                        "msc_amp_control_b": float(msc_metrics_control_b["amp"]),
+                        "msc_amp_walls": float(msc_metrics_walls["amp"]),
+                        "msc_component_control_a": float(msc_metrics_control_a["msc"]),
+                        "msc_component_control_b": float(msc_metrics_control_b["msc"]),
+                        "msc_component_walls": float(msc_metrics_walls["msc"]),
+                        "msc_tau_best_steps_control_a": int(msc_metrics_control_a["tau_best_steps"]),
+                        "msc_tau_best_steps_control_b": int(msc_metrics_control_b["tau_best_steps"]),
+                        "msc_tau_best_steps_walls": int(msc_metrics_walls["tau_best_steps"]),
+                        "msc_sample_every_steps": int(metric_cfg["sample_every_steps"]),
+                        "msc_time_sampling": int(metric_cfg["time_sampling"]),
+                    }
+                )
+                if save_lagrangian_tracks:
+                    _save_npz_atomic(
+                        trial_lag_npz,
+                        xy_control_a=xy_control_a,
+                        xy_control_b=xy_control_b,
+                        xy_walls=xy_walls,
+                        sample_offsets_steps=(
+                            np.arange(1, int(metric_cfg["time_sampling"]) + 1, dtype=np.int32)
+                            * int(metric_cfg["sample_every_steps"])
+                        ),
+                        sample_every_steps=np.asarray(int(metric_cfg["sample_every_steps"]), dtype=np.int32),
+                        trajectory_start_steps=np.asarray(int(late_start), dtype=np.int32),
+                        trajectory_end_steps=np.asarray(int(late_end), dtype=np.int32),
+                        trajectory_window_steps=np.asarray(int(late_window_steps), dtype=np.int32),
+                        metric_window_size_steps=np.asarray(int(metric_cfg["window_size_frames"] * metric_cfg["sample_every_steps"]), dtype=np.int32),
+                        metric_window_step_steps=np.asarray(int(metric_cfg["window_step_frames"] * metric_cfg["sample_every_steps"]), dtype=np.int32),
+                        metric_tau_steps=np.asarray(int(metric_cfg["tau_steps"]), dtype=np.int32),
+                    )
+                pbar_stats.update(
+                    {
+                        "msc_ctrl": f"{msc_loss_control_mean:.4f}",
+                        "msc_walls": f"{msc_loss_walls:.4f}",
+                    }
+                )
+
+            _write_json(trial_json, row)
+            rows.append(row)
+            if pbar_stats:
+                pbar.set_postfix(**pbar_stats)
 
         rows = sorted(rows, key=lambda r: int(r["trial_idx"]))
-        summary = _summarize_trials(rows)
+        summary = {}
+        if enable_clip:
+            summary.update(_summarize_trials(rows))
+            summary.update(
+                _summarize_prefixed_rows(
+                    rows,
+                    baseline_key="clip_oe_loss_control_mean",
+                    effect_key="clip_oe_loss_walls",
+                    prefix="clip_oe_loss",
+                )
+            )
+        if enable_msc:
+            summary.update(
+                _summarize_prefixed_rows(
+                    rows,
+                    baseline_key="msc_loss_control_mean",
+                    effect_key="msc_loss_walls",
+                    prefix="msc_loss",
+                )
+            )
+            summary.update(
+                _summarize_prefixed_rows(
+                    rows,
+                    baseline_key="msc_score_control_mean",
+                    effect_key="msc_score_walls",
+                    prefix="msc_score",
+                )
+            )
         summary.update(
             {
+                "n_trials": int(len(rows)),
                 "save_dir": str(save_dir),
                 "checkpoint_dir": None if resolved_checkpoint_dir is None else str(resolved_checkpoint_dir),
                 "params_path": None if resolved_params_path is None else str(resolved_params_path),
                 "params_name": str(getattr(args, "params_name", "best")),
+                "enable_clip": bool(enable_clip),
+                "enable_msc": bool(enable_msc),
                 "foundation_model": fm_name,
                 "distance_metric": distance_metric,
                 "grid_split": int(split_n),
@@ -608,11 +1000,14 @@ def main(cfg, args):
                 "late_window_start_steps": int(late_start),
                 "late_window_end_steps": int(late_end),
                 "late_window_steps": int(late_window_steps),
-                "time_sampling": int(time_sampling),
+                "clip_time_sampling": None if not enable_clip else int(time_sampling),
                 "resume_enabled": bool(resume),
                 "save_embeddings": bool(save_embeddings),
+                "save_lagrangian_tracks": bool(save_lagrangian_tracks),
             }
         )
+        if metric_info is not None:
+            summary["msc_metric_summary"] = metric_info
 
         _save_csv(save_dir / "trial_results.csv", rows)
         _write_json(save_dir / "summary.json", summary)
@@ -626,15 +1021,22 @@ def main(cfg, args):
         for key, value in summary.items():
             if isinstance(value, (int, float)) and value is not None:
                 run.summary[f"history_dependence/{key}"] = value
+        if metric_info is not None:
+            run.summary["history_dependence/msc_metric_summary"] = str(metric_info)
 
         print(f"Completed trials: {summary.get('n_trials', 0)}")
-        print(f"Mean baseline distance: {summary.get('mean_baseline_distance', float('nan')):.6f}")
-        print(f"Mean walls-effect distance: {summary.get('mean_walls_effect_distance', float('nan')):.6f}")
-        print(f"Mean effect-baseline delta: {summary.get('mean_effect_minus_baseline', float('nan')):.6f}")
-        print(f"Fraction effect > baseline: {summary.get('fraction_effect_gt_baseline', float('nan')):.6f}")
-        pval = summary.get("wilcoxon_greater_pvalue", None)
-        if pval is not None:
-            print(f"Wilcoxon p(effect > baseline): {pval:.6g}")
+        if enable_clip:
+            print(f"Mean baseline distance: {summary.get('mean_baseline_distance', float('nan')):.6f}")
+            print(f"Mean walls-effect distance: {summary.get('mean_walls_effect_distance', float('nan')):.6f}")
+            print(f"Mean effect-baseline delta: {summary.get('mean_effect_minus_baseline', float('nan')):.6f}")
+            print(f"Fraction effect > baseline: {summary.get('fraction_effect_gt_baseline', float('nan')):.6f}")
+            pval = summary.get("wilcoxon_greater_pvalue", None)
+            if pval is not None:
+                print(f"Wilcoxon p(effect > baseline): {pval:.6g}")
+            print(f"Mean CLIP OE walls-control delta: {summary.get('clip_oe_loss_mean_effect_minus_baseline', float('nan')):.6f}")
+        if enable_msc:
+            print(f"Mean MSC loss walls-control delta: {summary.get('msc_loss_mean_effect_minus_baseline', float('nan')):.6f}")
+            print(f"Mean MSC score walls-control delta: {summary.get('msc_score_mean_effect_minus_baseline', float('nan')):.6f}")
     finally:
         run.finish()
 
