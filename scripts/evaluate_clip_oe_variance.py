@@ -709,11 +709,25 @@ def _iter_resume_cache_paths(
         f"*__iter_{int(gen_idx):05d}.npz",
         f"*__iter_{int(gen_idx):05d}.partial*.npz",
     ]
-    for base in (expected_raw_path.parent, save_dir, run_path / "raw_scores", run_path, project_root):
+    direct_bases = (
+        expected_raw_path.parent,
+        save_dir,
+        run_path / "raw_scores",
+        run_path,
+        project_root,
+    )
+    for base in direct_bases:
         if not base.exists():
             continue
         for pattern in patterns:
             for path in sorted(base.glob(pattern)):
+                add(path)
+    sibling_root = run_path.parent
+    if sibling_root.exists():
+        for pattern in patterns:
+            for path in sorted(sibling_root.glob(f"*/raw_scores/{pattern}")):
+                add(path)
+            for path in sorted(sibling_root.glob(pattern)):
                 add(path)
     return out
 
@@ -1222,6 +1236,7 @@ def main(cfg, args):
                 known_mask = np.zeros((total_size,), dtype=bool)
                 seed_info = None
                 if resume:
+                    best_seed = None
                     for cache_path in _iter_resume_cache_paths(
                         expected_raw_path=raw_scores_path,
                         expected_partial_path=partial_scores_path,
@@ -1241,8 +1256,11 @@ def main(cfg, args):
                         )
                         if seed_result is None:
                             continue
-                        scores_flat_by_metric, known_mask, seed_info = seed_result
-                        break
+                        seeded_scores, seeded_mask, seeded_info = seed_result
+                        if best_seed is None or int(seeded_info["seeded_count"]) > int(best_seed[2]["seeded_count"]):
+                            best_seed = (seeded_scores, seeded_mask, seeded_info)
+                    if best_seed is not None:
+                        scores_flat_by_metric, known_mask, seed_info = best_seed
 
                 loaded_candidate_indices = candidate_indices
                 loaded_candidate_labels = candidate_labels
