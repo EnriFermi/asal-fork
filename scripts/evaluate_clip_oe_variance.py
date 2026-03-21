@@ -571,6 +571,7 @@ def _save_partial_population_scores(
     candidate_indices: np.ndarray,
     candidate_labels: np.ndarray,
     training_losses: np.ndarray | None,
+    known_mask: np.ndarray | None = None,
 ) -> None:
     payload: dict[str, np.ndarray] = {
         "meta__bs_values": np.asarray(bs_values, dtype=np.int32),
@@ -584,6 +585,8 @@ def _save_partial_population_scores(
     }
     if training_losses is not None:
         payload["meta__training_losses_selected"] = np.asarray(training_losses, dtype=np.float32)
+    if known_mask is not None:
+        payload["meta__known_mask"] = np.asarray(known_mask, dtype=bool)
     for metric_name, flat_scores in scores_flat_by_metric.items():
         payload[f"{metric_name}__scores_flat"] = np.asarray(flat_scores, dtype=np.float32)
     _save_npz_atomic(out_path, **payload)
@@ -665,6 +668,189 @@ def _load_partial_population_scores(
                 )
             scores_flat_by_metric[metric_name] = flat
     return scores_flat_by_metric, stored_completed, candidate_indices, candidate_labels, training_losses
+
+
+def _compute_total_single_scores(bs_ref: int, bs_values: list[int], n_repeats: int) -> int:
+    return int(bs_ref) + int(n_repeats) * sum(int(bs) for bs in bs_values)
+
+
+def _score_layout(bs_ref: int, bs_values: list[int], n_repeats: int) -> dict[str | int, tuple[int, int]]:
+    layout: dict[str | int, tuple[int, int]] = {"ref": (0, int(bs_ref))}
+    offset = int(bs_ref)
+    for bs in bs_values:
+        width = int(n_repeats) * int(bs)
+        layout[int(bs)] = (offset, offset + width)
+        offset += width
+    return layout
+
+
+def _iter_resume_cache_paths(
+    *,
+    expected_raw_path: Path,
+    expected_partial_path: Path,
+    save_dir: Path,
+    project_root: Path,
+    gen_idx: int,
+) -> list[Path]:
+    out: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(path: Path) -> None:
+        path = Path(path)
+        if path in seen:
+            return
+        seen.add(path)
+        out.append(path)
+
+    add(expected_raw_path)
+    add(expected_partial_path)
+    patterns = [
+        f"*__iter_{int(gen_idx):05d}.npz",
+        f"*__iter_{int(gen_idx):05d}.partial*.npz",
+    ]
+    for base in (expected_raw_path.parent, save_dir, project_root):
+        if not base.exists():
+            continue
+        for pattern in patterns:
+            for path in sorted(base.glob(pattern)):
+                add(path)
+    return out
+
+
+def _seed_scores_from_cache_file(
+    in_path: Path,
+    *,
+    metric_names: list[str],
+    bs_values: list[int],
+    n_repeats: int,
+    bs_ref: int,
+    candidate_indices_current: np.ndarray,
+    total_single_scores: int,
+) -> tuple[dict[str, np.ndarray], np.ndarray, dict[str, object]] | None:
+    if not in_path.exists():
+        return None
+
+    with np.load(in_path, allow_pickle=False) as data:
+        required_meta = {"meta__bs_values", "meta__bs_ref", "meta__n_repeats", "meta__candidate_indices"}
+        if not required_meta.issubset(set(data.files)):
+            return None
+
+        stored_bs_values = np.asarray(data["meta__bs_values"], dtype=np.int32).tolist()
+        stored_bs_ref = int(np.asarray(data["meta__bs_ref"]).reshape(()))
+        stored_n_repeats = int(np.asarray(data["meta__n_repeats"]).reshape(()))
+        if stored_bs_values != [int(x) for x in bs_values]:
+            return None
+        if stored_bs_ref != int(bs_ref):
+            return None
+        if stored_n_repeats < 1 or stored_n_repeats > int(n_repeats):
+            return None
+
+        if "meta__metric_names" in data.files:
+            stored_metric_names = sorted(str(x) for x in np.asarray(data["meta__metric_names"]).tolist())
+            if stored_metric_names != sorted(metric_names):
+                return None
+
+        candidate_indices_stored = np.asarray(data["meta__candidate_indices"], dtype=np.int32)
+        candidate_labels_stored = (
+            np.asarray(data["meta__candidate_labels"]).astype(str)
+            if "meta__candidate_labels" in data.files
+            else np.asarray(["cached"] * int(candidate_indices_stored.size), dtype="<U8")
+        )
+
+        current_row_by_idx = {int(idx): row for row, idx in enumerate(np.asarray(candidate_indices_current, dtype=np.int32).tolist())}
+        if any(int(idx) not in current_row_by_idx for idx in candidate_indices_stored.tolist()):
+            return None
+
+        stored_total_single_scores = int(
+            np.asarray(data["meta__total_single_scores"]).reshape(())
+        ) if "meta__total_single_scores" in data.files else _compute_total_single_scores(
+            stored_bs_ref,
+            [int(x) for x in stored_bs_values],
+            stored_n_repeats,
+        )
+
+        cached_score_matrices: dict[str, np.ndarray] = {}
+        cache_kind = None
+        if all(f"{metric_name}__score_matrix_single" in data.files for metric_name in metric_names):
+            cache_kind = "raw"
+            for metric_name in metric_names:
+                matrix = np.asarray(data[f"{metric_name}__score_matrix_single"], dtype=np.float32)
+                if matrix.shape != (int(candidate_indices_stored.size), stored_total_single_scores):
+                    return None
+                cached_score_matrices[metric_name] = matrix
+            stored_known_mask = np.ones(
+                (int(candidate_indices_stored.size), stored_total_single_scores),
+                dtype=bool,
+            )
+        elif all(f"{metric_name}__scores_flat" in data.files for metric_name in metric_names):
+            cache_kind = "partial"
+            flat_size = int(candidate_indices_stored.size) * stored_total_single_scores
+            if "meta__known_mask" in data.files:
+                known_flat = np.asarray(data["meta__known_mask"], dtype=bool).reshape(-1)
+                if known_flat.size != flat_size:
+                    return None
+            elif "meta__completed" in data.files:
+                completed = int(np.asarray(data["meta__completed"]).reshape(()))
+                if not (0 <= completed <= flat_size):
+                    return None
+                known_flat = np.zeros((flat_size,), dtype=bool)
+                known_flat[:completed] = True
+            else:
+                return None
+            stored_known_mask = known_flat.reshape(int(candidate_indices_stored.size), stored_total_single_scores)
+            for metric_name in metric_names:
+                flat = np.asarray(data[f"{metric_name}__scores_flat"], dtype=np.float32).reshape(-1)
+                if flat.size != flat_size:
+                    return None
+                cached_score_matrices[metric_name] = flat.reshape(int(candidate_indices_stored.size), stored_total_single_scores)
+        else:
+            return None
+
+    current_candidate_count = int(candidate_indices_current.size)
+    seeded_matrices = {
+        metric_name: np.full((current_candidate_count, total_single_scores), np.nan, dtype=np.float32)
+        for metric_name in metric_names
+    }
+    seeded_known_mask = np.zeros((current_candidate_count, total_single_scores), dtype=bool)
+
+    stored_layout = _score_layout(int(bs_ref), [int(x) for x in bs_values], stored_n_repeats)
+    requested_layout = _score_layout(int(bs_ref), [int(x) for x in bs_values], int(n_repeats))
+
+    for stored_row, cand_idx in enumerate(candidate_indices_stored.tolist()):
+        current_row = current_row_by_idx[int(cand_idx)]
+        block_specs: list[tuple[slice, slice]] = [
+            (slice(*stored_layout["ref"]), slice(*requested_layout["ref"])),
+        ]
+        for bs in bs_values:
+            src_start, src_end = stored_layout[int(bs)]
+            dst_start, _ = requested_layout[int(bs)]
+            block_specs.append((slice(src_start, src_end), slice(dst_start, dst_start + (src_end - src_start))))
+
+        for src_slice, dst_slice in block_specs:
+            known_block = stored_known_mask[stored_row, src_slice]
+            if not np.any(known_block):
+                continue
+            seeded_known_mask[current_row, dst_slice][known_block] = True
+            for metric_name in metric_names:
+                seeded_matrices[metric_name][current_row, dst_slice][known_block] = cached_score_matrices[metric_name][stored_row, src_slice][known_block]
+
+    seeded_count = int(seeded_known_mask.sum())
+    if seeded_count == 0:
+        return None
+
+    info = {
+        "path": str(in_path),
+        "kind": str(cache_kind),
+        "seeded_count": int(seeded_count),
+        "stored_n_repeats": int(stored_n_repeats),
+        "stored_candidate_count": int(candidate_indices_stored.size),
+        "stored_candidate_labels": [str(x) for x in candidate_labels_stored.tolist()],
+    }
+    return (
+        {metric_name: matrix.reshape(-1) for metric_name, matrix in seeded_matrices.items()},
+        seeded_known_mask.reshape(-1),
+        info,
+    )
 
 
 def _accumulate_population_rows(
@@ -1027,103 +1213,100 @@ def main(cfg, args):
                 raw_scores_path = raw_scores_dir / f"{_slugify(run_label)}__iter_{int(gen_idx):05d}.npz"
                 partial_scores_path = raw_scores_dir / f"{_slugify(run_label)}__iter_{int(gen_idx):05d}.partial.npz"
 
-                score_matrices = None
-                loaded_candidate_indices = candidate_indices
-                loaded_candidate_labels = candidate_labels
-                loaded_train_loss_gen = train_loss_gen
-                if resume and raw_scores_path.exists():
-                    score_matrices, loaded_candidate_indices, loaded_candidate_labels, loaded_train_loss_gen = _load_raw_population_scores(
-                        raw_scores_path,
-                        metric_names=metric_names,
-                        bs_values=bs_values,
-                        n_repeats=n_repeats,
-                        bs_ref=bs_ref,
-                    )
-                    if not np.array_equal(loaded_candidate_indices, candidate_indices):
-                        raise ValueError(
-                            f"Raw cache {raw_scores_path} candidate_indices do not match current selection. "
-                            "Delete the cache or keep subsampling config unchanged."
-                        )
-                    if not np.array_equal(loaded_candidate_labels.astype(str), candidate_labels.astype(str)):
-                        raise ValueError(
-                            f"Raw cache {raw_scores_path} candidate_labels do not match current selection. "
-                            "Delete the cache or keep subsampling config unchanged."
-                        )
-                    if loaded_train_loss_gen is not None and loaded_train_loss_gen.shape != train_loss_gen.shape:
-                        raise ValueError(
-                            f"Raw cache {raw_scores_path} selected training losses shape {loaded_train_loss_gen.shape} "
-                            f"does not match current selection {train_loss_gen.shape}."
-                        )
-                    resumed_generations += 1
-                    print(f"[resume] using cached raw scores: {run_label} iter={int(gen_idx)} ({selected_pop_size}/{pop_size} candidates)")
-                else:
-                    candidate_ids = np.repeat(np.arange(selected_pop_size, dtype=np.int32), total_single_scores)
-                    total_size = int(candidate_ids.size)
-                    scores_flat_by_metric = {
-                        metric_name: np.empty((total_size,), dtype=np.float32) for metric_name in metric_names
-                    }
-                    start = 0
-                    if resume and partial_scores_path.exists():
-                        (
-                            scores_flat_by_metric,
-                            start,
-                            loaded_candidate_indices,
-                            loaded_candidate_labels,
-                            loaded_train_loss_gen,
-                        ) = _load_partial_population_scores(
-                            partial_scores_path,
+                candidate_ids = np.repeat(np.arange(selected_pop_size, dtype=np.int32), total_single_scores)
+                total_size = int(candidate_ids.size)
+                scores_flat_by_metric = {
+                    metric_name: np.full((total_size,), np.nan, dtype=np.float32) for metric_name in metric_names
+                }
+                known_mask = np.zeros((total_size,), dtype=bool)
+                seed_info = None
+                if resume:
+                    for cache_path in _iter_resume_cache_paths(
+                        expected_raw_path=raw_scores_path,
+                        expected_partial_path=partial_scores_path,
+                        save_dir=save_dir,
+                        project_root=project_root,
+                        gen_idx=int(gen_idx),
+                    ):
+                        seed_result = _seed_scores_from_cache_file(
+                            cache_path,
                             metric_names=metric_names,
                             bs_values=bs_values,
                             n_repeats=n_repeats,
                             bs_ref=bs_ref,
-                            total_size=total_size,
+                            candidate_indices_current=candidate_indices,
                             total_single_scores=total_single_scores,
                         )
-                        if not np.array_equal(loaded_candidate_indices, candidate_indices):
-                            raise ValueError(
-                                f"Partial cache {partial_scores_path} candidate_indices do not match current selection. "
-                                "Delete the cache or keep subsampling config unchanged."
-                            )
-                        if not np.array_equal(loaded_candidate_labels.astype(str), candidate_labels.astype(str)):
-                            raise ValueError(
-                                f"Partial cache {partial_scores_path} candidate_labels do not match current selection. "
-                                "Delete the cache or keep subsampling config unchanged."
-                            )
-                        if loaded_train_loss_gen is not None and loaded_train_loss_gen.shape != train_loss_gen.shape:
-                            raise ValueError(
-                                f"Partial cache {partial_scores_path} selected training losses shape {loaded_train_loss_gen.shape} "
-                                f"does not match current selection {train_loss_gen.shape}."
-                            )
-                        if start > 0:
-                            resumed_partial_generations += 1
-                            print(
-                                f"[resume] continuing partial raw scores: {run_label} iter={int(gen_idx)} "
-                                f"from {start}/{total_size} singles ({selected_pop_size}/{pop_size} candidates)"
-                            )
-                    remaining_size = int(total_size - start)
+                        if seed_result is None:
+                            continue
+                        scores_flat_by_metric, known_mask, seed_info = seed_result
+                        break
+
+                loaded_candidate_indices = candidate_indices
+                loaded_candidate_labels = candidate_labels
+                loaded_train_loss_gen = train_loss_gen
+
+                score_matrices = None
+                known_count = int(known_mask.sum())
+                if known_count == total_size:
+                    resumed_generations += 1
+                    print(
+                        f"[resume] using cached scores: {run_label} iter={int(gen_idx)} "
+                        f"from {known_count}/{total_size} singles via {seed_info['path'] if seed_info else raw_scores_path} "
+                        f"({selected_pop_size}/{pop_size} candidates)"
+                    )
+                    score_matrices = {
+                        metric_name: scores_flat_by_metric[metric_name].reshape(selected_pop_size, total_single_scores)
+                        for metric_name in metric_names
+                    }
+                    if seed_info is not None and Path(str(seed_info["path"])) != raw_scores_path:
+                        _save_raw_population_scores(
+                            raw_scores_path,
+                            score_matrices=score_matrices,
+                            bs_values=bs_values,
+                            n_repeats=n_repeats,
+                            bs_ref=bs_ref,
+                            candidate_indices=candidate_indices,
+                            candidate_labels=candidate_labels,
+                            training_losses=train_loss_gen,
+                        )
+                else:
+                    if known_count > 0:
+                        resumed_partial_generations += 1
+                        print(
+                            f"[resume] continuing from cached scores: {run_label} iter={int(gen_idx)} "
+                            f"at {known_count}/{total_size} singles via {seed_info['path'] if seed_info else partial_scores_path} "
+                            f"({selected_pop_size}/{pop_size} candidates)"
+                        )
+                    pending_flat_idx = np.flatnonzero(~known_mask)
+                    remaining_size = int(pending_flat_idx.size)
                     desc = f"{run_label} iter={gen_idx} cand={selected_pop_size}/{pop_size}"
-                    if start > 0:
-                        desc += f" resume={start}/{total_size}"
+                    if known_count > 0:
+                        desc += f" resume={known_count}/{total_size}"
                     pbar = tqdm(
                         total=remaining_size,
                         desc=desc,
                         leave=False,
                     )
-                    while start < total_size:
-                        batch = min(eval_batch_size, total_size - start)
-                        ids_chunk = candidate_ids[start:start + batch]
+                    cursor = 0
+                    while cursor < remaining_size:
+                        batch = min(eval_batch_size, remaining_size - cursor)
+                        flat_idx_chunk = pending_flat_idx[cursor:cursor + batch]
+                        ids_chunk = candidate_ids[flat_idx_chunk]
                         params_chunk = jnp.asarray(params_gen[ids_chunk])
                         rng, rng_batch = jax.random.split(rng)
                         keys = jax.random.split(rng_batch, batch)
                         for metric_name in metric_names:
                             chunk_scores = np.asarray(jax.device_get(eval_fns[metric_name](keys, params_chunk)), dtype=np.float32)
-                            scores_flat_by_metric[metric_name][start:start + batch] = chunk_scores
-                        start += batch
+                            scores_flat_by_metric[metric_name][flat_idx_chunk] = chunk_scores
+                        known_mask[flat_idx_chunk] = True
+                        cursor += batch
+                        completed = int(known_mask.sum())
                         if resume:
                             _save_partial_population_scores(
                                 partial_scores_path,
                                 scores_flat_by_metric=scores_flat_by_metric,
-                                completed=start,
+                                completed=completed,
                                 total_single_scores=total_single_scores,
                                 bs_values=bs_values,
                                 n_repeats=n_repeats,
@@ -1131,6 +1314,7 @@ def main(cfg, args):
                                 candidate_indices=candidate_indices,
                                 candidate_labels=candidate_labels,
                                 training_losses=train_loss_gen,
+                                known_mask=known_mask,
                             )
                         pbar.update(batch)
                     pbar.close()
