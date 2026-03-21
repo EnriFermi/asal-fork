@@ -603,32 +603,56 @@ def _load_partial_population_scores(
         stored_bs_values = np.asarray(data["meta__bs_values"], dtype=np.int32).tolist()
         stored_bs_ref = int(np.asarray(data["meta__bs_ref"]).reshape(()))
         stored_n_repeats = int(np.asarray(data["meta__n_repeats"]).reshape(()))
-        stored_completed = int(np.asarray(data["meta__completed"]).reshape(()))
-        stored_total_single_scores = int(np.asarray(data["meta__total_single_scores"]).reshape(()))
         if stored_bs_values != [int(x) for x in bs_values] or stored_bs_ref != int(bs_ref) or stored_n_repeats != int(n_repeats):
             raise ValueError(
                 f"Partial cache mismatch in {in_path}: expected bs_ref={bs_ref}, bs_values={bs_values}, n_repeats={n_repeats}; "
                 f"got bs_ref={stored_bs_ref}, bs_values={stored_bs_values}, n_repeats={stored_n_repeats}."
-            )
-        if stored_total_single_scores != int(total_single_scores):
-            raise ValueError(
-                f"Partial cache mismatch in {in_path}: expected total_single_scores={total_single_scores}, "
-                f"got {stored_total_single_scores}."
             )
         stored_metric_names = sorted(str(x) for x in np.asarray(data["meta__metric_names"]).tolist())
         if stored_metric_names != sorted(metric_names):
             raise ValueError(
                 f"Partial cache mismatch in {in_path}: expected metrics {sorted(metric_names)}, got {stored_metric_names}."
             )
-        if not (0 <= stored_completed <= total_size):
-            raise ValueError(
-                f"Partial cache mismatch in {in_path}: completed={stored_completed} outside [0, {total_size}]."
-            )
         candidate_indices = np.asarray(data["meta__candidate_indices"], dtype=np.int32)
         candidate_labels = np.asarray(data["meta__candidate_labels"]).astype(str)
         training_losses = None
         if "meta__training_losses_selected" in data.files:
             training_losses = np.asarray(data["meta__training_losses_selected"], dtype=np.float32)
+
+        # Backward compatibility:
+        # some interrupted runs may leave a full raw cache under the partial filename.
+        # Those archives do not have meta__completed / meta__total_single_scores, but they
+        # do have <metric>__score_matrix_single arrays, which we can flatten and treat as complete.
+        if "meta__completed" not in data.files:
+            raw_score_matrices = {}
+            for metric_name in metric_names:
+                raw_key = f"{metric_name}__score_matrix_single"
+                if raw_key not in data.files:
+                    raise ValueError(
+                        f"Partial cache {in_path} is missing meta__completed and does not look like a raw cache; "
+                        f"expected either meta__completed or {raw_key}."
+                    )
+                matrix = np.asarray(data[raw_key], dtype=np.float32)
+                if matrix.ndim != 2 or matrix.shape != (candidate_indices.size, total_single_scores):
+                    raise ValueError(
+                        f"Partial cache {in_path} raw matrix {raw_key} has shape {matrix.shape}, "
+                        f"expected {(candidate_indices.size, total_single_scores)}."
+                    )
+                raw_score_matrices[metric_name] = matrix.reshape(-1)
+            return raw_score_matrices, total_size, candidate_indices, candidate_labels, training_losses
+
+        stored_completed = int(np.asarray(data["meta__completed"]).reshape(()))
+        stored_total_single_scores = int(np.asarray(data["meta__total_single_scores"]).reshape(()))
+        if stored_total_single_scores != int(total_single_scores):
+            raise ValueError(
+                f"Partial cache mismatch in {in_path}: expected total_single_scores={total_single_scores}, "
+                f"got {stored_total_single_scores}."
+            )
+        if not (0 <= stored_completed <= total_size):
+            raise ValueError(
+                f"Partial cache mismatch in {in_path}: completed={stored_completed} outside [0, {total_size}]."
+            )
+
         scores_flat_by_metric = {}
         for metric_name in metric_names:
             key = f"{metric_name}__scores_flat"
