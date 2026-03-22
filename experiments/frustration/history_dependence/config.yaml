@@ -61,7 +61,9 @@ protocol:
   wall_pad: 5
 
 evaluation:
-  n_initial_states: 16
+  enable_clip: true
+  enable_msc: true
+  n_initial_states: 5
   foundation_model: clip
   clip_img_size: 224
   time_sampling: 8
@@ -71,6 +73,43 @@ evaluation:
   distance_metric: cosine_mean
   resume: true
   save_embeddings: true
+  save_lagrangian_tracks: true
+
+metric:
+  sample_every_steps: 1000
+  metric_window_size_steps: 20000
+  metric_window_step_steps: 5000
+  metric_tau_steps: 3000
+  metric_range_start_steps: 0
+  metric_range_end_steps: null
+  metric_window_size_frames: null
+  metric_window_step_frames: null
+  metric_tau_frames: null
+  metric_tau_mode: fixed
+  metric_tau_grid_steps: null
+  metric_tau_grid_frames: null
+  metric_m_samples: 48
+  metric_m_min: 4
+  metric_n_proj: 16
+  metric_null_reps: 6
+  metric_particle_samples: 64
+  metric_dirs_seed: 123
+  metric_periodic: null
+  metric_domain_y: null
+  metric_domain_x: null
+  metric_lagrangian_n_particles: 256
+  metric_lagrangian_init_mode: mass
+  metric_lagrangian_flow_channel: -1
+  metric_lagrangian_flow_reduce: mass_weighted
+  metric_lagrangian_channel_mode: resample
+  metric_lagrangian_noise_model: rt_box
+  metric_lagrangian_diffusion_scale: 1.0
+  metric_preprocess_mode: clip
+  metric_scales: null
+  metric_scale_weights: null
+  metric_alpha: 0.0
+  metric_beta: 1.0
+  metric_eps: 1.0e-12
 
 logging:
   wandb_project: asal

@@ -30,6 +30,7 @@ parser = argparse.ArgumentParser()
 group = parser.add_argument_group("meta")
 group.add_argument("--seed", type=int, default=1, help="the random seed")
 group.add_argument("--save_dir", type=str, default=None, help="path to save results to")
+group.add_argument("--resume", action="store_true", help="resume from save_dir/resume_state.pkl if it exists")
 
 group = parser.add_argument_group("substrate")
 group.add_argument("--substrate", type=str, default='lenia', help="name of the substrate")
@@ -204,6 +205,276 @@ def _initialize_strategy_with_mean(strategy, rng_init, es_params, init_mean):
         return _replace_state_fields(state, **updates)
 
 
+def _to_numpy_tree(tree):
+    return jax.tree.map(lambda x: np.array(x), tree)
+
+
+def _to_jax_tree(tree):
+    return jax.tree.map(lambda x: jnp.asarray(x), tree)
+
+
+def _load_resume_state(save_dir):
+    if save_dir is None:
+        return None
+    path = os.path.join(save_dir, "resume_state.pkl")
+    if not os.path.exists(path):
+        return None
+    return util.load_pkl(save_dir, "resume_state")
+
+
+def _load_optional_pkl(save_dir, name):
+    if save_dir is None:
+        return None
+    path = os.path.join(save_dir, f"{name}.pkl")
+    if not os.path.exists(path):
+        return None
+    return util.load_pkl(save_dir, name)
+
+
+def _has_legacy_saved_outputs(save_dir):
+    if save_dir is None:
+        return False
+    legacy_names = (
+        "data.pkl",
+        "best.pkl",
+        "best_traj.pkl",
+        "pop_traj.pkl",
+        "palette_traj.pkl",
+    )
+    return any(os.path.exists(os.path.join(save_dir, name)) for name in legacy_names)
+
+
+def _initialize_optimizer_state(args, *, params_init, strategy, es_params, substrate):
+    rng = jax.random.PRNGKey(args.seed)
+    if params_init == "strategy_default":
+        rng, _rng = split(rng)
+        es_state = strategy.initialize(_rng, es_params)
+    elif params_init == "substrate_default":
+        rng, rng_mean, rng_init = jax.random.split(rng, 3)
+        init_mean = substrate.default_params(rng_mean)
+        es_state = _initialize_strategy_with_mean(strategy, rng_init, es_params, init_mean)
+    else:
+        raise ValueError(f"Unhandled params_init {params_init!r}.")
+    return rng, es_state
+
+
+def _unstack_tree_axis0(tree):
+    if tree is None:
+        return []
+    leaves = jax.tree_util.tree_leaves(tree)
+    if len(leaves) == 0:
+        return []
+    length = int(np.asarray(leaves[0]).shape[0])
+    return [jax.tree.map(lambda x: np.array(x[i]), tree) for i in range(length)]
+
+
+def _save_resume_state(
+    save_dir,
+    *,
+    next_iter,
+    rng,
+    es_state,
+    optimizer_name,
+    params_init,
+    args,
+    substrate_n_params,
+    data,
+    best_params_traj,
+    best_loss_traj,
+    pop_params_traj,
+    pop_loss_traj,
+    palette_traj,
+):
+    if save_dir is None:
+        return
+    payload = dict(
+        version=1,
+        next_iter=int(next_iter),
+        optimizer_name=str(optimizer_name),
+        params_init=str(params_init),
+        pop_size=int(args.pop_size),
+        substrate_n_params=int(substrate_n_params),
+        n_iters_target=int(args.n_iters),
+        rng=np.array(rng),
+        es_state=_to_numpy_tree(es_state),
+        data=[] if len(data) == 0 else _to_numpy_tree(data),
+        best_params_traj=[np.array(x) for x in best_params_traj],
+        best_loss_traj=np.asarray(best_loss_traj),
+        pop_params_traj=[np.array(x) for x in pop_params_traj],
+        pop_loss_traj=[np.array(x) for x in pop_loss_traj],
+        palette_traj=palette_traj,
+    )
+    util.save_pkl(save_dir, "resume_state", payload)
+
+
+def _restore_resume_state(
+    checkpoint,
+    *,
+    optimizer_name,
+    params_init,
+    pop_size,
+    substrate_n_params,
+):
+    if checkpoint is None:
+        return None
+    ckpt_optimizer = str(checkpoint.get("optimizer_name"))
+    if ckpt_optimizer != str(optimizer_name):
+        raise ValueError(
+            f"Resume checkpoint optimizer mismatch: checkpoint={ckpt_optimizer!r}, current={optimizer_name!r}."
+        )
+    ckpt_params_init = str(checkpoint.get("params_init"))
+    if ckpt_params_init != str(params_init):
+        raise ValueError(
+            f"Resume checkpoint params_init mismatch: checkpoint={ckpt_params_init!r}, current={params_init!r}."
+        )
+    ckpt_pop_size = int(checkpoint.get("pop_size"))
+    if ckpt_pop_size != int(pop_size):
+        raise ValueError(
+            f"Resume checkpoint pop_size mismatch: checkpoint={ckpt_pop_size}, current={int(pop_size)}."
+        )
+    ckpt_n_params = int(checkpoint.get("substrate_n_params"))
+    if ckpt_n_params != int(substrate_n_params):
+        raise ValueError(
+            f"Resume checkpoint substrate_n_params mismatch: checkpoint={ckpt_n_params}, current={int(substrate_n_params)}."
+        )
+    return dict(
+        next_iter=int(checkpoint.get("next_iter", 0)),
+        rng=jnp.asarray(checkpoint["rng"]),
+        es_state=_to_jax_tree(checkpoint["es_state"]),
+        data=list(checkpoint.get("data", [])),
+        best_params_traj=[np.array(x) for x in checkpoint.get("best_params_traj", [])],
+        best_loss_traj=[float(x) for x in np.asarray(checkpoint.get("best_loss_traj", []))],
+        pop_params_traj=[np.array(x) for x in checkpoint.get("pop_params_traj", [])],
+        pop_loss_traj=[np.array(x) for x in checkpoint.get("pop_loss_traj", [])],
+        palette_traj=list(checkpoint.get("palette_traj", [])),
+    )
+
+
+def _restore_legacy_saved_outputs(
+    save_dir,
+    *,
+    args,
+    strategy,
+    es_params,
+    substrate,
+    optimizer_name,
+    params_init,
+):
+    pop_traj = _load_optional_pkl(save_dir, "pop_traj")
+    if pop_traj is None:
+        raise FileNotFoundError(
+            f"resume=true, but legacy save_dir {save_dir!r} has no pop_traj.pkl. "
+            "Cannot reconstruct optimizer state."
+        )
+    if not isinstance(pop_traj, dict) or "params" not in pop_traj or "loss" not in pop_traj:
+        raise ValueError("Legacy pop_traj.pkl must contain 'params' and 'loss'.")
+
+    pop_params_arr = np.asarray(pop_traj["params"])
+    pop_loss_arr = np.asarray(pop_traj["loss"])
+    if pop_params_arr.ndim != 3:
+        raise ValueError(
+            f"Expected pop_traj['params'] to have shape (T, pop_size, n_params), got {pop_params_arr.shape}."
+        )
+    if pop_loss_arr.shape != pop_params_arr.shape[:2]:
+        raise ValueError(
+            f"Expected pop_traj['loss'] to have shape {pop_params_arr.shape[:2]}, got {pop_loss_arr.shape}."
+        )
+    if int(pop_params_arr.shape[1]) != int(args.pop_size):
+        raise ValueError(
+            f"Legacy pop_traj population size mismatch: checkpoint={int(pop_params_arr.shape[1])}, "
+            f"current={int(args.pop_size)}."
+        )
+    if int(pop_params_arr.shape[2]) != int(substrate.n_params):
+        raise ValueError(
+            f"Legacy pop_traj parameter size mismatch: checkpoint={int(pop_params_arr.shape[2])}, "
+            f"current={int(substrate.n_params)}."
+        )
+
+    start_iter = int(pop_params_arr.shape[0])
+    rng, es_state = _initialize_optimizer_state(
+        args,
+        params_init=params_init,
+        strategy=strategy,
+        es_params=es_params,
+        substrate=substrate,
+    )
+
+    replay_best_params = []
+    replay_best_loss = []
+    for i_iter in range(start_iter):
+        rng, rng_iter = split(rng)
+        params_iter_saved = jnp.asarray(pop_params_arr[i_iter])
+        loss_iter_saved = jnp.asarray(pop_loss_arr[i_iter])
+        params_iter_asked, ask_state = strategy.ask(rng_iter, es_state, es_params)
+        if not np.allclose(
+            np.asarray(params_iter_asked),
+            np.asarray(params_iter_saved),
+            rtol=1e-5,
+            atol=1e-6,
+        ):
+            raise ValueError(
+                "Legacy resume replay mismatch: reconstructed population does not match saved pop_traj. "
+                "This usually means the code/config/evosax version differs from the original run."
+            )
+        es_state = strategy.tell(params_iter_saved, loss_iter_saved, ask_state, es_params)
+        replay_best_params.append(np.array(es_state.best_member))
+        replay_best_loss.append(float(es_state.best_fitness))
+        if args.full_video_interval > 0 and (i_iter % args.full_video_interval == 0):
+            rng, _ = split(rng)
+
+    best_traj = _load_optional_pkl(save_dir, "best_traj")
+    if best_traj is not None:
+        if "params" not in best_traj or "loss" not in best_traj:
+            raise ValueError("Legacy best_traj.pkl must contain 'params' and 'loss'.")
+        best_params_arr = np.asarray(best_traj["params"])
+        best_loss_arr = np.asarray(best_traj["loss"])
+        if int(best_params_arr.shape[0]) != start_iter or int(best_loss_arr.shape[0]) != start_iter:
+            raise ValueError(
+                "Legacy best_traj.pkl length does not match pop_traj.pkl length; cannot resume safely."
+            )
+        if start_iter > 0:
+            if not np.allclose(best_params_arr[-1], replay_best_params[-1], rtol=1e-5, atol=1e-6):
+                raise ValueError("Legacy best_traj.pkl final params do not match replayed optimizer state.")
+            if not np.allclose(best_loss_arr[-1], replay_best_loss[-1], rtol=1e-6, atol=1e-8):
+                raise ValueError("Legacy best_traj.pkl final loss does not match replayed optimizer state.")
+        best_params_traj = [np.array(x) for x in best_params_arr]
+        best_loss_traj = [float(x) for x in best_loss_arr]
+    else:
+        best_params_traj = replay_best_params
+        best_loss_traj = replay_best_loss
+
+    best_obj = _load_optional_pkl(save_dir, "best")
+    if best_obj is not None and start_iter > 0:
+        best_member_saved, best_fitness_saved = best_obj
+        if not np.allclose(np.asarray(best_member_saved), replay_best_params[-1], rtol=1e-5, atol=1e-6):
+            raise ValueError("Legacy best.pkl params do not match replayed optimizer state.")
+        if not np.allclose(float(best_fitness_saved), replay_best_loss[-1], rtol=1e-6, atol=1e-8):
+            raise ValueError("Legacy best.pkl loss does not match replayed optimizer state.")
+
+    data_stacked = _load_optional_pkl(save_dir, "data")
+    data = _unstack_tree_axis0(data_stacked)
+    if len(data) not in (0, start_iter):
+        raise ValueError("Legacy data.pkl length does not match pop_traj.pkl length.")
+
+    palette_traj = _load_optional_pkl(save_dir, "palette_traj")
+    if palette_traj is None:
+        palette_traj = []
+
+    return dict(
+        next_iter=start_iter,
+        rng=rng,
+        es_state=es_state,
+        data=data,
+        best_params_traj=best_params_traj,
+        best_loss_traj=best_loss_traj,
+        pop_params_traj=[np.array(x) for x in pop_params_arr],
+        pop_loss_traj=[np.array(x) for x in pop_loss_arr],
+        palette_traj=list(palette_traj),
+        resumed_from_legacy=True,
+        optimizer_name=str(optimizer_name),
+    )
+
+
 
 import imageio.v3 as iio
 import numpy as np
@@ -326,15 +597,6 @@ def main(args):
             sigma_init=args.sigma,
         )
         es_params = strategy.default_params
-        if params_init == "strategy_default":
-            rng, _rng = split(rng)
-            es_state = strategy.initialize(_rng, es_params)
-        elif params_init == "substrate_default":
-            rng, rng_mean, rng_init = jax.random.split(rng, 3)
-            init_mean = substrate.default_params(rng_mean)
-            es_state = _initialize_strategy_with_mean(strategy, rng_init, es_params, init_mean)
-        else:
-            raise ValueError(f"Unhandled params_init {params_init!r}.")
 
         def calc_loss(rng, params): # calculate the loss given the simulation parameters
             rollout_data = rollout_fn(rng, params)
@@ -424,7 +686,95 @@ def main(args):
         pop_params_traj = []
         pop_loss_traj = []
         palette_traj = []
-        pbar = tqdm(range(args.n_iters))
+        start_iter = 0
+        resumed = False
+        resumed_from_legacy = False
+        if bool(getattr(args, "resume", False)):
+            resume_state = _load_resume_state(args.save_dir)
+            if resume_state is not None:
+                restored = _restore_resume_state(
+                    resume_state,
+                    optimizer_name=optimizer_name,
+                    params_init=params_init,
+                    pop_size=args.pop_size,
+                    substrate_n_params=substrate.n_params,
+                )
+                start_iter = restored["next_iter"]
+                rng = restored["rng"]
+                es_state = restored["es_state"]
+                data = restored["data"]
+                best_params_traj = restored["best_params_traj"]
+                best_loss_traj = restored["best_loss_traj"]
+                pop_params_traj = restored["pop_params_traj"]
+                pop_loss_traj = restored["pop_loss_traj"]
+                palette_traj = restored["palette_traj"]
+                resumed = True
+                print(f"Resuming optimization from iter {start_iter} using {args.save_dir}/resume_state.pkl")
+            elif _has_legacy_saved_outputs(args.save_dir):
+                restored = _restore_legacy_saved_outputs(
+                    args.save_dir,
+                    args=args,
+                    strategy=strategy,
+                    es_params=es_params,
+                    substrate=substrate,
+                    optimizer_name=optimizer_name,
+                    params_init=params_init,
+                )
+                start_iter = restored["next_iter"]
+                rng = restored["rng"]
+                es_state = restored["es_state"]
+                data = restored["data"]
+                best_params_traj = restored["best_params_traj"]
+                best_loss_traj = restored["best_loss_traj"]
+                pop_params_traj = restored["pop_params_traj"]
+                pop_loss_traj = restored["pop_loss_traj"]
+                palette_traj = restored["palette_traj"]
+                resumed = True
+                resumed_from_legacy = True
+                print(
+                    f"Recovered legacy optimization state from iter {start_iter} "
+                    f"using saved outputs in {args.save_dir}"
+                )
+                _save_resume_state(
+                    args.save_dir,
+                    next_iter=start_iter,
+                    rng=rng,
+                    es_state=es_state,
+                    optimizer_name=optimizer_name,
+                    params_init=params_init,
+                    args=args,
+                    substrate_n_params=substrate.n_params,
+                    data=data,
+                    best_params_traj=best_params_traj,
+                    best_loss_traj=best_loss_traj,
+                    pop_params_traj=pop_params_traj,
+                    pop_loss_traj=pop_loss_traj,
+                    palette_traj=palette_traj,
+                )
+        if not resumed:
+            rng, es_state = _initialize_optimizer_state(
+                args,
+                params_init=params_init,
+                strategy=strategy,
+                es_params=es_params,
+                substrate=substrate,
+            )
+
+        run.summary["resume/enabled"] = bool(getattr(args, "resume", False))
+        run.summary["resume/loaded"] = bool(resumed)
+        run.summary["resume/legacy_recovered"] = bool(resumed_from_legacy)
+        run.summary["resume/start_iter"] = int(start_iter)
+        if args.save_dir is not None:
+            run.summary["resume/checkpoint_path"] = os.path.join(args.save_dir, "resume_state.pkl")
+        if start_iter >= int(args.n_iters):
+            print(
+                f"Run already completed for n_iters={int(args.n_iters)} "
+                f"(resume checkpoint next_iter={int(start_iter)}). Nothing to do."
+            )
+            return
+
+        save_interval = max(1, args.n_iters // 10)
+        pbar = tqdm(range(start_iter, args.n_iters), initial=start_iter, total=args.n_iters)
         # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True, profile_memory=True) as prof:
         # with jax.profiler.trace("prof_dir", create_perfetto_link=True):
         for i_iter in pbar:
@@ -557,7 +907,7 @@ def main(args):
             if palette_stats is not None:
                 palette_traj.append(dict(iter=i_iter, **palette_stats))
             pbar.set_postfix(best_loss=es_state.best_fitness.item())
-            if args.save_dir is not None and (i_iter % (args.n_iters//10)==0 or i_iter==args.n_iters-1): # save data every 10% of the run
+            if args.save_dir is not None and (i_iter % save_interval == 0 or i_iter == args.n_iters - 1): # save data every 10% of the run
                 data_save = jax.tree.map(lambda *x: np.array(jnp.stack(x, axis=0)), *data)
                 util.save_pkl(args.save_dir, "data", data_save)
                 best = jax.tree.map(lambda x: np.array(x), (es_state.best_member, es_state.best_fitness))
@@ -576,6 +926,22 @@ def main(args):
                     util.save_pkl(args.save_dir, "pop_traj", pop_traj)
                 if len(palette_traj) > 0:
                     util.save_pkl(args.save_dir, "palette_traj", palette_traj)
+                _save_resume_state(
+                    args.save_dir,
+                    next_iter=i_iter + 1,
+                    rng=rng,
+                    es_state=es_state,
+                    optimizer_name=optimizer_name,
+                    params_init=params_init,
+                    args=args,
+                    substrate_n_params=substrate.n_params,
+                    data=data,
+                    best_params_traj=best_params_traj,
+                    best_loss_traj=best_loss_traj,
+                    pop_params_traj=pop_params_traj,
+                    pop_loss_traj=pop_loss_traj,
+                    palette_traj=palette_traj,
+                )
 
         # (Optional) Final PCA summary is now covered by per-iteration logging above
     finally:

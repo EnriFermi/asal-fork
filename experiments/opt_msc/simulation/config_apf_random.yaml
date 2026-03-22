@@ -93,10 +93,12 @@ logging:
   log_step_range: [null, null]
 
 random_best:
-  seed: 42
+  seed: 1
   fitness: 0.0
-  init_mode: substrate_default   # substrate_default | sep_cma_es_ask
-  # For sep_cma_es_ask, set CMA-ES init params explicitly to match main_opt/main_opt_msc.
-  # cma_sigma_init: 0.2
-  # cma_pop_size: 8
-  # cma_member_idx: 0
+  init_mode: sep_cma_es_ask   # substrate_default | sep_cma_es_ask
+  cma_sigma_init: 0.2
+  cma_pop_size: 8
+  cma_member_idx: 0
+
+random_batch:
+  n_runs: 1
