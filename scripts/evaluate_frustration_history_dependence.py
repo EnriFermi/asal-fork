@@ -344,6 +344,27 @@ def _build_state_advancer(substrate, steps: int):
     return jax.jit(advance_fn)
 
 
+def _build_state_chunk_stepper(substrate):
+    cache = {}
+
+    def get_stepper(steps: int):
+        steps = int(steps)
+        if steps <= 0:
+            return lambda step_keys, state0, params_in: state0
+        if steps not in cache:
+            def advance_fn(step_keys, state0, params_in):
+                def body_fn(state, step_key):
+                    return substrate.step_state(step_key, state, params_in), None
+
+                state_final, _ = jax.lax.scan(body_fn, state0, step_keys)
+                return state_final
+
+            cache[steps] = jax.jit(advance_fn)
+        return cache[steps]
+
+    return get_stepper
+
+
 def _build_block_warmupper(block_substrate, n_blocks: int, steps: int):
     if steps <= 0:
         return lambda rng_key, state0, params_in: state0
@@ -389,6 +410,29 @@ def _build_embedding_rollout(substrate, fm, *, window_steps: int, time_sampling:
         return z_seq
 
     return jax.jit(rollout_fn)
+
+
+def _build_embedding_chunk_stepper(substrate, fm, *, img_size: int):
+    cache = {}
+
+    def get_stepper(steps: int):
+        steps = int(steps)
+        if steps <= 0:
+            raise ValueError("Embedding chunk size must be >= 1.")
+        if steps not in cache:
+            def rollout_chunk(rng_key, state0, params_in):
+                def step_fn(state, step_key):
+                    return substrate.step_state(step_key, state, params_in), None
+
+                state_next, _ = jax.lax.scan(step_fn, state0, jax.random.split(rng_key, steps))
+                img = substrate.render_state(state_next, params=params_in, img_size=img_size)
+                z = fm.embed_img(img)
+                return state_next, z
+
+            cache[steps] = jax.jit(rollout_chunk)
+        return cache[steps]
+
+    return get_stepper
 
 
 def _build_lagrangian_rollout(
@@ -468,6 +512,189 @@ def _build_lagrangian_rollout(
         return xy_seq
 
     return jax.jit(rollout_fn)
+
+
+def _build_lagrangian_chunk_stepper(
+    substrate,
+    *,
+    chunk_steps: int,
+    lag_flow_channel: int,
+    lag_flow_reduce: str,
+    lag_channel_mode: str,
+    lag_noise_model: str,
+    lag_diffusion_scale: float,
+):
+    chunk_steps = int(chunk_steps)
+    if chunk_steps <= 0:
+        raise ValueError("Lagrangian chunk size must be >= 1.")
+
+    def rollout_chunk(rng_key, carry0, params_in):
+        rt = substrate.RT
+
+        def step_fn(state, key_step):
+            st, pts, ch = state
+            st = substrate.step_state(key_step, st, params_in)
+            lag_key = jax.random.fold_in(key_step, jnp.uint32(0x4C4147))
+            pts, ch = rt.advect_particles(
+                points=pts,
+                F=st["F"],
+                A=st["A"],
+                channel=lag_flow_channel,
+                reduce=lag_flow_reduce,
+                point_channels=ch,
+                channel_mode=lag_channel_mode,
+                key=lag_key,
+                noise_model=lag_noise_model,
+                diffusion_scale=lag_diffusion_scale,
+            )
+            return (st, pts, ch), None
+
+        carry_next, _ = jax.lax.scan(step_fn, carry0, jax.random.split(rng_key, chunk_steps))
+        return carry_next, carry_next[1]
+
+    return jax.jit(rollout_chunk)
+
+
+def _advance_state_with_progress(
+    *,
+    get_stepper,
+    rng_key,
+    state0,
+    params_in,
+    steps: int,
+    chunk_steps: int,
+    desc: str,
+    show_progress: bool,
+):
+    if steps <= 0:
+        return state0
+    chunk_steps = max(1, int(chunk_steps))
+    all_step_keys = jax.random.split(rng_key, int(steps))
+    state = state0
+    steps_done = 0
+    pbar = tqdm(total=int(steps), desc=desc, leave=False, dynamic_ncols=True, disable=not show_progress)
+    try:
+        while steps_done < steps:
+            cur = min(chunk_steps, steps - steps_done)
+            step_keys = all_step_keys[steps_done:steps_done + cur]
+            state = get_stepper(cur)(step_keys, state, params_in)
+            steps_done += cur
+            pbar.update(cur)
+    finally:
+        pbar.close()
+    return state
+
+
+def _rollout_embeddings_with_progress(
+    *,
+    get_stepper,
+    rng_key,
+    state0,
+    params_in,
+    window_steps: int,
+    time_sampling: int,
+    desc: str,
+    show_progress: bool,
+):
+    if window_steps <= 0:
+        raise ValueError("Embedding rollout window_steps must be >= 1.")
+    if time_sampling < 1 or window_steps % time_sampling != 0:
+        raise ValueError(
+            f"Embedding rollout requires window_steps % time_sampling == 0, got {window_steps} and {time_sampling}."
+        )
+    chunk_steps = window_steps // time_sampling
+    state = state0
+    zs = []
+    chunk_keys = jax.random.split(rng_key, int(time_sampling))
+    pbar = tqdm(total=int(window_steps), desc=desc, leave=False, dynamic_ncols=True, disable=not show_progress)
+    try:
+        for key_chunk in chunk_keys:
+            state, z = get_stepper(chunk_steps)(key_chunk, state, params_in)
+            zs.append(np.asarray(jax.device_get(z), dtype=np.float32))
+            pbar.update(chunk_steps)
+    finally:
+        pbar.close()
+    return np.stack(zs, axis=0)
+
+
+def _init_lagrangian_carry(
+    *,
+    substrate,
+    state0,
+    key_pts,
+    key_ch,
+    lag_n_particles: int,
+    lag_init_mode: str,
+    lag_channel_mode: str,
+):
+    if "F" not in state0:
+        raise ValueError(
+            "State does not contain flow field F. "
+            "For FlowLenia set debug_return_F=true before MSC evaluation."
+        )
+    if not hasattr(substrate, "RT"):
+        raise ValueError("Substrate does not provide RT for lagrangian advection.")
+
+    rt = substrate.RT
+    pts0 = _init_lagrangian_points_jax(
+        state0["A"],
+        n_particles=lag_n_particles,
+        init_mode=lag_init_mode,
+        border=str(getattr(rt, "border", "wall")),
+        sigma=float(getattr(rt, "sigma", 0.0)),
+        key=key_pts,
+    )
+    if lag_channel_mode in ("fixed", "resample"):
+        ch0 = rt.sample_point_channels(pts0, state0["A"], key_ch)
+    else:
+        ch0 = jnp.zeros((lag_n_particles,), dtype=jnp.int32)
+    return (state0, pts0, ch0)
+
+
+def _rollout_lagrangian_with_progress(
+    *,
+    chunk_stepper,
+    substrate,
+    rng_key,
+    state0,
+    params_in,
+    time_sampling: int,
+    chunk_steps: int,
+    lag_n_particles: int,
+    lag_init_mode: str,
+    lag_channel_mode: str,
+    desc: str,
+    show_progress: bool,
+):
+    if time_sampling < 1:
+        raise ValueError("Lagrangian rollout time_sampling must be >= 1.")
+    k_pts, k_ch, k_scan = jax.random.split(rng_key, 3)
+    carry = _init_lagrangian_carry(
+        substrate=substrate,
+        state0=state0,
+        key_pts=k_pts,
+        key_ch=k_ch,
+        lag_n_particles=lag_n_particles,
+        lag_init_mode=lag_init_mode,
+        lag_channel_mode=lag_channel_mode,
+    )
+    xy_seq = []
+    chunk_keys = jax.random.split(k_scan, int(time_sampling))
+    pbar = tqdm(
+        total=int(time_sampling * chunk_steps),
+        desc=desc,
+        leave=False,
+        dynamic_ncols=True,
+        disable=not show_progress,
+    )
+    try:
+        for key_chunk in chunk_keys:
+            carry, xy = chunk_stepper(key_chunk, carry, params_in)
+            xy_seq.append(np.asarray(jax.device_get(xy), dtype=np.float32))
+            pbar.update(chunk_steps)
+    finally:
+        pbar.close()
+    return np.stack(xy_seq, axis=0)
 
 
 def _sequence_distance(z_a: np.ndarray, z_b: np.ndarray, metric: str) -> tuple[float, np.ndarray]:
@@ -656,22 +883,36 @@ def main(cfg, args):
         resume = bool(getattr(args, "resume", True))
         save_embeddings = bool(getattr(args, "save_embeddings", True))
         save_lagrangian_tracks = bool(getattr(args, "save_lagrangian_tracks", enable_msc))
+        show_inner_progress = bool(getattr(args, "show_inner_progress", True))
+        inner_progress_chunk_steps = int(getattr(args, "inner_progress_chunk_steps", 10_000))
+        if inner_progress_chunk_steps < 1:
+            raise ValueError("evaluation.inner_progress_chunk_steps must be >= 1.")
 
         fm_name = None
         fm = None
         clip_img_size = None
         distance_metric = None
         embed_rollout = None
+        embed_chunk_stepper = None
         if enable_clip:
             fm_name = str(getattr(args, "foundation_model", "clip"))
             fm = foundation_models.create_foundation_model(fm_name)
             clip_img_size = int(getattr(args, "clip_img_size", 224))
             distance_metric = str(getattr(args, "distance_metric", "cosine_mean"))
+            embed_chunk_stepper = _build_embedding_chunk_stepper(
+                substrate,
+                fm,
+                img_size=clip_img_size,
+            )
 
         metric_cfg = None
         metric_info = None
         metric_eval = None
         lagrangian_rollout = None
+        lagrangian_chunk_stepper = None
+        lag_n_particles = None
+        lag_init_mode = None
+        lag_channel_mode = None
         if enable_msc:
             metric_node = OmegaConf.merge(cfg.get("substrate", {}), cfg.get("metric", {}))
             metric_dict = OmegaConf.to_container(metric_node, resolve=True)
@@ -698,22 +939,39 @@ def main(cfg, args):
             _write_json(save_dir / "msc_metric_summary.json", metric_info)
             metric_loss_fn = make_metric_loss_fn(metric_cfg)
             metric_eval = jax.jit(metric_loss_fn)
+            lag_n_particles = int(getattr(metric_args, "metric_lagrangian_n_particles", 256))
+            lag_init_mode = str(getattr(metric_args, "metric_lagrangian_init_mode", "mass"))
+            lag_flow_channel = int(getattr(metric_args, "metric_lagrangian_flow_channel", -1))
+            lag_flow_reduce = str(getattr(metric_args, "metric_lagrangian_flow_reduce", "mass_weighted"))
+            lag_channel_mode = str(getattr(metric_args, "metric_lagrangian_channel_mode", "mix"))
+            lag_noise_model = str(getattr(metric_args, "metric_lagrangian_noise_model", "none"))
+            lag_diffusion_scale = float(getattr(metric_args, "metric_lagrangian_diffusion_scale", 1.0))
             lagrangian_rollout = _build_lagrangian_rollout(
                 substrate,
                 rollout_steps=late_window_steps,
                 metric_cfg=metric_cfg,
-                lag_n_particles=int(getattr(metric_args, "metric_lagrangian_n_particles", 256)),
-                lag_init_mode=str(getattr(metric_args, "metric_lagrangian_init_mode", "mass")),
-                lag_flow_channel=int(getattr(metric_args, "metric_lagrangian_flow_channel", -1)),
-                lag_flow_reduce=str(getattr(metric_args, "metric_lagrangian_flow_reduce", "mass_weighted")),
-                lag_channel_mode=str(getattr(metric_args, "metric_lagrangian_channel_mode", "mix")),
-                lag_noise_model=str(getattr(metric_args, "metric_lagrangian_noise_model", "none")),
-                lag_diffusion_scale=float(getattr(metric_args, "metric_lagrangian_diffusion_scale", 1.0)),
+                lag_n_particles=lag_n_particles,
+                lag_init_mode=lag_init_mode,
+                lag_flow_channel=lag_flow_channel,
+                lag_flow_reduce=lag_flow_reduce,
+                lag_channel_mode=lag_channel_mode,
+                lag_noise_model=lag_noise_model,
+                lag_diffusion_scale=lag_diffusion_scale,
+            )
+            lagrangian_chunk_stepper = _build_lagrangian_chunk_stepper(
+                substrate,
+                chunk_steps=int(metric_cfg["sample_every_steps"]),
+                lag_flow_channel=lag_flow_channel,
+                lag_flow_reduce=lag_flow_reduce,
+                lag_channel_mode=lag_channel_mode,
+                lag_noise_model=lag_noise_model,
+                lag_diffusion_scale=lag_diffusion_scale,
             )
 
         block_template = block_substrate.init_state(jax.random.PRNGKey(0), params)
 
         control_prefix_advancer = _build_state_advancer(substrate, late_start)
+        control_prefix_chunk_stepper = _build_state_chunk_stepper(substrate)
         walls_warmupper = _build_block_warmupper(block_substrate, n_blocks, warmup_steps)
         walls_post_advancer = _build_state_advancer(substrate, late_start - warmup_steps)
         if enable_clip:
@@ -767,8 +1025,26 @@ def main(cfg, args):
 
             initial_state = substrate.init_state(k_init, params)
 
-            control_a_start = control_prefix_advancer(k_ctrl_a_prefix, initial_state, params)
-            control_b_start = control_prefix_advancer(k_ctrl_b_prefix, initial_state, params)
+            control_a_start = _advance_state_with_progress(
+                get_stepper=control_prefix_chunk_stepper,
+                rng_key=k_ctrl_a_prefix,
+                state0=initial_state,
+                params_in=params,
+                steps=late_start,
+                chunk_steps=inner_progress_chunk_steps,
+                desc=f"trial {trial_idx:05d} control_a_prefix",
+                show_progress=show_inner_progress,
+            )
+            control_b_start = _advance_state_with_progress(
+                get_stepper=control_prefix_chunk_stepper,
+                rng_key=k_ctrl_b_prefix,
+                state0=initial_state,
+                params_in=params,
+                steps=late_start,
+                chunk_steps=inner_progress_chunk_steps,
+                desc=f"trial {trial_idx:05d} control_b_prefix",
+                show_progress=show_inner_progress,
+            )
 
             block_state0 = _prepare_block_template_state(
                 initial_state=initial_state,
@@ -805,13 +1081,25 @@ def main(cfg, args):
             pbar_stats = {}
 
             if enable_clip:
-                z_control_a = np.asarray(
-                    jax.device_get(embed_rollout(k_ctrl_a_window, control_a_start, params)),
-                    dtype=np.float32,
+                z_control_a = _rollout_embeddings_with_progress(
+                    get_stepper=embed_chunk_stepper,
+                    rng_key=k_ctrl_a_window,
+                    state0=control_a_start,
+                    params_in=params,
+                    window_steps=late_window_steps,
+                    time_sampling=time_sampling,
+                    desc=f"trial {trial_idx:05d} control_a_clip",
+                    show_progress=show_inner_progress,
                 )
-                z_control_b = np.asarray(
-                    jax.device_get(embed_rollout(k_ctrl_b_window, control_b_start, params)),
-                    dtype=np.float32,
+                z_control_b = _rollout_embeddings_with_progress(
+                    get_stepper=embed_chunk_stepper,
+                    rng_key=k_ctrl_b_window,
+                    state0=control_b_start,
+                    params_in=params,
+                    window_steps=late_window_steps,
+                    time_sampling=time_sampling,
+                    desc=f"trial {trial_idx:05d} control_b_clip",
+                    show_progress=show_inner_progress,
                 )
                 z_walls = np.asarray(
                     jax.device_get(embed_rollout(k_walls_window, walls_start, params)),
@@ -860,13 +1148,33 @@ def main(cfg, args):
                 )
 
             if enable_msc:
-                xy_control_a = np.asarray(
-                    jax.device_get(lagrangian_rollout(k_ctrl_a_msc_roll, control_a_start, params)),
-                    dtype=np.float32,
+                xy_control_a = _rollout_lagrangian_with_progress(
+                    chunk_stepper=lagrangian_chunk_stepper,
+                    substrate=substrate,
+                    rng_key=k_ctrl_a_msc_roll,
+                    state0=control_a_start,
+                    params_in=params,
+                    time_sampling=int(metric_cfg["time_sampling"]),
+                    chunk_steps=int(metric_cfg["sample_every_steps"]),
+                    lag_n_particles=lag_n_particles,
+                    lag_init_mode=lag_init_mode,
+                    lag_channel_mode=lag_channel_mode,
+                    desc=f"trial {trial_idx:05d} control_a_msc",
+                    show_progress=show_inner_progress,
                 )
-                xy_control_b = np.asarray(
-                    jax.device_get(lagrangian_rollout(k_ctrl_b_msc_roll, control_b_start, params)),
-                    dtype=np.float32,
+                xy_control_b = _rollout_lagrangian_with_progress(
+                    chunk_stepper=lagrangian_chunk_stepper,
+                    substrate=substrate,
+                    rng_key=k_ctrl_b_msc_roll,
+                    state0=control_b_start,
+                    params_in=params,
+                    time_sampling=int(metric_cfg["time_sampling"]),
+                    chunk_steps=int(metric_cfg["sample_every_steps"]),
+                    lag_n_particles=lag_n_particles,
+                    lag_init_mode=lag_init_mode,
+                    lag_channel_mode=lag_channel_mode,
+                    desc=f"trial {trial_idx:05d} control_b_msc",
+                    show_progress=show_inner_progress,
                 )
                 xy_walls = np.asarray(
                     jax.device_get(lagrangian_rollout(k_walls_msc_roll, walls_start, params)),
