@@ -403,17 +403,32 @@ def _restore_legacy_saved_outputs(
     replay_best_loss = []
     for i_iter in range(start_iter):
         rng, rng_iter = split(rng)
+        _, rng_ask = split(rng_iter)
         params_iter_saved = jnp.asarray(pop_params_arr[i_iter])
         loss_iter_saved = jnp.asarray(pop_loss_arr[i_iter])
-        params_iter_asked, ask_state = strategy.ask(rng_iter, es_state, es_params)
+        params_iter_asked, ask_state = strategy.ask(rng_ask, es_state, es_params)
         if not np.allclose(
             np.asarray(params_iter_asked),
             np.asarray(params_iter_saved),
             rtol=1e-5,
             atol=1e-6,
         ):
+            asked_np = np.asarray(params_iter_asked)
+            saved_np = np.asarray(params_iter_saved)
+            abs_diff = np.abs(asked_np - saved_np)
+            tol = 1e-6 + 1e-5 * np.abs(saved_np)
+            mismatch_mask = abs_diff > tol
+            mismatch_count = int(mismatch_mask.sum())
+            worst_flat = int(abs_diff.argmax())
+            worst_idx = np.unravel_index(worst_flat, abs_diff.shape)
             raise ValueError(
                 "Legacy resume replay mismatch: reconstructed population does not match saved pop_traj. "
+                f"iter={i_iter}, mismatch_count={mismatch_count}, "
+                f"max_abs_diff={float(abs_diff.max()):.6e}, "
+                f"mean_abs_diff={float(abs_diff.mean()):.6e}, "
+                f"worst_idx={worst_idx}, "
+                f"saved={float(saved_np[worst_idx]):.6e}, "
+                f"replayed={float(asked_np[worst_idx]):.6e}. "
                 "This usually means the code/config/evosax version differs from the original run."
             )
         es_state = strategy.tell(params_iter_saved, loss_iter_saved, ask_state, es_params)
