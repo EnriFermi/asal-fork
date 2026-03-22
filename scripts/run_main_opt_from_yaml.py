@@ -9,6 +9,7 @@ from omegaconf import OmegaConf
 META_FLAGS = {
     "seed": "seed",
     "save_dir": "save_dir",
+    "resume": "resume",
 }
 
 SUBSTRATE_FLAGS = {
@@ -89,6 +90,7 @@ LOGGING_FLAGS = {
 }
 
 BOOL_SOURCE_KEYS = {
+    "resume",
     "mutations",
     "optimize_mutation_scale",
     "volcano",

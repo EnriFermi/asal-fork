@@ -1,6 +1,7 @@
 meta:
   seed: 1
   save_dir: experiments/opt_1/checkpoints/clip_oe_run
+  resume: true
 
 substrate:
   substrate: lenia_flow
