@@ -78,6 +78,7 @@ group.add_argument("--food_vis_scale", type=float, default=1.0, help="for lenia_
 group.add_argument("--food_vis_color", type=str, default="0.6,0.3,0.0", help="for lenia_flow: food visualization color as 'r,g,b'")
 group.add_argument("--food_diffusion_alpha", type=float, default=0.0, help="for lenia_flow: blend factor for food diffusion (0=off)")
 group.add_argument("--mass_clip_eps", type=float, default=0.0, help="for lenia_flow: zero-out per-pixel mass below this sum")
+group.add_argument("--mass_renorm", action='store_true', help="for lenia_flow: explicitly renormalize per-channel mass after reintegration")
 
 group = parser.add_argument_group("evaluation")
 group.add_argument(

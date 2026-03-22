@@ -58,6 +58,7 @@ SUBSTRATE_FLAGS = {
     "food_vis_color": "food_vis_color",
     "food_diffusion_alpha": "food_diffusion_alpha",
     "mass_clip_eps": "mass_clip_eps",
+    "mass_renorm": "mass_renorm",
 }
 
 EVALUATION_FLAGS = {
@@ -97,6 +98,7 @@ BOOL_SOURCE_KEYS = {
     "volcano",
     "food",
     "food_auto_size",
+    "mass_renorm",
 }
 
 

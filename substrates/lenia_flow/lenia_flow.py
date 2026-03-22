@@ -115,6 +115,7 @@ class FlowLenia:
         food_vis_color=(0.6, 0.3, 0.0),  # RGB overlay for food
         food_diffusion_alpha: float = 0.0,  # blend factor for food diffusion (0=off)
         mass_clip_eps: float = 0.0,  # zero-out tiny masses below this per-pixel sum
+        mass_renorm: bool = False,  # explicitly renormalize A after RT to preserve per-channel mass
         # debugging / logging
         debug_return_F: bool = False,  # include the reintegration flow field F in the returned state
     ):
@@ -166,6 +167,7 @@ class FlowLenia:
         self.food_vis_color = tuple(food_vis_color)
         self.food_diffusion_alpha = float(food_diffusion_alpha)
         self.mass_clip_eps = float(mass_clip_eps)
+        self.mass_renorm = bool(mass_renorm)
         self.debug_return_F = bool(debug_return_F)
 
         # Connectivity: by default, all k kernels read from channel 0 and
@@ -402,6 +404,14 @@ class FlowLenia:
         F = jnp.clip(F * (1 - alpha) - C_grad * alpha, -mag, mag)
 
         nA, nP = self.RT(A, P, F)
+
+        # Optional explicit per-channel mass renormalization for long-rollout stability.
+        # Disabled by default for backward compatibility with older runs.
+        if self.mass_renorm:
+            mass_prev = jnp.sum(A, axis=(0, 1), keepdims=True)
+            mass_next = jnp.sum(nA, axis=(0, 1), keepdims=True)
+            scale = jnp.where(mass_next > 0.0, mass_prev / (mass_next + 1e-12), 1.0)
+            nA = nA * scale
 
         # Clip vanishingly small masses (per-pixel sum) to zero to avoid dust
         if self.mass_clip_eps > 0:

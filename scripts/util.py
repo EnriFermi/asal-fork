@@ -99,6 +99,7 @@ def flow_lenia_kwargs_from_args(args: Any) -> Dict[str, Any]:
         food_vis_color=parse_color_str(args.food_vis_color),
         food_diffusion_alpha=float(args.food_diffusion_alpha),
         mass_clip_eps=float(args.mass_clip_eps),
+        mass_renorm=bool(getattr(args, "mass_renorm", False)),
     )
 
 
