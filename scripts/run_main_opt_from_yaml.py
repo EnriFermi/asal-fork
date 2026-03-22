@@ -82,6 +82,7 @@ OPTIMIZATION_FLAGS = {
 
 LOGGING_FLAGS = {
     "wandb_project": "wandb_project",
+    "save_every": "save_every",
     "pca_every": "pca_every",
     "pca_history": "pca_history",
     "full_video_interval": "full_video_interval",

@@ -70,6 +70,7 @@ optimization:
 
 logging:
   wandb_project: asal
+  save_every: 5
   pca_every: 25
   pca_history: 100
   full_video_interval: 0
