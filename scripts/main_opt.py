@@ -111,6 +111,7 @@ group.add_argument("--eval_splits", type=int, default=1, help="number of splits 
 
 group = parser.add_argument_group("logging")
 group.add_argument("--wandb_project", type=str, default="asal", help="Weights & Biases project name")
+group.add_argument("--save_every", type=int, default=None, help="save data/best/pop_traj/resume_state every N iterations; default is n_iters//10")
 group.add_argument("--pca_every", type=int, default=1, help="Log population PCA every N iters; <=0 disables")
 group.add_argument("--pca_history", type=int, default=100, help="History length for PCA trajectory logging")
 group.add_argument("--full_video_interval", type=int, default=1, help="Log best-member full video every N iters; <=0 disables")
@@ -788,7 +789,14 @@ def main(args):
             )
             return
 
-        save_interval = max(1, args.n_iters // 10)
+        save_every = getattr(args, "save_every", None)
+        if save_every is None:
+            save_interval = max(1, args.n_iters // 10)
+        else:
+            save_interval = int(save_every)
+            if save_interval < 1:
+                raise ValueError(f"save_every must be >= 1, got {save_interval}.")
+        run.summary["logging/save_interval"] = int(save_interval)
         pbar = tqdm(range(start_iter, args.n_iters), initial=start_iter, total=args.n_iters)
         # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True, profile_memory=True) as prof:
         # with jax.profiler.trace("prof_dir", create_perfetto_link=True):
