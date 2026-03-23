@@ -1,19 +1,19 @@
 meta:
-  save_dir: .
+  save_dir: data/lockheed_1
 
 substrate:
   substrate: lenia_flow
-  rollout_steps: 3000000
-  grid_size: 64
+  rollout_steps: 500
+  grid_size: 512
   C: 3
-  k: 108
-  kernel_components: 3
-  M: "18,9,9;9,18,9;9,9,18"  # hypothesis: symmetric 3x3 with sum(M)=108
+  k: 27
+  kernel_components: 15
+  M: "3,3,3;3,3,3;3,3,3"  # hypothesis: symmetric 3x3 with sum(M)=108
   dd: 5
   dt: 0.2
   sigma: 0.65
   border: wall
-  mix_rule: stoch
+  mix_rule: stoch_gene_wise
   base_seed: 0
   seed_patch_size: 20
   seed_n_patches: 24
@@ -63,7 +63,7 @@ simulation:
   macro_block_size: null
   batch_steps: 256
   jit_microbatch: 64
-  max_steps: 3000000
+  max_steps: 100000
   mass_plot: experiments/root_best/simulation_lockheed_guess_m108/root_best__lockheed_guess_m108__mass.png
   log_mass_every: 1024
   traj_iter: null
