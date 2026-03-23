@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import jax.scipy as jsp
 from jax.random import split
-from .utils import conn_from_matrix, get_kernels_fft, sobel, growth
+from .utils import conn_from_matrix, get_kernels_fft, sobel, sobel_lax, growth
 from .reintegration_tracking import ReintegrationTracking
 from typing import NamedTuple
 
@@ -79,6 +79,7 @@ class FlowLenia:
         sigma: float = 0.65,
         border: str = "wall",
         mix_rule: str = "stoch",
+        sobel_impl: str = "scipy",
         base_seed: int = 0,
         seed_patch_size: int = 20,
         seed_n_patches: int = 1,
@@ -129,6 +130,7 @@ class FlowLenia:
         self.sigma = sigma
         self.border = border
         self.mix_rule = mix_rule
+        self.sobel_impl = sobel_impl
         self.base_seed = int(base_seed)
         self.seed_patch_size = seed_patch_size
         self.seed_n_patches = seed_n_patches
@@ -401,8 +403,9 @@ class FlowLenia:
         U = jnp.dstack([U[:, :, self.cfg.c1[c]].sum(axis=-1) for c in range(self.cfg.C)])
 
         # Flow field and reintegration
-        F = sobel(U)
-        C_grad = sobel(A.sum(axis=-1, keepdims=True))
+        sobel_fn = sobel_lax if self.sobel_impl == "lax" else sobel
+        F = sobel_fn(U)
+        C_grad = sobel_fn(A.sum(axis=-1, keepdims=True))
         alpha = jnp.clip((A[:, :, None, :] / 2) ** 2, 0.0, 1.0)
         mag = self.cfg.dd - self.cfg.sigma
         F = jnp.clip(F * (1 - alpha) - C_grad * alpha, -mag, mag)
