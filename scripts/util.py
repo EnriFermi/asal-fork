@@ -49,7 +49,9 @@ def parse_color_str(s: str) -> Tuple[float, float, float]:
 
 
 def flow_lenia_kwargs_from_args(args: Any) -> Dict[str, Any]:
-    seed_n = getattr(args, "n_seeds", getattr(args, "seed_n_patches"))
+    seed_n = getattr(args, "n_seeds", None)
+    if seed_n is None:
+        seed_n = getattr(args, "seed_n_patches")
     mutation_scale = getattr(args, "mutation_scale", 1.0)
     optimize_mutation_scale = getattr(args, "optimize_mutation_scale", False)
     flow_sigma = getattr(args, "flow_sigma", None)
