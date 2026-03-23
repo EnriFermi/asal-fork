@@ -1,5 +1,6 @@
 import os
 import argparse
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -95,6 +96,8 @@ def main():
     parser.add_argument('--oe_every', type=int, default=100, help='Steps between open-endedness evaluations')
     parser.add_argument('--oe_plot', type=str, default='oe_loss.png', help='Path to save open-endedness loss plot')
     parser.add_argument('--wandb_project', type=str, default='asal', help='W&B project name for logging simulation dynamics')
+    parser.add_argument('--debug_dump_seed_prefix', type=str, default=None, help='If set, save raw-seed and post-init debug artifacts using this prefix')
+    parser.add_argument('--debug_exit_after_dump', action='store_true', help='Exit after saving debug seed/init artifacts')
     args = parser.parse_args()
 
     run = wandb.init(project=args.wandb_project, config={**vars(args)})
@@ -206,6 +209,27 @@ def main():
     rollout_steps = substrate.rollout_steps if args.rollout_steps is None else args.rollout_steps
 
     rng = jax.random.PRNGKey(args.seed)
+
+    if args.debug_dump_seed_prefix:
+        prefix = Path(args.debug_dump_seed_prefix)
+        prefix.parent.mkdir(parents=True, exist_ok=True)
+        seed_state = substrate.seed_state(rng, best_member)
+        init_state = substrate.init_state(rng, best_member)
+        seed_rgb = np.asarray(substrate.render_state(seed_state, best_member, img_size=args.img_size))
+        init_rgb = np.asarray(substrate.render_state(init_state, best_member, img_size=args.img_size))
+        iio.imwrite(f"{prefix}_seed.png", (np.clip(seed_rgb, 0.0, 1.0) * 255).astype(np.uint8))
+        iio.imwrite(f"{prefix}_init.png", (np.clip(init_rgb, 0.0, 1.0) * 255).astype(np.uint8))
+        np.savez_compressed(
+            f"{prefix}_states.npz",
+            seed_A=np.asarray(seed_state["A"]),
+            seed_P=np.asarray(seed_state["P"]),
+            init_A=np.asarray(init_state["A"]),
+            init_P=np.asarray(init_state["P"]),
+        )
+        print(f"Saved debug seed/init artifacts with prefix {prefix}")
+        if args.debug_exit_after_dump:
+            run.finish()
+            return
 
     fm = None
     oe_steps = []

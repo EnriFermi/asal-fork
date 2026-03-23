@@ -155,6 +155,10 @@ class FlattenSubstrateParameters():
     def init_state(self, rng, params):
         params = self.param_reshaper.reshape_single(params)
         return self.substrate.init_state(rng, params)
+
+    def seed_state(self, rng, params):
+        params = self.param_reshaper.reshape_single(params)
+        return self.substrate.seed_state(rng, params)
     
     def step_state(self, rng, state, params):
         params = self.param_reshaper.reshape_single(params)
