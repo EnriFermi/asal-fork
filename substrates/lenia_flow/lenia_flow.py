@@ -267,7 +267,7 @@ class FlowLenia:
         return jnp.concatenate(parts, axis=0)
 
     # ---------- state interface ----------
-    def init_state(self, rng, params):
+    def seed_state(self, rng, params):
         # Apply deltas to dynamics only
         n_dyn = self.base_dyn_raw.size
         dyn_delta = params[:n_dyn]
@@ -378,6 +378,10 @@ class FlowLenia:
         state = {"A": A, "P": P, "fK": fK, "m": m, "s": s, "fcr": fcr, "Food": Food, "t": t}
         if self.debug_return_F:
             state["F"] = jnp.zeros((self.cfg.X, self.cfg.Y, 2, self.cfg.C), dtype=A.dtype)
+        return state
+
+    def init_state(self, rng, params):
+        state = self.seed_state(rng, params)
         # Step once to avoid trivial zero image, like Lenia
         return self.step_state(rng, state, params)
 
