@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import jax.scipy as jsp
 from jax.random import split
-from .utils import conn_from_matrix, get_kernels_fft, sobel, sobel_lax, growth
+from .utils import conn_from_matrix, get_kernels_fft, sobel, sobel_lax, sobel_lax_legacy, growth
 from .reintegration_tracking import ReintegrationTracking
 from typing import NamedTuple
 
@@ -403,7 +403,12 @@ class FlowLenia:
         U = jnp.dstack([U[:, :, self.cfg.c1[c]].sum(axis=-1) for c in range(self.cfg.C)])
 
         # Flow field and reintegration
-        sobel_fn = sobel_lax if self.sobel_impl == "lax" else sobel
+        if self.sobel_impl == "lax":
+            sobel_fn = sobel_lax
+        elif self.sobel_impl == "lax_legacy":
+            sobel_fn = sobel_lax_legacy
+        else:
+            sobel_fn = sobel
         F = sobel_fn(U)
         C_grad = sobel_fn(A.sum(axis=-1, keepdims=True))
         alpha = jnp.clip((A[:, :, None, :] / 2) ** 2, 0.0, 1.0)
