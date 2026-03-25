@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from .io import infer_lagrangian_metadata
-from .utils import REPO_ROOT, pair_type
+from .utils import REPO_ROOT, pair_type, progress, progress_bar
 
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
@@ -156,7 +156,14 @@ def derive_metric_config(cfg: dict[str, Any], run_collection) -> dict[str, Any] 
     return resolve_metric_config(args)
 
 
-def compute_delta_h_summary(xy_seq: np.ndarray, metric_cfg: dict[str, Any], *, selected_tau_index: int | None = None) -> dict[str, Any]:
+def compute_delta_h_summary(
+    xy_seq: np.ndarray,
+    metric_cfg: dict[str, Any],
+    *,
+    selected_tau_index: int | None = None,
+    progress_desc: str | None = None,
+    progress_enabled: bool = False,
+) -> dict[str, Any]:
     xy = np.asarray(xy_seq, dtype=np.float64)
     if xy.ndim != 3 or xy.shape[-1] != 2:
         raise ValueError(f"Lagrangian trajectories must have shape (T, N, 2), got {xy.shape}.")
@@ -173,7 +180,14 @@ def compute_delta_h_summary(xy_seq: np.ndarray, metric_cfg: dict[str, Any], *, s
     score_all = []
     amp_all = []
     msc_all = []
-    for tau_idx, tau_frames in enumerate(tau_frames_list):
+    tau_iter = progress(
+        enumerate(tau_frames_list),
+        total=len(tau_frames_list),
+        desc=progress_desc or "Delta-H taus",
+        enabled=progress_enabled,
+        leave=False,
+    )
+    for tau_idx, tau_frames in tau_iter:
         tseg = int(metric_cfg["tseg_list"][tau_idx])
         m_count = int(metric_cfg["m_count_list"][tau_idx])
         win = int(metric_cfg["window_size_frames"])
@@ -325,6 +339,9 @@ def compute_trajectory_observables(
     metric_cfg: dict[str, Any],
 ) -> tuple[pd.DataFrame, dict[str, dict[str, Any]]]:
     traj_cfg = dict(cfg.get("trajectories", {}))
+    progress_cfg = dict(cfg.get("progress", {}))
+    show_progress = bool(progress_cfg.get("enabled", True))
+    show_inner = bool(progress_cfg.get("show_inner", True))
     occupancy_bins = int(traj_cfg.get("occupancy_bins", 64))
     selected_tau_index = traj_cfg.get("selected_tau_index")
     available = runs[runs["has_lagrangian"]].copy().reset_index(drop=True)
@@ -333,12 +350,21 @@ def compute_trajectory_observables(
 
     run_rows = []
     per_run: dict[str, dict[str, Any]] = {}
-    for _, row in available.iterrows():
+    run_iter = progress(
+        available.to_dict(orient="records"),
+        total=int(available.shape[0]),
+        desc="Trajectory observables",
+        enabled=show_progress,
+        leave=False,
+    )
+    for row in run_iter:
         xy = load_lagrangian_fn(row)
         delta_h_summary = compute_delta_h_summary(
             xy,
             metric_cfg,
             selected_tau_index=None if selected_tau_index is None else int(selected_tau_index),
+            progress_desc=f"Delta-H {row['run_id']}",
+            progress_enabled=show_progress and show_inner,
         )
         coarse = compute_coarse_observables(xy, metric_cfg, occupancy_bins=occupancy_bins)
         metrics = dict(delta_h_summary)
@@ -375,6 +401,8 @@ def compute_trajectory_pairwise(
     cfg: dict[str, Any],
 ) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
     traj_cfg = dict(cfg.get("trajectories", {}))
+    progress_cfg = dict(cfg.get("progress", {}))
+    show_progress = bool(progress_cfg.get("enabled", True))
     map_metrics = [str(x) for x in traj_cfg.get("pairwise_map_metrics", ["l2"])]
     scalar_keys = [
         "msc_scalar",
@@ -399,37 +427,40 @@ def compute_trajectory_pairwise(
 
     metrics_by_id = run_metrics.set_index("run_id").to_dict(orient="index")
     pair_rows = []
-    for i in range(n_runs):
-        row_i = available.iloc[i]
-        data_i = per_run[row_i["run_id"]]
-        scal_i = metrics_by_id[row_i["run_id"]]
-        for j in range(i + 1, n_runs):
-            row_j = available.iloc[j]
-            data_j = per_run[row_j["run_id"]]
-            scal_j = metrics_by_id[row_j["run_id"]]
-            record = {
-                "run_a": row_i["run_id"],
-                "run_b": row_j["run_id"],
-                "condition_a": row_i["condition"],
-                "condition_b": row_j["condition"],
-                "pair_type": pair_type(row_i["condition"], row_j["condition"]),
-                "pair_group_a": row_i["pair_group_id"],
-                "pair_group_b": row_j["pair_group_id"],
-                "same_pair_group": bool(row_i["pair_group_id"] == row_j["pair_group_id"]),
-            }
-            for metric in map_metrics:
-                name = f"delta_h_{metric}"
-                value = delta_h_map_distance(data_i["delta_h_map"], data_j["delta_h_map"], metric=metric)
-                matrices[name][i, j] = value
-                matrices[name][j, i] = value
-                record[name] = value
-            for key in scalar_keys:
-                name = f"absdiff_{key}"
-                value = abs(float(scal_i[key]) - float(scal_j[key]))
-                matrices[name][i, j] = value
-                matrices[name][j, i] = value
-                record[name] = value
-            pair_rows.append(record)
+    pair_total = n_runs * (n_runs - 1) // 2
+    with progress_bar(total=pair_total, desc="Trajectory pairwise", enabled=show_progress, leave=False) as pbar:
+        for i in range(n_runs):
+            row_i = available.iloc[i]
+            data_i = per_run[row_i["run_id"]]
+            scal_i = metrics_by_id[row_i["run_id"]]
+            for j in range(i + 1, n_runs):
+                row_j = available.iloc[j]
+                data_j = per_run[row_j["run_id"]]
+                scal_j = metrics_by_id[row_j["run_id"]]
+                record = {
+                    "run_a": row_i["run_id"],
+                    "run_b": row_j["run_id"],
+                    "condition_a": row_i["condition"],
+                    "condition_b": row_j["condition"],
+                    "pair_type": pair_type(row_i["condition"], row_j["condition"]),
+                    "pair_group_a": row_i["pair_group_id"],
+                    "pair_group_b": row_j["pair_group_id"],
+                    "same_pair_group": bool(row_i["pair_group_id"] == row_j["pair_group_id"]),
+                }
+                for metric in map_metrics:
+                    name = f"delta_h_{metric}"
+                    value = delta_h_map_distance(data_i["delta_h_map"], data_j["delta_h_map"], metric=metric)
+                    matrices[name][i, j] = value
+                    matrices[name][j, i] = value
+                    record[name] = value
+                for key in scalar_keys:
+                    name = f"absdiff_{key}"
+                    value = abs(float(scal_i[key]) - float(scal_j[key]))
+                    matrices[name][i, j] = value
+                    matrices[name][j, i] = value
+                    record[name] = value
+                pair_rows.append(record)
+                pbar.update(1)
 
     matrix_frames = {
         name: pd.DataFrame(value, index=run_ids, columns=run_ids)

@@ -47,6 +47,10 @@ statistics:
   permutation_samples: 20000
   permutation_seed: 0
 
+progress:
+  enabled: true
+  show_inner: true
+
 reporting:
   representative_runs_per_condition: 2
   primary_embedding_metric: embedding_cloud_chamfer_cosine

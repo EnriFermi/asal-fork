@@ -26,7 +26,7 @@ from .trajectory_metrics import (
     compute_trajectory_pairwise,
     derive_metric_config,
 )
-from .utils import REPO_ROOT, ensure_dir, save_dataframe, save_matrix, save_npz, write_json
+from .utils import REPO_ROOT, ensure_dir, progress_bar, save_dataframe, save_matrix, save_npz, write_json
 from .utils import resolve_config_path
 
 
@@ -69,6 +69,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "permutation_max_exact": 200000,
         "permutation_samples": 20000,
         "permutation_seed": 0,
+    },
+    "progress": {
+        "enabled": True,
+        "show_inner": True,
     },
     "reporting": {
         "representative_runs_per_condition": 2,
@@ -123,6 +127,8 @@ def _save_resolved_config(cfg: dict[str, Any], output_dir: Path) -> None:
 
 def run_analysis(config_or_path: str | Path | dict[str, Any]) -> dict[str, Any]:
     cfg = load_analysis_config(config_or_path) if not isinstance(config_or_path, dict) else config_or_path
+    progress_cfg = dict(cfg.get("progress", {}))
+    show_progress = bool(progress_cfg.get("enabled", True))
     output_dir = resolve_config_path(cfg["output"]["dir"], Path(cfg["_config_dir"]))
     if output_dir is None:
         raise ValueError("output.dir must be set.")
@@ -133,177 +139,195 @@ def run_analysis(config_or_path: str | Path | dict[str, Any]) -> dict[str, Any]:
     ensure_dir(output_dir / "run_observables")
     _save_resolved_config(cfg, output_dir)
 
-    run_collection = build_run_collection(cfg)
-    runs = run_collection.runs.copy()
-    save_dataframe(output_dir / "tables" / "run_catalog.csv", runs)
-    write_json(output_dir / "source_summary.json", run_collection.source_summary)
-    if run_collection.metric_summary is not None:
-        write_json(output_dir / "source_metric_summary.json", run_collection.metric_summary)
+    stage_total = 7
+    with progress_bar(total=stage_total, desc="Offline analysis", enabled=show_progress, leave=True) as stage_bar:
+        run_collection = build_run_collection(cfg)
+        runs = run_collection.runs.copy()
+        save_dataframe(output_dir / "tables" / "run_catalog.csv", runs)
+        write_json(output_dir / "source_summary.json", run_collection.source_summary)
+        if run_collection.metric_summary is not None:
+            write_json(output_dir / "source_metric_summary.json", run_collection.metric_summary)
+        stage_bar.set_postfix(step="loaded runs")
+        stage_bar.update(1)
 
-    matrices: dict[str, pd.DataFrame] = {}
-    pair_frames = []
-    figures: dict[str, str] = {}
+        matrices: dict[str, pd.DataFrame] = {}
+        pair_frames = []
+        figures: dict[str, str] = {}
 
-    if bool(cfg.get("embeddings", {}).get("enabled", True)):
-        emb_pairs, emb_matrices_raw = compute_embedding_pairwise(runs, load_embeddings, cfg)
-        emb_matrices = {f"embedding_{name}": matrix for name, matrix in emb_matrices_raw.items()}
-        matrices.update(emb_matrices)
-        pair_frames.append(emb_pairs)
-        for name, matrix in emb_matrices.items():
-            save_matrix(output_dir / "matrices" / f"{name}.csv", matrix)
+        if bool(cfg.get("embeddings", {}).get("enabled", True)):
+            emb_pairs, emb_matrices_raw = compute_embedding_pairwise(runs, load_embeddings, cfg)
+            emb_matrices = {f"embedding_{name}": matrix for name, matrix in emb_matrices_raw.items()}
+            matrices.update(emb_matrices)
+            pair_frames.append(emb_pairs)
+            for name, matrix in emb_matrices.items():
+                save_matrix(output_dir / "matrices" / f"{name}.csv", matrix)
+        stage_bar.set_postfix(step="embeddings")
+        stage_bar.update(1)
 
-    metric_cfg = derive_metric_config(cfg, run_collection)
-    run_metrics = pd.DataFrame()
-    per_run = {}
-    if metric_cfg is not None and bool(cfg.get("trajectories", {}).get("enabled", True)):
-        write_json(output_dir / "trajectory_metric_config.json", metric_cfg)
-        run_metrics, per_run = compute_trajectory_observables(runs, load_lagrangian, cfg, metric_cfg)
-        for _, row in run_metrics.iterrows():
-            run_id = row["run_id"]
-            data = per_run[run_id]
-            safe_id = run_id.replace("/", "__")
-            map_path = output_dir / "run_observables" / f"{safe_id}_delta_h_map.npz"
-            save_npz(
-                map_path,
-                delta_h_map=data["delta_h_map"],
-                delta_h_best=data["delta_h_best"],
-                tau_frames=data["tau_frames"],
-                tau_steps=data["tau_steps"],
-                window_start_frames=data["window_start_frames"],
-                window_start_steps=data["window_start_steps"],
-                score_by_tau=data["score_by_tau"],
-                amp_by_tau=data["amp_by_tau"],
-                msc_by_tau=data["msc_by_tau"],
-            )
-            run_metrics.loc[run_metrics["run_id"] == run_id, "delta_h_map_path"] = str(map_path)
-        save_dataframe(output_dir / "tables" / "run_trajectory_observables.csv", run_metrics)
-        traj_pairs, traj_matrices = compute_trajectory_pairwise(runs, run_metrics, per_run, cfg)
-        matrices.update(traj_matrices)
-        pair_frames.append(traj_pairs)
-        for name, matrix in traj_matrices.items():
-            save_matrix(output_dir / "matrices" / f"{name}.csv", matrix)
+        metric_cfg = derive_metric_config(cfg, run_collection)
+        run_metrics = pd.DataFrame()
+        per_run = {}
+        if metric_cfg is not None and bool(cfg.get("trajectories", {}).get("enabled", True)):
+            write_json(output_dir / "trajectory_metric_config.json", metric_cfg)
+            run_metrics, per_run = compute_trajectory_observables(runs, load_lagrangian, cfg, metric_cfg)
+            for _, row in run_metrics.iterrows():
+                run_id = row["run_id"]
+                data = per_run[run_id]
+                safe_id = run_id.replace("/", "__")
+                map_path = output_dir / "run_observables" / f"{safe_id}_delta_h_map.npz"
+                save_npz(
+                    map_path,
+                    delta_h_map=data["delta_h_map"],
+                    delta_h_best=data["delta_h_best"],
+                    tau_frames=data["tau_frames"],
+                    tau_steps=data["tau_steps"],
+                    window_start_frames=data["window_start_frames"],
+                    window_start_steps=data["window_start_steps"],
+                    score_by_tau=data["score_by_tau"],
+                    amp_by_tau=data["amp_by_tau"],
+                    msc_by_tau=data["msc_by_tau"],
+                )
+                run_metrics.loc[run_metrics["run_id"] == run_id, "delta_h_map_path"] = str(map_path)
+            save_dataframe(output_dir / "tables" / "run_trajectory_observables.csv", run_metrics)
+            traj_pairs, traj_matrices = compute_trajectory_pairwise(runs, run_metrics, per_run, cfg)
+            matrices.update(traj_matrices)
+            pair_frames.append(traj_pairs)
+            for name, matrix in traj_matrices.items():
+                save_matrix(output_dir / "matrices" / f"{name}.csv", matrix)
+        stage_bar.set_postfix(step="trajectories")
+        stage_bar.update(1)
 
-    pairwise = _merge_pair_frames(pair_frames)
-    if not pairwise.empty:
-        save_dataframe(output_dir / "tables" / "pairwise_distances.csv", pairwise)
+        pairwise = _merge_pair_frames(pair_frames)
+        if not pairwise.empty:
+            save_dataframe(output_dir / "tables" / "pairwise_distances.csv", pairwise)
 
-    numeric_pair_cols = [
-        column
-        for column in pairwise.columns
-        if column not in {
-            "run_a",
-            "run_b",
-            "condition_a",
-            "condition_b",
-            "pair_type",
-            "pair_group_a",
-            "pair_group_b",
-            "same_pair_group",
-        }
-    ]
-    pair_summary = summarize_pairwise_values(pairwise, numeric_pair_cols)
-    effect_sizes = compute_effect_sizes(pairwise, numeric_pair_cols)
-    save_dataframe(output_dir / "tables" / "pairwise_summary.csv", pair_summary)
-    save_dataframe(output_dir / "tables" / "effect_sizes.csv", effect_sizes)
+        numeric_pair_cols = [
+            column
+            for column in pairwise.columns
+            if column not in {
+                "run_a",
+                "run_b",
+                "condition_a",
+                "condition_b",
+                "pair_type",
+                "pair_group_a",
+                "pair_group_b",
+                "same_pair_group",
+            }
+        ]
+        pair_summary = summarize_pairwise_values(pairwise, numeric_pair_cols)
+        effect_sizes = compute_effect_sizes(pairwise, numeric_pair_cols)
+        save_dataframe(output_dir / "tables" / "pairwise_summary.csv", pair_summary)
+        save_dataframe(output_dir / "tables" / "effect_sizes.csv", effect_sizes)
+        stage_bar.set_postfix(step="summaries")
+        stage_bar.update(1)
 
-    stats_cfg = dict(cfg.get("statistics", {}))
-    permutation_rows = []
-    for name, matrix in matrices.items():
-        permutation_rows.append(
-            permutation_test_from_matrix(
-                matrix,
-                runs,
-                observable=name,
-                max_exact=int(stats_cfg.get("permutation_max_exact", 200000)),
-                n_samples=int(stats_cfg.get("permutation_samples", 20000)),
-                seed=int(stats_cfg.get("permutation_seed", 0)),
-            )
-        )
-    permutation_df = pd.DataFrame(permutation_rows)
-    save_dataframe(output_dir / "tables" / "permutation_tests.csv", permutation_df)
+        stats_cfg = dict(cfg.get("statistics", {}))
+        permutation_rows = []
+        with progress_bar(total=len(matrices), desc="Permutation tests", enabled=show_progress, leave=False) as perm_bar:
+            for name, matrix in matrices.items():
+                permutation_rows.append(
+                    permutation_test_from_matrix(
+                        matrix,
+                        runs,
+                        observable=name,
+                        max_exact=int(stats_cfg.get("permutation_max_exact", 200000)),
+                        n_samples=int(stats_cfg.get("permutation_samples", 20000)),
+                        seed=int(stats_cfg.get("permutation_seed", 0)),
+                    )
+                )
+                perm_bar.update(1)
+        permutation_df = pd.DataFrame(permutation_rows)
+        save_dataframe(output_dir / "tables" / "permutation_tests.csv", permutation_df)
+        stage_bar.set_postfix(step="permutations")
+        stage_bar.update(1)
 
-    reporting_cfg = dict(cfg.get("reporting", {}))
-    concordance_cols = [
-        reporting_cfg.get("primary_embedding_metric"),
-        reporting_cfg.get("primary_delta_h_metric"),
-        reporting_cfg.get("primary_scalar_metric"),
-    ]
-    concordance_cols = [col for col in concordance_cols if col]
-    concordance = compute_concordance(pairwise, concordance_cols)
-    save_dataframe(output_dir / "tables" / "concordance.csv", concordance)
+        reporting_cfg = dict(cfg.get("reporting", {}))
+        concordance_cols = [
+            reporting_cfg.get("primary_embedding_metric"),
+            reporting_cfg.get("primary_delta_h_metric"),
+            reporting_cfg.get("primary_scalar_metric"),
+        ]
+        concordance_cols = [col for col in concordance_cols if col]
+        concordance = compute_concordance(pairwise, concordance_cols)
+        save_dataframe(output_dir / "tables" / "concordance.csv", concordance)
+        stage_bar.set_postfix(step="concordance")
+        stage_bar.update(1)
 
-    dpi = int(reporting_cfg.get("figure_dpi", 180))
-    frame_panel_path = output_dir / "figures" / "representative_frames.png"
-    if plot_frame_panel(
-        runs,
-        frame_panel_path,
-        n_per_condition=int(reporting_cfg.get("representative_runs_per_condition", 2)),
-        dpi=dpi,
-    ):
-        figures["representative_frames"] = str(frame_panel_path)
-
-    primary_embedding = str(reporting_cfg.get("primary_embedding_metric", "embedding_cloud_chamfer_cosine"))
-    if primary_embedding in matrices:
-        matrix_path = output_dir / "figures" / f"{primary_embedding}_matrix.png"
-        plot_distance_matrix(matrices[primary_embedding], runs, matrix_path, title=f"{primary_embedding} distance matrix", dpi=dpi)
-        figures["embedding_distance_matrix"] = str(matrix_path)
-        strip_path = output_dir / "figures" / f"{primary_embedding}_strip.png"
-        plot_pair_strip(pairwise, primary_embedding, strip_path, title=f"{primary_embedding} by pair class", dpi=dpi)
-        figures["embedding_strip"] = str(strip_path)
-
-    primary_delta_h = str(reporting_cfg.get("primary_delta_h_metric", "delta_h_l2"))
-    if primary_delta_h in matrices:
-        dh_matrix_path = output_dir / "figures" / f"{primary_delta_h}_matrix.png"
-        plot_distance_matrix(matrices[primary_delta_h], runs, dh_matrix_path, title=f"{primary_delta_h} distance matrix", dpi=dpi)
-        figures["delta_h_distance_matrix"] = str(dh_matrix_path)
-        dh_strip_path = output_dir / "figures" / f"{primary_delta_h}_strip.png"
-        plot_pair_strip(pairwise, primary_delta_h, dh_strip_path, title=f"{primary_delta_h} by pair class", dpi=dpi)
-        figures["delta_h_strip"] = str(dh_strip_path)
-
-    if per_run:
-        delta_h_examples_path = output_dir / "figures" / "delta_h_examples.png"
-        plot_delta_h_examples(
-            per_run,
+        dpi = int(reporting_cfg.get("figure_dpi", 180))
+        frame_panel_path = output_dir / "figures" / "representative_frames.png"
+        if plot_frame_panel(
             runs,
-            delta_h_examples_path,
+            frame_panel_path,
             n_per_condition=int(reporting_cfg.get("representative_runs_per_condition", 2)),
             dpi=dpi,
-        )
-        figures["delta_h_examples"] = str(delta_h_examples_path)
+        ):
+            figures["representative_frames"] = str(frame_panel_path)
 
-    if primary_embedding in pairwise.columns and primary_delta_h in pairwise.columns:
-        scatter_path = output_dir / "figures" / "embedding_vs_delta_h.png"
-        plot_scatter(
-            pairwise,
-            primary_embedding,
-            primary_delta_h,
-            scatter_path,
-            title="Embedding distance vs delta-h distance",
-            dpi=dpi,
-        )
-        figures["embedding_vs_delta_h"] = str(scatter_path)
+        primary_embedding = str(reporting_cfg.get("primary_embedding_metric", "embedding_cloud_chamfer_cosine"))
+        if primary_embedding in matrices:
+            matrix_path = output_dir / "figures" / f"{primary_embedding}_matrix.png"
+            plot_distance_matrix(matrices[primary_embedding], runs, matrix_path, title=f"{primary_embedding} distance matrix", dpi=dpi)
+            figures["embedding_distance_matrix"] = str(matrix_path)
+            strip_path = output_dir / "figures" / f"{primary_embedding}_strip.png"
+            plot_pair_strip(pairwise, primary_embedding, strip_path, title=f"{primary_embedding} by pair class", dpi=dpi)
+            figures["embedding_strip"] = str(strip_path)
 
-    if not run_metrics.empty:
-        msc_cols = [
-            "run_id",
-            "condition",
-            "msc_scalar",
-            "score_scalar",
-            "amp_scalar",
-            "tau_best_steps",
-            "mean_speed",
-            "speed_std",
-            "occupied_area_fraction",
-            "spatial_spread",
-        ]
-        msc_table = run_metrics[msc_cols].sort_values(["condition", "run_id"]).reset_index(drop=True)
-        save_dataframe(output_dir / "tables" / "msc_run_values.csv", msc_table)
-        pair_cols = ["run_a", "run_b", "pair_type", "absdiff_msc_scalar"]
-        if "absdiff_msc_scalar" in pairwise.columns:
-            save_dataframe(output_dir / "tables" / "msc_pairwise_differences.csv", pairwise[pair_cols])
-        table_path = output_dir / "figures" / "msc_run_table.png"
-        plot_table(msc_table, table_path, title="MSC_t and coarse trajectory observables", dpi=dpi)
-        figures["msc_table"] = str(table_path)
+        primary_delta_h = str(reporting_cfg.get("primary_delta_h_metric", "delta_h_l2"))
+        if primary_delta_h in matrices:
+            dh_matrix_path = output_dir / "figures" / f"{primary_delta_h}_matrix.png"
+            plot_distance_matrix(matrices[primary_delta_h], runs, dh_matrix_path, title=f"{primary_delta_h} distance matrix", dpi=dpi)
+            figures["delta_h_distance_matrix"] = str(dh_matrix_path)
+            dh_strip_path = output_dir / "figures" / f"{primary_delta_h}_strip.png"
+            plot_pair_strip(pairwise, primary_delta_h, dh_strip_path, title=f"{primary_delta_h} by pair class", dpi=dpi)
+            figures["delta_h_strip"] = str(dh_strip_path)
+
+        if per_run:
+            delta_h_examples_path = output_dir / "figures" / "delta_h_examples.png"
+            plot_delta_h_examples(
+                per_run,
+                runs,
+                delta_h_examples_path,
+                n_per_condition=int(reporting_cfg.get("representative_runs_per_condition", 2)),
+                dpi=dpi,
+            )
+            figures["delta_h_examples"] = str(delta_h_examples_path)
+
+        if primary_embedding in pairwise.columns and primary_delta_h in pairwise.columns:
+            scatter_path = output_dir / "figures" / "embedding_vs_delta_h.png"
+            plot_scatter(
+                pairwise,
+                primary_embedding,
+                primary_delta_h,
+                scatter_path,
+                title="Embedding distance vs delta-h distance",
+                dpi=dpi,
+            )
+            figures["embedding_vs_delta_h"] = str(scatter_path)
+
+        if not run_metrics.empty:
+            msc_cols = [
+                "run_id",
+                "condition",
+                "msc_scalar",
+                "score_scalar",
+                "amp_scalar",
+                "tau_best_steps",
+                "mean_speed",
+                "speed_std",
+                "occupied_area_fraction",
+                "spatial_spread",
+            ]
+            msc_table = run_metrics[msc_cols].sort_values(["condition", "run_id"]).reset_index(drop=True)
+            save_dataframe(output_dir / "tables" / "msc_run_values.csv", msc_table)
+            pair_cols = ["run_a", "run_b", "pair_type", "absdiff_msc_scalar"]
+            if "absdiff_msc_scalar" in pairwise.columns:
+                save_dataframe(output_dir / "tables" / "msc_pairwise_differences.csv", pairwise[pair_cols])
+            table_path = output_dir / "figures" / "msc_run_table.png"
+            plot_table(msc_table, table_path, title="MSC_t and coarse trajectory observables", dpi=dpi)
+            figures["msc_table"] = str(table_path)
+        stage_bar.set_postfix(step="figures")
+        stage_bar.update(1)
 
     overview = {
         "n_runs": int(runs.shape[0]),
