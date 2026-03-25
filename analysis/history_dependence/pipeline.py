@@ -10,7 +10,7 @@ from omegaconf import OmegaConf
 
 from .embedding_metrics import compute_embedding_pairwise
 from .io import build_run_collection, load_embeddings, load_lagrangian
-from .report_main_observable import generate_main_observable_report
+from .report_main_observable import generate_main_observable_report, generate_trial_level_metric_tests
 from .reporting import (
     compute_concordance,
     compute_effect_sizes,
@@ -89,6 +89,28 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "strip_center": "mean",
         "include_matrix_figure": True,
         "figure_dpi": 180,
+        "trial_effect_mode": "mean_controls",
+        "trial_anchor_variant": "control_a",
+    },
+    "trial_level_tests": {
+        "enabled": True,
+        "metrics": [
+            "delta_h_dist_tau3000_ks",
+            "delta_h_dist_tau3000_energy",
+            "absdiff_mean_speed",
+            "absdiff_speed_std",
+            "absdiff_spatial_spread",
+        ],
+        "effect_mode": "anchor",
+        "anchor_variant": "control_a",
+        "bootstrap_reps": 2000,
+        "bootstrap_seed": 0,
+        "ci_level": 0.95,
+        "permutation_max_exact": 200000,
+        "permutation_samples": 20000,
+        "permutation_seed": 0,
+        "zero_tolerance": 1e-12,
+        "figure_dpi": 180,
     },
     "progress": {
         "enabled": True,
@@ -159,7 +181,7 @@ def run_analysis(config_or_path: str | Path | dict[str, Any]) -> dict[str, Any]:
     ensure_dir(output_dir / "run_observables")
     _save_resolved_config(cfg, output_dir)
 
-    stage_total = 8
+    stage_total = 9
     with progress_bar(total=stage_total, desc="Offline analysis", enabled=show_progress, leave=True) as stage_bar:
         run_collection = build_run_collection(cfg)
         runs = run_collection.runs.copy()
@@ -274,6 +296,10 @@ def run_analysis(config_or_path: str | Path | dict[str, Any]) -> dict[str, Any]:
         stage_bar.set_postfix(step="main observable")
         stage_bar.update(1)
 
+        trial_level_tests = generate_trial_level_metric_tests(runs, matrices, output_dir, cfg)
+        stage_bar.set_postfix(step="trial tests")
+        stage_bar.update(1)
+
         reporting_cfg = dict(cfg.get("reporting", {}))
         concordance_cols = [
             reporting_cfg.get("primary_embedding_metric"),
@@ -363,6 +389,8 @@ def run_analysis(config_or_path: str | Path | dict[str, Any]) -> dict[str, Any]:
 
     if main_observable_report:
         figures.update(main_observable_report["paths"]["figure_paths"])
+    if trial_level_tests:
+        figures.update(trial_level_tests["paths"]["figure_paths"])
 
     overview = {
         "n_runs": int(runs.shape[0]),
@@ -375,6 +403,7 @@ def run_analysis(config_or_path: str | Path | dict[str, Any]) -> dict[str, Any]:
         "figure_paths": figures,
         "main_observable_distance_name": None if not main_observable_report else main_observable_report["summary"]["distance_name"],
         "main_observable_report": None if not main_observable_report else main_observable_report["text_summary"],
+        "trial_level_report": None if not trial_level_tests else trial_level_tests.get("report_text"),
     }
     write_json(output_dir / "overview.json", overview)
 
@@ -391,6 +420,7 @@ def run_analysis(config_or_path: str | Path | dict[str, Any]) -> dict[str, Any]:
         "matrices": matrices,
         "figures": figures,
         "main_observable": main_observable_report,
+        "trial_level_tests": trial_level_tests,
     }
 
 
@@ -403,6 +433,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Runs: {result['runs'].shape[0]}")
     if result.get("main_observable"):
         print(result["main_observable"]["text_summary"])
+    if result.get("trial_level_tests", {}).get("report_text"):
+        print(result["trial_level_tests"]["report_text"])
     if not result["effect_sizes"].empty:
         top = result["effect_sizes"].sort_values("observable").head(8)
         print(top.to_string(index=False))
