@@ -4,11 +4,13 @@ import argparse
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 from omegaconf import OmegaConf
 
 from .embedding_metrics import compute_embedding_pairwise
 from .io import build_run_collection, load_embeddings, load_lagrangian
+from .report_main_observable import generate_main_observable_report
 from .reporting import (
     compute_concordance,
     compute_effect_sizes,
@@ -63,12 +65,30 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "metric_beta": 1.0,
         "occupancy_bins": 64,
         "pairwise_map_metrics": ["l2", "mean_abs"],
+        "fixed_tau_distribution_steps": 3000,
+        "pairwise_distribution_metrics": ["wasserstein", "ks", "energy"],
         "primary_map_metric": "delta_h_l2",
     },
     "statistics": {
         "permutation_max_exact": 200000,
         "permutation_samples": 20000,
         "permutation_seed": 0,
+    },
+    "main_observable": {
+        "enabled": True,
+        "distance_name": "embedding_cloud_chamfer_cosine",
+        "class_a": "free-wall",
+        "class_b": "free-free",
+        "tie_tolerance": 0.0,
+        "bootstrap_reps": 2000,
+        "bootstrap_seed": 0,
+        "ci_level": 0.95,
+        "permutation_max_exact": 200000,
+        "permutation_samples": 20000,
+        "permutation_seed": 0,
+        "strip_center": "mean",
+        "include_matrix_figure": True,
+        "figure_dpi": 180,
     },
     "progress": {
         "enabled": True,
@@ -139,7 +159,7 @@ def run_analysis(config_or_path: str | Path | dict[str, Any]) -> dict[str, Any]:
     ensure_dir(output_dir / "run_observables")
     _save_resolved_config(cfg, output_dir)
 
-    stage_total = 7
+    stage_total = 8
     with progress_bar(total=stage_total, desc="Offline analysis", enabled=show_progress, leave=True) as stage_bar:
         run_collection = build_run_collection(cfg)
         runs = run_collection.runs.copy()
@@ -175,8 +195,7 @@ def run_analysis(config_or_path: str | Path | dict[str, Any]) -> dict[str, Any]:
                 data = per_run[run_id]
                 safe_id = run_id.replace("/", "__")
                 map_path = output_dir / "run_observables" / f"{safe_id}_delta_h_map.npz"
-                save_npz(
-                    map_path,
+                payload = dict(
                     delta_h_map=data["delta_h_map"],
                     delta_h_best=data["delta_h_best"],
                     tau_frames=data["tau_frames"],
@@ -186,6 +205,15 @@ def run_analysis(config_or_path: str | Path | dict[str, Any]) -> dict[str, Any]:
                     score_by_tau=data["score_by_tau"],
                     amp_by_tau=data["amp_by_tau"],
                     msc_by_tau=data["msc_by_tau"],
+                )
+                if "delta_h_fixed_tau" in data:
+                    payload["delta_h_fixed_tau"] = data["delta_h_fixed_tau"]
+                    payload["delta_h_fixed_tau_idx"] = np.asarray(data["delta_h_fixed_tau_idx"], dtype=np.int32)
+                    payload["delta_h_fixed_tau_steps"] = np.asarray(data["delta_h_fixed_tau_steps"], dtype=np.int32)
+                    payload["delta_h_fixed_tau_frames"] = np.asarray(data["delta_h_fixed_tau_frames"], dtype=np.int32)
+                save_npz(
+                    map_path,
+                    **payload,
                 )
                 run_metrics.loc[run_metrics["run_id"] == run_id, "delta_h_map_path"] = str(map_path)
             save_dataframe(output_dir / "tables" / "run_trajectory_observables.csv", run_metrics)
@@ -240,6 +268,10 @@ def run_analysis(config_or_path: str | Path | dict[str, Any]) -> dict[str, Any]:
         permutation_df = pd.DataFrame(permutation_rows)
         save_dataframe(output_dir / "tables" / "permutation_tests.csv", permutation_df)
         stage_bar.set_postfix(step="permutations")
+        stage_bar.update(1)
+
+        main_observable_report = generate_main_observable_report(runs, matrices, output_dir, cfg)
+        stage_bar.set_postfix(step="main observable")
         stage_bar.update(1)
 
         reporting_cfg = dict(cfg.get("reporting", {}))
@@ -329,6 +361,9 @@ def run_analysis(config_or_path: str | Path | dict[str, Any]) -> dict[str, Any]:
         stage_bar.set_postfix(step="figures")
         stage_bar.update(1)
 
+    if main_observable_report:
+        figures.update(main_observable_report["paths"]["figure_paths"])
+
     overview = {
         "n_runs": int(runs.shape[0]),
         "n_free_runs": int((runs["condition"] == "free").sum()),
@@ -338,6 +373,8 @@ def run_analysis(config_or_path: str | Path | dict[str, Any]) -> dict[str, Any]:
         "primary_delta_h_metric": primary_delta_h,
         "primary_scalar_metric": str(reporting_cfg.get("primary_scalar_metric", "absdiff_msc_scalar")),
         "figure_paths": figures,
+        "main_observable_distance_name": None if not main_observable_report else main_observable_report["summary"]["distance_name"],
+        "main_observable_report": None if not main_observable_report else main_observable_report["text_summary"],
     }
     write_json(output_dir / "overview.json", overview)
 
@@ -353,6 +390,7 @@ def run_analysis(config_or_path: str | Path | dict[str, Any]) -> dict[str, Any]:
         "concordance": concordance,
         "matrices": matrices,
         "figures": figures,
+        "main_observable": main_observable_report,
     }
 
 
@@ -363,6 +401,8 @@ def main(argv: list[str] | None = None) -> int:
     result = run_analysis(args.config)
     print(f"Saved offline analysis to {result['output_dir']}")
     print(f"Runs: {result['runs'].shape[0]}")
+    if result.get("main_observable"):
+        print(result["main_observable"]["text_summary"])
     if not result["effect_sizes"].empty:
         top = result["effect_sizes"].sort_values("observable").head(8)
         print(top.to_string(index=False))
