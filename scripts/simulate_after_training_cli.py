@@ -49,7 +49,7 @@ def main():
     parser.add_argument('--sigma', type=float, default=0.65, help='For FlowLenia: sigma parameter')
     parser.add_argument('--border', type=str, default="wall", help='For FlowLenia: border mode')
     parser.add_argument('--mix_rule', type=str, default="stoch", help='For FlowLenia: mix rule')
-    parser.add_argument('--sobel_impl', type=str, default='scipy', choices=['scipy', 'lax'], help='For FlowLenia: gradient operator implementation')
+    parser.add_argument('--sobel_impl', type=str, default='scipy', choices=['scipy', 'lax', 'lax_legacy'], help='For FlowLenia: gradient operator implementation')
     parser.add_argument('--base_seed', type=int, default=0, help='For FlowLenia: deterministic base-parameter seed')
     parser.add_argument('--seed_patch_size', type=int, default=20, help='For FlowLenia: size of seed patch')
     parser.add_argument('--seed_mode', type=str, default='notebook_centers', choices=['center', 'random_patches', 'notebook_centers'], help='For FlowLenia: seeding mode')
