@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from .io import infer_lagrangian_metadata
-from .utils import REPO_ROOT, pair_type
+from .utils import REPO_ROOT, pair_type, progress, progress_bar
 
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
@@ -90,6 +90,63 @@ def _score_from_h(h: np.ndarray, metric_cfg: dict[str, Any]) -> tuple[float, flo
     return score, amp, msc
 
 
+def _resolve_fixed_tau_index(
+    tau_steps: np.ndarray,
+    tau_frames: np.ndarray,
+    *,
+    fixed_tau_steps: int | None = None,
+    fixed_tau_frames: int | None = None,
+) -> int | None:
+    if fixed_tau_steps is not None:
+        matches = np.flatnonzero(np.asarray(tau_steps, dtype=np.int64) == int(fixed_tau_steps))
+        if matches.size < 1:
+            raise ValueError(
+                f"Requested fixed tau_steps={fixed_tau_steps}, but available tau_steps are "
+                f"{np.asarray(tau_steps, dtype=np.int64).tolist()}."
+            )
+        return int(matches[0])
+    if fixed_tau_frames is not None:
+        matches = np.flatnonzero(np.asarray(tau_frames, dtype=np.int64) == int(fixed_tau_frames))
+        if matches.size < 1:
+            raise ValueError(
+                f"Requested fixed tau_frames={fixed_tau_frames}, but available tau_frames are "
+                f"{np.asarray(tau_frames, dtype=np.int64).tolist()}."
+            )
+        return int(matches[0])
+    return None
+
+
+def delta_h_distribution_distance(values_a: np.ndarray, values_b: np.ndarray, metric: str = "wasserstein") -> float:
+    a = np.sort(np.asarray(values_a, dtype=np.float64).reshape(-1))
+    b = np.sort(np.asarray(values_b, dtype=np.float64).reshape(-1))
+    if a.size < 1 or b.size < 1:
+        raise ValueError("Delta-H distribution vectors must be non-empty.")
+
+    metric = str(metric).strip().lower()
+    if metric == "wasserstein":
+        x = np.concatenate([a, b])
+        x.sort()
+        if x.size < 2:
+            return 0.0
+        dx = np.diff(x)
+        cdf_a = np.searchsorted(a, x[:-1], side="right") / float(a.size)
+        cdf_b = np.searchsorted(b, x[:-1], side="right") / float(b.size)
+        return float(np.sum(np.abs(cdf_a - cdf_b) * dx))
+    if metric == "ks":
+        x = np.concatenate([a, b])
+        x.sort()
+        cdf_a = np.searchsorted(a, x, side="right") / float(a.size)
+        cdf_b = np.searchsorted(b, x, side="right") / float(b.size)
+        return float(np.max(np.abs(cdf_a - cdf_b)))
+    if metric == "energy":
+        cross = np.mean(np.abs(a[:, None] - b[None, :]))
+        within_a = np.mean(np.abs(a[:, None] - a[None, :]))
+        within_b = np.mean(np.abs(b[:, None] - b[None, :]))
+        val = max(0.0, 2.0 * cross - within_a - within_b)
+        return float(np.sqrt(val))
+    raise ValueError(f"Unsupported delta-h distribution distance metric={metric!r}.")
+
+
 def derive_metric_config(cfg: dict[str, Any], run_collection) -> dict[str, Any] | None:
     traj_cfg = dict(cfg.get("trajectories", {}))
     if not bool(traj_cfg.get("enabled", True)):
@@ -156,7 +213,14 @@ def derive_metric_config(cfg: dict[str, Any], run_collection) -> dict[str, Any] 
     return resolve_metric_config(args)
 
 
-def compute_delta_h_summary(xy_seq: np.ndarray, metric_cfg: dict[str, Any], *, selected_tau_index: int | None = None) -> dict[str, Any]:
+def compute_delta_h_summary(
+    xy_seq: np.ndarray,
+    metric_cfg: dict[str, Any],
+    *,
+    selected_tau_index: int | None = None,
+    progress_desc: str | None = None,
+    progress_enabled: bool = False,
+) -> dict[str, Any]:
     xy = np.asarray(xy_seq, dtype=np.float64)
     if xy.ndim != 3 or xy.shape[-1] != 2:
         raise ValueError(f"Lagrangian trajectories must have shape (T, N, 2), got {xy.shape}.")
@@ -173,7 +237,14 @@ def compute_delta_h_summary(xy_seq: np.ndarray, metric_cfg: dict[str, Any], *, s
     score_all = []
     amp_all = []
     msc_all = []
-    for tau_idx, tau_frames in enumerate(tau_frames_list):
+    tau_iter = progress(
+        enumerate(tau_frames_list),
+        total=len(tau_frames_list),
+        desc=progress_desc or "Delta-H taus",
+        enabled=progress_enabled,
+        leave=False,
+    )
+    for tau_idx, tau_frames in tau_iter:
         tseg = int(metric_cfg["tseg_list"][tau_idx])
         m_count = int(metric_cfg["m_count_list"][tau_idx])
         win = int(metric_cfg["window_size_frames"])
@@ -325,23 +396,55 @@ def compute_trajectory_observables(
     metric_cfg: dict[str, Any],
 ) -> tuple[pd.DataFrame, dict[str, dict[str, Any]]]:
     traj_cfg = dict(cfg.get("trajectories", {}))
+    progress_cfg = dict(cfg.get("progress", {}))
+    show_progress = bool(progress_cfg.get("enabled", True))
+    show_inner = bool(progress_cfg.get("show_inner", True))
     occupancy_bins = int(traj_cfg.get("occupancy_bins", 64))
     selected_tau_index = traj_cfg.get("selected_tau_index")
+    fixed_tau_steps = traj_cfg.get("fixed_tau_distribution_steps", None)
+    fixed_tau_frames = traj_cfg.get("fixed_tau_distribution_frames", None)
     available = runs[runs["has_lagrangian"]].copy().reset_index(drop=True)
     if available.empty:
         return pd.DataFrame(), {}
 
     run_rows = []
     per_run: dict[str, dict[str, Any]] = {}
-    for _, row in available.iterrows():
+    run_iter = progress(
+        available.to_dict(orient="records"),
+        total=int(available.shape[0]),
+        desc="Trajectory observables",
+        enabled=show_progress,
+        leave=False,
+    )
+    for row in run_iter:
         xy = load_lagrangian_fn(row)
         delta_h_summary = compute_delta_h_summary(
             xy,
             metric_cfg,
             selected_tau_index=None if selected_tau_index is None else int(selected_tau_index),
+            progress_desc=f"Delta-H {row['run_id']}",
+            progress_enabled=show_progress and show_inner,
         )
         coarse = compute_coarse_observables(xy, metric_cfg, occupancy_bins=occupancy_bins)
         metrics = dict(delta_h_summary)
+        fixed_tau_idx = _resolve_fixed_tau_index(
+            metrics["tau_steps"],
+            metrics["tau_frames"],
+            fixed_tau_steps=None if fixed_tau_steps is None else int(fixed_tau_steps),
+            fixed_tau_frames=None if fixed_tau_frames is None else int(fixed_tau_frames),
+        )
+        if fixed_tau_idx is not None:
+            fixed_tau_values = np.asarray(metrics["delta_h_map"][fixed_tau_idx], dtype=np.float64)
+            metrics.update(
+                {
+                    "delta_h_fixed_tau": fixed_tau_values,
+                    "delta_h_fixed_tau_idx": int(fixed_tau_idx),
+                    "delta_h_fixed_tau_steps": int(np.asarray(metrics["tau_steps"])[fixed_tau_idx]),
+                    "delta_h_fixed_tau_frames": int(np.asarray(metrics["tau_frames"])[fixed_tau_idx]),
+                    "delta_h_fixed_tau_mean": float(np.mean(fixed_tau_values)),
+                    "delta_h_fixed_tau_std": float(np.std(fixed_tau_values)),
+                }
+            )
         metrics.update(coarse)
         per_run[row["run_id"]] = metrics
         run_rows.append(
@@ -358,6 +461,11 @@ def compute_trajectory_observables(
                 "msc_scalar": float(metrics["msc_scalar"]),
                 "delta_h_best_mean": float(metrics["delta_h_best_mean"]),
                 "delta_h_best_std": float(metrics["delta_h_best_std"]),
+                "delta_h_fixed_tau_idx": None if "delta_h_fixed_tau_idx" not in metrics else int(metrics["delta_h_fixed_tau_idx"]),
+                "delta_h_fixed_tau_steps": None if "delta_h_fixed_tau_steps" not in metrics else int(metrics["delta_h_fixed_tau_steps"]),
+                "delta_h_fixed_tau_frames": None if "delta_h_fixed_tau_frames" not in metrics else int(metrics["delta_h_fixed_tau_frames"]),
+                "delta_h_fixed_tau_mean": None if "delta_h_fixed_tau_mean" not in metrics else float(metrics["delta_h_fixed_tau_mean"]),
+                "delta_h_fixed_tau_std": None if "delta_h_fixed_tau_std" not in metrics else float(metrics["delta_h_fixed_tau_std"]),
                 "mean_speed": float(metrics["mean_speed"]),
                 "speed_std": float(metrics["speed_std"]),
                 "occupied_area_fraction": float(metrics["occupied_area_fraction"]),
@@ -375,7 +483,10 @@ def compute_trajectory_pairwise(
     cfg: dict[str, Any],
 ) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
     traj_cfg = dict(cfg.get("trajectories", {}))
+    progress_cfg = dict(cfg.get("progress", {}))
+    show_progress = bool(progress_cfg.get("enabled", True))
     map_metrics = [str(x) for x in traj_cfg.get("pairwise_map_metrics", ["l2"])]
+    distribution_metrics = [str(x) for x in traj_cfg.get("pairwise_distribution_metrics", [])]
     scalar_keys = [
         "msc_scalar",
         "score_scalar",
@@ -391,6 +502,17 @@ def compute_trajectory_pairwise(
     n_runs = int(available.shape[0])
     run_ids = available["run_id"].tolist()
     matrix_names = [f"delta_h_{metric}" for metric in map_metrics]
+    fixed_tau_steps = traj_cfg.get("fixed_tau_distribution_steps", None)
+    fixed_tau_frames = traj_cfg.get("fixed_tau_distribution_frames", None)
+    dist_name_suffix = None
+    if distribution_metrics:
+        if fixed_tau_steps is not None:
+            dist_name_suffix = f"tau{int(fixed_tau_steps)}"
+        elif fixed_tau_frames is not None:
+            dist_name_suffix = f"tauf{int(fixed_tau_frames)}"
+        else:
+            dist_name_suffix = "taufixed"
+        matrix_names.extend(f"delta_h_dist_{dist_name_suffix}_{metric}" for metric in distribution_metrics)
     matrix_names.extend(f"absdiff_{key}" for key in scalar_keys)
     matrices = {
         name: np.zeros((n_runs, n_runs), dtype=np.float64)
@@ -399,37 +521,52 @@ def compute_trajectory_pairwise(
 
     metrics_by_id = run_metrics.set_index("run_id").to_dict(orient="index")
     pair_rows = []
-    for i in range(n_runs):
-        row_i = available.iloc[i]
-        data_i = per_run[row_i["run_id"]]
-        scal_i = metrics_by_id[row_i["run_id"]]
-        for j in range(i + 1, n_runs):
-            row_j = available.iloc[j]
-            data_j = per_run[row_j["run_id"]]
-            scal_j = metrics_by_id[row_j["run_id"]]
-            record = {
-                "run_a": row_i["run_id"],
-                "run_b": row_j["run_id"],
-                "condition_a": row_i["condition"],
-                "condition_b": row_j["condition"],
-                "pair_type": pair_type(row_i["condition"], row_j["condition"]),
-                "pair_group_a": row_i["pair_group_id"],
-                "pair_group_b": row_j["pair_group_id"],
-                "same_pair_group": bool(row_i["pair_group_id"] == row_j["pair_group_id"]),
-            }
-            for metric in map_metrics:
-                name = f"delta_h_{metric}"
-                value = delta_h_map_distance(data_i["delta_h_map"], data_j["delta_h_map"], metric=metric)
-                matrices[name][i, j] = value
-                matrices[name][j, i] = value
-                record[name] = value
-            for key in scalar_keys:
-                name = f"absdiff_{key}"
-                value = abs(float(scal_i[key]) - float(scal_j[key]))
-                matrices[name][i, j] = value
-                matrices[name][j, i] = value
-                record[name] = value
-            pair_rows.append(record)
+    pair_total = n_runs * (n_runs - 1) // 2
+    with progress_bar(total=pair_total, desc="Trajectory pairwise", enabled=show_progress, leave=False) as pbar:
+        for i in range(n_runs):
+            row_i = available.iloc[i]
+            data_i = per_run[row_i["run_id"]]
+            scal_i = metrics_by_id[row_i["run_id"]]
+            for j in range(i + 1, n_runs):
+                row_j = available.iloc[j]
+                data_j = per_run[row_j["run_id"]]
+                scal_j = metrics_by_id[row_j["run_id"]]
+                record = {
+                    "run_a": row_i["run_id"],
+                    "run_b": row_j["run_id"],
+                    "condition_a": row_i["condition"],
+                    "condition_b": row_j["condition"],
+                    "pair_type": pair_type(row_i["condition"], row_j["condition"]),
+                    "pair_group_a": row_i["pair_group_id"],
+                    "pair_group_b": row_j["pair_group_id"],
+                    "same_pair_group": bool(row_i["pair_group_id"] == row_j["pair_group_id"]),
+                }
+                for metric in map_metrics:
+                    name = f"delta_h_{metric}"
+                    value = delta_h_map_distance(data_i["delta_h_map"], data_j["delta_h_map"], metric=metric)
+                    matrices[name][i, j] = value
+                    matrices[name][j, i] = value
+                    record[name] = value
+                if distribution_metrics:
+                    if "delta_h_fixed_tau" not in data_i or "delta_h_fixed_tau" not in data_j:
+                        raise ValueError(
+                            "Requested pairwise_distribution_metrics, but delta_h_fixed_tau is unavailable. "
+                            "Set trajectories.fixed_tau_distribution_steps or fixed_tau_distribution_frames."
+                        )
+                    for metric in distribution_metrics:
+                        name = f"delta_h_dist_{dist_name_suffix}_{metric}"
+                        value = delta_h_distribution_distance(data_i["delta_h_fixed_tau"], data_j["delta_h_fixed_tau"], metric=metric)
+                        matrices[name][i, j] = value
+                        matrices[name][j, i] = value
+                        record[name] = value
+                for key in scalar_keys:
+                    name = f"absdiff_{key}"
+                    value = abs(float(scal_i[key]) - float(scal_j[key]))
+                    matrices[name][i, j] = value
+                    matrices[name][j, i] = value
+                    record[name] = value
+                pair_rows.append(record)
+                pbar.update(1)
 
     matrix_frames = {
         name: pd.DataFrame(value, index=run_ids, columns=run_ids)
