@@ -6,11 +6,18 @@ from typing import Any, Dict, Tuple
 import numpy as np
 
 
+def _atomic_path(path: str) -> str:
+    return f"{path}.tmp"
+
+
 def save_json(save_dir, name, item):
     if save_dir is not None:
         os.makedirs(f"{save_dir}/", exist_ok=True)
-        with open(f"{save_dir}/{name}.json", "w") as f:
+        path = f"{save_dir}/{name}.json"
+        tmp_path = _atomic_path(path)
+        with open(tmp_path, "w") as f:
             json.dump(item, f)
+        os.replace(tmp_path, path)
             
 def load_json(load_dir, name):
     if load_dir is not None:
@@ -22,8 +29,11 @@ def load_json(load_dir, name):
 def save_pkl(save_dir, name, item):
     if save_dir is not None:
         os.makedirs(f"{save_dir}/", exist_ok=True)
-        with open(f"{save_dir}/{name}.pkl", "wb") as f:
+        path = f"{save_dir}/{name}.pkl"
+        tmp_path = _atomic_path(path)
+        with open(tmp_path, "wb") as f:
             pickle.dump(item, f)
+        os.replace(tmp_path, path)
 
 
 def load_pkl(load_dir, name):

@@ -54,6 +54,111 @@ def _patch_wandb_pandas_check() -> None:
 _patch_wandb_pandas_check()
 
 
+def _to_numpy_tree(tree):
+    return jax.tree.map(lambda x: np.array(x), tree)
+
+
+def _to_jax_tree(tree):
+    return jax.tree.map(lambda x: jnp.asarray(x), tree)
+
+
+def _load_resume_state(save_dir):
+    if save_dir is None:
+        return None
+    path = os.path.join(save_dir, "resume_state.pkl")
+    if not os.path.exists(path):
+        return None
+    return util.load_pkl(save_dir, "resume_state")
+
+
+def _save_resume_state(
+    save_dir,
+    *,
+    next_iter,
+    rng,
+    es_state,
+    pop_size,
+    candidate_dims,
+    substrate_param_dims,
+    optimize_tau,
+    data,
+    best_params_traj,
+    best_tau_traj,
+    best_loss_traj,
+    pop_params_traj,
+    pop_tau_traj,
+    pop_loss_traj,
+    palette_traj,
+):
+    if save_dir is None:
+        return
+    payload = dict(
+        version=1,
+        next_iter=int(next_iter),
+        pop_size=int(pop_size),
+        candidate_dims=int(candidate_dims),
+        substrate_param_dims=int(substrate_param_dims),
+        optimize_tau=bool(optimize_tau),
+        rng=np.array(rng),
+        es_state=_to_numpy_tree(es_state),
+        data=[] if len(data) == 0 else _to_numpy_tree(data),
+        best_params_traj=[np.array(x) for x in best_params_traj],
+        best_tau_traj=list(best_tau_traj),
+        best_loss_traj=np.asarray(best_loss_traj, dtype=np.float32),
+        pop_params_traj=[np.array(x) for x in pop_params_traj],
+        pop_tau_traj=list(pop_tau_traj),
+        pop_loss_traj=[np.array(x) for x in pop_loss_traj],
+        palette_traj=list(palette_traj),
+    )
+    util.save_pkl(save_dir, "resume_state", payload)
+
+
+def _restore_resume_state(
+    checkpoint,
+    *,
+    pop_size,
+    candidate_dims,
+    substrate_param_dims,
+    optimize_tau,
+):
+    if checkpoint is None:
+        return None
+    ckpt_pop_size = int(checkpoint.get("pop_size"))
+    if ckpt_pop_size != int(pop_size):
+        raise ValueError(
+            f"Resume checkpoint pop_size mismatch: checkpoint={ckpt_pop_size}, current={int(pop_size)}."
+        )
+    ckpt_candidate_dims = int(checkpoint.get("candidate_dims"))
+    if ckpt_candidate_dims != int(candidate_dims):
+        raise ValueError(
+            f"Resume checkpoint candidate_dims mismatch: checkpoint={ckpt_candidate_dims}, current={int(candidate_dims)}."
+        )
+    ckpt_substrate_dims = int(checkpoint.get("substrate_param_dims"))
+    if ckpt_substrate_dims != int(substrate_param_dims):
+        raise ValueError(
+            f"Resume checkpoint substrate_param_dims mismatch: checkpoint={ckpt_substrate_dims}, "
+            f"current={int(substrate_param_dims)}."
+        )
+    ckpt_optimize_tau = bool(checkpoint.get("optimize_tau", False))
+    if ckpt_optimize_tau != bool(optimize_tau):
+        raise ValueError(
+            f"Resume checkpoint optimize_tau mismatch: checkpoint={ckpt_optimize_tau}, current={bool(optimize_tau)}."
+        )
+    return dict(
+        next_iter=int(checkpoint.get("next_iter", 0)),
+        rng=jnp.asarray(checkpoint["rng"]),
+        es_state=_to_jax_tree(checkpoint["es_state"]),
+        data=list(checkpoint.get("data", [])),
+        best_params_traj=[np.array(x) for x in checkpoint.get("best_params_traj", [])],
+        best_tau_traj=list(checkpoint.get("best_tau_traj", [])),
+        best_loss_traj=[float(x) for x in np.asarray(checkpoint.get("best_loss_traj", []))],
+        pop_params_traj=[np.array(x) for x in checkpoint.get("pop_params_traj", [])],
+        pop_tau_traj=list(checkpoint.get("pop_tau_traj", [])),
+        pop_loss_traj=[np.array(x) for x in checkpoint.get("pop_loss_traj", [])],
+        palette_traj=list(checkpoint.get("palette_traj", [])),
+    )
+
+
 def _init_lagrangian_points_jax(
     A0: jax.Array,
     *,
@@ -102,6 +207,8 @@ def _init_lagrangian_points_jax(
 def load_config():
     if len(sys.argv) < 2:
         raise SystemExit("Usage: python scripts/main_opt_msc.py <config.yaml>")
+    if not OmegaConf.has_resolver("env"):
+        OmegaConf.register_new_resolver("env", lambda k, default=None: os.getenv(k, default))
     cfg = OmegaConf.load(sys.argv[1])
     flat = OmegaConf.merge(
         cfg.get("meta", {}),
@@ -332,15 +439,12 @@ def main(cfg, args):
             loss_dict = jax.tree.map(lambda x: x.mean(axis=1), loss_dict)
             return rng, loss, loss_dict
 
-        rng = jax.random.PRNGKey(args.seed)
         strategy = evosax.Sep_CMA_ES(
             popsize=args.pop_size,
             num_dims=substrate_param_dims + tau_extra_dims,
             sigma_init=args.sigma,
         )
         es_params = strategy.default_params
-        rng, _rng = split(rng)
-        es_state = strategy.initialize(_rng, es_params)
 
         pop_batch = int(getattr(args, "pop_batch", args.pop_size))
         if pop_batch < 1:
@@ -348,6 +452,15 @@ def main(cfg, args):
 
         pca_every = int(getattr(args, "pca_every", 25))
         pca_history = int(getattr(args, "pca_history", 100))
+        save_every = getattr(args, "save_every", None)
+        if save_every is None:
+            save_interval = max(1, int(args.n_iters) // 10)
+        else:
+            save_interval = int(save_every)
+            if save_interval < 1:
+                raise ValueError(f"save_every must be >= 1, got {save_interval}.")
+        resume_enabled = bool(getattr(args, "resume", False))
+        run.summary["logging/save_interval"] = int(save_interval)
 
         data = []
         best_params_traj = []
@@ -357,7 +470,50 @@ def main(cfg, args):
         pop_tau_traj = []
         pop_loss_traj = []
         palette_traj = []
-        pbar = tqdm(range(args.n_iters))
+        start_iter = 0
+        resumed = False
+        rng = jax.random.PRNGKey(args.seed)
+        candidate_dims = int(substrate_param_dims + tau_extra_dims)
+        if resume_enabled:
+            resume_state = _load_resume_state(args.save_dir)
+            if resume_state is not None:
+                restored = _restore_resume_state(
+                    resume_state,
+                    pop_size=args.pop_size,
+                    candidate_dims=candidate_dims,
+                    substrate_param_dims=substrate_param_dims,
+                    optimize_tau=optimize_tau,
+                )
+                start_iter = restored["next_iter"]
+                rng = restored["rng"]
+                es_state = restored["es_state"]
+                data = restored["data"]
+                best_params_traj = restored["best_params_traj"]
+                best_tau_traj = restored["best_tau_traj"]
+                best_loss_traj = restored["best_loss_traj"]
+                pop_params_traj = restored["pop_params_traj"]
+                pop_tau_traj = restored["pop_tau_traj"]
+                pop_loss_traj = restored["pop_loss_traj"]
+                palette_traj = restored["palette_traj"]
+                resumed = True
+                print(f"Resuming optimization from iter {start_iter} using {args.save_dir}/resume_state.pkl")
+        if not resumed:
+            rng, _rng = split(rng)
+            es_state = strategy.initialize(_rng, es_params)
+
+        run.summary["resume/enabled"] = bool(resume_enabled)
+        run.summary["resume/loaded"] = bool(resumed)
+        run.summary["resume/start_iter"] = int(start_iter)
+        if args.save_dir is not None:
+            run.summary["resume/checkpoint_path"] = os.path.join(args.save_dir, "resume_state.pkl")
+        if start_iter >= int(args.n_iters):
+            print(
+                f"Run already completed for n_iters={int(args.n_iters)} "
+                f"(resume checkpoint next_iter={int(start_iter)}). Nothing to do."
+            )
+            return
+
+        pbar = tqdm(range(start_iter, args.n_iters), initial=start_iter, total=args.n_iters)
 
         for i_iter in pbar:
             rng, _rng = split(rng)
@@ -513,7 +669,7 @@ def main(cfg, args):
                 palette_traj.append(dict(iter=i_iter, **palette_stats))
             pbar.set_postfix(best_loss=es_state.best_fitness.item())
 
-            if args.save_dir is not None and (i_iter % max(1, args.n_iters // 10) == 0 or i_iter == args.n_iters - 1):
+            if args.save_dir is not None and (i_iter % save_interval == 0 or i_iter == args.n_iters - 1):
                 data_save = jax.tree.map(lambda *x: np.array(jnp.stack(x, axis=0)), *data)
                 util.save_pkl(args.save_dir, "data", data_save)
                 best = (best_member_np, np.array(es_state.best_fitness))
@@ -546,6 +702,24 @@ def main(cfg, args):
                     util.save_pkl(args.save_dir, "pop_traj", pop_traj)
                 if len(palette_traj) > 0:
                     util.save_pkl(args.save_dir, "palette_traj", palette_traj)
+                _save_resume_state(
+                    args.save_dir,
+                    next_iter=i_iter + 1,
+                    rng=rng,
+                    es_state=es_state,
+                    pop_size=args.pop_size,
+                    candidate_dims=candidate_dims,
+                    substrate_param_dims=substrate_param_dims,
+                    optimize_tau=optimize_tau,
+                    data=data,
+                    best_params_traj=best_params_traj,
+                    best_tau_traj=best_tau_traj,
+                    best_loss_traj=best_loss_traj,
+                    pop_params_traj=pop_params_traj,
+                    pop_tau_traj=pop_tau_traj,
+                    pop_loss_traj=pop_loss_traj,
+                    palette_traj=palette_traj,
+                )
 
     finally:
         run.finish()
