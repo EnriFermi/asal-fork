@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import jax.scipy as jsp
 from jax.random import split
-from .utils import conn_from_matrix, get_kernels_fft, sobel, growth
+from .utils import conn_from_matrix, get_kernels_fft, sobel, sobel_lax, sobel_lax_legacy, growth
 from .reintegration_tracking import ReintegrationTracking
 from typing import NamedTuple
 
@@ -79,6 +79,7 @@ class FlowLenia:
         sigma: float = 0.65,
         border: str = "wall",
         mix_rule: str = "stoch",
+        sobel_impl: str = "scipy",
         base_seed: int = 0,
         seed_patch_size: int = 20,
         seed_n_patches: int = 1,
@@ -129,6 +130,7 @@ class FlowLenia:
         self.sigma = sigma
         self.border = border
         self.mix_rule = mix_rule
+        self.sobel_impl = sobel_impl
         self.base_seed = int(base_seed)
         self.seed_patch_size = seed_patch_size
         self.seed_n_patches = seed_n_patches
@@ -267,7 +269,7 @@ class FlowLenia:
         return jnp.concatenate(parts, axis=0)
 
     # ---------- state interface ----------
-    def init_state(self, rng, params):
+    def seed_state(self, rng, params):
         # Apply deltas to dynamics only
         n_dyn = self.base_dyn_raw.size
         dyn_delta = params[:n_dyn]
@@ -378,6 +380,10 @@ class FlowLenia:
         state = {"A": A, "P": P, "fK": fK, "m": m, "s": s, "fcr": fcr, "Food": Food, "t": t}
         if self.debug_return_F:
             state["F"] = jnp.zeros((self.cfg.X, self.cfg.Y, 2, self.cfg.C), dtype=A.dtype)
+        return state
+
+    def init_state(self, rng, params):
+        state = self.seed_state(rng, params)
         # Step once to avoid trivial zero image, like Lenia
         return self.step_state(rng, state, params)
 
@@ -397,8 +403,14 @@ class FlowLenia:
         U = jnp.dstack([U[:, :, self.cfg.c1[c]].sum(axis=-1) for c in range(self.cfg.C)])
 
         # Flow field and reintegration
-        F = sobel(U)
-        C_grad = sobel(A.sum(axis=-1, keepdims=True))
+        if self.sobel_impl == "lax":
+            sobel_fn = sobel_lax
+        elif self.sobel_impl == "lax_legacy":
+            sobel_fn = sobel_lax_legacy
+        else:
+            sobel_fn = sobel
+        F = sobel_fn(U)
+        C_grad = sobel_fn(A.sum(axis=-1, keepdims=True))
         alpha = jnp.clip((A[:, :, None, :] / 2) ** 2, 0.0, 1.0)
         mag = self.cfg.dd - self.cfg.sigma
         F = jnp.clip(F * (1 - alpha) - C_grad * alpha, -mag, mag)

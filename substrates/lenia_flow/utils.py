@@ -20,21 +20,83 @@ kx = jnp.array([
 ])
 ky = jnp.transpose(kx)
 
-def sobel_x(A):
+SOBEL_KX = kx.astype(jnp.float32)
+SOBEL_KY = ky.astype(jnp.float32)
+
+
+def _sobel_conv(A, kernel):
+    """
+    Depthwise 2D conv of A (H,W,C) with a 3x3 kernel shared across channels.
+    Returns (H,W,C).
+    """
+    _, _, C = A.shape
+    lhs = A[jnp.newaxis, ...]  # (1,H,W,C)
+    ker = jnp.tile(kernel[:, :, None, None], (1, 1, 1, C))  # (3,3,1,C)
+    out = jax.lax.conv_general_dilated(
+        lhs,
+        ker,
+        window_strides=(1, 1),
+        padding="SAME",
+        dimension_numbers=("NHWC", "HWIO", "NHWC"),
+        feature_group_count=C,
+    )
+    return out[0]
+
+
+def _sobel_conv_legacy(A, kernel):
+    """
+    Historical lax.conv implementation preserved verbatim for reproduction.
+    """
+    _, _, C = A.shape
+    lhs = A[jnp.newaxis, ...]  # (1,H,W,C)
+    ker = jnp.tile(kernel[:, :, None, None], (1, 1, C, 1))  # (3,3,C,1)
+    out = jax.lax.conv_general_dilated(
+        lhs,
+        ker,
+        window_strides=(1, 1),
+        padding="SAME",
+        dimension_numbers=("NHWC", "HWIO", "NHWC"),
+        feature_group_count=C,
+    )
+    return out[0]
+
+
+def sobel_x_scipy(A):
     """
     A : (x, y, c)
     ret : (x, y, c)
     """
     return jnp.dstack([jsp.signal.convolve2d(A[:, :, c], kx, mode = 'same') 
                     for c in range(A.shape[-1])])
-def sobel_y(A):
+
+
+def sobel_y_scipy(A):
     return jnp.dstack([jsp.signal.convolve2d(A[:, :, c], ky, mode = 'same') 
                     for c in range(A.shape[-1])])
   
+
 @jax.jit
-def sobel(A):
-    return jnp.concatenate((sobel_y(A)[:, :, None, :], sobel_x(A)[:, :, None, :]),
+def sobel_scipy(A):
+    return jnp.concatenate((sobel_y_scipy(A)[:, :, None, :], sobel_x_scipy(A)[:, :, None, :]),
                             axis = 2)
+
+
+@jax.jit
+def sobel_lax(A):
+    sx = _sobel_conv(A, SOBEL_KX)
+    sy = _sobel_conv(A, SOBEL_KY)
+    return jnp.concatenate((sy[:, :, None, :], sx[:, :, None, :]), axis=2)
+
+
+@jax.jit
+def sobel_lax_legacy(A):
+    sx = _sobel_conv_legacy(A, SOBEL_KX)
+    sy = _sobel_conv_legacy(A, SOBEL_KY)
+    return jnp.concatenate((sy[:, :, None, :], sx[:, :, None, :]), axis=2)
+
+
+def sobel(A):
+    return sobel_scipy(A)
 
 
 

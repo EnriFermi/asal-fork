@@ -6,11 +6,18 @@ from typing import Any, Dict, Tuple
 import numpy as np
 
 
+def _atomic_path(path: str) -> str:
+    return f"{path}.tmp"
+
+
 def save_json(save_dir, name, item):
     if save_dir is not None:
         os.makedirs(f"{save_dir}/", exist_ok=True)
-        with open(f"{save_dir}/{name}.json", "w") as f:
+        path = f"{save_dir}/{name}.json"
+        tmp_path = _atomic_path(path)
+        with open(tmp_path, "w") as f:
             json.dump(item, f)
+        os.replace(tmp_path, path)
             
 def load_json(load_dir, name):
     if load_dir is not None:
@@ -22,8 +29,11 @@ def load_json(load_dir, name):
 def save_pkl(save_dir, name, item):
     if save_dir is not None:
         os.makedirs(f"{save_dir}/", exist_ok=True)
-        with open(f"{save_dir}/{name}.pkl", "wb") as f:
+        path = f"{save_dir}/{name}.pkl"
+        tmp_path = _atomic_path(path)
+        with open(tmp_path, "wb") as f:
             pickle.dump(item, f)
+        os.replace(tmp_path, path)
 
 
 def load_pkl(load_dir, name):
@@ -49,7 +59,9 @@ def parse_color_str(s: str) -> Tuple[float, float, float]:
 
 
 def flow_lenia_kwargs_from_args(args: Any) -> Dict[str, Any]:
-    seed_n = getattr(args, "n_seeds", getattr(args, "seed_n_patches"))
+    seed_n = getattr(args, "n_seeds", None)
+    if seed_n is None:
+        seed_n = getattr(args, "seed_n_patches")
     mutation_scale = getattr(args, "mutation_scale", 1.0)
     optimize_mutation_scale = getattr(args, "optimize_mutation_scale", False)
     flow_sigma = getattr(args, "flow_sigma", None)
@@ -66,6 +78,7 @@ def flow_lenia_kwargs_from_args(args: Any) -> Dict[str, Any]:
         sigma=float(flow_sigma),
         border=str(args.border),
         mix_rule=str(args.mix_rule),
+        sobel_impl=str(getattr(args, "sobel_impl", "scipy")),
         base_seed=int(getattr(args, "base_seed", 0)),
         seed_patch_size=int(args.seed_patch_size),
         seed_n_patches=int(seed_n),
