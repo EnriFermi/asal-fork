@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,8 @@ from scripts.clip_deltah_msc_metric import resolve_metric_config
 from .embedding_metrics import cloud_distance, synchronized_distance
 from .pipeline import load_analysis_config
 from .trajectory_metrics import compute_delta_h_summary, delta_h_distribution_distance, delta_h_map_distance
+
+_CACHE_VERSION = "paper_check_history_distances_v2"
 
 
 def _is_missing(value: Any) -> bool:
@@ -40,6 +43,76 @@ def _resolve_artifact_path(row: dict[str, Any], field: str) -> Path | None:
     if _is_missing(base):
         return path
     return Path(str(base)) / path
+
+
+def _progress(iterable, *, total: int, enabled: bool, desc: str):
+    if not enabled:
+        for item in iterable:
+            yield item
+        return
+    try:
+        from tqdm.auto import tqdm  # type: ignore
+
+        yield from tqdm(iterable, total=total, desc=desc, leave=False)
+        return
+    except Exception:
+        pass
+    for idx, item in enumerate(iterable, start=1):
+        if idx == 1 or idx == total or idx % 5 == 0:
+            print(f"[{desc}] {idx}/{total}")
+        yield item
+
+
+def _config_signature(analysis_cfg: dict[str, Any]) -> str:
+    payload = {
+        "cache_version": _CACHE_VERSION,
+        "embeddings": analysis_cfg.get("embeddings", {}),
+        "trajectories": analysis_cfg.get("trajectories", {}),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _cache_path_for_row(row: dict[str, Any]) -> Path | None:
+    lagrangian_path = _resolve_artifact_path(row, "lagrangian_path")
+    if lagrangian_path is not None:
+        return lagrangian_path.with_name(f"{lagrangian_path.stem}_history_distance_cache.json")
+    embeddings_path = _resolve_artifact_path(row, "embeddings_path")
+    if embeddings_path is not None:
+        return embeddings_path.with_name(f"{embeddings_path.stem}_history_distance_cache.json")
+    return None
+
+
+def _load_cache(path: Path, *, signature: str) -> dict[str, float] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("signature", "")) != signature:
+        return None
+    metrics = payload.get("metrics")
+    if not isinstance(metrics, dict):
+        return None
+    out: dict[str, float] = {}
+    for key, value in metrics.items():
+        if isinstance(key, str) and isinstance(value, (int, float)):
+            out[key] = float(value)
+    return out
+
+
+def _save_cache(path: Path, *, signature: str, metrics: dict[str, float]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "signature": signature,
+        "metrics": {str(key): float(value) for key, value in metrics.items()},
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, sort_keys=True))
+    tmp.replace(path)
 
 
 def _load_source_metric_summary(frustration_root: Path) -> dict[str, Any]:
@@ -99,6 +172,17 @@ def _resolve_fixed_tau_index(
             )
         return int(matches[0])
     return None
+
+
+def _normalize_delta_h_values(values: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    if arr.size < 1:
+        raise ValueError("Delta-H distribution vectors must be non-empty.")
+    mean = float(np.mean(arr))
+    std = float(np.std(arr))
+    if not np.isfinite(std) or std < eps:
+        return arr - mean
+    return (arr - mean) / std
 
 
 def _build_metric_cfg(
@@ -198,6 +282,7 @@ def history_distance_base_names(analysis_cfg_or_path: dict[str, Any] | str | Pat
         else:
             suffix = "taufixed"
         names.extend(f"delta_h_dist_{suffix}_{metric}" for metric in distribution_metrics)
+        names.extend(f"delta_h_dist_{suffix}_{metric}_zscore" for metric in distribution_metrics)
     return names
 
 
@@ -312,6 +397,18 @@ def _compute_trajectory_metrics(
                 fixed_c,
             )
             out.update({f"{base_name}__{key}": value for key, value in stats.items()})
+        fixed_a_z = _normalize_delta_h_values(fixed_a)
+        fixed_b_z = _normalize_delta_h_values(fixed_b)
+        fixed_c_z = _normalize_delta_h_values(fixed_c)
+        for metric in distribution_metrics:
+            base_name = f"delta_h_dist_{suffix}_{metric}_zscore"
+            stats = _pairwise_effect_triplet(
+                lambda x, y, metric=metric: delta_h_distribution_distance(x, y, metric=metric),
+                fixed_a_z,
+                fixed_b_z,
+                fixed_c_z,
+            )
+            out.update({f"{base_name}__{key}": value for key, value in stats.items()})
     return out
 
 
@@ -319,6 +416,8 @@ def augment_rows_with_history_dependence_distances(
     rows: pd.DataFrame,
     *,
     analysis_config_path: str | Path,
+    use_cache: bool = True,
+    show_progress: bool = True,
 ) -> tuple[pd.DataFrame, list[str], list[str]]:
     if rows.empty:
         cfg = load_analysis_config(analysis_config_path)
@@ -326,34 +425,63 @@ def augment_rows_with_history_dependence_distances(
         return rows.copy(), [f"{name}__effect_minus_baseline" for name in base_names], base_names
 
     analysis_cfg = load_analysis_config(analysis_config_path)
+    cfg_signature = _config_signature(analysis_cfg)
     base_names = history_distance_base_names(analysis_cfg)
     effect_cols = [f"{name}__effect_minus_baseline" for name in base_names]
     out = rows.copy()
 
     source_metric_cache: dict[Path, dict[str, Any]] = {}
+    embeddings_cache: dict[Path, dict[str, float]] = {}
+    trajectory_cache: dict[Path, dict[str, float]] = {}
 
-    for idx, row in out.iterrows():
+    row_iter = list(out.iterrows())
+    for idx, row in _progress(
+        row_iter,
+        total=len(row_iter),
+        enabled=show_progress,
+        desc="history distances",
+    ):
         row_dict = dict(row)
         computed: dict[str, float] = {}
+        cache_path = _cache_path_for_row(row_dict)
+
+        if use_cache and cache_path is not None:
+            cached = _load_cache(cache_path, signature=cfg_signature)
+            if cached is not None:
+                for key, value in cached.items():
+                    out.at[idx, key] = value
+                continue
 
         embeddings_path = _resolve_artifact_path(row_dict, "embeddings_path")
         if embeddings_path is not None and embeddings_path.exists():
-            computed.update(_compute_embedding_metrics(embeddings_path, analysis_cfg))
+            if embeddings_path not in embeddings_cache:
+                embeddings_cache[embeddings_path] = _compute_embedding_metrics(embeddings_path, analysis_cfg)
+            computed.update(embeddings_cache[embeddings_path])
 
         lagrangian_path = _resolve_artifact_path(row_dict, "lagrangian_path")
         if lagrangian_path is not None and lagrangian_path.exists():
-            frustration_root = Path(str(row_dict.get("frustration_root"))) if not _is_missing(row_dict.get("frustration_root")) else lagrangian_path.parent.parent
-            if frustration_root not in source_metric_cache:
-                source_metric_cache[frustration_root] = _load_source_metric_summary(frustration_root)
-            computed.update(
-                _compute_trajectory_metrics(
+            if lagrangian_path not in trajectory_cache:
+                frustration_root = Path(str(row_dict.get("frustration_root"))) if not _is_missing(row_dict.get("frustration_root")) else lagrangian_path.parent.parent
+                if frustration_root not in source_metric_cache:
+                    source_metric_cache[frustration_root] = _load_source_metric_summary(frustration_root)
+                trajectory_cache[lagrangian_path] = _compute_trajectory_metrics(
                     lagrangian_path,
                     analysis_cfg,
                     source_metric_summary=source_metric_cache[frustration_root],
                 )
-            )
+            computed.update(trajectory_cache[lagrangian_path])
 
         for key, value in computed.items():
             out.at[idx, key] = value
+
+        if use_cache and cache_path is not None and computed:
+            try:
+                _save_cache(
+                    cache_path,
+                    signature=cfg_signature,
+                    metrics=computed,
+                )
+            except Exception:
+                pass
 
     return out, [col for col in effect_cols if col in out.columns], base_names
