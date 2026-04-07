@@ -116,6 +116,112 @@ def flow_lenia_kwargs_from_args(args: Any) -> Dict[str, Any]:
     )
 
 
+def _maybe_set_kwarg(kwargs: Dict[str, Any], args: Any, name: str, cast) -> None:
+    if not hasattr(args, name):
+        return
+    value = getattr(args, name)
+    if value is None:
+        return
+    kwargs[name] = cast(value)
+
+
+def substrate_kwargs_from_args(args: Any) -> Dict[str, Any]:
+    substrate_name = str(getattr(args, "substrate"))
+    if substrate_name == "lenia_flow":
+        return flow_lenia_kwargs_from_args(args)
+
+    kwargs: Dict[str, Any] = {}
+    if substrate_name == "boids":
+        for name, cast in (
+            ("n_boids", int),
+            ("n_nbrs", int),
+            ("visual_range", float),
+            ("speed", float),
+            ("controller", str),
+            ("dt", float),
+            ("bird_render_size", float),
+            ("bird_render_sharpness", float),
+            ("space_size", float),
+            ("red_boid", bool),
+        ):
+            _maybe_set_kwarg(kwargs, args, name, cast)
+        return kwargs
+
+    if substrate_name == "plife":
+        for name, cast in (
+            ("n_particles", int),
+            ("n_colors", int),
+            ("n_dims", int),
+            ("x_dist_bins", int),
+            ("beta", float),
+            ("alpha", float),
+            ("mass", float),
+            ("dt", float),
+            ("half_life", float),
+            ("rmax", float),
+            ("render_radius", float),
+            ("sharpness", float),
+            ("search_space", str),
+            ("color_palette", str),
+            ("background_color", str),
+        ):
+            _maybe_set_kwarg(kwargs, args, name, cast)
+        return kwargs
+
+    if substrate_name == "plife_plus":
+        for name, cast in (
+            ("n_particles", int),
+            ("n_colors", int),
+            ("n_dims", int),
+            ("x_dist_bins", int),
+            ("beta", float),
+            ("alpha", float),
+            ("mass", float),
+            ("dt", float),
+            ("half_life", float),
+            ("rmax", float),
+            ("render_radius", float),
+            ("sharpness", float),
+            ("update_colors", bool),
+            ("world_size", float),
+            ("color_palette", str),
+            ("background_color", str),
+        ):
+            _maybe_set_kwarg(kwargs, args, name, cast)
+        return kwargs
+
+    return kwargs
+
+
+def metric_periodic_space_defaults(substrate: Any) -> Dict[str, Any]:
+    base = substrate.substrate if hasattr(substrate, "substrate") else substrate
+    if hasattr(base, "border"):
+        domain = float(getattr(getattr(base, "cfg", None), "X", getattr(base, "grid_size", 0)))
+        return dict(
+            periodic=(str(getattr(base, "border", "wall")) == "torus"),
+            domain_y=domain,
+            domain_x=float(getattr(getattr(base, "cfg", None), "Y", getattr(base, "grid_size", 0))),
+        )
+
+    if hasattr(base, "space_size"):
+        size = float(getattr(base, "space_size"))
+        return dict(periodic=True, domain_y=size, domain_x=size)
+
+    if hasattr(base, "world_size"):
+        size = float(getattr(base, "world_size"))
+        return dict(periodic=True, domain_y=size, domain_x=size)
+
+    name = str(getattr(base, "name", ""))
+    if name in {"plife", "plife_plus", "plenia"}:
+        return dict(periodic=True, domain_y=1.0, domain_x=1.0)
+
+    if hasattr(base, "grid_size"):
+        size = float(getattr(base, "grid_size"))
+        return dict(periodic=False, domain_y=size, domain_x=size)
+
+    return dict(periodic=False, domain_y=0.0, domain_x=0.0)
+
+
 def _softmax_np(x: np.ndarray, axis: int = -1) -> np.ndarray:
     x = x - np.max(x, axis=axis, keepdims=True)
     exp_x = np.exp(x)

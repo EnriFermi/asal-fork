@@ -204,6 +204,57 @@ def _init_lagrangian_points_jax(
     return pts.astype(jnp.float32)
 
 
+def _normalize_metric_trajectory_source(source_raw) -> str:
+    normalized = str(source_raw).strip().lower().replace("-", "_")
+    aliases = {
+        "auto": "auto",
+        "lagrangian": "lagrangian",
+        "state_x": "state_x",
+        "direct": "state_x",
+        "positions": "state_x",
+        "position": "state_x",
+        "direct_x": "state_x",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            "metric_trajectory_source must be one of "
+            "['auto', 'lagrangian', 'state_x'], "
+            f"got {source_raw!r}."
+        )
+    return aliases[normalized]
+
+
+def _infer_metric_trajectory_source(args, substrate) -> tuple[str, dict | None]:
+    requested = _normalize_metric_trajectory_source(getattr(args, "metric_trajectory_source", "auto"))
+    sample_info = None
+    if requested == "lagrangian":
+        return requested, sample_info
+    if requested == "state_x":
+        params0 = substrate.default_params(jax.random.PRNGKey(0))
+        state0 = substrate.init_state(jax.random.PRNGKey(1), params0)
+        if not isinstance(state0, dict) or "x" not in state0:
+            raise ValueError(
+                "metric_trajectory_source='state_x' requires substrate.init_state(...) "
+                "to return a dict containing key 'x'."
+            )
+        sample_info = dict(tracked_entities=int(state0["x"].shape[0]))
+        return requested, sample_info
+
+    if hasattr(substrate, "RT"):
+        return "lagrangian", sample_info
+
+    params0 = substrate.default_params(jax.random.PRNGKey(0))
+    state0 = substrate.init_state(jax.random.PRNGKey(1), params0)
+    if isinstance(state0, dict) and "x" in state0:
+        sample_info = dict(tracked_entities=int(state0["x"].shape[0]))
+        return "state_x", sample_info
+
+    raise ValueError(
+        "Could not infer metric trajectory source automatically. "
+        "Set metric_trajectory_source explicitly to 'lagrangian' or 'state_x'."
+    )
+
+
 def load_config():
     if len(sys.argv) < 2:
         raise SystemExit("Usage: python scripts/main_opt_msc.py <config.yaml>")
@@ -225,13 +276,10 @@ def main(cfg, args):
     wandb_project = str(getattr(args, "wandb_project", "asal"))
     run = wandb.init(project=wandb_project, config=OmegaConf.to_container(cfg, resolve=True))
     try:
-        if args.substrate == "lenia_flow":
-            base_substrate = substrates.create_substrate(
-                args.substrate,
-                **util.flow_lenia_kwargs_from_args(args),
-            )
-        else:
-            base_substrate = substrates.create_substrate(args.substrate)
+        base_substrate = substrates.create_substrate(
+            args.substrate,
+            **util.substrate_kwargs_from_args(args),
+        )
         if hasattr(base_substrate, "debug_return_F"):
             base_substrate.debug_return_F = True
         substrate = substrates.FlattenSubstrateParameters(base_substrate)
@@ -239,13 +287,14 @@ def main(cfg, args):
         if args.rollout_steps is None:
             args.rollout_steps = substrate.rollout_steps
 
-        # Auto-fill periodic settings for lagrangian displacement unwrapping.
+        # Auto-fill periodic settings for trajectory displacement unwrapping.
+        metric_space_defaults = util.metric_periodic_space_defaults(base_substrate)
         if (not hasattr(args, "metric_periodic")) or (getattr(args, "metric_periodic", None) is None):
-            args.metric_periodic = str(getattr(substrate, "border", "wall")) == "torus"
+            args.metric_periodic = bool(metric_space_defaults["periodic"])
         if (not hasattr(args, "metric_domain_y")) or (getattr(args, "metric_domain_y", None) is None):
-            args.metric_domain_y = float(getattr(getattr(substrate, "cfg", None), "X", getattr(substrate, "grid_size", 0)))
+            args.metric_domain_y = float(metric_space_defaults["domain_y"])
         if (not hasattr(args, "metric_domain_x")) or (getattr(args, "metric_domain_x", None) is None):
-            args.metric_domain_x = float(getattr(getattr(substrate, "cfg", None), "Y", getattr(substrate, "grid_size", 0)))
+            args.metric_domain_x = float(metric_space_defaults["domain_x"])
 
         metric_cfg = resolve_metric_config(args)
         metric_info = metric_summary(metric_cfg)
@@ -265,6 +314,11 @@ def main(cfg, args):
         chunk_steps = int(metric_cfg["sample_every_steps"])
         time_sampling = int(metric_cfg["time_sampling"])
         substrate_param_dims = int(substrate.n_params)
+        trajectory_source, trajectory_sample_info = _infer_metric_trajectory_source(args, substrate)
+        run.summary["metric_cfg/trajectory_source"] = str(trajectory_source)
+        if trajectory_sample_info is not None:
+            for k, v in trajectory_sample_info.items():
+                run.summary[f"metric_cfg/{k}"] = v
 
         def split_candidate_params(params_full):
             params_sub = params_full[:substrate_param_dims]
@@ -348,67 +402,95 @@ def main(cfg, args):
         else:
             run.summary["clip_logging/enabled"] = False
 
-        lag_n_particles = int(getattr(args, "metric_lagrangian_n_particles", 256))
-        lag_init_mode = str(getattr(args, "metric_lagrangian_init_mode", "mass"))
-        lag_flow_channel = int(getattr(args, "metric_lagrangian_flow_channel", -1))
-        lag_flow_reduce = str(getattr(args, "metric_lagrangian_flow_reduce", "mass_weighted"))
-        lag_channel_mode = str(getattr(args, "metric_lagrangian_channel_mode", "mix"))
-        lag_noise_model = str(getattr(args, "metric_lagrangian_noise_model", "none"))
-        lag_diffusion_scale = float(getattr(args, "metric_lagrangian_diffusion_scale", 1.0))
+        if trajectory_source == "lagrangian":
+            lag_n_particles = int(getattr(args, "metric_lagrangian_n_particles", 256))
+            lag_init_mode = str(getattr(args, "metric_lagrangian_init_mode", "mass"))
+            lag_flow_channel = int(getattr(args, "metric_lagrangian_flow_channel", -1))
+            lag_flow_reduce = str(getattr(args, "metric_lagrangian_flow_reduce", "mass_weighted"))
+            lag_channel_mode = str(getattr(args, "metric_lagrangian_channel_mode", "mix"))
+            lag_noise_model = str(getattr(args, "metric_lagrangian_noise_model", "none"))
+            lag_diffusion_scale = float(getattr(args, "metric_lagrangian_diffusion_scale", 1.0))
+            run.summary["metric_cfg/lagrangian_n_particles"] = int(lag_n_particles)
 
-        def rollout_lagrangian_xy(rng, params):
-            k_state, k_pts, k_ch, k_scan = jax.random.split(rng, 4)
-            s0 = substrate.init_state(k_state, params)
-            if "F" not in s0:
-                raise ValueError(
-                    "State does not contain flow field F. "
-                    "For FlowLenia set debug_return_F=true before optimization."
+            def rollout_metric_xy(rng, params):
+                k_state, k_pts, k_ch, k_scan = jax.random.split(rng, 4)
+                s0 = substrate.init_state(k_state, params)
+                if "F" not in s0:
+                    raise ValueError(
+                        "State does not contain flow field F. "
+                        "For FlowLenia set debug_return_F=true before optimization."
+                    )
+                if not hasattr(substrate, "RT"):
+                    raise ValueError("Substrate does not provide RT for lagrangian advection.")
+
+                rt = substrate.RT
+                pts0 = _init_lagrangian_points_jax(
+                    s0["A"],
+                    n_particles=lag_n_particles,
+                    init_mode=lag_init_mode,
+                    border=str(getattr(rt, "border", "wall")),
+                    sigma=float(getattr(rt, "sigma", 0.0)),
+                    key=k_pts,
                 )
-            if not hasattr(substrate, "RT"):
-                raise ValueError("Substrate does not provide RT for lagrangian advection.")
+                if lag_channel_mode in ("fixed", "resample"):
+                    ch0 = rt.sample_point_channels(pts0, s0["A"], k_ch)
+                else:
+                    ch0 = jnp.zeros((lag_n_particles,), dtype=jnp.int32)
 
-            rt = substrate.RT
-            pts0 = _init_lagrangian_points_jax(
-                s0["A"],
-                n_particles=lag_n_particles,
-                init_mode=lag_init_mode,
-                border=str(getattr(rt, "border", "wall")),
-                sigma=float(getattr(rt, "sigma", 0.0)),
-                key=k_pts,
-            )
-            if lag_channel_mode in ("fixed", "resample"):
-                ch0 = rt.sample_point_channels(pts0, s0["A"], k_ch)
-            else:
-                ch0 = jnp.zeros((lag_n_particles,), dtype=jnp.int32)
+                def step_fn(state, key_step):
+                    st, pts, ch = state
+                    st = substrate.step_state(key_step, st, params)
+                    lag_key = jax.random.fold_in(key_step, jnp.uint32(0x4C4147))
+                    pts, ch = rt.advect_particles(
+                        points=pts,
+                        F=st["F"],
+                        A=st["A"],
+                        channel=lag_flow_channel,
+                        reduce=lag_flow_reduce,
+                        point_channels=ch,
+                        channel_mode=lag_channel_mode,
+                        key=lag_key,
+                        noise_model=lag_noise_model,
+                        diffusion_scale=lag_diffusion_scale,
+                    )
+                    return (st, pts, ch), None
 
-            def step_fn(state, key_step):
-                st, pts, ch = state
-                st = substrate.step_state(key_step, st, params)
-                lag_key = jax.random.fold_in(key_step, jnp.uint32(0x4C4147))
-                pts, ch = rt.advect_particles(
-                    points=pts,
-                    F=st["F"],
-                    A=st["A"],
-                    channel=lag_flow_channel,
-                    reduce=lag_flow_reduce,
-                    point_channels=ch,
-                    channel_mode=lag_channel_mode,
-                    key=lag_key,
-                    noise_model=lag_noise_model,
-                    diffusion_scale=lag_diffusion_scale,
+                def chunk_fn(state, key_chunk):
+                    state_next, _ = jax.lax.scan(step_fn, state, split(key_chunk, chunk_steps))
+                    return state_next, state_next[1]
+
+                (_, _, _), xy_seq = jax.lax.scan(
+                    chunk_fn,
+                    (s0, pts0, ch0),
+                    split(k_scan, time_sampling),
                 )
-                return (st, pts, ch), None
+                return xy_seq  # (time_sampling, N_particles, 2)
+        elif trajectory_source == "state_x":
+            def rollout_metric_xy(rng, params):
+                k_state, k_scan = jax.random.split(rng, 2)
+                s0 = substrate.init_state(k_state, params)
+                if "x" not in s0:
+                    raise ValueError(
+                        "State does not contain key 'x'. "
+                        "Set metric_trajectory_source='lagrangian' or use a substrate with explicit positions."
+                    )
 
-            def chunk_fn(state, key_chunk):
-                state_next, _ = jax.lax.scan(step_fn, state, split(key_chunk, chunk_steps))
-                return state_next, state_next[1]
+                def step_fn(state, key_step):
+                    state_next = substrate.step_state(key_step, state, params)
+                    return state_next, None
 
-            (_, _, _), xy_seq = jax.lax.scan(
-                chunk_fn,
-                (s0, pts0, ch0),
-                split(k_scan, time_sampling),
-            )
-            return xy_seq  # (time_sampling, N_particles, 2)
+                def chunk_fn(state, key_chunk):
+                    state_next, _ = jax.lax.scan(step_fn, state, split(key_chunk, chunk_steps))
+                    return state_next, state_next["x"]
+
+                _, xy_seq = jax.lax.scan(
+                    chunk_fn,
+                    s0,
+                    split(k_scan, time_sampling),
+                )
+                return xy_seq
+        else:
+            raise ValueError(f"Unhandled metric trajectory source {trajectory_source!r}.")
 
         def calc_loss(rng, params_full):
             params, tau_selector = split_candidate_params(params_full)
@@ -416,7 +498,7 @@ def main(cfg, args):
                 rng_roll, rng_metric, rng_clip = split(rng, 3)
             else:
                 rng_roll, rng_metric = split(rng)
-            xy_seq = rollout_lagrangian_xy(rng_roll, params)
+            xy_seq = rollout_metric_xy(rng_roll, params)
             if optimize_tau:
                 msc_loss, msc_dict = metric_loss_fn(rng_metric, xy_seq, tau_selector=tau_selector)
             else:

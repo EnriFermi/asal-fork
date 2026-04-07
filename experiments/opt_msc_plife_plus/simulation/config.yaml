@@ -1,0 +1,39 @@
+meta:
+  save_dir: experiments/opt_msc_plife_plus/checkpoints/longrun_check
+
+substrate:
+  substrate: plife_plus
+  rollout_steps: 200000
+  n_particles: 1000
+  n_colors: 6
+  dt: 0.02
+  beta: 0.3
+  mass: 0.1
+  half_life: 0.04
+  rmax: 0.1
+  render_radius: 0.04
+  sharpness: 30.0
+  update_colors: true
+  world_size: 1.0
+  background_color: black
+
+simulation:
+  time_sampling: video
+  img_size: 224
+  seed: 0
+  output: experiments/opt_msc_plife_plus/figures/best_simulation.mp4
+  fps: 60
+  codec: libx264
+  macro_block_size: null
+  batch_steps: 512
+  jit_microbatch: 128
+  max_steps: 20000
+  mass_plot: experiments/opt_msc_plife_plus/figures/best_mass.png
+  log_mass_every: 1000
+  traj_iter: null
+  compute_oe: false
+  oe_every: 100
+  oe_plot: experiments/opt_msc_plife_plus/figures/best_oe.png
+
+logging:
+  wandb_project: asal
