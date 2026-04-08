@@ -41,6 +41,7 @@ class ParticleLifePlus():
                  dt=0.002, half_life=0.04, rmax=0.1,
                  render_radius=1e-2, sharpness=20.,
                  update_colors=True, world_size=1.,
+                 border='torus',
                  color_palette='ff0000-00ff00-0000ff-ffff00-ff00ff-00ffff-ffffff-8f5d00', background_color='black'):
         self.n_particles = n_particles
         self.n_colors = n_colors
@@ -53,8 +54,10 @@ class ParticleLifePlus():
         self.sharpness = sharpness
         self.update_colors = update_colors
         self.world_size = world_size
+        self.border = border
         self.color_palette = color_palette
         self.background_color = background_color
+        assert border in ('torus', 'wall'), "border must be 'torus' or 'wall'"
 
         self.fixed_params = dict(
             beta=jnp.array(beta),
@@ -75,9 +78,21 @@ class ParticleLifePlus():
         c = jax.random.normal(_rng1, (self.n_particles, self.n_colors))
         c = c/jnp.linalg.norm(c, axis=-1, keepdims=True)
 
-        x = jax.random.uniform(_rng2, (self.n_particles, self.n_dims), minval=0., maxval=1.)
+        x = jax.random.uniform(_rng2, (self.n_particles, self.n_dims), minval=0., maxval=self.world_size)
         v = jnp.zeros((self.n_particles, self.n_dims))
         return dict(c=c, x=x, v=v)
+
+    def _apply_boundary(self, x, v):
+        if self.border == 'torus':
+            return x % self.world_size, v
+
+        hit_lo = x < 0.0
+        hit_hi = x > self.world_size
+        x = jnp.where(hit_lo, -x, x)
+        x = jnp.where(hit_hi, 2.0 * self.world_size - x, x)
+        v = jnp.where(hit_lo | hit_hi, -v, v)
+        x = jnp.clip(x, 0.0, self.world_size)
+        return x, v
     
     def step_state(self, rng, state, params):
         x, v, c = state['x'], state['v'], state['c']
@@ -97,7 +112,13 @@ class ParticleLifePlus():
         
         def calc_force(x1, x2, c1, c2): # force exerted on x1 by x2
             r = x2 - x1
-            r = jax.lax.select(r>0.5, r-1, jax.lax.select(r<-0.5, r+1, r))  # circular boundary
+            if self.border == 'torus':
+                half_world = 0.5 * self.world_size
+                r = jax.lax.select(
+                    r > half_world,
+                    r - self.world_size,
+                    jax.lax.select(r < -half_world, r + self.world_size, r),
+                )
 
             alpha, dc1 = self.plife_net.apply(params['alpha'], c1, c2)
             rlen = jnp.linalg.norm(r)
@@ -117,7 +138,7 @@ class ParticleLifePlus():
         mu = (0.5) ** (dt / half_life)
         v = mu * v + acc * dt
         x = x + v * dt
-        x = x%1. # circular boundary
+        x, v = self._apply_boundary(x, v)
 
         if self.update_colors:
             c = c + dc1*dt
@@ -137,7 +158,7 @@ class ParticleLifePlus():
         # i = jnp.argsort(mass)[::-1]
         # x, c, mass = x[i], c[i], mass[i]
 
-        xgrid = ygrid = jnp.linspace(0, 1, img_size)
+        xgrid = ygrid = jnp.linspace(0, self.world_size, img_size)
         xgrid, ygrid = jnp.meshgrid(xgrid, ygrid, indexing='ij')
 
         def render_circle(img, circle_data):
@@ -155,4 +176,3 @@ class ParticleLifePlus():
         img, _ = jax.lax.scan(render_circle, img, (*x.T, radius, c))
         return img
     
-

@@ -44,6 +44,7 @@ def create_substrate(substrate_name, **kwargs):
             dt=0.01,
             bird_render_size=0.015,
             bird_render_sharpness=40.,
+            border='torus',
         )
         params.update(kwargs)
         substrate = Boids(**params)
@@ -91,6 +92,7 @@ def create_substrate(substrate_name, **kwargs):
             render_radius=0.04,
             sharpness=30.,
             background_color='black',
+            border='torus',
         )
         params.update(kwargs)
         substrate = ParticleLifePlus(**params)

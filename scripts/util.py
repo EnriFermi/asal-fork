@@ -143,6 +143,7 @@ def substrate_kwargs_from_args(args: Any) -> Dict[str, Any]:
             ("bird_render_sharpness", float),
             ("space_size", float),
             ("red_boid", bool),
+            ("border", str),
         ):
             _maybe_set_kwarg(kwargs, args, name, cast)
         return kwargs
@@ -184,6 +185,7 @@ def substrate_kwargs_from_args(args: Any) -> Dict[str, Any]:
             ("sharpness", float),
             ("update_colors", bool),
             ("world_size", float),
+            ("border", str),
             ("color_palette", str),
             ("background_color", str),
         ):
@@ -196,11 +198,17 @@ def substrate_kwargs_from_args(args: Any) -> Dict[str, Any]:
 def metric_periodic_space_defaults(substrate: Any) -> Dict[str, Any]:
     base = substrate.substrate if hasattr(substrate, "substrate") else substrate
     if hasattr(base, "border"):
-        domain = float(getattr(getattr(base, "cfg", None), "X", getattr(base, "grid_size", 0)))
+        if hasattr(base, "space_size"):
+            domain_y = domain_x = float(getattr(base, "space_size"))
+        elif hasattr(base, "world_size"):
+            domain_y = domain_x = float(getattr(base, "world_size"))
+        else:
+            domain_y = float(getattr(getattr(base, "cfg", None), "X", getattr(base, "grid_size", 0)))
+            domain_x = float(getattr(getattr(base, "cfg", None), "Y", getattr(base, "grid_size", domain_y)))
         return dict(
             periodic=(str(getattr(base, "border", "wall")) == "torus"),
-            domain_y=domain,
-            domain_x=float(getattr(getattr(base, "cfg", None), "Y", getattr(base, "grid_size", 0))),
+            domain_y=domain_y,
+            domain_x=domain_x,
         )
 
     if hasattr(base, "space_size"):
