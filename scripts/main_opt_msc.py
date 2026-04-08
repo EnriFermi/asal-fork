@@ -122,6 +122,25 @@ def _build_candidate_init_mean(
     return jnp.concatenate((init_mean, tau0), axis=0)
 
 
+def _unwrap_sampled_xy_jax(
+    xy_seq: jax.Array,
+    *,
+    domain_y: float,
+    domain_x: float,
+) -> jax.Array:
+    if xy_seq.shape[0] <= 1:
+        return xy_seq
+    dxy = xy_seq[1:] - xy_seq[:-1]
+    if domain_y > 0:
+        dy = (dxy[..., 0] + 0.5 * domain_y) % domain_y - 0.5 * domain_y
+        dxy = dxy.at[..., 0].set(dy)
+    if domain_x > 0:
+        dx = (dxy[..., 1] + 0.5 * domain_x) % domain_x - 0.5 * domain_x
+        dxy = dxy.at[..., 1].set(dx)
+    increments = jnp.cumsum(dxy, axis=0)
+    return jnp.concatenate((xy_seq[:1], xy_seq[:1] + increments), axis=0)
+
+
 def _load_resume_state(save_dir):
     if save_dir is None:
         return None
@@ -313,6 +332,8 @@ def _infer_metric_trajectory_source(args, substrate) -> tuple[str, dict | None]:
 
     params0 = substrate.default_params(jax.random.PRNGKey(0))
     state0 = substrate.init_state(jax.random.PRNGKey(1), params0)
+    if hasattr(substrate, "RT"):
+        return "lagrangian", sample_info
     if isinstance(state0, dict) and "x" in state0:
         sample_info = dict(tracked_entities=int(state0["x"].shape[0]))
         return "state_x", sample_info
@@ -364,7 +385,24 @@ def main(cfg, args):
         if (not hasattr(args, "metric_domain_x")) or (getattr(args, "metric_domain_x", None) is None):
             args.metric_domain_x = float(metric_space_defaults["domain_x"])
 
+        params_init = _canonicalize_params_init(getattr(args, "params_init", "strategy_default"))
+        run.summary["optimizer/params_init"] = params_init
+        trajectory_source, trajectory_sample_info = _infer_metric_trajectory_source(args, substrate)
+        run.summary["metric_cfg/trajectory_source"] = str(trajectory_source)
+        if trajectory_sample_info is not None:
+            for k, v in trajectory_sample_info.items():
+                run.summary[f"metric_cfg/{k}"] = v
+        state_x_unwrap = bool(getattr(args, "metric_unwrap_state_x", True))
+
         metric_cfg = resolve_metric_config(args)
+        optimize_tau = str(metric_cfg.get("tau_mode", "fixed")) == "trainable_grid"
+        tau_extra_dims = 1 if optimize_tau else 0
+        positions_unwrapped = bool(
+            trajectory_source == "state_x"
+            and bool(metric_space_defaults["periodic"])
+            and state_x_unwrap
+        )
+        metric_cfg["positions_unwrapped"] = positions_unwrapped
         metric_info = metric_summary(metric_cfg)
         print("Resolved metric config:", metric_info)
         for k, v in metric_info.items():
@@ -373,8 +411,6 @@ def main(cfg, args):
             else:
                 run.summary[f"metric_cfg/{k}"] = v
         metric_loss_fn = make_metric_loss_fn(metric_cfg)
-        optimize_tau = str(metric_cfg.get("tau_mode", "fixed")) == "trainable_grid"
-        tau_extra_dims = 1 if optimize_tau else 0
         run.summary["metric_cfg/trainable_tau"] = bool(optimize_tau)
         if optimize_tau:
             run.summary["metric_cfg/tau_grid_steps"] = str(metric_cfg.get("tau_steps_list", []))
@@ -382,13 +418,6 @@ def main(cfg, args):
         chunk_steps = int(metric_cfg["sample_every_steps"])
         time_sampling = int(metric_cfg["time_sampling"])
         substrate_param_dims = int(substrate.n_params)
-        params_init = _canonicalize_params_init(getattr(args, "params_init", "strategy_default"))
-        run.summary["optimizer/params_init"] = params_init
-        trajectory_source, trajectory_sample_info = _infer_metric_trajectory_source(args, substrate)
-        run.summary["metric_cfg/trajectory_source"] = str(trajectory_source)
-        if trajectory_sample_info is not None:
-            for k, v in trajectory_sample_info.items():
-                run.summary[f"metric_cfg/{k}"] = v
 
         def split_candidate_params(params_full):
             params_sub = params_full[:substrate_param_dims]
@@ -558,6 +587,12 @@ def main(cfg, args):
                     s0,
                     split(k_scan, time_sampling),
                 )
+                if positions_unwrapped:
+                    xy_seq = _unwrap_sampled_xy_jax(
+                        xy_seq,
+                        domain_y=float(metric_space_defaults["domain_y"]),
+                        domain_x=float(metric_space_defaults["domain_x"]),
+                    )
                 return xy_seq
         else:
             raise ValueError(f"Unhandled metric trajectory source {trajectory_source!r}.")

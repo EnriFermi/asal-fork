@@ -15,6 +15,7 @@ substrate:
   sharpness: 30.0
   update_colors: true
   world_size: 1.0
+  border: wall
   background_color: black
 
 simulation:
