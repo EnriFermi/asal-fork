@@ -17,6 +17,7 @@ substrate:
   sharpness: 30.0
   update_colors: true
   world_size: 1.0
+  border: wall
   background_color: black
 
 evaluation:
@@ -37,11 +38,12 @@ logging:
 
 metric:
   metric_trajectory_source: state_x
+  metric_unwrap_state_x: true
   metric_tau_mode: trainable_grid
-  metric_tau_grid_steps: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000]
+  metric_tau_grid_steps: [100, 200, 400, 800, 1200, 1600, 2000, 3000, 4000]
   metric_window_size_steps: 20000
   metric_window_step_steps: 5000
-  metric_tau_steps: 3000
+  metric_tau_steps: 800
   metric_range_start_steps: 50000
   metric_range_end_steps: 200000
   metric_window_size_frames: null

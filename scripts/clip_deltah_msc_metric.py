@@ -409,6 +409,7 @@ def metric_summary(cfg: dict[str, Any]) -> dict[str, Any]:
         null_reps=int(cfg["null_reps"]),
         particle_samples=int(cfg["particle_samples"]),
         periodic=bool(cfg["periodic"]),
+        positions_unwrapped=bool(cfg.get("positions_unwrapped", False)),
         domain_y=float(cfg["domain_y"]),
         domain_x=float(cfg["domain_x"]),
         preprocess_mode=str(cfg["preprocess_mode"]),
@@ -456,6 +457,7 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
     eps = float(cfg["eps"])
     dirs_seed = int(cfg["dirs_seed"])
     periodic = bool(cfg["periodic"])
+    positions_unwrapped = bool(cfg.get("positions_unwrapped", False))
     domain_y = float(cfg["domain_y"])
     domain_x = float(cfg["domain_x"])
     sample_stride_steps = float(cfg["sample_stride_steps"])
@@ -476,7 +478,7 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
         return sig
 
     def _delta_periodic(dx: jnp.ndarray) -> jnp.ndarray:
-        if periodic:
+        if periodic and not positions_unwrapped:
             if domain_y > 0:
                 dy = (dx[..., 0] + 0.5 * domain_y) % domain_y - 0.5 * domain_y
                 dx = dx.at[..., 0].set(dy)
@@ -564,7 +566,11 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
             up = jnp.repeat(g_2r, 2)[:U_cmp]
             overlap = jnp.sum(g_r_cmp * up)
             power = jnp.sum(g_r_cmp * g_r_cmp)
-            d_r = 1.0 - overlap / (power + eps)
+            d_r = jnp.where(
+                power > eps,
+                1.0 - overlap / (power + eps),
+                jnp.array(0.0, dtype=dtype),
+            )
             msc = msc + (wr * d_r)
         score = alpha * amp + beta * msc
         return score, amp, msc
