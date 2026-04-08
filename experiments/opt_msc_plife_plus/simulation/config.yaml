@@ -19,14 +19,14 @@ substrate:
 
 simulation:
   time_sampling: video
-  img_size: 224
+  img_size: 160
   seed: 0
   output: experiments/opt_msc_plife_plus/figures/best_simulation.mp4
   fps: 60
   codec: libx264
   macro_block_size: null
-  batch_steps: 512
-  jit_microbatch: 128
+  batch_steps: 64
+  jit_microbatch: 1
   max_steps: 20000
   mass_plot: experiments/opt_msc_plife_plus/figures/best_mass.png
   log_mass_every: 1000

@@ -39,7 +39,7 @@ logging:
 random_best:
   seed: 1
   fitness: 0.0
-  init_mode: sep_cma_es_ask   # the initial CMA-ES ask population
+  init_mode: sep_cma_es_ask_substrate_default   # initial CMA-ES ask population around substrate.default_params
   cma_sigma_init: 0.2
   cma_pop_size: 8
   cma_member_idx: 0
