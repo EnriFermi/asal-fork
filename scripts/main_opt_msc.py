@@ -108,6 +108,20 @@ def _initialize_strategy_with_mean(strategy, rng_init, es_params, init_mean):
         return _replace_state_fields(state, **updates)
 
 
+def _build_candidate_init_mean(
+    *,
+    substrate,
+    rng_mean,
+    optimize_tau: bool,
+) -> jax.Array:
+    init_mean = jnp.asarray(substrate.default_params(rng_mean), dtype=jnp.float32)
+    if not optimize_tau:
+        return init_mean
+    # raw tau latent = 0 -> sigmoid(0)=0.5, i.e. the middle of the tau grid
+    tau0 = jnp.zeros((1,), dtype=init_mean.dtype)
+    return jnp.concatenate((init_mean, tau0), axis=0)
+
+
 def _load_resume_state(save_dir):
     if save_dir is None:
         return None
@@ -642,7 +656,11 @@ def main(cfg, args):
                 es_state = strategy.initialize(_rng, es_params)
             elif params_init == "substrate_default":
                 rng, rng_mean, rng_init = jax.random.split(rng, 3)
-                init_mean = substrate.default_params(rng_mean)
+                init_mean = _build_candidate_init_mean(
+                    substrate=substrate,
+                    rng_mean=rng_mean,
+                    optimize_tau=optimize_tau,
+                )
                 es_state = _initialize_strategy_with_mean(strategy, rng_init, es_params, init_mean)
             else:
                 raise ValueError(f"Unhandled params_init {params_init!r}.")
