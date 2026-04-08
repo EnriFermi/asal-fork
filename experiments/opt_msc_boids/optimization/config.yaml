@@ -22,6 +22,7 @@ evaluation:
   log_clip_evolution: false
 
 optimization:
+  params_init: substrate_default
   bs: 1
   pop_batch: 8
   pop_size: 8

@@ -62,6 +62,52 @@ def _to_jax_tree(tree):
     return jax.tree.map(lambda x: jnp.asarray(x), tree)
 
 
+def _canonicalize_params_init(name):
+    if name is None:
+        return "strategy_default"
+    normalized = str(name).strip().lower().replace("-", "_")
+    aliases = {
+        "strategy_default": "strategy_default",
+        "optimizer_default": "strategy_default",
+        "default": "strategy_default",
+        "substrate_default": "substrate_default",
+        "default_params": "substrate_default",
+        "smart": "substrate_default",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            f"Unknown params_init {name!r}. Use 'strategy_default' or 'substrate_default'."
+        )
+    return aliases[normalized]
+
+
+def _replace_state_fields(state, **updates):
+    if hasattr(state, "replace"):
+        return state.replace(**updates)
+    if hasattr(state, "_replace"):
+        return state._replace(**updates)
+    for key, value in updates.items():
+        setattr(state, key, value)
+    return state
+
+
+def _initialize_strategy_with_mean(strategy, rng_init, es_params, init_mean):
+    try:
+        return strategy.initialize(rng_init, es_params, init_mean=init_mean)
+    except TypeError:
+        state = strategy.initialize(rng_init, es_params)
+        updates = {}
+        if hasattr(state, "mean"):
+            updates["mean"] = jnp.asarray(init_mean)
+        if hasattr(state, "best_member"):
+            updates["best_member"] = jnp.asarray(init_mean)
+        if not updates:
+            raise RuntimeError(
+                "Could not set a custom optimizer initialization mean on this evosax strategy/state."
+            )
+        return _replace_state_fields(state, **updates)
+
+
 def _load_resume_state(save_dir):
     if save_dir is None:
         return None
@@ -81,6 +127,7 @@ def _save_resume_state(
     candidate_dims,
     substrate_param_dims,
     optimize_tau,
+    params_init,
     data,
     best_params_traj,
     best_tau_traj,
@@ -99,6 +146,7 @@ def _save_resume_state(
         candidate_dims=int(candidate_dims),
         substrate_param_dims=int(substrate_param_dims),
         optimize_tau=bool(optimize_tau),
+        params_init=str(params_init),
         rng=np.array(rng),
         es_state=_to_numpy_tree(es_state),
         data=[] if len(data) == 0 else _to_numpy_tree(data),
@@ -120,6 +168,7 @@ def _restore_resume_state(
     candidate_dims,
     substrate_param_dims,
     optimize_tau,
+    params_init,
 ):
     if checkpoint is None:
         return None
@@ -143,6 +192,11 @@ def _restore_resume_state(
     if ckpt_optimize_tau != bool(optimize_tau):
         raise ValueError(
             f"Resume checkpoint optimize_tau mismatch: checkpoint={ckpt_optimize_tau}, current={bool(optimize_tau)}."
+        )
+    ckpt_params_init = str(checkpoint.get("params_init", "strategy_default"))
+    if ckpt_params_init != str(params_init):
+        raise ValueError(
+            f"Resume checkpoint params_init mismatch: checkpoint={ckpt_params_init!r}, current={params_init!r}."
         )
     return dict(
         next_iter=int(checkpoint.get("next_iter", 0)),
@@ -314,6 +368,8 @@ def main(cfg, args):
         chunk_steps = int(metric_cfg["sample_every_steps"])
         time_sampling = int(metric_cfg["time_sampling"])
         substrate_param_dims = int(substrate.n_params)
+        params_init = _canonicalize_params_init(getattr(args, "params_init", "strategy_default"))
+        run.summary["optimizer/params_init"] = params_init
         trajectory_source, trajectory_sample_info = _infer_metric_trajectory_source(args, substrate)
         run.summary["metric_cfg/trajectory_source"] = str(trajectory_source)
         if trajectory_sample_info is not None:
@@ -565,6 +621,7 @@ def main(cfg, args):
                     candidate_dims=candidate_dims,
                     substrate_param_dims=substrate_param_dims,
                     optimize_tau=optimize_tau,
+                    params_init=params_init,
                 )
                 start_iter = restored["next_iter"]
                 rng = restored["rng"]
@@ -580,8 +637,15 @@ def main(cfg, args):
                 resumed = True
                 print(f"Resuming optimization from iter {start_iter} using {args.save_dir}/resume_state.pkl")
         if not resumed:
-            rng, _rng = split(rng)
-            es_state = strategy.initialize(_rng, es_params)
+            if params_init == "strategy_default":
+                rng, _rng = split(rng)
+                es_state = strategy.initialize(_rng, es_params)
+            elif params_init == "substrate_default":
+                rng, rng_mean, rng_init = jax.random.split(rng, 3)
+                init_mean = substrate.default_params(rng_mean)
+                es_state = _initialize_strategy_with_mean(strategy, rng_init, es_params, init_mean)
+            else:
+                raise ValueError(f"Unhandled params_init {params_init!r}.")
 
         run.summary["resume/enabled"] = bool(resume_enabled)
         run.summary["resume/loaded"] = bool(resumed)
@@ -793,6 +857,7 @@ def main(cfg, args):
                     candidate_dims=candidate_dims,
                     substrate_param_dims=substrate_param_dims,
                     optimize_tau=optimize_tau,
+                    params_init=params_init,
                     data=data,
                     best_params_traj=best_params_traj,
                     best_tau_traj=best_tau_traj,
