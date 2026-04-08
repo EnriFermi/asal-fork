@@ -6,9 +6,9 @@ meta:
 substrate:
   substrate: plife_plus
   rollout_steps: 200000
-  n_particles: 1000
-  n_colors: 6
-  dt: 0.02
+  n_particles: 800
+  n_colors: 5
+  dt: 0.05
   beta: 0.3
   mass: 0.1
   half_life: 0.04
@@ -27,7 +27,7 @@ optimization:
   bs: 1
   pop_batch: 8
   pop_size: 8
-  n_iters: 100
+  n_iters: 50
   sigma: 0.2
 
 logging:
