@@ -297,6 +297,9 @@ def _normalize_metric_trajectory_source(source_raw) -> str:
         "auto": "auto",
         "lagrangian": "lagrangian",
         "state_x": "state_x",
+        "state": "state_x",
+        "state_array": "state_x",
+        "state_positions": "state_x",
         "direct": "state_x",
         "positions": "state_x",
         "position": "state_x",
@@ -311,6 +314,23 @@ def _normalize_metric_trajectory_source(source_raw) -> str:
     return aliases[normalized]
 
 
+def _extract_state_positions(state) -> jax.Array:
+    if isinstance(state, dict):
+        if "x" not in state:
+            raise ValueError(
+                "metric_trajectory_source='state_x' requires a state dict containing key 'x' "
+                "or a state array with shape (..., 2)."
+            )
+        return state["x"]
+    arr = jnp.asarray(state)
+    if arr.ndim < 2 or int(arr.shape[-1]) != 2:
+        raise ValueError(
+            "metric_trajectory_source='state_x' requires a state dict containing key 'x' "
+            "or a state array with shape (..., 2)."
+        )
+    return arr
+
+
 def _infer_metric_trajectory_source(args, substrate) -> tuple[str, dict | None]:
     requested = _normalize_metric_trajectory_source(getattr(args, "metric_trajectory_source", "auto"))
     sample_info = None
@@ -319,12 +339,8 @@ def _infer_metric_trajectory_source(args, substrate) -> tuple[str, dict | None]:
     if requested == "state_x":
         params0 = substrate.default_params(jax.random.PRNGKey(0))
         state0 = substrate.init_state(jax.random.PRNGKey(1), params0)
-        if not isinstance(state0, dict) or "x" not in state0:
-            raise ValueError(
-                "metric_trajectory_source='state_x' requires substrate.init_state(...) "
-                "to return a dict containing key 'x'."
-            )
-        sample_info = dict(tracked_entities=int(state0["x"].shape[0]))
+        xy0 = _extract_state_positions(state0)
+        sample_info = dict(tracked_entities=int(xy0.shape[0]))
         return requested, sample_info
 
     if hasattr(substrate, "RT"):
@@ -334,8 +350,12 @@ def _infer_metric_trajectory_source(args, substrate) -> tuple[str, dict | None]:
     state0 = substrate.init_state(jax.random.PRNGKey(1), params0)
     if hasattr(substrate, "RT"):
         return "lagrangian", sample_info
-    if isinstance(state0, dict) and "x" in state0:
-        sample_info = dict(tracked_entities=int(state0["x"].shape[0]))
+    try:
+        xy0 = _extract_state_positions(state0)
+    except ValueError:
+        xy0 = None
+    if xy0 is not None:
+        sample_info = dict(tracked_entities=int(xy0.shape[0]))
         return "state_x", sample_info
 
     raise ValueError(
@@ -580,7 +600,7 @@ def main(cfg, args):
 
                 def chunk_fn(state, key_chunk):
                     state_next, _ = jax.lax.scan(step_fn, state, split(key_chunk, chunk_steps))
-                    return state_next, state_next["x"]
+                    return state_next, _extract_state_positions(state_next)
 
                 _, xy_seq = jax.lax.scan(
                     chunk_fn,

@@ -75,6 +75,23 @@ def _metric_seed(paper_cfg, trial_idx: int) -> int:
     return base + int(trial_idx)
 
 
+def _canonicalize_random_mean_init(name) -> str:
+    normalized = str(name or "strategy_default").strip().lower().replace("-", "_")
+    aliases = {
+        "strategy_default": "strategy_default",
+        "optimizer_default": "strategy_default",
+        "default": "strategy_default",
+        "substrate_default": "substrate_default",
+        "default_params": "substrate_default",
+        "smart": "substrate_default",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            f"Unknown params_init {name!r}. Use 'strategy_default' or 'substrate_default'."
+        )
+    return aliases[normalized]
+
+
 def _build_trial_artifact_dir(save_root: Path, trial_idx: int) -> Path:
     return ensure_dir(save_root / "trial_artifacts" / _trial_name(trial_idx))
 
@@ -89,6 +106,7 @@ def _ensure_random_checkpoint(
     member_idx: int,
     group_idx: int,
     random_idx: int,
+    mean_init_mode: str = "strategy_default",
 ) -> None:
     best_path = random_dir / "best.pkl"
     if best_path.exists():
@@ -100,6 +118,7 @@ def _ensure_random_checkpoint(
         sigma_init=float(sigma_init),
         pop_size=int(pop_size),
         member_idx=int(member_idx),
+        mean_init_mode=str(mean_init_mode),
     )
     util.save_pkl(str(random_dir), "best", (np.asarray(params, dtype=np.float32), 0.0))
     _write_json(
@@ -111,6 +130,7 @@ def _ensure_random_checkpoint(
             "member_idx": int(member_idx),
             "pop_size": int(pop_size),
             "sigma_init": float(sigma_init),
+            "mean_init_mode": str(mean_init_mode),
         },
     )
 
@@ -241,14 +261,16 @@ def main() -> int:
     opt_base_cfg, _ = load_stage_base_config(opt_stage_cfg, config_path.parent)
     opt_flat = _flat_opt_args(opt_base_cfg)
     opt_args = SimpleNamespace(**OmegaConf.to_container(opt_flat, resolve=True))
-    if str(opt_args.substrate) != "lenia_flow":
-        raise ValueError("paper_check random baselines currently support substrate='lenia_flow' only.")
-    substrate = substrates.create_substrate(opt_args.substrate, **util.flow_lenia_kwargs_from_args(opt_args))
+    substrate = substrates.create_substrate(
+        opt_args.substrate,
+        **util.substrate_kwargs_from_args(opt_args),
+    )
     substrate = substrates.FlattenSubstrateParameters(substrate)
     random_root = ensure_dir(save_root_abs / "random_params")
     random_seed_base = int(paper_section.get("random_param_seed_base", 500_000))
     opt_pop_size = int(getattr(opt_args, "pop_size"))
     opt_sigma = float(getattr(opt_args, "sigma"))
+    opt_params_init = _canonicalize_random_mean_init(getattr(opt_args, "params_init", "strategy_default"))
 
     pending_job_cfgs: list[Path] = []
     for group_idx in assigned_groups:
@@ -287,6 +309,7 @@ def main() -> int:
                 member_idx=member_idx,
                 group_idx=group_idx,
                 random_idx=random_idx,
+                mean_init_mode=opt_params_init,
             )
             checkpoint_rel = Path(str(random_dir_abs.relative_to(repo)))
             candidate_specs.append(
