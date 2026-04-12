@@ -153,7 +153,10 @@ def _create_substrate(args, *, enable_msc: bool = False):
             **kw,
         )
     else:
-        base = substrates.create_substrate(args.substrate)
+        base = substrates.create_substrate(
+            args.substrate,
+            **util.substrate_kwargs_from_args(args),
+        )
     return substrates.FlattenSubstrateParameters(base)
 
 

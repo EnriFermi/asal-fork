@@ -192,6 +192,14 @@ def substrate_kwargs_from_args(args: Any) -> Dict[str, Any]:
             _maybe_set_kwarg(kwargs, args, name, cast)
         return kwargs
 
+    if substrate_name == "plenia":
+        for name, cast in (
+            ("n_particles", int),
+            ("dt", float),
+        ):
+            _maybe_set_kwarg(kwargs, args, name, cast)
+        return kwargs
+
     return kwargs
 
 
@@ -220,7 +228,10 @@ def metric_periodic_space_defaults(substrate: Any) -> Dict[str, Any]:
         return dict(periodic=True, domain_y=size, domain_x=size)
 
     name = str(getattr(base, "name", ""))
-    if name in {"plife", "plife_plus", "plenia"}:
+    if name == "plenia":
+        return dict(periodic=False, domain_y=0.0, domain_x=0.0)
+
+    if name in {"plife", "plife_plus"}:
         return dict(periodic=True, domain_y=1.0, domain_x=1.0)
 
     if hasattr(base, "grid_size"):

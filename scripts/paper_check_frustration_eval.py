@@ -99,6 +99,8 @@ def _make_trial_paths(root_dir: Path, trial_idx: int) -> dict[str, Path]:
 
 
 def _state_to_np_payload(prefix: str, state: dict[str, jax.Array]) -> dict[str, np.ndarray]:
+    if not isinstance(state, dict):
+        return {f"{prefix}__array": np.asarray(jax.device_get(state))}
     payload = {}
     for key, value in state.items():
         payload[f"{prefix}{key}"] = np.asarray(jax.device_get(value))
@@ -106,6 +108,9 @@ def _state_to_np_payload(prefix: str, state: dict[str, jax.Array]) -> dict[str, 
 
 
 def _state_from_npz(prefix: str, data) -> dict[str, jax.Array]:
+    array_key = f"{prefix}__array"
+    if array_key in data.files:
+        return jnp.asarray(np.asarray(data[array_key]))
     out = {}
     for key in data.files:
         if key.startswith(prefix):
@@ -590,6 +595,13 @@ def _validate_divisibility(*, total_steps: int, warmup_steps: int, late_start: i
 
 
 def main(cfg, args):
+    if str(getattr(args, "substrate")) != "lenia_flow":
+        if len(sys.argv) < 2:
+            raise SystemExit("Usage: python scripts/paper_check_frustration_eval.py <resolved_job_config.yaml>")
+        from paper_check_frustration_batch_eval import run_batch
+
+        return run_batch([sys.argv[1]])
+
     project_root = _repo_root()
     root_save_dir = Path(project_root / str(getattr(args, "save_dir")))
     root_save_dir.mkdir(parents=True, exist_ok=True)
