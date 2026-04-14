@@ -41,6 +41,9 @@ def _build_run_config(paper_cfg, config_path: Path, run_idx: int):
     wandb_project = paper_cfg.get("meta", {}).get("wandb_project", None)
     if wandb_project is not None:
         base_cfg.logging.wandb_project = str(wandb_project)
+    wandb_mode = paper_cfg.get("meta", {}).get("wandb_mode", None)
+    if wandb_mode is not None:
+        base_cfg.logging.wandb_mode = str(wandb_mode)
 
     save_every = stage_cfg.get("save_every", None)
     if save_every is not None:
