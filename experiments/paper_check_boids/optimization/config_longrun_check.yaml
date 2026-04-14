@@ -32,6 +32,7 @@ optimization:
 
 logging:
   wandb_project: asal
+  wandb_mode: online
   pca_every: 0
 
 metric:
