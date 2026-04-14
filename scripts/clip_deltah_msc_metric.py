@@ -520,12 +520,16 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
 
         X0 = X_w[k_idx][:, p_idx, :]
         X1 = X_w[k_idx + tau][:, p_idx, :]
+        X_sample = X_w[:, p_idx, :]
         dx = _delta_periodic(X1 - X0)
         dt = jnp.maximum(
             jnp.asarray(float(tau) * sample_stride_steps, dtype=xy_seq.dtype),
             jnp.asarray(1e-12, dtype=xy_seq.dtype),
         )
         v_s = dx / dt  # (m_count, S, 2)
+        dx_norm = jnp.linalg.norm(dx, axis=-1)
+        speed_norm = jnp.linalg.norm(v_s, axis=-1)
+        pos_flat = X_sample.reshape((-1, 2))
 
         dirs = jax.random.normal(dir_key, (n_proj, 2), dtype=xy_seq.dtype)
         dirs = dirs / jnp.maximum(jnp.linalg.norm(dirs, axis=1, keepdims=True), 1e-12)
@@ -548,7 +552,21 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
             h0 = jax.vmap(_one_null)(null_keys)
             h_null = jnp.median(h0)
 
-        return h_real - h_null
+        h_delta = h_real - h_null
+        return dict(
+            delta_h=h_delta,
+            h_real=h_real,
+            h_null=h_null,
+            dx_norm_mean=jnp.mean(dx_norm),
+            dx_norm_std=jnp.std(dx_norm),
+            dx_norm_max=jnp.max(dx_norm),
+            speed_norm_mean=jnp.mean(speed_norm),
+            speed_norm_std=jnp.std(speed_norm),
+            speed_norm_max=jnp.max(speed_norm),
+            speed_component_std_mean=jnp.mean(jnp.std(v_s.reshape((-1, 2)), axis=0)),
+            position_std_mean=jnp.mean(jnp.std(pos_flat, axis=0)),
+            position_range_mean=jnp.mean(jnp.max(pos_flat, axis=0) - jnp.min(pos_flat, axis=0)),
+        )
 
     def _score_from_h(h: jnp.ndarray, dtype: jnp.dtype) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         h_pos = _preprocess(h)
@@ -580,6 +598,17 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
         keys_tau = jax.random.split(rng_metric, tau_count)
 
         h_list = []
+        h_real_list = []
+        h_null_list = []
+        dx_norm_mean_list = []
+        dx_norm_std_list = []
+        dx_norm_max_list = []
+        speed_norm_mean_list = []
+        speed_norm_std_list = []
+        speed_norm_max_list = []
+        speed_component_std_mean_list = []
+        position_std_mean_list = []
+        position_range_mean_list = []
         score_list = []
         amp_list = []
         msc_list = []
@@ -588,7 +617,7 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
             tseg = int(tseg_list[i])
             m_count = int(m_count_list[i])
             keys_w = jax.random.split(keys_tau[i], W)
-            h = jax.vmap(
+            window_diag = jax.vmap(
                 lambda s, k: _delta_h_window(
                     xy_seq,
                     s,
@@ -598,13 +627,36 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
                     m_count=m_count,
                 )
             )(starts, keys_w)
+            h = window_diag["delta_h"]
             score, amp, msc = _score_from_h(h, xy_seq.dtype)
             h_list.append(h)
+            h_real_list.append(window_diag["h_real"])
+            h_null_list.append(window_diag["h_null"])
+            dx_norm_mean_list.append(window_diag["dx_norm_mean"])
+            dx_norm_std_list.append(window_diag["dx_norm_std"])
+            dx_norm_max_list.append(window_diag["dx_norm_max"])
+            speed_norm_mean_list.append(window_diag["speed_norm_mean"])
+            speed_norm_std_list.append(window_diag["speed_norm_std"])
+            speed_norm_max_list.append(window_diag["speed_norm_max"])
+            speed_component_std_mean_list.append(window_diag["speed_component_std_mean"])
+            position_std_mean_list.append(window_diag["position_std_mean"])
+            position_range_mean_list.append(window_diag["position_range_mean"])
             score_list.append(score)
             amp_list.append(amp)
             msc_list.append(msc)
 
         h_all = jnp.stack(h_list, axis=0)  # (Ktau, W)
+        h_real_all = jnp.stack(h_real_list, axis=0)
+        h_null_all = jnp.stack(h_null_list, axis=0)
+        dx_norm_mean_all = jnp.stack(dx_norm_mean_list, axis=0)
+        dx_norm_std_all = jnp.stack(dx_norm_std_list, axis=0)
+        dx_norm_max_all = jnp.stack(dx_norm_max_list, axis=0)
+        speed_norm_mean_all = jnp.stack(speed_norm_mean_list, axis=0)
+        speed_norm_std_all = jnp.stack(speed_norm_std_list, axis=0)
+        speed_norm_max_all = jnp.stack(speed_norm_max_list, axis=0)
+        speed_component_std_mean_all = jnp.stack(speed_component_std_mean_list, axis=0)
+        position_std_mean_all = jnp.stack(position_std_mean_list, axis=0)
+        position_range_mean_all = jnp.stack(position_range_mean_list, axis=0)
         score_all = jnp.stack(score_list, axis=0)  # (Ktau,)
         amp_all = jnp.stack(amp_list, axis=0)
         msc_all = jnp.stack(msc_list, axis=0)
@@ -620,6 +672,17 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
         amp = amp_all[best_idx]
         msc = msc_all[best_idx]
         h_best = h_all[best_idx]
+        h_real_best = h_real_all[best_idx]
+        h_null_best = h_null_all[best_idx]
+        dx_norm_mean_best = dx_norm_mean_all[best_idx]
+        dx_norm_std_best = dx_norm_std_all[best_idx]
+        dx_norm_max_best = dx_norm_max_all[best_idx]
+        speed_norm_mean_best = speed_norm_mean_all[best_idx]
+        speed_norm_std_best = speed_norm_std_all[best_idx]
+        speed_norm_max_best = speed_norm_max_all[best_idx]
+        speed_component_std_mean_best = speed_component_std_mean_all[best_idx]
+        position_std_mean_best = position_std_mean_all[best_idx]
+        position_range_mean_best = position_range_mean_all[best_idx]
 
         tau_frames_arr = jnp.asarray(tau_frames_list, dtype=jnp.int32)
         tau_steps_arr = jnp.asarray(tau_steps_list, dtype=jnp.int32)
@@ -641,6 +704,34 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
             delta_h_std=jnp.std(h_best),
             delta_h_min=jnp.min(h_best),
             delta_h_max=jnp.max(h_best),
+            delta_h_abs_mean=jnp.mean(jnp.abs(h_best)),
+            delta_h_positive_frac=jnp.mean((h_best > 0.0).astype(xy_seq.dtype)),
+            h_real_mean=jnp.mean(h_real_best),
+            h_real_std=jnp.std(h_real_best),
+            h_real_min=jnp.min(h_real_best),
+            h_real_max=jnp.max(h_real_best),
+            h_null_mean=jnp.mean(h_null_best),
+            h_null_std=jnp.std(h_null_best),
+            h_null_min=jnp.min(h_null_best),
+            h_null_max=jnp.max(h_null_best),
+            h_real_minus_null_mean=jnp.mean(h_real_best - h_null_best),
+            h_real_over_null_mean=jnp.mean(h_real_best / jnp.maximum(jnp.abs(h_null_best), eps)),
+            h_delta_over_real_mean=jnp.mean(h_best / jnp.maximum(jnp.abs(h_real_best), eps)),
+            dx_norm_mean=jnp.mean(dx_norm_mean_best),
+            dx_norm_std_mean=jnp.mean(dx_norm_std_best),
+            dx_norm_max=jnp.max(dx_norm_max_best),
+            speed_norm_mean=jnp.mean(speed_norm_mean_best),
+            speed_norm_std_mean=jnp.mean(speed_norm_std_best),
+            speed_norm_max=jnp.max(speed_norm_max_best),
+            speed_component_std_mean=jnp.mean(speed_component_std_mean_best),
+            position_std_mean=jnp.mean(position_std_mean_best),
+            position_range_mean=jnp.mean(position_range_mean_best),
+            delta_h_tau_mean=jnp.mean(h_all),
+            delta_h_tau_abs_mean=jnp.mean(jnp.abs(h_all)),
+            h_real_tau_mean=jnp.mean(h_real_all),
+            h_null_tau_mean=jnp.mean(h_null_all),
+            dx_norm_tau_mean=jnp.mean(dx_norm_mean_all),
+            speed_norm_tau_mean=jnp.mean(speed_norm_mean_all),
             tau_selected_idx=tau_selected_idx,
             tau_best_frames=tau_best_frames.astype(xy_seq.dtype),
             tau_best_steps=tau_best_steps.astype(xy_seq.dtype),
