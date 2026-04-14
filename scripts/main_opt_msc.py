@@ -2,6 +2,12 @@ import os
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "scripts")):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 import evosax
 import jax
@@ -331,6 +337,56 @@ def _extract_state_positions(state) -> jax.Array:
     return arr
 
 
+def _state_has_color_vectors(state) -> bool:
+    if not isinstance(state, dict) or "c" not in state:
+        return False
+    c = jnp.asarray(state["c"])
+    return c.ndim == 2 and int(c.shape[0]) > 0 and int(c.shape[1]) > 0
+
+
+def _color_diversity_stats(c: jax.Array) -> dict[str, jax.Array]:
+    c = jnp.asarray(c, dtype=jnp.float32)
+    n = int(c.shape[0])
+    d = int(c.shape[1])
+    eps = jnp.asarray(1e-8, dtype=c.dtype)
+
+    c_mean = jnp.mean(c, axis=0)
+    centered = c - c_mean
+    dim_var = jnp.mean(centered * centered, axis=0)
+    diversity = jnp.sum(dim_var)
+    pairwise_sqdist = jnp.where(
+        n > 1,
+        (2.0 * float(n) / float(max(n - 1, 1))) * diversity,
+        jnp.asarray(0.0, dtype=c.dtype),
+    )
+
+    labels = jnp.argmax(c, axis=-1)
+    counts = jnp.bincount(labels, length=d).astype(c.dtype)
+    probs = counts / jnp.maximum(jnp.sum(counts), eps)
+    entropy = -jnp.sum(jnp.where(probs > 0.0, probs * jnp.log(probs + eps), 0.0))
+    entropy_norm = entropy / jnp.maximum(jnp.log(jnp.asarray(float(d), dtype=c.dtype)), eps)
+
+    norms = jnp.linalg.norm(c, axis=-1)
+    if d >= 3:
+        rgb = jnp.clip((c[:, :3] + 1.0) * 0.5, 0.0, 1.0)
+        rgb_std_mean = jnp.mean(jnp.std(rgb, axis=0))
+        rgb_range_mean = jnp.mean(jnp.max(rgb, axis=0) - jnp.min(rgb, axis=0))
+    else:
+        rgb_std_mean = jnp.asarray(0.0, dtype=c.dtype)
+        rgb_range_mean = jnp.asarray(0.0, dtype=c.dtype)
+
+    return {
+        "color_diversity": diversity,
+        "color_pairwise_sqdist": pairwise_sqdist,
+        "color_dim_entropy": entropy,
+        "color_dim_entropy_norm": entropy_norm,
+        "color_norm_mean": jnp.mean(norms),
+        "color_norm_std": jnp.std(norms),
+        "color_rgb_std_mean": rgb_std_mean,
+        "color_rgb_range_mean": rgb_range_mean,
+    }
+
+
 def _infer_metric_trajectory_source(args, substrate) -> tuple[str, dict | None]:
     requested = _normalize_metric_trajectory_source(getattr(args, "metric_trajectory_source", "auto"))
     sample_info = None
@@ -383,7 +439,11 @@ def load_config():
 
 def main(cfg, args):
     wandb_project = str(getattr(args, "wandb_project", "asal"))
-    run = wandb.init(project=wandb_project, config=OmegaConf.to_container(cfg, resolve=True))
+    wandb_mode = getattr(args, "wandb_mode", None)
+    wandb_kwargs = dict(project=wandb_project, config=OmegaConf.to_container(cfg, resolve=True))
+    if wandb_mode is not None:
+        wandb_kwargs["mode"] = str(wandb_mode)
+    run = wandb.init(**wandb_kwargs)
     try:
         base_substrate = substrates.create_substrate(
             args.substrate,
@@ -438,6 +498,15 @@ def main(cfg, args):
         chunk_steps = int(metric_cfg["sample_every_steps"])
         time_sampling = int(metric_cfg["time_sampling"])
         substrate_param_dims = int(substrate.n_params)
+        log_color_diversity_requested = bool(getattr(args, "log_color_diversity", True))
+        color_probe_params = substrate.default_params(jax.random.PRNGKey(17))
+        color_probe_state = substrate.init_state(jax.random.PRNGKey(18), color_probe_params)
+        log_color_diversity = bool(log_color_diversity_requested and _state_has_color_vectors(color_probe_state))
+        run.summary["color_logging/enabled"] = bool(log_color_diversity)
+        run.summary["color_logging/requested"] = bool(log_color_diversity_requested)
+        if log_color_diversity:
+            run.summary["color_logging/n_elements"] = int(color_probe_state["c"].shape[0])
+            run.summary["color_logging/n_color_dims"] = int(color_probe_state["c"].shape[1])
 
         def split_candidate_params(params_full):
             params_sub = params_full[:substrate_param_dims]
@@ -531,7 +600,7 @@ def main(cfg, args):
             lag_diffusion_scale = float(getattr(args, "metric_lagrangian_diffusion_scale", 1.0))
             run.summary["metric_cfg/lagrangian_n_particles"] = int(lag_n_particles)
 
-            def rollout_metric_xy(rng, params):
+            def rollout_metric_xy_and_aux(rng, params):
                 k_state, k_pts, k_ch, k_scan = jax.random.split(rng, 4)
                 s0 = substrate.init_state(k_state, params)
                 if "F" not in s0:
@@ -583,37 +652,49 @@ def main(cfg, args):
                     (s0, pts0, ch0),
                     split(k_scan, time_sampling),
                 )
-                return xy_seq  # (time_sampling, N_particles, 2)
+                return xy_seq, {}  # (time_sampling, N_particles, 2)
         elif trajectory_source == "state_x":
-            def rollout_metric_xy(rng, params):
+            def rollout_metric_xy_and_aux(rng, params):
                 k_state, k_scan = jax.random.split(rng, 2)
                 s0 = substrate.init_state(k_state, params)
-                if "x" not in s0:
-                    raise ValueError(
-                        "State does not contain key 'x'. "
-                        "Set metric_trajectory_source='lagrangian' or use a substrate with explicit positions."
-                    )
+                _extract_state_positions(s0)
 
                 def step_fn(state, key_step):
                     state_next = substrate.step_state(key_step, state, params)
                     return state_next, None
 
-                def chunk_fn(state, key_chunk):
-                    state_next, _ = jax.lax.scan(step_fn, state, split(key_chunk, chunk_steps))
-                    return state_next, _extract_state_positions(state_next)
+                if log_color_diversity:
+                    def chunk_fn(state, key_chunk):
+                        state_next, _ = jax.lax.scan(step_fn, state, split(key_chunk, chunk_steps))
+                        return state_next, (
+                            _extract_state_positions(state_next),
+                            _color_diversity_stats(state_next["c"]),
+                        )
 
-                _, xy_seq = jax.lax.scan(
-                    chunk_fn,
-                    s0,
-                    split(k_scan, time_sampling),
-                )
+                    _, (xy_seq, color_seq) = jax.lax.scan(
+                        chunk_fn,
+                        s0,
+                        split(k_scan, time_sampling),
+                    )
+                    color_aux = jax.tree.map(lambda x: jnp.mean(x, axis=0), color_seq)
+                else:
+                    def chunk_fn(state, key_chunk):
+                        state_next, _ = jax.lax.scan(step_fn, state, split(key_chunk, chunk_steps))
+                        return state_next, _extract_state_positions(state_next)
+
+                    _, xy_seq = jax.lax.scan(
+                        chunk_fn,
+                        s0,
+                        split(k_scan, time_sampling),
+                    )
+                    color_aux = {}
                 if positions_unwrapped:
                     xy_seq = _unwrap_sampled_xy_jax(
                         xy_seq,
                         domain_y=float(metric_space_defaults["domain_y"]),
                         domain_x=float(metric_space_defaults["domain_x"]),
                     )
-                return xy_seq
+                return xy_seq, color_aux
         else:
             raise ValueError(f"Unhandled metric trajectory source {trajectory_source!r}.")
 
@@ -623,11 +704,13 @@ def main(cfg, args):
                 rng_roll, rng_metric, rng_clip = split(rng, 3)
             else:
                 rng_roll, rng_metric = split(rng)
-            xy_seq = rollout_metric_xy(rng_roll, params)
+            xy_seq, aux_dict = rollout_metric_xy_and_aux(rng_roll, params)
             if optimize_tau:
                 msc_loss, msc_dict = metric_loss_fn(rng_metric, xy_seq, tau_selector=tau_selector)
             else:
                 msc_loss, msc_dict = metric_loss_fn(rng_metric, xy_seq)
+            if aux_dict:
+                msc_dict = dict(msc_dict, **aux_dict)
             if not log_clip_evolution:
                 return msc_loss, msc_dict
             clip_out = rollout_clip(rng_clip, params)
