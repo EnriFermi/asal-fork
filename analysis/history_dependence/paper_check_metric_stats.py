@@ -15,7 +15,7 @@ from .embedding_metrics import cloud_distance, synchronized_distance
 from .pipeline import load_analysis_config
 from .trajectory_metrics import compute_delta_h_summary, delta_h_distribution_distance, delta_h_map_distance
 
-_CACHE_VERSION = "paper_check_history_distances_v2"
+_CACHE_VERSION = "paper_check_history_distances_v3"
 
 
 def _is_missing(value: Any) -> bool:
@@ -197,18 +197,18 @@ def _build_metric_cfg(
 
     rollout_steps = (
         traj_cfg.get("rollout_steps")
-        or source_metric.get("rollout_steps")
         or lag_meta.get("trajectory_window_steps")
+        or source_metric.get("rollout_steps")
     )
     sample_every_steps = (
         traj_cfg.get("sample_every_steps")
-        or source_metric.get("sample_every_steps")
         or lag_meta.get("sample_every_steps")
+        or source_metric.get("sample_every_steps")
     )
     time_sampling = (
         traj_cfg.get("time_sampling")
-        or source_metric.get("time_sampling")
         or lag_meta.get("time_sampling")
+        or source_metric.get("time_sampling")
     )
 
     if rollout_steps is None and sample_every_steps is not None and time_sampling is not None:
