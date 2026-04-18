@@ -3,7 +3,14 @@ os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 # os.environ["JAX_PLATFORM_NAME"] = "cpu"
 
 import argparse
+import sys
+from pathlib import Path
 from functools import partial
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "scripts")):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 import jax
 import jax.numpy as jnp
@@ -25,6 +32,27 @@ import util
 
 print(jax.devices())
 print(jax.default_backend())
+
+
+def _parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected boolean value, got {value!r}.")
+
+
+def _provided_cli_flags(argv=None) -> set[str]:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    flags = set()
+    for token in argv:
+        if token.startswith("--"):
+            flags.add(token[2:].split("=", 1)[0].replace("-", "_"))
+    return flags
+
 
 parser = argparse.ArgumentParser()
 group = parser.add_argument_group("meta")
@@ -79,6 +107,32 @@ group.add_argument("--food_vis_color", type=str, default="0.6,0.3,0.0", help="fo
 group.add_argument("--food_diffusion_alpha", type=float, default=0.0, help="for lenia_flow: blend factor for food diffusion (0=off)")
 group.add_argument("--mass_clip_eps", type=float, default=0.0, help="for lenia_flow: zero-out per-pixel mass below this sum")
 group.add_argument("--mass_renorm", action='store_true', help="for lenia_flow: explicitly renormalize per-channel mass after reintegration")
+group.add_argument("--n_boids", type=int, default=None, help="for boids: number of boids")
+group.add_argument("--n_nbrs", type=int, default=None, help="for boids: nearest neighbors considered")
+group.add_argument("--visual_range", type=float, default=None, help="for boids: visible neighbor radius")
+group.add_argument("--speed", type=float, default=None, help="for boids: forward speed")
+group.add_argument("--controller", type=str, default=None, help="for boids: controller type")
+group.add_argument("--bird_render_size", type=float, default=None, help="for boids: rendered bird size")
+group.add_argument("--bird_render_sharpness", type=float, default=None, help="for boids: rendered bird edge sharpness")
+group.add_argument("--space_size", type=float, default=None, help="for boids: simulation domain size")
+group.add_argument("--red_boid", type=_parse_bool, default=None, help="for boids: highlight one boid in red")
+group.add_argument("--n_particles", type=int, default=None, help="for particle substrates: number of particles")
+group.add_argument("--n_colors", type=int, default=None, help="for particle substrates: number of colors/color dimensions")
+group.add_argument("--n_dims", type=int, default=None, help="for particle substrates: number of spatial dimensions")
+group.add_argument("--x_dist_bins", type=int, default=None, help="for Particle Life: initial position distribution bins")
+group.add_argument("--beta", type=float, default=None, help="for Particle Life: short-range repulsion fraction")
+group.add_argument("--alpha", type=float, default=None, help="for Particle Life: fixed alpha fallback")
+group.add_argument("--mass", type=float, default=None, help="for Particle Life: particle mass")
+group.add_argument("--half_life", type=float, default=None, help="for Particle Life: velocity damping half-life")
+group.add_argument("--rmax", type=float, default=None, help="for Particle Life: interaction radius")
+group.add_argument("--render_radius", type=float, default=None, help="for particle substrates: render radius")
+group.add_argument("--sharpness", type=float, default=None, help="for particle substrates: render sharpness")
+group.add_argument("--search_space", type=str, default=None, help="for Particle Life: optimized parameter names")
+group.add_argument("--update_colors", type=_parse_bool, default=None, help="for Particle Life++: enable color dynamics")
+group.add_argument("--world_size", type=float, default=None, help="for Particle Life++: simulation domain size")
+group.add_argument("--neighbor_mode", type=str, default=None, help="for Particle Life++: neighbor evaluation mode")
+group.add_argument("--color_palette", type=str, default=None, help="for particle substrates: color palette")
+group.add_argument("--background_color", type=str, default=None, help="for particle substrates: render background color")
 
 group = parser.add_argument_group("evaluation")
 group.add_argument(
@@ -112,6 +166,7 @@ group.add_argument("--eval_splits", type=int, default=1, help="number of splits 
 
 group = parser.add_argument_group("logging")
 group.add_argument("--wandb_project", type=str, default="asal", help="Weights & Biases project name")
+group.add_argument("--wandb_mode", type=str, default=None, help="Weights & Biases mode, e.g. online/offline/disabled")
 group.add_argument("--save_every", type=int, default=None, help="save data/best/pop_traj/resume_state every N iterations; default is n_iters//10")
 group.add_argument("--pca_every", type=int, default=1, help="Log population PCA every N iters; <=0 disables")
 group.add_argument("--pca_history", type=int, default=100, help="History length for PCA trajectory logging")
@@ -120,8 +175,9 @@ group.add_argument("--full_video_rollout_steps", type=int, default=None, help="O
 group.add_argument("--full_video_img_size", type=int, default=140, help="Image size for full video logging")
 
 
-def parse_args(*args, **kwargs):
-    args = parser.parse_args(*args, **kwargs)
+def parse_args(argv=None):
+    args = parser.parse_args(argv)
+    args._provided_flags = _provided_cli_flags(argv)
     for k, v in vars(args).items():
         if isinstance(v, str) and v.lower() == "none":
             setattr(args, k, None)  # set all "none" to None
@@ -258,6 +314,12 @@ def _initialize_optimizer_state(args, *, params_init, strategy, es_params, subst
     else:
         raise ValueError(f"Unhandled params_init {params_init!r}.")
     return rng, es_state
+
+
+def _provided_substrate_kwargs(args):
+    provided = set(getattr(args, "_provided_flags", set()))
+    kwargs = util.substrate_kwargs_from_args(args)
+    return {name: value for name, value in kwargs.items() if name in provided}
 
 
 def _unstack_tree_axis0(tree):
@@ -503,7 +565,11 @@ def show_video(x, fps=25, path="tmp.gif"):
     # display(Image(path))
 
 def main(args):
-    run = wandb.init(project=args.wandb_project, config={**vars(args)})
+    wandb_config = {k: v for k, v in vars(args).items() if not k.startswith("_")}
+    wandb_kwargs = dict(project=args.wandb_project, config=wandb_config)
+    if getattr(args, "wandb_mode", None) is not None:
+        wandb_kwargs["mode"] = str(args.wandb_mode)
+    run = wandb.init(**wandb_kwargs)
     try:
         prompts = args.prompts.split(";")
         if args.time_sampling < len(prompts): # doing multiple prompts
@@ -524,7 +590,10 @@ def main(args):
                 **util.flow_lenia_kwargs_from_args(args),
             )
         else:
-            substrate = substrates.create_substrate(args.substrate)
+            substrate = substrates.create_substrate(
+                args.substrate,
+                **_provided_substrate_kwargs(args),
+            )
         # Optional: control initial seeding for FlowLenia
         if hasattr(substrate, 'seed_n_patches'):
             try:

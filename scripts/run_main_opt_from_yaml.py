@@ -3,6 +3,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "scripts")):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
 from omegaconf import OmegaConf
 
 
@@ -59,6 +64,32 @@ SUBSTRATE_FLAGS = {
     "food_diffusion_alpha": "food_diffusion_alpha",
     "mass_clip_eps": "mass_clip_eps",
     "mass_renorm": "mass_renorm",
+    "n_boids": "n_boids",
+    "n_nbrs": "n_nbrs",
+    "visual_range": "visual_range",
+    "speed": "speed",
+    "controller": "controller",
+    "bird_render_size": "bird_render_size",
+    "bird_render_sharpness": "bird_render_sharpness",
+    "space_size": "space_size",
+    "red_boid": "red_boid",
+    "n_particles": "n_particles",
+    "n_colors": "n_colors",
+    "n_dims": "n_dims",
+    "x_dist_bins": "x_dist_bins",
+    "beta": "beta",
+    "alpha": "alpha",
+    "mass": "mass",
+    "half_life": "half_life",
+    "rmax": "rmax",
+    "render_radius": "render_radius",
+    "sharpness": "sharpness",
+    "search_space": "search_space",
+    "update_colors": "update_colors",
+    "world_size": "world_size",
+    "neighbor_mode": "neighbor_mode",
+    "color_palette": "color_palette",
+    "background_color": "background_color",
 }
 
 EVALUATION_FLAGS = {
@@ -83,6 +114,7 @@ OPTIMIZATION_FLAGS = {
 
 LOGGING_FLAGS = {
     "wandb_project": "wandb_project",
+    "wandb_mode": "wandb_mode",
     "save_every": "save_every",
     "pca_every": "pca_every",
     "pca_history": "pca_history",

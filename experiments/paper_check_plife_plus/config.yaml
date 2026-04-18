@@ -3,7 +3,7 @@ meta:
   num_machines: ${env:PAPER_NUM_MACHINES,2}
   wandb_project: asal
   wandb_mode: online
-  output_root: experiments/paper_check_plenia/checkpoints
+  output_root: experiments/paper_check_plife_plus/checkpoints
 
 paper_check:
   num_optimizations: 5

@@ -1,5 +1,11 @@
 import os
 import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "scripts")):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 import jax
 import jax.numpy as jnp
@@ -34,6 +40,8 @@ def load_config():
     if len(sys.argv) < 2:
         raise SystemExit("Usage: python scripts/simulate_after_training.py <config.yaml>")
     cfg = OmegaConf.load(sys.argv[1])
+    if len(sys.argv) > 2:
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(sys.argv[2:]))
     flat = OmegaConf.merge(
         cfg.get("meta", {}),
         cfg.get("substrate", {}),
@@ -173,44 +181,58 @@ def main(cfg, args):
     rng, rng_init = split(rng)
     state0 = substrate.init_state(rng_init, best_member)
     track_mass = isinstance(state0, dict) and "A" in state0
+    track_p_max = isinstance(state0, dict) and "P" in state0
     mass_channels_count = int(np.asarray(state0["A"]).shape[-1]) if track_mass else 0
+    p_max_plot = getattr(args, "p_max_plot", None)
+    if p_max_plot is None and track_p_max and getattr(args, "mass_plot", None):
+        root, ext = os.path.splitext(str(args.mass_plot))
+        p_max_plot = f"{root}_pmax{ext or '.png'}"
+    if p_max_plot is None and track_p_max and getattr(args, "output", None):
+        root, _ = os.path.splitext(str(args.output))
+        p_max_plot = f"{root}_pmax.png"
 
-    # Build JIT-compiled microbatch stepper that returns (state_next, frames[mb, H, W, 3], masses[mb, C]).
-    def build_batch_stepper(mb: int, *, track_mass: bool, mass_channels_count: int):
+    # Build JIT-compiled microbatch stepper that returns frame and scalar traces.
+    def build_batch_stepper(mb: int, *, track_mass: bool, mass_channels_count: int, track_p_max: bool):
         if track_mass:
             def run_batch(state, rng):
                 rngs = jax.random.split(rng, mb)
                 frames0 = jnp.zeros((mb, args.img_size, args.img_size, 3), dtype=jnp.float32)
                 masses0 = jnp.zeros((mb, mass_channels_count), dtype=jnp.float32)
+                p_max0 = jnp.zeros((mb,), dtype=jnp.float32)
 
                 def body(i, carry):
-                    s, frames, masses = carry
+                    s, frames, masses, p_max = carry
                     s = substrate.step_state(rngs[i], s, best_member)
                     frame = substrate.render_state(s, best_member, img_size=args.img_size)
                     frames = frames.at[i].set(frame)
                     mch = jnp.sum(s["A"], axis=(0, 1))
                     masses = masses.at[i].set(mch)
-                    return (s, frames, masses)
+                    if track_p_max:
+                        p_max = p_max.at[i].set(jnp.mean(jnp.max(s["P"], axis=-1)))
+                    return (s, frames, masses, p_max)
 
-                state_next, frames, masses = jax.lax.fori_loop(0, mb, body, (state, frames0, masses0))
-                return state_next, frames, masses
+                state_next, frames, masses, p_max = jax.lax.fori_loop(0, mb, body, (state, frames0, masses0, p_max0))
+                return state_next, frames, masses, p_max
 
             return jax.jit(run_batch)
 
         def run_batch(state, rng):
             rngs = jax.random.split(rng, mb)
             frames0 = jnp.zeros((mb, args.img_size, args.img_size, 3), dtype=jnp.float32)
+            p_max0 = jnp.zeros((mb,), dtype=jnp.float32)
 
             def body(i, carry):
-                s, frames = carry
+                s, frames, p_max = carry
                 s = substrate.step_state(rngs[i], s, best_member)
                 frame = substrate.render_state(s, best_member, img_size=args.img_size)
                 frames = frames.at[i].set(frame)
-                return (s, frames)
+                if track_p_max:
+                    p_max = p_max.at[i].set(jnp.mean(jnp.max(s["P"], axis=-1)))
+                return (s, frames, p_max)
 
-            state_next, frames = jax.lax.fori_loop(0, mb, body, (state, frames0))
+            state_next, frames, p_max = jax.lax.fori_loop(0, mb, body, (state, frames0, p_max0))
             masses = jnp.zeros((mb, 0), dtype=jnp.float32)
-            return state_next, frames, masses
+            return state_next, frames, masses, p_max
 
         return jax.jit(run_batch)
 
@@ -218,6 +240,7 @@ def main(cfg, args):
         int(args.jit_microbatch),
         track_mass=track_mass,
         mass_channels_count=mass_channels_count,
+        track_p_max=track_p_max,
     )
 
     # Streaming writer for 'video': compute frames in jitted microbatches and append
@@ -226,6 +249,7 @@ def main(cfg, args):
         s = state0
         mass_total = []
         mass_channels = [[] for _ in range(mass_channels_count)]
+        p_max_mean = []
         steps_done = 0
         with tqdm() as pbar:
             print(args.batch_steps, args.max_steps)
@@ -236,9 +260,10 @@ def main(cfg, args):
                     mb = int(args.jit_microbatch)
                     mb = remaining if remaining < mb else mb
                     rng, _rng = split(rng)
-                    s, batch_frames, batch_masses = step_micro(s, _rng)
+                    s, batch_frames, batch_masses, batch_p_max = step_micro(s, _rng)
                     batch_frames = np.asarray(batch_frames[:mb])  # (mb, H, W, 3)
                     batch_masses = np.asarray(batch_masses[:mb]) if track_mass else None
+                    batch_p_max = np.asarray(batch_p_max[:mb]) if track_p_max else None
                     batch_u8 = (np.clip(batch_frames, 0.0, 1.0) * 255).astype(np.uint8)
 
                     for i_frame in range(batch_u8.shape[0]):
@@ -253,6 +278,11 @@ def main(cfg, args):
                             m_tot = float(np.sum(mchs))
                             mass_total.append(m_tot)
                             wandb.log({"mass_total": m_tot, "step": global_step})
+
+                        if track_p_max:
+                            p_val = float(batch_p_max[i_frame])
+                            p_max_mean.append(p_val)
+                            wandb.log({"p_max_mean": p_val, "step": global_step})
 
                         # optional: open-endedness evaluation
                         if args.compute_oe and (global_step % args.oe_every == 0):
@@ -301,6 +331,23 @@ def main(cfg, args):
                 print(f"Saved mass traces to {args.mass_plot}")
             except Exception as e:
                 print(f"Failed to save mass plot: {e}")
+
+        # save mean spatial max(P) plot if available
+        if track_p_max and len(p_max_mean) > 0 and p_max_plot:
+            try:
+                out_dir = os.path.dirname(str(p_max_plot))
+                if out_dir:
+                    os.makedirs(out_dir, exist_ok=True)
+                plt.figure(figsize=(8,4))
+                plt.plot(p_max_mean, label='mean max(P)')
+                plt.xlabel('frame')
+                plt.ylabel('mean over positions of max P')
+                plt.legend()
+                plt.tight_layout()
+                plt.savefig(p_max_plot, dpi=150)
+                print(f"Saved mean max(P) trace to {p_max_plot}")
+            except Exception as e:
+                print(f"Failed to save mean max(P) plot: {e}")
 
         # save open-endedness loss plot if requested
         if args.compute_oe and len(oe_values) > 0:

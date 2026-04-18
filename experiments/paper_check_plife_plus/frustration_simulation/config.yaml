@@ -1,17 +1,28 @@
 meta:
   seed: 0
-  save_dir: experiments/paper_check_plenia/checkpoints/frustration_simulation
+  save_dir: experiments/paper_check_plife_plus/checkpoints/frustration_simulation
 
 source:
-  checkpoint_dir: experiments/paper_check_plenia/checkpoints/optimization/run_000
+  checkpoint_dir: experiments/paper_check_plife_plus/checkpoints/optimization/run_000
   params_name: best
   params_path: null
 
 substrate:
-  substrate: plenia
+  substrate: plife_plus
   rollout_steps: 200000
-  n_particles: 200
-  dt: 0.1
+  n_particles: 1000
+  n_colors: 6
+  dt: 0.02
+  beta: 0.3
+  mass: 0.1
+  half_life: 0.04
+  rmax: 0.1
+  render_radius: 0.04
+  sharpness: 30.0
+  update_colors: true
+  world_size: 1.0
+  border: wall
+  background_color: black
 
 protocol:
   warmup_steps: 100000
@@ -21,7 +32,7 @@ protocol:
   perturbation_grid_split: 2
   perturbation_strength: 1.0
   perturbation_jitter: 0.0
-  perturbation_domain_padding: 0.05
+  perturbation_velocity_mode: keep
 
 evaluation:
   enable_clip: true
@@ -41,7 +52,7 @@ evaluation:
 metric:
   sample_every_steps: 1000
   metric_trajectory_source: state_x
-  metric_unwrap_state_x: false
+  metric_unwrap_state_x: true
   metric_window_size_steps: 20000
   metric_window_step_steps: 5000
   metric_tau_steps: 3000
@@ -59,7 +70,7 @@ metric:
   metric_null_reps: 6
   metric_particle_samples: 64
   metric_dirs_seed: 123
-  metric_periodic: false
+  metric_periodic: null
   metric_domain_y: null
   metric_domain_x: null
   metric_preprocess_mode: clip

@@ -42,6 +42,7 @@ class ParticleLifePlus():
                  render_radius=1e-2, sharpness=20.,
                  update_colors=True, world_size=1.,
                  border='torus',
+                 neighbor_mode='dense',
                  color_palette='ff0000-00ff00-0000ff-ffff00-ff00ff-00ffff-ffffff-8f5d00', background_color='black'):
         self.n_particles = n_particles
         self.n_colors = n_colors
@@ -58,6 +59,8 @@ class ParticleLifePlus():
         self.color_palette = color_palette
         self.background_color = background_color
         assert border in ('torus', 'wall'), "border must be 'torus' or 'wall'"
+        assert neighbor_mode in ('dense', 'radius_exact'), "neighbor_mode must be 'dense' or 'radius_exact'"
+        self.neighbor_mode = neighbor_mode
 
         self.fixed_params = dict(
             beta=jnp.array(beta),
@@ -93,6 +96,17 @@ class ParticleLifePlus():
         v = jnp.where(hit_lo | hit_hi, -v, v)
         x = jnp.clip(x, 0.0, self.world_size)
         return x, v
+
+    def _pairwise_delta(self, x_src, x_tgt):
+        r = x_tgt - x_src
+        if self.border == 'torus':
+            half_world = 0.5 * self.world_size
+            r = jax.lax.select(
+                r > half_world,
+                r - self.world_size,
+                jax.lax.select(r < -half_world, r + self.world_size, r),
+            )
+        return r
     
     def step_state(self, rng, state, params):
         x, v, c = state['x'], state['v'], state['c']
@@ -110,16 +124,7 @@ class ParticleLifePlus():
             cond_second = (beta < r) & (r < 1)
             return jnp.where(cond_first, first, jnp.where(cond_second, second, 0.))
         
-        def calc_force(x1, x2, c1, c2): # force exerted on x1 by x2
-            r = x2 - x1
-            if self.border == 'torus':
-                half_world = 0.5 * self.world_size
-                r = jax.lax.select(
-                    r > half_world,
-                    r - self.world_size,
-                    jax.lax.select(r < -half_world, r + self.world_size, r),
-                )
-
+        def calc_force_from_delta(r, c1, c2): # force exerted on c1/x1 by c2/x2
             alpha, dc1 = self.plife_net.apply(params['alpha'], c1, c2)
             rlen = jnp.linalg.norm(r)
             rdir = r / (rlen + 1e-8)
@@ -128,12 +133,45 @@ class ParticleLifePlus():
 
             dc1 = dc1 * jax.nn.relu(1.-rlen/rmax)
             return force, dc1 # (n_dims), (n_colors)
-        
-        f, dc1 = jax.vmap(jax.vmap(calc_force, in_axes=(None, 0, None, 0)), in_axes=(0, None, 0, None))(x, x, c, c)
-        # f: (this_particle, other_particle, n_dims)
-        # dc1: (this_particle, other_particle, n_colors)
-        acc = f.sum(axis=-2) / mass
-        dc1 = dc1.sum(axis=-2)
+
+        if self.neighbor_mode == 'radius_exact':
+            pair_ids = jnp.arange(self.n_particles * self.n_particles)
+            force0 = jnp.zeros((self.n_particles, self.n_dims), dtype=x.dtype)
+            dc0 = jnp.zeros((self.n_particles, self.n_colors), dtype=c.dtype)
+
+            def add_pair(carry, pair_id):
+                force_sum, dc_sum = carry
+                i = pair_id // self.n_particles
+                j = pair_id - i * self.n_particles
+                r = self._pairwise_delta(x[i], x[j])
+                rlen = jnp.linalg.norm(r)
+
+                def active(_):
+                    return calc_force_from_delta(r, c[i], c[j])
+
+                def inactive(_):
+                    return (
+                        jnp.zeros((self.n_dims,), dtype=x.dtype),
+                        jnp.zeros((self.n_colors,), dtype=c.dtype),
+                    )
+
+                force, dc1 = jax.lax.cond(rlen < rmax, active, inactive, operand=None)
+                force_sum = force_sum.at[i].add(force)
+                dc_sum = dc_sum.at[i].add(dc1)
+                return (force_sum, dc_sum), None
+
+            (force_sum, dc1), _ = jax.lax.scan(add_pair, (force0, dc0), pair_ids)
+            acc = force_sum / mass
+        else:
+            r = self._pairwise_delta(x[:, None, :], x[None, :, :])
+            f, dc1 = jax.vmap(
+                jax.vmap(calc_force_from_delta, in_axes=(0, None, 0)),
+                in_axes=(0, 0, None),
+            )(r, c, c)
+            # f: (this_particle, other_particle, n_dims)
+            # dc1: (this_particle, other_particle, n_colors)
+            acc = f.sum(axis=-2) / mass
+            dc1 = dc1.sum(axis=-2)
         
         mu = (0.5) ** (dt / half_life)
         v = mu * v + acc * dt

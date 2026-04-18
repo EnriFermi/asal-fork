@@ -4,6 +4,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "scripts")):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
 from omegaconf import OmegaConf
 
 from paper_check_common import (
@@ -41,6 +46,9 @@ def _build_run_config(paper_cfg, config_path: Path, run_idx: int):
     wandb_project = paper_cfg.get("meta", {}).get("wandb_project", None)
     if wandb_project is not None:
         base_cfg.logging.wandb_project = str(wandb_project)
+    wandb_mode = paper_cfg.get("meta", {}).get("wandb_mode", None)
+    if wandb_mode is not None:
+        base_cfg.logging.wandb_mode = str(wandb_mode)
 
     save_every = stage_cfg.get("save_every", None)
     if save_every is not None:

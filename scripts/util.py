@@ -186,6 +186,7 @@ def substrate_kwargs_from_args(args: Any) -> Dict[str, Any]:
             ("update_colors", bool),
             ("world_size", float),
             ("border", str),
+            ("neighbor_mode", str),
             ("color_palette", str),
             ("background_color", str),
         ):
