@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,8 +13,6 @@ from scripts.clip_deltah_msc_metric import resolve_metric_config
 from .embedding_metrics import cloud_distance, synchronized_distance
 from .pipeline import load_analysis_config
 from .trajectory_metrics import compute_delta_h_summary, delta_h_distribution_distance, delta_h_map_distance
-
-_CACHE_VERSION = "paper_check_history_distances_v3"
 
 
 def _is_missing(value: Any) -> bool:
@@ -61,58 +58,6 @@ def _progress(iterable, *, total: int, enabled: bool, desc: str):
         if idx == 1 or idx == total or idx % 5 == 0:
             print(f"[{desc}] {idx}/{total}")
         yield item
-
-
-def _config_signature(analysis_cfg: dict[str, Any]) -> str:
-    payload = {
-        "cache_version": _CACHE_VERSION,
-        "embeddings": analysis_cfg.get("embeddings", {}),
-        "trajectories": analysis_cfg.get("trajectories", {}),
-    }
-    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
-
-
-def _cache_path_for_row(row: dict[str, Any]) -> Path | None:
-    lagrangian_path = _resolve_artifact_path(row, "lagrangian_path")
-    if lagrangian_path is not None:
-        return lagrangian_path.with_name(f"{lagrangian_path.stem}_history_distance_cache.json")
-    embeddings_path = _resolve_artifact_path(row, "embeddings_path")
-    if embeddings_path is not None:
-        return embeddings_path.with_name(f"{embeddings_path.stem}_history_distance_cache.json")
-    return None
-
-
-def _load_cache(path: Path, *, signature: str) -> dict[str, float] | None:
-    if not path.exists():
-        return None
-    try:
-        payload = json.loads(path.read_text())
-    except Exception:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    if str(payload.get("signature", "")) != signature:
-        return None
-    metrics = payload.get("metrics")
-    if not isinstance(metrics, dict):
-        return None
-    out: dict[str, float] = {}
-    for key, value in metrics.items():
-        if isinstance(key, str) and isinstance(value, (int, float)):
-            out[key] = float(value)
-    return out
-
-
-def _save_cache(path: Path, *, signature: str, metrics: dict[str, float]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "signature": signature,
-        "metrics": {str(key): float(value) for key, value in metrics.items()},
-    }
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, sort_keys=True))
-    tmp.replace(path)
 
 
 def _load_source_metric_summary(frustration_root: Path) -> dict[str, Any]:
@@ -358,7 +303,13 @@ def _compute_trajectory_metrics(
     summary_a = compute_delta_h_summary(xy_a, metric_cfg)
     summary_b = compute_delta_h_summary(xy_b, metric_cfg)
     summary_c = compute_delta_h_summary(xy_c, metric_cfg)
-    out: dict[str, float] = {}
+    out: dict[str, float] = _msc_scalar_metrics_from_summaries(
+        summary_a,
+        summary_b,
+        summary_c,
+        metric_cfg=metric_cfg,
+        time_sampling=int(xy_a.shape[0]),
+    )
 
     for metric in [str(x) for x in traj_cfg.get("pairwise_map_metrics", ["l2"])]:
         base_name = f"delta_h_{metric}"
@@ -412,11 +363,55 @@ def _compute_trajectory_metrics(
     return out
 
 
+def _msc_scalar_metrics_from_summaries(
+    summary_a: dict[str, Any],
+    summary_b: dict[str, Any],
+    summary_c: dict[str, Any],
+    *,
+    metric_cfg: dict[str, Any],
+    time_sampling: int,
+) -> dict[str, float]:
+    score_a = float(summary_a["score_scalar"])
+    score_b = float(summary_b["score_scalar"])
+    score_w = float(summary_c["score_scalar"])
+    loss_a = -score_a
+    loss_b = -score_b
+    loss_w = -score_w
+    score_control_mean = 0.5 * (score_a + score_b)
+    loss_control_mean = 0.5 * (loss_a + loss_b)
+    return {
+        "msc_loss_control_a": float(loss_a),
+        "msc_loss_control_b": float(loss_b),
+        "msc_loss_control_mean": float(loss_control_mean),
+        "msc_loss_walls": float(loss_w),
+        "msc_loss_walls_minus_control_mean": float(loss_w - loss_control_mean),
+        "msc_loss_walls_minus_control_a": float(loss_w - loss_a),
+        "msc_score_control_a": float(score_a),
+        "msc_score_control_b": float(score_b),
+        "msc_score_control_mean": float(score_control_mean),
+        "msc_score_walls": float(score_w),
+        "msc_score_walls_minus_control_mean": float(score_w - score_control_mean),
+        "msc_score_walls_minus_control_a": float(score_w - score_a),
+        "msc_amp_control_a": float(summary_a["amp_scalar"]),
+        "msc_amp_control_b": float(summary_b["amp_scalar"]),
+        "msc_amp_walls": float(summary_c["amp_scalar"]),
+        "msc_component_control_a": float(summary_a["msc_scalar"]),
+        "msc_component_control_b": float(summary_b["msc_scalar"]),
+        "msc_component_walls": float(summary_c["msc_scalar"]),
+        "msc_tau_best_steps_control_a": float(summary_a["tau_best_steps"]),
+        "msc_tau_best_steps_control_b": float(summary_b["tau_best_steps"]),
+        "msc_tau_best_steps_walls": float(summary_c["tau_best_steps"]),
+        "msc_score_anchor_absdiff_minus_baseline": float(abs(score_w - score_a) - abs(score_b - score_a)),
+        "msc_loss_anchor_absdiff_minus_baseline": float(abs(loss_w - loss_a) - abs(loss_b - loss_a)),
+        "msc_sample_every_steps": float(metric_cfg["sample_every_steps"]),
+        "msc_time_sampling": float(time_sampling),
+    }
+
+
 def augment_rows_with_history_dependence_distances(
     rows: pd.DataFrame,
     *,
     analysis_config_path: str | Path,
-    use_cache: bool = True,
     show_progress: bool = True,
 ) -> tuple[pd.DataFrame, list[str], list[str]]:
     if rows.empty:
@@ -425,14 +420,9 @@ def augment_rows_with_history_dependence_distances(
         return rows.copy(), [f"{name}__effect_minus_baseline" for name in base_names], base_names
 
     analysis_cfg = load_analysis_config(analysis_config_path)
-    cfg_signature = _config_signature(analysis_cfg)
     base_names = history_distance_base_names(analysis_cfg)
     effect_cols = [f"{name}__effect_minus_baseline" for name in base_names]
     out = rows.copy()
-
-    source_metric_cache: dict[Path, dict[str, Any]] = {}
-    embeddings_cache: dict[Path, dict[str, float]] = {}
-    trajectory_cache: dict[Path, dict[str, float]] = {}
 
     row_iter = list(out.iterrows())
     for idx, row in _progress(
@@ -443,45 +433,27 @@ def augment_rows_with_history_dependence_distances(
     ):
         row_dict = dict(row)
         computed: dict[str, float] = {}
-        cache_path = _cache_path_for_row(row_dict)
-
-        if use_cache and cache_path is not None:
-            cached = _load_cache(cache_path, signature=cfg_signature)
-            if cached is not None:
-                for key, value in cached.items():
-                    out.at[idx, key] = value
-                continue
 
         embeddings_path = _resolve_artifact_path(row_dict, "embeddings_path")
         if embeddings_path is not None and embeddings_path.exists():
-            if embeddings_path not in embeddings_cache:
-                embeddings_cache[embeddings_path] = _compute_embedding_metrics(embeddings_path, analysis_cfg)
-            computed.update(embeddings_cache[embeddings_path])
+            computed.update(_compute_embedding_metrics(embeddings_path, analysis_cfg))
 
         lagrangian_path = _resolve_artifact_path(row_dict, "lagrangian_path")
         if lagrangian_path is not None and lagrangian_path.exists():
-            if lagrangian_path not in trajectory_cache:
-                frustration_root = Path(str(row_dict.get("frustration_root"))) if not _is_missing(row_dict.get("frustration_root")) else lagrangian_path.parent.parent
-                if frustration_root not in source_metric_cache:
-                    source_metric_cache[frustration_root] = _load_source_metric_summary(frustration_root)
-                trajectory_cache[lagrangian_path] = _compute_trajectory_metrics(
+            frustration_root = (
+                Path(str(row_dict.get("frustration_root")))
+                if not _is_missing(row_dict.get("frustration_root"))
+                else lagrangian_path.parent.parent
+            )
+            computed.update(
+                _compute_trajectory_metrics(
                     lagrangian_path,
                     analysis_cfg,
-                    source_metric_summary=source_metric_cache[frustration_root],
+                    source_metric_summary=_load_source_metric_summary(frustration_root),
                 )
-            computed.update(trajectory_cache[lagrangian_path])
+            )
 
         for key, value in computed.items():
             out.at[idx, key] = value
-
-        if use_cache and cache_path is not None and computed:
-            try:
-                _save_cache(
-                    cache_path,
-                    signature=cfg_signature,
-                    metrics=computed,
-                )
-            except Exception:
-                pass
 
     return out, [col for col in effect_cols if col in out.columns], base_names
