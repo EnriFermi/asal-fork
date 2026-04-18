@@ -470,6 +470,8 @@ def _save_lane_checkpoint(lane: dict) -> None:
         rng=state["rng"],
         full_steps=state["full_steps"],
         late_steps=state["late_steps"],
+        z_late_steps=state.get("z_late_steps", state["late_steps"]),
+        xy_late_steps=state.get("xy_late_steps", state["late_steps"]),
         z_full=state["z_full"],
         z_full_blocks=state["z_full_blocks"],
         z_late=state["z_late"],
@@ -483,6 +485,8 @@ def _lane_output(lane: dict) -> dict[str, np.ndarray]:
     return {
         "full_steps": np.asarray(state["full_steps"], dtype=np.int32),
         "late_steps": np.asarray(state["late_steps"], dtype=np.int32),
+        "z_late_steps": np.asarray(state.get("z_late_steps", state["late_steps"]), dtype=np.int32),
+        "xy_late_steps": np.asarray(state.get("xy_late_steps", state["late_steps"]), dtype=np.int32),
         "z_full": _stack_or_empty(state["z_full"], dtype=np.float32),
         "z_full_blocks": _stack_or_empty(state["z_full_blocks"], dtype=np.float32),
         "z_late": _stack_or_empty(state["z_late"], dtype=np.float32),
@@ -552,8 +556,10 @@ def _append_late_all(lanes: list[dict], group_indices: list[int], *, z_host: np.
         state = lanes[lane_idx]["state"]
         state["late_steps"].append(int(state["current_step"]))
         if z_host is not None:
+            state.setdefault("z_late_steps", []).append(int(state["current_step"]))
             state["z_late"].append(np.asarray(z_host[local_idx], dtype=np.float32))
         if xy_host is not None:
+            state.setdefault("xy_late_steps", []).append(int(state["current_step"]))
             state["xy_late"].append(np.asarray(xy_host[local_idx], dtype=np.float32))
 
 
@@ -581,6 +587,8 @@ def _load_or_init_generic_lane(
             global_state=substrate.init_state(init_key, lane["params"]),
             full_steps=[],
             late_steps=[],
+            z_late_steps=[],
+            xy_late_steps=[],
             z_full=[],
             z_full_blocks=[],
             z_late=[],
@@ -604,6 +612,7 @@ def _run_generic_global_lanes(
     late_start: int,
     late_end: int,
     base_chunk_steps: int,
+    clip_sample_every_steps: int,
     checkpoint_every_steps: int,
     full_embedding_sample_every_steps: int,
     enable_clip: bool,
@@ -650,12 +659,18 @@ def _run_generic_global_lanes(
 
             global_batch = _stack_trees(global_states)
             xy_host = None
-            need_late = bool(int(late_start) < next_step <= int(late_end))
+            in_late_window = bool(int(late_start) < next_step <= int(late_end))
+            need_late_xy = bool(enable_msc and in_late_window)
+            need_late_z = bool(
+                enable_clip
+                and in_late_window
+                and ((next_step - int(late_start)) % int(clip_sample_every_steps) == 0)
+            )
             need_full = bool(enable_clip and next_step % int(full_embedding_sample_every_steps) == 0)
-            if enable_msc and need_late:
+            if need_late_xy:
                 xy_host = np.asarray(jax.device_get(_extract_positions_from_state(global_batch)), dtype=np.float32)
 
-            if enable_clip and (need_late or need_full):
+            if enable_clip and (need_late_z or need_full):
                 z_all_host = np.asarray(jax.device_get(embed_global_batch(global_batch, params_batch)), dtype=np.float32)
             else:
                 z_all_host = None
@@ -668,11 +683,13 @@ def _run_generic_global_lanes(
                 state["global_state"] = global_states[local_idx]
                 state["mode"] = "global"
 
-                if need_late:
+                if need_late_z or need_late_xy:
                     state["late_steps"].append(next_step)
-                    if enable_clip:
+                    if need_late_z:
+                        state.setdefault("z_late_steps", []).append(next_step)
                         state["z_late"].append(np.asarray(z_all_host[local_idx], dtype=np.float32))
-                    if xy_host is not None:
+                    if need_late_xy:
+                        state.setdefault("xy_late_steps", []).append(next_step)
                         state["xy_late"].append(np.asarray(xy_host[local_idx], dtype=np.float32))
 
                 if need_full and lane["full_embeddings_enabled"]:
@@ -1070,6 +1087,7 @@ def _finalize_trial(
         "warmup_steps": int(getattr(args, "warmup_steps")),
         "total_steps": int(getattr(args, "total_steps")),
         "clip_time_sampling": int(run_outputs["control_a"]["z_late"].shape[0]) if enable_clip else None,
+        "clip_sample_every_steps": int(getattr(args, "clip_sample_every_steps", getattr(args, "sample_every_steps", 0))) if enable_clip else None,
         "distance_metric": distance_metric if enable_clip else None,
         "foundation_model": None if not enable_clip else str(getattr(args, "foundation_model", "clip")),
     }
@@ -1078,6 +1096,11 @@ def _finalize_trial(
         z_control_a = run_outputs["control_a"]["z_late"]
         z_control_b = run_outputs["control_b"]["z_late"]
         z_walls = run_outputs["walls"]["z_late"]
+        if min(z_control_a.shape[0], z_control_b.shape[0], z_walls.shape[0]) < 1:
+            raise ValueError(
+                "No late CLIP samples were collected. Decrease evaluation.clip_sample_every_steps "
+                "or enlarge the late window."
+            )
         baseline_distance, baseline_per_t = _sequence_distance(z_control_a, z_control_b, distance_metric)
         walls_a_distance, walls_a_per_t = _sequence_distance(z_control_a, z_walls, distance_metric)
         walls_b_distance, walls_b_per_t = _sequence_distance(z_control_b, z_walls, distance_metric)
@@ -1109,7 +1132,8 @@ def _finalize_trial(
             baseline_per_t=baseline_per_t,
             walls_ctrl_a_per_t=walls_a_per_t,
             walls_ctrl_b_per_t=walls_b_per_t,
-            late_sample_steps=np.asarray(run_outputs["control_a"]["late_steps"], dtype=np.int32),
+            late_sample_steps=np.asarray(run_outputs["control_a"]["z_late_steps"], dtype=np.int32),
+            z_late_sample_steps=np.asarray(run_outputs["control_a"]["z_late_steps"], dtype=np.int32),
             z_control_a_full=run_outputs["control_a"]["z_full"],
             z_control_a_full_steps=np.asarray(run_outputs["control_a"]["full_steps"], dtype=np.int32),
             z_walls_full=run_outputs["walls"]["z_full"],
@@ -1173,7 +1197,8 @@ def _finalize_trial(
             xy_control_a=xy_control_a,
             xy_control_b=xy_control_b,
             xy_walls=xy_walls,
-            sample_offsets_steps=np.asarray(run_outputs["control_a"]["late_steps"], dtype=np.int32) - int(late_start),
+            sample_offsets_steps=np.asarray(run_outputs["control_a"]["xy_late_steps"], dtype=np.int32) - int(late_start),
+            xy_late_sample_steps=np.asarray(run_outputs["control_a"]["xy_late_steps"], dtype=np.int32),
             sample_every_steps=np.asarray(int(metric_cfg["sample_every_steps"]), dtype=np.int32),
             trajectory_start_steps=np.asarray(int(late_start), dtype=np.int32),
             trajectory_end_steps=np.asarray(int(late_end), dtype=np.int32),
@@ -1208,6 +1233,7 @@ def _run_generic_state_perturbation_trials(
     late_start: int,
     late_end: int,
     base_chunk_steps: int,
+    clip_sample_every_steps: int,
     checkpoint_every_steps: int,
     full_embedding_sample_every_steps: int,
 ):
@@ -1331,6 +1357,7 @@ def _run_generic_state_perturbation_trials(
         late_start=late_start,
         late_end=late_end,
         base_chunk_steps=base_chunk_steps,
+        clip_sample_every_steps=clip_sample_every_steps,
         checkpoint_every_steps=checkpoint_every_steps,
         full_embedding_sample_every_steps=full_embedding_sample_every_steps,
         enable_clip=enable_clip,
@@ -1413,6 +1440,7 @@ def run_batch(job_config_paths: list[str | Path]) -> int:
         base_chunk_steps = int(getattr(common_args, "sample_every_steps"))
         checkpoint_every_steps = int(getattr(common_args, "checkpoint_every_steps", base_chunk_steps))
         full_embedding_sample_every_steps = int(getattr(common_args, "full_embedding_sample_every_steps", base_chunk_steps))
+        clip_sample_every_steps = int(getattr(common_args, "clip_sample_every_steps", base_chunk_steps))
         _validate_divisibility(
             total_steps=total_steps,
             warmup_steps=warmup_steps,
@@ -1422,6 +1450,19 @@ def run_batch(job_config_paths: list[str | Path]) -> int:
             checkpoint_every_steps=checkpoint_every_steps,
             full_embedding_sample_every_steps=full_embedding_sample_every_steps,
         )
+        if clip_sample_every_steps < 1:
+            raise ValueError("evaluation.clip_sample_every_steps must be >= 1.")
+        if clip_sample_every_steps % base_chunk_steps != 0:
+            raise ValueError(
+                "evaluation.clip_sample_every_steps must be divisible by "
+                f"metric.sample_every_steps={base_chunk_steps}, got {clip_sample_every_steps}."
+            )
+        if enable_clip and clip_sample_every_steps > int(late_end - late_start):
+            raise ValueError(
+                "evaluation.clip_sample_every_steps is larger than the late window; "
+                f"got clip_sample_every_steps={clip_sample_every_steps}, "
+                f"late_window_steps={int(late_end - late_start)}."
+            )
 
         substrate = _create_substrate(common_args, enable_msc=enable_msc)
         if str(common_args.substrate) != "lenia_flow":
@@ -1439,6 +1480,7 @@ def run_batch(job_config_paths: list[str | Path]) -> int:
                 late_start=late_start,
                 late_end=late_end,
                 base_chunk_steps=base_chunk_steps,
+                clip_sample_every_steps=clip_sample_every_steps,
                 checkpoint_every_steps=checkpoint_every_steps,
                 full_embedding_sample_every_steps=full_embedding_sample_every_steps,
             )

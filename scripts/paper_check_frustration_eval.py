@@ -134,11 +134,17 @@ def _load_run_checkpoint(path: Path):
             "rng": jnp.asarray(np.asarray(data["rng"], dtype=np.uint32)),
             "full_steps": np.asarray(data["full_steps"], dtype=np.int32).tolist() if "full_steps" in data.files else [],
             "late_steps": np.asarray(data["late_steps"], dtype=np.int32).tolist() if "late_steps" in data.files else [],
+            "z_late_steps": np.asarray(data["z_late_steps"], dtype=np.int32).tolist() if "z_late_steps" in data.files else [],
+            "xy_late_steps": np.asarray(data["xy_late_steps"], dtype=np.int32).tolist() if "xy_late_steps" in data.files else [],
             "z_full": [arr for arr in np.asarray(data["z_full"], dtype=np.float32)] if "z_full" in data.files else [],
             "z_full_blocks": [arr for arr in np.asarray(data["z_full_blocks"], dtype=np.float32)] if "z_full_blocks" in data.files else [],
             "z_late": [arr for arr in np.asarray(data["z_late"], dtype=np.float32)] if "z_late" in data.files else [],
             "xy_late": [arr for arr in np.asarray(data["xy_late"], dtype=np.float32)] if "xy_late" in data.files else [],
         }
+        if not ckpt["z_late_steps"] and ckpt["z_late"]:
+            ckpt["z_late_steps"] = list(ckpt["late_steps"])
+        if not ckpt["xy_late_steps"] and ckpt["xy_late"]:
+            ckpt["xy_late_steps"] = list(ckpt["late_steps"])
         if ckpt["mode"] == "block":
             ckpt["block_state"] = _state_from_npz("block__", data)
         elif ckpt["mode"] == "global":
@@ -165,16 +171,24 @@ def _save_run_checkpoint(
     z_full_blocks: list[np.ndarray],
     z_late: list[np.ndarray],
     xy_late: list[np.ndarray],
+    z_late_steps: list[int] | None = None,
+    xy_late_steps: list[int] | None = None,
     block_state: dict[str, jax.Array] | None = None,
     global_state: dict[str, jax.Array] | None = None,
     lag_carry=None,
 ) -> None:
+    if z_late_steps is None:
+        z_late_steps = late_steps
+    if xy_late_steps is None:
+        xy_late_steps = late_steps
     payload = {
         "mode": np.asarray(str(mode)),
         "current_step": np.asarray(int(current_step), dtype=np.int32),
         "rng": np.asarray(jax.device_get(rng), dtype=np.uint32),
         "full_steps": np.asarray(full_steps, dtype=np.int32),
         "late_steps": np.asarray(late_steps, dtype=np.int32),
+        "z_late_steps": np.asarray(z_late_steps, dtype=np.int32),
+        "xy_late_steps": np.asarray(xy_late_steps, dtype=np.int32),
         "z_full": _stack_or_empty(z_full, dtype=np.float32),
         "z_full_blocks": _stack_or_empty(z_full_blocks, dtype=np.float32),
         "z_late": _stack_or_empty(z_late, dtype=np.float32),
