@@ -9,5 +9,7 @@ if ! command -v "${python_bin}" >/dev/null 2>&1; then
   python_bin="python"
 fi
 
+cfg="${CFG:-${exp_dir}/config_clip.yaml}"
+
 cd "${repo_root}"
-"${python_bin}" "${repo_root}/scripts/main_opt_msc.py" "${exp_dir}/config.yaml"
+"${python_bin}" "${repo_root}/scripts/run_main_opt_from_yaml.py" "${cfg}"

@@ -9,6 +9,11 @@ from types import SimpleNamespace
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "scripts")):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
 import jax
 import jax.numpy as jnp
 import numpy as np

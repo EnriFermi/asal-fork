@@ -7,6 +7,11 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "scripts")):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
 import numpy as np
 from omegaconf import OmegaConf
 
