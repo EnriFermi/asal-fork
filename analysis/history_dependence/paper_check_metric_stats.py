@@ -119,6 +119,33 @@ def _resolve_fixed_tau_index(
     return None
 
 
+def _distribution_tau_request(traj_cfg: dict[str, Any]) -> tuple[int | None, int | None]:
+    tau_mode = str(traj_cfg.get("metric_tau_mode", "fixed")).strip().lower()
+    if tau_mode == "fixed":
+        metric_tau_steps = traj_cfg.get("metric_tau_steps")
+        metric_tau_frames = traj_cfg.get("metric_tau_frames")
+        if metric_tau_steps is not None:
+            return int(metric_tau_steps), None
+        if metric_tau_frames is not None:
+            return None, int(metric_tau_frames)
+
+    fixed_tau_steps = traj_cfg.get("fixed_tau_distribution_steps")
+    fixed_tau_frames = traj_cfg.get("fixed_tau_distribution_frames")
+    return (
+        None if fixed_tau_steps is None else int(fixed_tau_steps),
+        None if fixed_tau_frames is None else int(fixed_tau_frames),
+    )
+
+
+def _distribution_tau_suffix(traj_cfg: dict[str, Any]) -> str:
+    fixed_tau_steps, fixed_tau_frames = _distribution_tau_request(traj_cfg)
+    if fixed_tau_steps is not None:
+        return f"tau{int(fixed_tau_steps)}"
+    if fixed_tau_frames is not None:
+        return f"tauf{int(fixed_tau_frames)}"
+    return "taufixed"
+
+
 def _normalize_delta_h_values(values: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
     arr = np.asarray(values, dtype=np.float64).reshape(-1)
     if arr.size < 1:
@@ -218,14 +245,7 @@ def history_distance_base_names(analysis_cfg_or_path: dict[str, Any] | str | Pat
 
     distribution_metrics = [str(metric) for metric in traj_cfg.get("pairwise_distribution_metrics", [])]
     if distribution_metrics:
-        fixed_tau_steps = traj_cfg.get("fixed_tau_distribution_steps")
-        fixed_tau_frames = traj_cfg.get("fixed_tau_distribution_frames")
-        if fixed_tau_steps is not None:
-            suffix = f"tau{int(fixed_tau_steps)}"
-        elif fixed_tau_frames is not None:
-            suffix = f"tauf{int(fixed_tau_frames)}"
-        else:
-            suffix = "taufixed"
+        suffix = _distribution_tau_suffix(traj_cfg)
         names.extend(f"delta_h_dist_{suffix}_{metric}" for metric in distribution_metrics)
         names.extend(f"delta_h_dist_{suffix}_{metric}_zscore" for metric in distribution_metrics)
     return names
@@ -323,11 +343,12 @@ def _compute_trajectory_metrics(
 
     distribution_metrics = [str(metric) for metric in traj_cfg.get("pairwise_distribution_metrics", [])]
     if distribution_metrics:
+        fixed_tau_steps, fixed_tau_frames = _distribution_tau_request(traj_cfg)
         fixed_tau_idx = _resolve_fixed_tau_index(
             np.asarray(summary_a["tau_steps"], dtype=np.int64),
             np.asarray(summary_a["tau_frames"], dtype=np.int64),
-            fixed_tau_steps=None if traj_cfg.get("fixed_tau_distribution_steps") is None else int(traj_cfg["fixed_tau_distribution_steps"]),
-            fixed_tau_frames=None if traj_cfg.get("fixed_tau_distribution_frames") is None else int(traj_cfg["fixed_tau_distribution_frames"]),
+            fixed_tau_steps=fixed_tau_steps,
+            fixed_tau_frames=fixed_tau_frames,
         )
         if fixed_tau_idx is None:
             raise ValueError(
