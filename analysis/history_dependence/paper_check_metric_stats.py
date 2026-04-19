@@ -15,6 +15,44 @@ from .pipeline import load_analysis_config
 from .trajectory_metrics import compute_delta_h_summary, delta_h_distribution_distance, delta_h_map_distance
 
 
+_PAIRWISE_STAT_KEYS = (
+    "baseline_distance",
+    "walls_effect_distance",
+    "walls_effect_distance_ctrl_a",
+    "walls_effect_distance_ctrl_b",
+    "effect_minus_baseline",
+    "effect_over_baseline_ratio",
+)
+
+_MSC_SCALAR_COLUMNS = (
+    "msc_loss_control_a",
+    "msc_loss_control_b",
+    "msc_loss_control_mean",
+    "msc_loss_walls",
+    "msc_loss_walls_minus_control_mean",
+    "msc_loss_walls_minus_control_a",
+    "msc_score_control_a",
+    "msc_score_control_b",
+    "msc_score_control_mean",
+    "msc_score_walls",
+    "msc_score_walls_minus_control_mean",
+    "msc_score_walls_minus_control_a",
+    "msc_amp_control_a",
+    "msc_amp_control_b",
+    "msc_amp_walls",
+    "msc_component_control_a",
+    "msc_component_control_b",
+    "msc_component_walls",
+    "msc_tau_best_steps_control_a",
+    "msc_tau_best_steps_control_b",
+    "msc_tau_best_steps_walls",
+    "msc_score_anchor_absdiff_minus_baseline",
+    "msc_loss_anchor_absdiff_minus_baseline",
+    "msc_sample_every_steps",
+    "msc_time_sampling",
+)
+
+
 def _is_missing(value: Any) -> bool:
     return value is None or (isinstance(value, float) and np.isnan(value))
 
@@ -255,6 +293,13 @@ def history_distance_effect_columns(analysis_cfg_or_path: dict[str, Any] | str |
     return [f"{name}__effect_minus_baseline" for name in history_distance_base_names(analysis_cfg_or_path)]
 
 
+def _recomputed_metric_columns(base_names: list[str]) -> list[str]:
+    columns = list(_MSC_SCALAR_COLUMNS)
+    for base_name in base_names:
+        columns.extend(f"{base_name}__{key}" for key in _PAIRWISE_STAT_KEYS)
+    return columns
+
+
 def _pairwise_effect_triplet(distance_fn, a: Any, b: Any, c: Any) -> dict[str, float]:
     baseline = float(distance_fn(a, b))
     walls_a = float(distance_fn(a, c))
@@ -320,9 +365,9 @@ def _compute_trajectory_metrics(
         xy_b = np.asarray(data["xy_control_b"], dtype=np.float64)
         xy_c = np.asarray(data["xy_walls"], dtype=np.float64)
 
-    summary_a = compute_delta_h_summary(xy_a, metric_cfg)
-    summary_b = compute_delta_h_summary(xy_b, metric_cfg)
-    summary_c = compute_delta_h_summary(xy_c, metric_cfg)
+    summary_a = compute_delta_h_summary(xy_a, metric_cfg, metric_rng_fold_in=0)
+    summary_b = compute_delta_h_summary(xy_b, metric_cfg, metric_rng_fold_in=1)
+    summary_c = compute_delta_h_summary(xy_c, metric_cfg, metric_rng_fold_in=2)
     out: dict[str, float] = _msc_scalar_metrics_from_summaries(
         summary_a,
         summary_b,
@@ -444,6 +489,11 @@ def augment_rows_with_history_dependence_distances(
     base_names = history_distance_base_names(analysis_cfg)
     effect_cols = [f"{name}__effect_minus_baseline" for name in base_names]
     out = rows.copy()
+    for col in _recomputed_metric_columns(base_names):
+        if col in out.columns:
+            out[col] = np.nan
+    out["history_embeddings_artifact_found"] = False
+    out["history_trajectory_artifact_found"] = False
 
     row_iter = list(out.iterrows())
     for idx, row in _progress(
@@ -457,10 +507,12 @@ def augment_rows_with_history_dependence_distances(
 
         embeddings_path = _resolve_artifact_path(row_dict, "embeddings_path")
         if embeddings_path is not None and embeddings_path.exists():
+            out.at[idx, "history_embeddings_artifact_found"] = True
             computed.update(_compute_embedding_metrics(embeddings_path, analysis_cfg))
 
         lagrangian_path = _resolve_artifact_path(row_dict, "lagrangian_path")
         if lagrangian_path is not None and lagrangian_path.exists():
+            out.at[idx, "history_trajectory_artifact_found"] = True
             frustration_root = (
                 Path(str(row_dict.get("frustration_root")))
                 if not _is_missing(row_dict.get("frustration_root"))

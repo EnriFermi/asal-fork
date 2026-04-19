@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pandas as pd
 
@@ -15,20 +17,7 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from clip_deltah_msc_metric import resolve_metric_config  # noqa: E402
-
-
-def _select_indices(n_total: int, n_keep: int) -> np.ndarray:
-    if n_keep >= n_total:
-        return np.arange(n_total, dtype=np.int32)
-    raw = np.linspace(0, n_total - 1, n_keep)
-    idx = np.unique(np.rint(raw).astype(np.int32))
-    if idx.size == n_keep:
-        return np.sort(idx)
-    extra = [i for i in range(n_total) if i not in set(idx.tolist())]
-    need = n_keep - idx.size
-    merged = np.concatenate([idx, np.asarray(extra[:need], dtype=np.int32)])
-    return np.sort(merged[:n_keep])
+from clip_deltah_msc_metric import make_metric_loss_fn, resolve_metric_config  # noqa: E402
 
 
 def _periodic_delta(dx: np.ndarray, *, periodic: bool, domain_y: float, domain_x: float) -> np.ndarray:
@@ -38,56 +27,6 @@ def _periodic_delta(dx: np.ndarray, *, periodic: bool, domain_y: float, domain_x
     if periodic and domain_x > 0:
         out[..., 1] = (out[..., 1] + 0.5 * domain_x) % domain_x - 0.5 * domain_x
     return out
-
-
-def _mean_pairwise_l1(sig: np.ndarray) -> float:
-    n = int(sig.shape[0])
-    if n < 2:
-        return 0.0
-    d = np.mean(np.abs(sig[:, None, :] - sig[None, :, :]), axis=2)
-    tri = np.triu_indices(n, k=1)
-    return float(np.mean(d[tri]))
-
-
-def _signature_from_increments(v_s: np.ndarray, dirs: np.ndarray) -> np.ndarray:
-    proj = np.einsum("msd,ld->msl", v_s, dirs)
-    proj = np.sort(proj, axis=0)
-    return np.transpose(proj, (1, 2, 0)).reshape(v_s.shape[1], -1)
-
-
-def _preprocess_h(h: np.ndarray, mode: str) -> np.ndarray:
-    mode = str(mode).strip().lower()
-    if mode == "clip":
-        return np.maximum(h, 0.0)
-    if mode == "shift":
-        return h - np.min(h)
-    return h
-
-
-def _score_from_h(h: np.ndarray, metric_cfg: dict[str, Any]) -> tuple[float, float, float]:
-    h_pos = _preprocess_h(np.asarray(h, dtype=np.float64), metric_cfg["preprocess_mode"])
-    amp = float(np.mean(h_pos))
-    msc = 0.0
-    w_count = int(metric_cfg["W"])
-    eps = float(metric_cfg["eps"])
-    for r, wr in metric_cfg["scale_pairs"]:
-        r = int(r)
-        wr = float(wr)
-        u_r = w_count // r
-        u_2r = w_count // (2 * r)
-        if u_r < 1 or u_2r < 1:
-            continue
-        g_r = np.mean(h_pos[: u_r * r].reshape(u_r, r), axis=1)
-        g_2r = np.mean(h_pos[: u_2r * (2 * r)].reshape(u_2r, 2 * r), axis=1)
-        u_cmp = min(u_r, 2 * u_2r)
-        g_r_cmp = g_r[:u_cmp]
-        up = np.repeat(g_2r, 2)[:u_cmp]
-        overlap = float(np.sum(g_r_cmp * up))
-        power = float(np.sum(g_r_cmp * g_r_cmp))
-        d_r = 1.0 - overlap / (power + eps)
-        msc += wr * d_r
-    score = float(metric_cfg["alpha"]) * amp + float(metric_cfg["beta"]) * msc
-    return score, amp, msc
 
 
 def _resolve_fixed_tau_index(
@@ -218,6 +157,7 @@ def compute_delta_h_summary(
     metric_cfg: dict[str, Any],
     *,
     selected_tau_index: int | None = None,
+    metric_rng_fold_in: int | None = None,
     progress_desc: str | None = None,
     progress_enabled: bool = False,
 ) -> dict[str, Any]:
@@ -225,100 +165,54 @@ def compute_delta_h_summary(
     if xy.ndim != 3 or xy.shape[-1] != 2:
         raise ValueError(f"Lagrangian trajectories must have shape (T, N, 2), got {xy.shape}.")
 
-    tau_frames_list = [int(x) for x in metric_cfg["tau_frames_list"]]
-    tau_steps_list = [int(x) for x in metric_cfg["tau_steps_list"]]
-    starts = np.asarray(metric_cfg["starts"], dtype=np.int32)
-    starts_steps = starts * int(metric_cfg["sample_every_steps"])
-    dirs_rng = np.random.default_rng(int(metric_cfg["dirs_seed"]))
-    dirs = dirs_rng.normal(size=(int(metric_cfg["n_proj"]), 2))
-    dirs = dirs / np.clip(np.linalg.norm(dirs, axis=1, keepdims=True), 1e-12, None)
+    if progress_enabled:
+        desc = progress_desc or "Delta-H"
+        print(f"[{desc}] scoring with scripts.clip_deltah_msc_metric.make_metric_loss_fn")
 
-    h_all = []
-    score_all = []
-    amp_all = []
-    msc_all = []
-    tau_iter = progress(
-        enumerate(tau_frames_list),
-        total=len(tau_frames_list),
-        desc=progress_desc or "Delta-H taus",
-        enabled=progress_enabled,
-        leave=False,
-    )
-    for tau_idx, tau_frames in tau_iter:
-        tseg = int(metric_cfg["tseg_list"][tau_idx])
-        m_count = int(metric_cfg["m_count_list"][tau_idx])
-        win = int(metric_cfg["window_size_frames"])
-        k_idx = np.arange(tseg, dtype=np.int32) if m_count >= tseg else _select_indices(tseg, m_count)
-        s_count = min(int(metric_cfg["particle_samples"]), int(xy.shape[1]))
-        p_idx = _select_indices(int(xy.shape[1]), s_count)
-        h_tau = []
-        for w_idx, start in enumerate(starts):
-            x_w = xy[start:start + win]
-            x0 = x_w[k_idx][:, p_idx, :]
-            x1 = x_w[k_idx + tau_frames][:, p_idx, :]
-            dx = _periodic_delta(
-                x1 - x0,
-                periodic=bool(metric_cfg["periodic"]),
-                domain_y=float(metric_cfg["domain_y"]),
-                domain_x=float(metric_cfg["domain_x"]),
-            )
-            dt = max(float(tau_frames) * float(metric_cfg["sample_stride_steps"]), 1e-12)
-            v_s = dx / dt
-            sig = _signature_from_increments(v_s, dirs)
-            h_real = _mean_pairwise_l1(sig)
-            if int(metric_cfg["null_reps"]) <= 0:
-                h_null = 0.0
-            else:
-                pool = v_s.reshape((-1, 2))
-                pool_n = int(pool.shape[0])
-                rng = np.random.default_rng(
-                    int(metric_cfg["dirs_seed"]) + 1009 * tau_idx + 7919 * w_idx
-                )
-                h0 = []
-                for _ in range(int(metric_cfg["null_reps"])):
-                    idx = rng.integers(0, pool_n, size=(m_count, s_count))
-                    v0 = pool[idx]
-                    sig0 = _signature_from_increments(v0, dirs)
-                    h0.append(_mean_pairwise_l1(sig0))
-                h_null = float(np.median(np.asarray(h0, dtype=np.float64)))
-            h_tau.append(h_real - h_null)
-        h_tau = np.asarray(h_tau, dtype=np.float64)
-        score_tau, amp_tau, msc_tau = _score_from_h(h_tau, metric_cfg)
-        h_all.append(h_tau)
-        score_all.append(score_tau)
-        amp_all.append(amp_tau)
-        msc_all.append(msc_tau)
+    metric_eval = jax.jit(make_metric_loss_fn(metric_cfg, include_maps=True))
+    rng = jax.random.PRNGKey(int(metric_cfg["dirs_seed"]))
+    if metric_rng_fold_in is not None:
+        rng = jax.random.fold_in(rng, int(metric_rng_fold_in))
 
-    h_all = np.asarray(h_all, dtype=np.float64)
-    score_all = np.asarray(score_all, dtype=np.float64)
-    amp_all = np.asarray(amp_all, dtype=np.float64)
-    msc_all = np.asarray(msc_all, dtype=np.float64)
+    tau_selector = None
+    if selected_tau_index is not None:
+        tau_count = max(1, len(metric_cfg.get("tau_frames_list", [metric_cfg["tau_frames"]])))
+        clipped_idx = int(np.clip(int(selected_tau_index), 0, tau_count - 1))
+        if tau_count <= 1:
+            tau_selector = jnp.asarray(0.0, dtype=jnp.float32)
+        else:
+            frac = np.clip(float(clipped_idx) / float(tau_count - 1), 1e-6, 1.0 - 1e-6)
+            tau_selector = jnp.asarray(np.log(frac / (1.0 - frac)), dtype=jnp.float32)
 
-    tau_mode = str(metric_cfg.get("tau_mode", "fixed")).strip().lower()
-    if tau_mode == "max_grid":
-        best_idx = int(np.argmax(score_all))
-    elif tau_mode == "trainable_grid":
-        best_idx = int(selected_tau_index or 0)
-    else:
-        best_idx = 0
+    _, info = metric_eval(rng, jnp.asarray(xy), tau_selector=tau_selector)
+    info = jax.device_get(info)
 
-    h_best = h_all[best_idx]
+    h_all = np.asarray(info["delta_h_map"], dtype=np.float64)
+    h_best = np.asarray(info["delta_h_best"], dtype=np.float64)
+    score_all = np.asarray(info["score_by_tau"], dtype=np.float64)
+    amp_all = np.asarray(info["amp_by_tau"], dtype=np.float64)
+    msc_all = np.asarray(info["msc_by_tau"], dtype=np.float64)
+    tau_frames = np.asarray(info["tau_frames"], dtype=np.int32)
+    tau_steps = np.asarray(info["tau_steps"], dtype=np.int32)
+    starts = np.asarray(info["window_start_frames"], dtype=np.int32)
+    starts_steps = np.asarray(info["window_start_steps"], dtype=np.int32)
+    best_idx = int(np.asarray(info["tau_selected_idx"]).item())
     return {
         "delta_h_map": h_all,
         "delta_h_best": h_best,
         "score_by_tau": score_all,
         "amp_by_tau": amp_all,
         "msc_by_tau": msc_all,
-        "tau_frames": np.asarray(tau_frames_list, dtype=np.int32),
-        "tau_steps": np.asarray(tau_steps_list, dtype=np.int32),
+        "tau_frames": tau_frames,
+        "tau_steps": tau_steps,
         "window_start_frames": starts.astype(np.int32),
         "window_start_steps": starts_steps.astype(np.int32),
         "tau_best_idx": int(best_idx),
-        "tau_best_frames": int(tau_frames_list[best_idx]),
-        "tau_best_steps": int(tau_steps_list[best_idx]),
-        "score_scalar": float(score_all[best_idx]),
-        "amp_scalar": float(amp_all[best_idx]),
-        "msc_scalar": float(msc_all[best_idx]),
+        "tau_best_frames": int(np.asarray(info["tau_best_frames"]).item()),
+        "tau_best_steps": int(np.asarray(info["tau_best_steps"]).item()),
+        "score_scalar": float(np.asarray(info["score"]).item()),
+        "amp_scalar": float(np.asarray(info["amp"]).item()),
+        "msc_scalar": float(np.asarray(info["msc"]).item()),
         "delta_h_best_mean": float(np.mean(h_best)),
         "delta_h_best_std": float(np.std(h_best)),
     }
