@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -11,13 +9,8 @@ import numpy as np
 import pandas as pd
 
 from .io import infer_lagrangian_metadata
-from .utils import REPO_ROOT, pair_type, progress, progress_bar
-
-SCRIPTS_DIR = REPO_ROOT / "scripts"
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
-
-from clip_deltah_msc_metric import make_metric_loss_fn, resolve_metric_config  # noqa: E402
+from .utils import pair_type, progress, progress_bar
+from scripts.clip_deltah_msc_metric import make_metric_loss_fn, resolve_metric_config
 
 
 def _periodic_delta(dx: np.ndarray, *, periodic: bool, domain_y: float, domain_x: float) -> np.ndarray:
@@ -157,6 +150,7 @@ def compute_delta_h_summary(
     metric_cfg: dict[str, Any],
     *,
     selected_tau_index: int | None = None,
+    metric_rng_seed: int | None = None,
     metric_rng_fold_in: int | None = None,
     progress_desc: str | None = None,
     progress_enabled: bool = False,
@@ -170,7 +164,8 @@ def compute_delta_h_summary(
         print(f"[{desc}] scoring with scripts.clip_deltah_msc_metric.make_metric_loss_fn")
 
     metric_eval = jax.jit(make_metric_loss_fn(metric_cfg, include_maps=True))
-    rng = jax.random.PRNGKey(int(metric_cfg["dirs_seed"]))
+    rng_seed = int(metric_cfg["dirs_seed"]) if metric_rng_seed is None else int(metric_rng_seed)
+    rng = jax.random.PRNGKey(rng_seed)
     if metric_rng_fold_in is not None:
         rng = jax.random.fold_in(rng, int(metric_rng_fold_in))
 

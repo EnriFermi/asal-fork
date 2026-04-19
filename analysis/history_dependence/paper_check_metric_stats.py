@@ -48,8 +48,16 @@ _MSC_SCALAR_COLUMNS = (
     "msc_tau_best_steps_walls",
     "msc_score_anchor_absdiff_minus_baseline",
     "msc_loss_anchor_absdiff_minus_baseline",
+    "msc_metric_backend",
+    "msc_metric_rng_seed_base",
     "msc_sample_every_steps",
     "msc_time_sampling",
+    "msc_metric_periodic",
+    "msc_metric_positions_unwrapped",
+    "msc_metric_scale_weight_sum",
+    "msc_metric_eps",
+    "msc_metric_alpha",
+    "msc_metric_beta",
 )
 
 
@@ -258,9 +266,27 @@ def _build_metric_cfg(
         metric_scale_weights=traj_cfg.get("metric_scale_weights"),
         metric_alpha=traj_cfg.get("metric_alpha", source_metric.get("alpha", 0.0)),
         metric_beta=traj_cfg.get("metric_beta", source_metric.get("beta", 1.0)),
-        metric_eps=traj_cfg.get("metric_eps", 1e-12),
+        metric_eps=traj_cfg.get("metric_eps", source_metric.get("eps", 1e-12)),
     )
-    return resolve_metric_config(args)
+    metric_cfg = resolve_metric_config(args)
+    positions_unwrapped = traj_cfg.get(
+        "metric_positions_unwrapped",
+        traj_cfg.get("positions_unwrapped", source_metric.get("positions_unwrapped", False)),
+    )
+    metric_cfg["positions_unwrapped"] = bool(positions_unwrapped)
+    return metric_cfg
+
+
+def _paper_check_metric_seed_base(row: dict[str, Any]) -> int | None:
+    metric_seed = row.get("metric_seed")
+    if not _is_missing(metric_seed):
+        return int(metric_seed)
+    seed_x = row.get("seed_x")
+    if _is_missing(seed_x):
+        seed_x = row.get("x_seed")
+    if _is_missing(seed_x):
+        return None
+    return int(seed_x) + 10_000_000
 
 
 def history_distance_base_names(analysis_cfg_or_path: dict[str, Any] | str | Path) -> list[str]:
@@ -351,6 +377,7 @@ def _compute_trajectory_metrics(
     lagrangian_path: Path,
     analysis_cfg: dict[str, Any],
     *,
+    row_dict: dict[str, Any],
     source_metric_summary: dict[str, Any],
 ) -> dict[str, float]:
     traj_cfg = dict(analysis_cfg.get("trajectories", {}))
@@ -365,14 +392,31 @@ def _compute_trajectory_metrics(
         xy_b = np.asarray(data["xy_control_b"], dtype=np.float64)
         xy_c = np.asarray(data["xy_walls"], dtype=np.float64)
 
-    summary_a = compute_delta_h_summary(xy_a, metric_cfg, metric_rng_fold_in=0)
-    summary_b = compute_delta_h_summary(xy_b, metric_cfg, metric_rng_fold_in=1)
-    summary_c = compute_delta_h_summary(xy_c, metric_cfg, metric_rng_fold_in=2)
+    metric_seed_base = _paper_check_metric_seed_base(row_dict)
+    summary_a = compute_delta_h_summary(
+        xy_a,
+        metric_cfg,
+        metric_rng_seed=metric_seed_base,
+        metric_rng_fold_in=0,
+    )
+    summary_b = compute_delta_h_summary(
+        xy_b,
+        metric_cfg,
+        metric_rng_seed=metric_seed_base,
+        metric_rng_fold_in=1,
+    )
+    summary_c = compute_delta_h_summary(
+        xy_c,
+        metric_cfg,
+        metric_rng_seed=metric_seed_base,
+        metric_rng_fold_in=2,
+    )
     out: dict[str, float] = _msc_scalar_metrics_from_summaries(
         summary_a,
         summary_b,
         summary_c,
         metric_cfg=metric_cfg,
+        metric_seed_base=metric_seed_base,
         time_sampling=int(xy_a.shape[0]),
     )
 
@@ -435,6 +479,7 @@ def _msc_scalar_metrics_from_summaries(
     summary_c: dict[str, Any],
     *,
     metric_cfg: dict[str, Any],
+    metric_seed_base: int | None,
     time_sampling: int,
 ) -> dict[str, float]:
     score_a = float(summary_a["score_scalar"])
@@ -446,6 +491,14 @@ def _msc_scalar_metrics_from_summaries(
     score_control_mean = 0.5 * (score_a + score_b)
     loss_control_mean = 0.5 * (loss_a + loss_b)
     return {
+        "msc_metric_backend": "scripts.clip_deltah_msc_metric.make_metric_loss_fn",
+        "msc_metric_rng_seed_base": np.nan if metric_seed_base is None else float(metric_seed_base),
+        "msc_metric_periodic": float(bool(metric_cfg["periodic"])),
+        "msc_metric_positions_unwrapped": float(bool(metric_cfg.get("positions_unwrapped", False))),
+        "msc_metric_scale_weight_sum": float(sum(float(w) for _, w in metric_cfg["scale_pairs"])),
+        "msc_metric_eps": float(metric_cfg["eps"]),
+        "msc_metric_alpha": float(metric_cfg["alpha"]),
+        "msc_metric_beta": float(metric_cfg["beta"]),
         "msc_loss_control_a": float(loss_a),
         "msc_loss_control_b": float(loss_b),
         "msc_loss_control_mean": float(loss_control_mean),
@@ -522,6 +575,7 @@ def augment_rows_with_history_dependence_distances(
                 _compute_trajectory_metrics(
                     lagrangian_path,
                     analysis_cfg,
+                    row_dict=row_dict,
                     source_metric_summary=_load_source_metric_summary(frustration_root),
                 )
             )
