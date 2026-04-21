@@ -23,6 +23,40 @@ from paper_check_common import (
 )
 
 
+def _entrypoint_command(stage_cfg, repo: Path, resolved_config_path: Path) -> list[str]:
+    raw = stage_cfg.get("entrypoint", stage_cfg.get("objective", "msc"))
+    name = str(raw).strip().lower().replace("-", "_")
+    aliases = {
+        "msc": "msc",
+        "main_opt_msc": "msc",
+        "delta_h": "msc",
+        "deltah": "msc",
+        "clip": "clip_oe",
+        "clip_oe": "clip_oe",
+        "oe": "clip_oe",
+        "oe_loss": "clip_oe",
+        "main_opt": "clip_oe",
+        "asal": "clip_oe",
+    }
+    if name not in aliases:
+        raise ValueError(
+            "Unknown optimization.entrypoint/objective "
+            f"{raw!r}. Use 'msc' or 'clip_oe'."
+        )
+    entrypoint = aliases[name]
+    if entrypoint == "msc":
+        return [
+            sys.executable,
+            str(repo / "scripts" / "main_opt_msc.py"),
+            str(resolved_config_path),
+        ]
+    return [
+        sys.executable,
+        str(repo / "scripts" / "run_main_opt_from_yaml.py"),
+        str(resolved_config_path),
+    ]
+
+
 def _build_run_config(paper_cfg, config_path: Path, run_idx: int):
     stage_cfg = paper_cfg.get("optimization", {})
     base_cfg, _ = load_stage_base_config(stage_cfg, config_path.parent)
@@ -75,15 +109,16 @@ def main() -> int:
     )
 
     repo = repo_root()
-    script_path = repo / "scripts" / "main_opt_msc.py"
+    stage_cfg = paper_cfg.get("optimization", {})
     for run_idx in assigned:
         _, resolved_config_path = _build_run_config(paper_cfg, config_path, run_idx)
+        cmd = _entrypoint_command(stage_cfg, repo, resolved_config_path)
         print(
             f"[paper_check/optimization] starting run_idx={run_idx} "
-            f"config={resolved_config_path}"
+            f"config={resolved_config_path} command={' '.join(cmd)}"
         )
         subprocess.run(
-            [sys.executable, str(script_path), str(resolved_config_path)],
+            cmd,
             cwd=str(repo),
             check=True,
         )
