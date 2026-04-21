@@ -103,6 +103,14 @@ plot:
     oe: "#C44E52"
     msc: "#4C72B0"
     random: "#55A868"
+  linewidths:
+    oe: 3.8
+    msc: 2.5
+    random: 2.5
+  individual_linewidths:
+    oe: 1.8
+    msc: 1.2
+    random: 1.2
   show_individual: true
   individual_alpha: 0.22
   summary_stat: mean
