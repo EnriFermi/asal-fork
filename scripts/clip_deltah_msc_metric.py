@@ -430,7 +430,7 @@ def _mean_pairwise_l1(sig: jnp.ndarray) -> jnp.ndarray:
     return jnp.sum(d * mask) / jnp.maximum(denom, jnp.array(1.0, dtype=sig.dtype))
 
 
-def make_metric_loss_fn(cfg: dict[str, Any]):
+def make_metric_loss_fn(cfg: dict[str, Any], *, include_maps: bool = False):
     starts = jnp.asarray(cfg["starts"], dtype=jnp.int32)
     W = int(cfg["W"])
     win = int(cfg["window_size_frames"])
@@ -696,7 +696,7 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
         tau_selected_idx = best_idx.astype(xy_seq.dtype)
 
         loss = -score
-        return loss, dict(
+        info = dict(
             score=score,
             amp=amp,
             msc=msc,
@@ -746,5 +746,18 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
             amp_tau_min=jnp.min(amp_all),
             amp_tau_mean=jnp.mean(amp_all),
         )
+        if include_maps:
+            info.update(
+                delta_h_map=h_all,
+                delta_h_best=h_best,
+                score_by_tau=score_all,
+                amp_by_tau=amp_all,
+                msc_by_tau=msc_all,
+                tau_frames=tau_frames_arr,
+                tau_steps=tau_steps_arr,
+                window_start_frames=starts.astype(jnp.int32),
+                window_start_steps=(starts * int(cfg["sample_stride_steps"])).astype(jnp.int32),
+            )
+        return loss, info
 
     return metric_loss_fn

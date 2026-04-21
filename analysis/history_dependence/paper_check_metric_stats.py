@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,7 +14,51 @@ from .embedding_metrics import cloud_distance, synchronized_distance
 from .pipeline import load_analysis_config
 from .trajectory_metrics import compute_delta_h_summary, delta_h_distribution_distance, delta_h_map_distance
 
-_CACHE_VERSION = "paper_check_history_distances_v2"
+
+_PAIRWISE_STAT_KEYS = (
+    "baseline_distance",
+    "walls_effect_distance",
+    "walls_effect_distance_ctrl_a",
+    "walls_effect_distance_ctrl_b",
+    "effect_minus_baseline",
+    "effect_over_baseline_ratio",
+)
+
+_MSC_SCALAR_COLUMNS = (
+    "msc_loss_control_a",
+    "msc_loss_control_b",
+    "msc_loss_control_mean",
+    "msc_loss_walls",
+    "msc_loss_walls_minus_control_mean",
+    "msc_loss_walls_minus_control_a",
+    "msc_score_control_a",
+    "msc_score_control_b",
+    "msc_score_control_mean",
+    "msc_score_walls",
+    "msc_score_walls_minus_control_mean",
+    "msc_score_walls_minus_control_a",
+    "msc_amp_control_a",
+    "msc_amp_control_b",
+    "msc_amp_walls",
+    "msc_component_control_a",
+    "msc_component_control_b",
+    "msc_component_walls",
+    "msc_tau_best_steps_control_a",
+    "msc_tau_best_steps_control_b",
+    "msc_tau_best_steps_walls",
+    "msc_score_anchor_absdiff_minus_baseline",
+    "msc_loss_anchor_absdiff_minus_baseline",
+    "msc_metric_backend",
+    "msc_metric_rng_seed_base",
+    "msc_sample_every_steps",
+    "msc_time_sampling",
+    "msc_metric_periodic",
+    "msc_metric_positions_unwrapped",
+    "msc_metric_scale_weight_sum",
+    "msc_metric_eps",
+    "msc_metric_alpha",
+    "msc_metric_beta",
+)
 
 
 def _is_missing(value: Any) -> bool:
@@ -61,58 +104,6 @@ def _progress(iterable, *, total: int, enabled: bool, desc: str):
         if idx == 1 or idx == total or idx % 5 == 0:
             print(f"[{desc}] {idx}/{total}")
         yield item
-
-
-def _config_signature(analysis_cfg: dict[str, Any]) -> str:
-    payload = {
-        "cache_version": _CACHE_VERSION,
-        "embeddings": analysis_cfg.get("embeddings", {}),
-        "trajectories": analysis_cfg.get("trajectories", {}),
-    }
-    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
-
-
-def _cache_path_for_row(row: dict[str, Any]) -> Path | None:
-    lagrangian_path = _resolve_artifact_path(row, "lagrangian_path")
-    if lagrangian_path is not None:
-        return lagrangian_path.with_name(f"{lagrangian_path.stem}_history_distance_cache.json")
-    embeddings_path = _resolve_artifact_path(row, "embeddings_path")
-    if embeddings_path is not None:
-        return embeddings_path.with_name(f"{embeddings_path.stem}_history_distance_cache.json")
-    return None
-
-
-def _load_cache(path: Path, *, signature: str) -> dict[str, float] | None:
-    if not path.exists():
-        return None
-    try:
-        payload = json.loads(path.read_text())
-    except Exception:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    if str(payload.get("signature", "")) != signature:
-        return None
-    metrics = payload.get("metrics")
-    if not isinstance(metrics, dict):
-        return None
-    out: dict[str, float] = {}
-    for key, value in metrics.items():
-        if isinstance(key, str) and isinstance(value, (int, float)):
-            out[key] = float(value)
-    return out
-
-
-def _save_cache(path: Path, *, signature: str, metrics: dict[str, float]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "signature": signature,
-        "metrics": {str(key): float(value) for key, value in metrics.items()},
-    }
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, sort_keys=True))
-    tmp.replace(path)
 
 
 def _load_source_metric_summary(frustration_root: Path) -> dict[str, Any]:
@@ -174,6 +165,33 @@ def _resolve_fixed_tau_index(
     return None
 
 
+def _distribution_tau_request(traj_cfg: dict[str, Any]) -> tuple[int | None, int | None]:
+    tau_mode = str(traj_cfg.get("metric_tau_mode", "fixed")).strip().lower()
+    if tau_mode == "fixed":
+        metric_tau_steps = traj_cfg.get("metric_tau_steps")
+        metric_tau_frames = traj_cfg.get("metric_tau_frames")
+        if metric_tau_steps is not None:
+            return int(metric_tau_steps), None
+        if metric_tau_frames is not None:
+            return None, int(metric_tau_frames)
+
+    fixed_tau_steps = traj_cfg.get("fixed_tau_distribution_steps")
+    fixed_tau_frames = traj_cfg.get("fixed_tau_distribution_frames")
+    return (
+        None if fixed_tau_steps is None else int(fixed_tau_steps),
+        None if fixed_tau_frames is None else int(fixed_tau_frames),
+    )
+
+
+def _distribution_tau_suffix(traj_cfg: dict[str, Any]) -> str:
+    fixed_tau_steps, fixed_tau_frames = _distribution_tau_request(traj_cfg)
+    if fixed_tau_steps is not None:
+        return f"tau{int(fixed_tau_steps)}"
+    if fixed_tau_frames is not None:
+        return f"tauf{int(fixed_tau_frames)}"
+    return "taufixed"
+
+
 def _normalize_delta_h_values(values: np.ndarray, *, eps: float = 1e-12) -> np.ndarray:
     arr = np.asarray(values, dtype=np.float64).reshape(-1)
     if arr.size < 1:
@@ -197,18 +215,18 @@ def _build_metric_cfg(
 
     rollout_steps = (
         traj_cfg.get("rollout_steps")
-        or source_metric.get("rollout_steps")
         or lag_meta.get("trajectory_window_steps")
+        or source_metric.get("rollout_steps")
     )
     sample_every_steps = (
         traj_cfg.get("sample_every_steps")
-        or source_metric.get("sample_every_steps")
         or lag_meta.get("sample_every_steps")
+        or source_metric.get("sample_every_steps")
     )
     time_sampling = (
         traj_cfg.get("time_sampling")
-        or source_metric.get("time_sampling")
         or lag_meta.get("time_sampling")
+        or source_metric.get("time_sampling")
     )
 
     if rollout_steps is None and sample_every_steps is not None and time_sampling is not None:
@@ -248,9 +266,27 @@ def _build_metric_cfg(
         metric_scale_weights=traj_cfg.get("metric_scale_weights"),
         metric_alpha=traj_cfg.get("metric_alpha", source_metric.get("alpha", 0.0)),
         metric_beta=traj_cfg.get("metric_beta", source_metric.get("beta", 1.0)),
-        metric_eps=traj_cfg.get("metric_eps", 1e-12),
+        metric_eps=traj_cfg.get("metric_eps", source_metric.get("eps", 1e-12)),
     )
-    return resolve_metric_config(args)
+    metric_cfg = resolve_metric_config(args)
+    positions_unwrapped = traj_cfg.get(
+        "metric_positions_unwrapped",
+        traj_cfg.get("positions_unwrapped", source_metric.get("positions_unwrapped", False)),
+    )
+    metric_cfg["positions_unwrapped"] = bool(positions_unwrapped)
+    return metric_cfg
+
+
+def _paper_check_metric_seed_base(row: dict[str, Any]) -> int | None:
+    metric_seed = row.get("metric_seed")
+    if not _is_missing(metric_seed):
+        return int(metric_seed)
+    seed_x = row.get("seed_x")
+    if _is_missing(seed_x):
+        seed_x = row.get("x_seed")
+    if _is_missing(seed_x):
+        return None
+    return int(seed_x) + 10_000_000
 
 
 def history_distance_base_names(analysis_cfg_or_path: dict[str, Any] | str | Path) -> list[str]:
@@ -273,14 +309,7 @@ def history_distance_base_names(analysis_cfg_or_path: dict[str, Any] | str | Pat
 
     distribution_metrics = [str(metric) for metric in traj_cfg.get("pairwise_distribution_metrics", [])]
     if distribution_metrics:
-        fixed_tau_steps = traj_cfg.get("fixed_tau_distribution_steps")
-        fixed_tau_frames = traj_cfg.get("fixed_tau_distribution_frames")
-        if fixed_tau_steps is not None:
-            suffix = f"tau{int(fixed_tau_steps)}"
-        elif fixed_tau_frames is not None:
-            suffix = f"tauf{int(fixed_tau_frames)}"
-        else:
-            suffix = "taufixed"
+        suffix = _distribution_tau_suffix(traj_cfg)
         names.extend(f"delta_h_dist_{suffix}_{metric}" for metric in distribution_metrics)
         names.extend(f"delta_h_dist_{suffix}_{metric}_zscore" for metric in distribution_metrics)
     return names
@@ -288,6 +317,13 @@ def history_distance_base_names(analysis_cfg_or_path: dict[str, Any] | str | Pat
 
 def history_distance_effect_columns(analysis_cfg_or_path: dict[str, Any] | str | Path) -> list[str]:
     return [f"{name}__effect_minus_baseline" for name in history_distance_base_names(analysis_cfg_or_path)]
+
+
+def _recomputed_metric_columns(base_names: list[str]) -> list[str]:
+    columns = list(_MSC_SCALAR_COLUMNS)
+    for base_name in base_names:
+        columns.extend(f"{base_name}__{key}" for key in _PAIRWISE_STAT_KEYS)
+    return columns
 
 
 def _pairwise_effect_triplet(distance_fn, a: Any, b: Any, c: Any) -> dict[str, float]:
@@ -341,6 +377,7 @@ def _compute_trajectory_metrics(
     lagrangian_path: Path,
     analysis_cfg: dict[str, Any],
     *,
+    row_dict: dict[str, Any],
     source_metric_summary: dict[str, Any],
 ) -> dict[str, float]:
     traj_cfg = dict(analysis_cfg.get("trajectories", {}))
@@ -355,10 +392,33 @@ def _compute_trajectory_metrics(
         xy_b = np.asarray(data["xy_control_b"], dtype=np.float64)
         xy_c = np.asarray(data["xy_walls"], dtype=np.float64)
 
-    summary_a = compute_delta_h_summary(xy_a, metric_cfg)
-    summary_b = compute_delta_h_summary(xy_b, metric_cfg)
-    summary_c = compute_delta_h_summary(xy_c, metric_cfg)
-    out: dict[str, float] = {}
+    metric_seed_base = _paper_check_metric_seed_base(row_dict)
+    summary_a = compute_delta_h_summary(
+        xy_a,
+        metric_cfg,
+        metric_rng_seed=metric_seed_base,
+        metric_rng_fold_in=0,
+    )
+    summary_b = compute_delta_h_summary(
+        xy_b,
+        metric_cfg,
+        metric_rng_seed=metric_seed_base,
+        metric_rng_fold_in=1,
+    )
+    summary_c = compute_delta_h_summary(
+        xy_c,
+        metric_cfg,
+        metric_rng_seed=metric_seed_base,
+        metric_rng_fold_in=2,
+    )
+    out: dict[str, float] = _msc_scalar_metrics_from_summaries(
+        summary_a,
+        summary_b,
+        summary_c,
+        metric_cfg=metric_cfg,
+        metric_seed_base=metric_seed_base,
+        time_sampling=int(xy_a.shape[0]),
+    )
 
     for metric in [str(x) for x in traj_cfg.get("pairwise_map_metrics", ["l2"])]:
         base_name = f"delta_h_{metric}"
@@ -372,11 +432,12 @@ def _compute_trajectory_metrics(
 
     distribution_metrics = [str(metric) for metric in traj_cfg.get("pairwise_distribution_metrics", [])]
     if distribution_metrics:
+        fixed_tau_steps, fixed_tau_frames = _distribution_tau_request(traj_cfg)
         fixed_tau_idx = _resolve_fixed_tau_index(
             np.asarray(summary_a["tau_steps"], dtype=np.int64),
             np.asarray(summary_a["tau_frames"], dtype=np.int64),
-            fixed_tau_steps=None if traj_cfg.get("fixed_tau_distribution_steps") is None else int(traj_cfg["fixed_tau_distribution_steps"]),
-            fixed_tau_frames=None if traj_cfg.get("fixed_tau_distribution_frames") is None else int(traj_cfg["fixed_tau_distribution_frames"]),
+            fixed_tau_steps=fixed_tau_steps,
+            fixed_tau_frames=fixed_tau_frames,
         )
         if fixed_tau_idx is None:
             raise ValueError(
@@ -412,11 +473,64 @@ def _compute_trajectory_metrics(
     return out
 
 
+def _msc_scalar_metrics_from_summaries(
+    summary_a: dict[str, Any],
+    summary_b: dict[str, Any],
+    summary_c: dict[str, Any],
+    *,
+    metric_cfg: dict[str, Any],
+    metric_seed_base: int | None,
+    time_sampling: int,
+) -> dict[str, float]:
+    score_a = float(summary_a["score_scalar"])
+    score_b = float(summary_b["score_scalar"])
+    score_w = float(summary_c["score_scalar"])
+    loss_a = -score_a
+    loss_b = -score_b
+    loss_w = -score_w
+    score_control_mean = 0.5 * (score_a + score_b)
+    loss_control_mean = 0.5 * (loss_a + loss_b)
+    return {
+        "msc_metric_backend": "scripts.clip_deltah_msc_metric.make_metric_loss_fn",
+        "msc_metric_rng_seed_base": np.nan if metric_seed_base is None else float(metric_seed_base),
+        "msc_metric_periodic": float(bool(metric_cfg["periodic"])),
+        "msc_metric_positions_unwrapped": float(bool(metric_cfg.get("positions_unwrapped", False))),
+        "msc_metric_scale_weight_sum": float(sum(float(w) for _, w in metric_cfg["scale_pairs"])),
+        "msc_metric_eps": float(metric_cfg["eps"]),
+        "msc_metric_alpha": float(metric_cfg["alpha"]),
+        "msc_metric_beta": float(metric_cfg["beta"]),
+        "msc_loss_control_a": float(loss_a),
+        "msc_loss_control_b": float(loss_b),
+        "msc_loss_control_mean": float(loss_control_mean),
+        "msc_loss_walls": float(loss_w),
+        "msc_loss_walls_minus_control_mean": float(loss_w - loss_control_mean),
+        "msc_loss_walls_minus_control_a": float(loss_w - loss_a),
+        "msc_score_control_a": float(score_a),
+        "msc_score_control_b": float(score_b),
+        "msc_score_control_mean": float(score_control_mean),
+        "msc_score_walls": float(score_w),
+        "msc_score_walls_minus_control_mean": float(score_w - score_control_mean),
+        "msc_score_walls_minus_control_a": float(score_w - score_a),
+        "msc_amp_control_a": float(summary_a["amp_scalar"]),
+        "msc_amp_control_b": float(summary_b["amp_scalar"]),
+        "msc_amp_walls": float(summary_c["amp_scalar"]),
+        "msc_component_control_a": float(summary_a["msc_scalar"]),
+        "msc_component_control_b": float(summary_b["msc_scalar"]),
+        "msc_component_walls": float(summary_c["msc_scalar"]),
+        "msc_tau_best_steps_control_a": float(summary_a["tau_best_steps"]),
+        "msc_tau_best_steps_control_b": float(summary_b["tau_best_steps"]),
+        "msc_tau_best_steps_walls": float(summary_c["tau_best_steps"]),
+        "msc_score_anchor_absdiff_minus_baseline": float(abs(score_w - score_a) - abs(score_b - score_a)),
+        "msc_loss_anchor_absdiff_minus_baseline": float(abs(loss_w - loss_a) - abs(loss_b - loss_a)),
+        "msc_sample_every_steps": float(metric_cfg["sample_every_steps"]),
+        "msc_time_sampling": float(time_sampling),
+    }
+
+
 def augment_rows_with_history_dependence_distances(
     rows: pd.DataFrame,
     *,
     analysis_config_path: str | Path,
-    use_cache: bool = True,
     show_progress: bool = True,
 ) -> tuple[pd.DataFrame, list[str], list[str]]:
     if rows.empty:
@@ -425,14 +539,14 @@ def augment_rows_with_history_dependence_distances(
         return rows.copy(), [f"{name}__effect_minus_baseline" for name in base_names], base_names
 
     analysis_cfg = load_analysis_config(analysis_config_path)
-    cfg_signature = _config_signature(analysis_cfg)
     base_names = history_distance_base_names(analysis_cfg)
     effect_cols = [f"{name}__effect_minus_baseline" for name in base_names]
     out = rows.copy()
-
-    source_metric_cache: dict[Path, dict[str, Any]] = {}
-    embeddings_cache: dict[Path, dict[str, float]] = {}
-    trajectory_cache: dict[Path, dict[str, float]] = {}
+    for col in _recomputed_metric_columns(base_names):
+        if col in out.columns:
+            out[col] = np.nan
+    out["history_embeddings_artifact_found"] = False
+    out["history_trajectory_artifact_found"] = False
 
     row_iter = list(out.iterrows())
     for idx, row in _progress(
@@ -443,45 +557,30 @@ def augment_rows_with_history_dependence_distances(
     ):
         row_dict = dict(row)
         computed: dict[str, float] = {}
-        cache_path = _cache_path_for_row(row_dict)
-
-        if use_cache and cache_path is not None:
-            cached = _load_cache(cache_path, signature=cfg_signature)
-            if cached is not None:
-                for key, value in cached.items():
-                    out.at[idx, key] = value
-                continue
 
         embeddings_path = _resolve_artifact_path(row_dict, "embeddings_path")
         if embeddings_path is not None and embeddings_path.exists():
-            if embeddings_path not in embeddings_cache:
-                embeddings_cache[embeddings_path] = _compute_embedding_metrics(embeddings_path, analysis_cfg)
-            computed.update(embeddings_cache[embeddings_path])
+            out.at[idx, "history_embeddings_artifact_found"] = True
+            computed.update(_compute_embedding_metrics(embeddings_path, analysis_cfg))
 
         lagrangian_path = _resolve_artifact_path(row_dict, "lagrangian_path")
         if lagrangian_path is not None and lagrangian_path.exists():
-            if lagrangian_path not in trajectory_cache:
-                frustration_root = Path(str(row_dict.get("frustration_root"))) if not _is_missing(row_dict.get("frustration_root")) else lagrangian_path.parent.parent
-                if frustration_root not in source_metric_cache:
-                    source_metric_cache[frustration_root] = _load_source_metric_summary(frustration_root)
-                trajectory_cache[lagrangian_path] = _compute_trajectory_metrics(
+            out.at[idx, "history_trajectory_artifact_found"] = True
+            frustration_root = (
+                Path(str(row_dict.get("frustration_root")))
+                if not _is_missing(row_dict.get("frustration_root"))
+                else lagrangian_path.parent.parent
+            )
+            computed.update(
+                _compute_trajectory_metrics(
                     lagrangian_path,
                     analysis_cfg,
-                    source_metric_summary=source_metric_cache[frustration_root],
+                    row_dict=row_dict,
+                    source_metric_summary=_load_source_metric_summary(frustration_root),
                 )
-            computed.update(trajectory_cache[lagrangian_path])
+            )
 
         for key, value in computed.items():
             out.at[idx, key] = value
-
-        if use_cache and cache_path is not None and computed:
-            try:
-                _save_cache(
-                    cache_path,
-                    signature=cfg_signature,
-                    metrics=computed,
-                )
-            except Exception:
-                pass
 
     return out, [col for col in effect_cols if col in out.columns], base_names
