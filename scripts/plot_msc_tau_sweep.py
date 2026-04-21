@@ -179,11 +179,15 @@ def _score_trajectory(
     _, info = metric_eval(rng, jnp.asarray(xy_seq, dtype=jnp.float32))
     info = jax.device_get(info)
     return {
+        "delta_h_map": np.asarray(info["delta_h_map"], dtype=np.float64),
+        "delta_h_best": np.asarray(info["delta_h_best"], dtype=np.float64),
         "score_by_tau": np.asarray(info["score_by_tau"], dtype=np.float64),
         "amp_by_tau": np.asarray(info["amp_by_tau"], dtype=np.float64),
         "msc_by_tau": np.asarray(info["msc_by_tau"], dtype=np.float64),
         "tau_steps": np.asarray(info["tau_steps"], dtype=np.int32),
         "tau_frames": np.asarray(info["tau_frames"], dtype=np.int32),
+        "window_start_steps": np.asarray(info["window_start_steps"], dtype=np.int32),
+        "window_start_frames": np.asarray(info["window_start_frames"], dtype=np.int32),
         "tau_selected_idx": int(np.asarray(info["tau_selected_idx"]).item()),
         "tau_best_steps": int(np.asarray(info["tau_best_steps"]).item()),
         "tau_best_frames": int(np.asarray(info["tau_best_frames"]).item()),
@@ -352,6 +356,119 @@ def _plot_tau_sweep(
     plt.close(fig)
 
 
+def _save_delta_h_group_heatmaps(
+    per_run_rows: list[dict[str, Any]],
+    *,
+    out_dir: Path,
+    group_order: list[str],
+    cmap: str,
+    center_zero: bool,
+    aggregate: str,
+) -> None:
+    if not per_run_rows:
+        return
+
+    aggregate = str(aggregate).strip().lower()
+    if aggregate not in {"mean", "median"}:
+        raise ValueError("plot.delta_h_heatmap_aggregate must be 'mean' or 'median'.")
+
+    grouped_maps: dict[str, np.ndarray] = {}
+    tau_steps_ref: np.ndarray | None = None
+    window_start_steps_ref: np.ndarray | None = None
+
+    for group in group_order:
+        rows = [row for row in per_run_rows if str(row["group"]) == group]
+        if not rows:
+            continue
+        maps = [np.asarray(row["delta_h_map"], dtype=np.float64) for row in rows]
+        tau_steps = np.asarray(rows[0]["tau_steps"], dtype=np.int32)
+        window_start_steps = np.asarray(rows[0]["window_start_steps"], dtype=np.int32)
+        for row in rows[1:]:
+            if not np.array_equal(np.asarray(row["tau_steps"], dtype=np.int32), tau_steps):
+                raise ValueError(f"tau_steps mismatch inside group {group!r}.")
+            if not np.array_equal(np.asarray(row["window_start_steps"], dtype=np.int32), window_start_steps):
+                raise ValueError(f"window_start_steps mismatch inside group {group!r}.")
+        stack = np.stack(maps, axis=0)
+        grouped_maps[group] = np.mean(stack, axis=0) if aggregate == "mean" else np.median(stack, axis=0)
+        if tau_steps_ref is None:
+            tau_steps_ref = tau_steps
+            window_start_steps_ref = window_start_steps
+
+    if not grouped_maps or tau_steps_ref is None or window_start_steps_ref is None:
+        return
+
+    vmax = max(float(np.max(np.abs(arr))) for arr in grouped_maps.values())
+    if vmax <= 0.0:
+        vmax = 1.0
+    vmin = -vmax if center_zero else min(float(np.min(arr)) for arr in grouped_maps.values())
+
+    np.savez_compressed(
+        out_dir / "delta_h_group_heatmaps.npz",
+        tau_steps=tau_steps_ref,
+        window_start_steps=window_start_steps_ref,
+        **{f"group_{group}": arr for group, arr in grouped_maps.items()},
+    )
+
+    n_groups = len(grouped_maps)
+    fig, axes = plt.subplots(
+        n_groups,
+        1,
+        figsize=(10.0, max(2.8 * n_groups, 3.2)),
+        dpi=180,
+        squeeze=False,
+    )
+    axes_flat = axes[:, 0]
+
+    xtick_idx = np.linspace(0, len(window_start_steps_ref) - 1, num=min(6, len(window_start_steps_ref)), dtype=int)
+    xtick_idx = np.unique(xtick_idx)
+    xtick_labels = [str(int(window_start_steps_ref[i])) for i in xtick_idx]
+
+    for ax, group in zip(axes_flat, grouped_maps.keys(), strict=False):
+        arr = grouped_maps[group]
+        im = ax.imshow(
+            arr,
+            aspect="auto",
+            origin="lower",
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            interpolation="nearest",
+        )
+        ax.set_title(f"{group}: mean deltaH map" if aggregate == "mean" else f"{group}: median deltaH map")
+        ax.set_ylabel("tau (steps)")
+        ax.set_yticks(np.arange(len(tau_steps_ref)))
+        ax.set_yticklabels([str(int(x)) for x in tau_steps_ref])
+        ax.set_xticks(xtick_idx)
+        ax.set_xticklabels(xtick_labels)
+        ax.set_xlabel("window start (steps)")
+        fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
+        fig.tight_layout()
+        fig_single, ax_single = plt.subplots(figsize=(10.0, 3.0), dpi=180)
+        im_single = ax_single.imshow(
+            arr,
+            aspect="auto",
+            origin="lower",
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            interpolation="nearest",
+        )
+        ax_single.set_title(f"{group}: mean deltaH map" if aggregate == "mean" else f"{group}: median deltaH map")
+        ax_single.set_ylabel("tau (steps)")
+        ax_single.set_yticks(np.arange(len(tau_steps_ref)))
+        ax_single.set_yticklabels([str(int(x)) for x in tau_steps_ref])
+        ax_single.set_xticks(xtick_idx)
+        ax_single.set_xticklabels(xtick_labels)
+        ax_single.set_xlabel("window start (steps)")
+        fig_single.colorbar(im_single, ax=ax_single, fraction=0.03, pad=0.02)
+        fig_single.tight_layout()
+        fig_single.savefig(out_dir / f"delta_h_heatmap_{group}.png", bbox_inches="tight")
+        plt.close(fig_single)
+
+    fig.savefig(out_dir / "delta_h_heatmaps.png", bbox_inches="tight")
+    plt.close(fig)
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         raise SystemExit("Usage: python scripts/plot_msc_tau_sweep.py <config.yaml>")
@@ -488,6 +605,10 @@ def main() -> int:
     error_band = str(plot_cfg.get("error_band", "std"))
     y_scale = str(plot_cfg.get("y_scale", "linear"))
     log_floor = float(plot_cfg.get("log_floor", 1.0e-12))
+    delta_h_heatmaps = bool(plot_cfg.get("delta_h_heatmaps", True))
+    delta_h_heatmap_cmap = str(plot_cfg.get("delta_h_heatmap_cmap", "coolwarm"))
+    delta_h_heatmap_center_zero = bool(plot_cfg.get("delta_h_heatmap_center_zero", True))
+    delta_h_heatmap_aggregate = str(plot_cfg.get("delta_h_heatmap_aggregate", "mean"))
 
     _plot_tau_sweep(
         long_df,
@@ -506,6 +627,15 @@ def main() -> int:
         y_scale=y_scale,
         log_floor=log_floor,
     )
+    if delta_h_heatmaps:
+        _save_delta_h_group_heatmaps(
+            per_run_rows,
+            out_dir=out_dir,
+            group_order=group_order,
+            cmap=delta_h_heatmap_cmap,
+            center_zero=delta_h_heatmap_center_zero,
+            aggregate=delta_h_heatmap_aggregate,
+        )
 
     summary_payload = {
         "n_runs": int(len(per_run_rows)),
@@ -514,6 +644,7 @@ def main() -> int:
         if summary_df.empty
         else sorted({int(x) for x in summary_df["tau_steps"].dropna().astype(int).tolist()}),
         "plot_path": str(out_dir / "tau_sweep_plot.png"),
+        "delta_h_heatmaps_path": str(out_dir / "delta_h_heatmaps.png"),
         "per_run_csv": str(out_dir / "tau_sweep_per_run.csv"),
         "group_summary_csv": str(out_dir / "tau_sweep_group_summary.csv"),
     }

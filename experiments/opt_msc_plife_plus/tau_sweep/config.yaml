@@ -98,6 +98,10 @@ plot:
   ylabel: MSC score
   y_scale: log
   log_floor: 1.0e-12
+  delta_h_heatmaps: true
+  delta_h_heatmap_cmap: coolwarm
+  delta_h_heatmap_center_zero: true
+  delta_h_heatmap_aggregate: mean
   group_order: [oe, msc, random]
   colors:
     oe: "#C44E52"
