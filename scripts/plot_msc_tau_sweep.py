@@ -255,6 +255,8 @@ def _plot_tau_sweep(
     individual_alpha: float,
     summary_stat: str,
     error_band: str,
+    y_scale: str,
+    log_floor: float,
 ) -> None:
     if long_df.empty:
         raise ValueError("No tau-sweep rows available for plotting.")
@@ -276,6 +278,12 @@ def _plot_tau_sweep(
     error_band = str(error_band).strip().lower()
     if error_band not in {"none", "std", "sem"}:
         raise ValueError("plot.error_band must be one of 'none', 'std', 'sem'.")
+    y_scale = str(y_scale).strip().lower()
+    if y_scale not in {"linear", "log"}:
+        raise ValueError("plot.y_scale must be one of 'linear', 'log'.")
+    log_floor = float(log_floor)
+    if log_floor <= 0.0:
+        raise ValueError("plot.log_floor must be > 0.")
 
     fig, ax = plt.subplots(figsize=(8.5, 5.0), dpi=180)
 
@@ -287,9 +295,12 @@ def _plot_tau_sweep(
         if show_individual:
             for run_id, run_df in sub.groupby("run_id", sort=False):
                 run_df = run_df.sort_values("tau_steps")
+                y_run = run_df[value_col].to_numpy(dtype=np.float64)
+                if y_scale == "log":
+                    y_run = np.maximum(y_run, log_floor)
                 ax.plot(
                     run_df["tau_steps"].to_numpy(dtype=np.float64),
-                    run_df[value_col].to_numpy(dtype=np.float64),
+                    y_run,
                     color=color,
                     alpha=float(individual_alpha),
                     linewidth=1.2,
@@ -302,6 +313,8 @@ def _plot_tau_sweep(
         )
         y = grouped[summary_stat].to_numpy(dtype=np.float64)
         x = grouped["tau_steps"].to_numpy(dtype=np.float64)
+        if y_scale == "log":
+            y = np.maximum(y, log_floor)
         ax.plot(
             x,
             y,
@@ -317,11 +330,17 @@ def _plot_tau_sweep(
             else:
                 denom = np.sqrt(np.maximum(grouped["count"].to_numpy(dtype=np.float64), 1.0))
                 err = grouped["std"].fillna(0.0).to_numpy(dtype=np.float64) / denom
-            ax.fill_between(x, y - err, y + err, color=color, alpha=0.15)
+            y_lo = y - err
+            y_hi = y + err
+            if y_scale == "log":
+                y_lo = np.maximum(y_lo, log_floor)
+                y_hi = np.maximum(y_hi, log_floor)
+            ax.fill_between(x, y_lo, y_hi, color=color, alpha=0.15)
 
     ax.set_xlabel("tau (steps)")
     ax.set_ylabel(ylabel)
     ax.set_title(title)
+    ax.set_yscale(y_scale)
     ax.grid(alpha=0.25)
     ax.legend(frameon=False)
     fig.tight_layout()
@@ -459,6 +478,8 @@ def main() -> int:
     individual_alpha = float(plot_cfg.get("individual_alpha", 0.2))
     summary_stat = str(plot_cfg.get("summary_stat", "mean"))
     error_band = str(plot_cfg.get("error_band", "std"))
+    y_scale = str(plot_cfg.get("y_scale", "linear"))
+    log_floor = float(plot_cfg.get("log_floor", 1.0e-12))
 
     _plot_tau_sweep(
         long_df,
@@ -472,6 +493,8 @@ def main() -> int:
         individual_alpha=individual_alpha,
         summary_stat=summary_stat,
         error_band=error_band,
+        y_scale=y_scale,
+        log_floor=log_floor,
     )
 
     summary_payload = {

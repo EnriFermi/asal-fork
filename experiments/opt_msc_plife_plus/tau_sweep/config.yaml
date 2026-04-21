@@ -96,6 +96,8 @@ plot:
   value_key: score_by_tau
   title: MSC score vs tau on shared rollouts
   ylabel: MSC score
+  y_scale: log
+  log_floor: 1.0e-12
   group_order: [oe, msc, random]
   colors:
     oe: "#C44E52"
