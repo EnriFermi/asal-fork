@@ -7,7 +7,7 @@ meta:
 
 substrate:
   substrate: plife_plus
-  rollout_steps: 1000
+  rollout_steps: 10000
   n_particles: 1000
   n_colors: 6
   n_dims: 2
@@ -38,7 +38,7 @@ metric:
   metric_window_step_steps: 50
   metric_tau_steps: 25
   metric_range_start_steps: 0
-  metric_range_end_steps: 1000
+  metric_range_end_steps: null
   metric_window_size_frames: null
   metric_window_step_frames: null
   metric_tau_frames: null
@@ -58,7 +58,7 @@ metric:
   metric_scales: null
   metric_scale_weights: null
 
-  metric_alpha: 1.0
+  metric_alpha: 0.0
   metric_beta: 1.0
   metric_eps: 1.0e-3
 
@@ -68,7 +68,7 @@ runs:
   - run_id: oe_000
     group: oe
     label: OE optimized
-    checkpoint_dir: experiments/opt_msc_plife_plus/checkpoints/clip_oe_sakana_defaults
+    checkpoint_dir: experiments/opt_msc_plife_plus/checkpoints/clip_oe_longrun
     params_name: best
     params_path: null
     trajectory_path: null
