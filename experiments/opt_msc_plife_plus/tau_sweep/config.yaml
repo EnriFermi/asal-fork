@@ -60,7 +60,7 @@ metric:
 
   metric_alpha: 0.0
   metric_beta: 1.0
-  metric_eps: 1.0e-3
+  metric_eps: 1.0e-6
 
 runs:
   # Duplicate entries inside a group if you want several runs averaged into one curve.
@@ -96,7 +96,7 @@ plot:
   value_key: score_by_tau
   title: MSC score vs tau on shared rollouts
   ylabel: MSC score
-  y_scale: log
+  y_scale: linear
   log_floor: 1.0e-12
   group_order: [oe, msc, random]
   colors:
@@ -104,11 +104,11 @@ plot:
     msc: "#4C72B0"
     random: "#55A868"
   linewidths:
-    oe: 3.8
+    oe: 2.5
     msc: 2.5
     random: 2.5
   individual_linewidths:
-    oe: 1.8
+    oe: 1.2
     msc: 1.2
     random: 1.2
   show_individual: true
