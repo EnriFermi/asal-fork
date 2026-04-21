@@ -249,6 +249,8 @@ def _plot_tau_sweep(
     value_key: str,
     group_order: list[str],
     colors: dict[str, str],
+    linewidths: dict[str, float],
+    individual_linewidths: dict[str, float],
     title: str,
     ylabel: str,
     show_individual: bool,
@@ -292,6 +294,8 @@ def _plot_tau_sweep(
         if sub.empty:
             continue
         color = colors.get(group, None)
+        line_width = float(linewidths.get(group, 2.5))
+        individual_line_width = float(individual_linewidths.get(group, 1.2))
         if show_individual:
             for run_id, run_df in sub.groupby("run_id", sort=False):
                 run_df = run_df.sort_values("tau_steps")
@@ -303,7 +307,7 @@ def _plot_tau_sweep(
                     y_run,
                     color=color,
                     alpha=float(individual_alpha),
-                    linewidth=1.2,
+                    linewidth=individual_line_width,
                 )
         grouped = (
             sub.groupby("tau_steps", dropna=False)[value_col]
@@ -319,7 +323,7 @@ def _plot_tau_sweep(
             x,
             y,
             marker="o",
-            linewidth=2.5,
+            linewidth=line_width,
             markersize=5.5,
             color=color,
             label=group,
@@ -471,6 +475,10 @@ def main() -> int:
     if not group_order:
         group_order = list(dict.fromkeys(long_df["group"].astype(str).tolist()))
     colors = {str(k): str(v) for k, v in dict(plot_cfg.get("colors", {})).items()}
+    linewidths = {str(k): float(v) for k, v in dict(plot_cfg.get("linewidths", {})).items()}
+    individual_linewidths = {
+        str(k): float(v) for k, v in dict(plot_cfg.get("individual_linewidths", {})).items()
+    }
     value_key = str(plot_cfg.get("value_key", "score_by_tau"))
     ylabel = str(plot_cfg.get("ylabel", "MSC score"))
     title = str(plot_cfg.get("title", "MSC tau sweep"))
@@ -487,6 +495,8 @@ def main() -> int:
         value_key=value_key,
         group_order=group_order,
         colors=colors,
+        linewidths=linewidths,
+        individual_linewidths=individual_linewidths,
         title=title,
         ylabel=ylabel,
         show_individual=show_individual,
