@@ -1,0 +1,64 @@
+base_config: experiments/opt_msc/optimization/config_longrun_check.yaml
+
+simulation:
+  rollout_steps: 300000
+  max_steps: 300000
+  seed: 0
+  img_size: 224
+  fps: 250
+  video_fps: 30
+  codec: libx264
+  macro_block_size: 1
+  jit_microbatch: 64
+
+logging:
+  snapshot_interval: 1000
+  snapshots_per_file: 50
+  save_A: true
+  save_F: true
+  save_rgb: false
+  save_fp16: true
+  compress: true
+  save_lagrangian: true
+  save_lagrangian_channels: true
+  lagrangian_n_particles: 8192
+  lagrangian_init_mode: mass
+  lagrangian_flow_channel: -1
+  lagrangian_flow_reduce: mass_weighted
+  lagrangian_channel_mode: resample
+  lagrangian_noise_model: rt_box
+  lagrangian_diffusion_scale: 1.0
+
+minibang:
+  checkpoint_dir: experiments/opt_msc/checkpoints/test_run_longrun_check
+  output_root: experiments/opt_msc/checkpoints/test_run_longrun_check/minibang_golden_set
+  n_trajectories: 80
+  batch_size: 2
+
+  selection_seed: 0
+  selection_iter_bins: 10
+  selection_elite_fraction: 0.35
+  selection_pool_min_per_bin: 8
+  selection_best_traj_per_bin: true
+  include_population: true
+  include_best_traj: true
+  include_final_best: true
+
+  compute_metrics: true
+  compute_delta_h: true
+  compute_clusters: true
+  metrics_strict: true
+  metrics_seed: 12345
+
+  # The optimization config uses trainable_grid; posthoc detection has no optimized
+  # tau latent, so the runner evaluates all tau values and takes max_grid by default.
+  minibang_metric_tau_mode: max_grid
+
+  cluster_k: 8
+  cluster_max_samples: 200000
+  cluster_samples_per_snapshot: null
+  cluster_min_mass: 1.0e-8
+  cluster_standardize: true
+  cluster_kmeans_iters: 40
+  cluster_kmeans_restarts: 2
+  cluster_change_lag_steps: 5000
