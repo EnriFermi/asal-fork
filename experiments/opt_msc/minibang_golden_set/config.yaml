@@ -33,7 +33,7 @@ minibang:
   checkpoint_dir: experiments/opt_msc/checkpoints/test_run_longrun_check
   output_root: experiments/opt_msc/checkpoints/test_run_longrun_check/minibang_golden_set
   n_trajectories: 80
-  batch_size: 2
+  batch_size: 8
 
   selection_seed: 0
   selection_iter_bins: 10
