@@ -34,6 +34,27 @@ def ensure_env_resolver() -> None:
         OmegaConf.register_new_resolver("env", lambda key, default=None: os.getenv(key, default))
 
 
+def _apply_rollout_overrides(cfg):
+    rollout = cfg.get("rollout", None)
+    if rollout is None:
+        return cfg, OmegaConf.create()
+
+    cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+    scalar_rollout = OmegaConf.create()
+    section_names = {"meta", "substrate", "simulation", "logging", "metric", "minibang"}
+    for key, value in rollout.items():
+        if value is None:
+            continue
+        key_s = str(key)
+        if key_s in section_names:
+            if cfg.get(key_s, None) is None:
+                cfg[key_s] = OmegaConf.create()
+            cfg[key_s] = OmegaConf.merge(cfg.get(key_s, {}), value)
+        else:
+            scalar_rollout[key_s] = value
+    return cfg, scalar_rollout
+
+
 def load_config(config_path: Path, overrides: list[str] | None = None):
     ensure_env_resolver()
     cfg = OmegaConf.load(str(config_path))
@@ -52,12 +73,14 @@ def load_config(config_path: Path, overrides: list[str] | None = None):
         cfg = OmegaConf.merge(base_cfg, cfg)
     if overrides:
         cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(list(overrides)))
+    cfg, scalar_rollout = _apply_rollout_overrides(cfg)
     flat = OmegaConf.merge(
         cfg.get("meta", {}),
         cfg.get("substrate", {}),
         cfg.get("simulation", {}),
         cfg.get("logging", {}),
         cfg.get("metric", {}),
+        scalar_rollout,
         cfg.get("minibang", {}),
     )
     return cfg, flat
