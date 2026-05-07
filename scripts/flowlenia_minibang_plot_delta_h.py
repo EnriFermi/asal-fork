@@ -162,17 +162,19 @@ def _compute_metrics_if_needed(
     metrics_path: Path | None,
     preferred_metrics_path: Path,
     metrics_seed: int,
-    overwrite: bool,
+    overwrite_delta_h: bool,
+    overwrite_cluster_mass: bool,
     need_delta_h: bool,
     need_cluster_mass: bool,
+    metric_overrides: dict[str, Any],
 ) -> Path | None:
     has_delta_h = metrics_path is not None and _npz_has_keys(
         metrics_path,
         ("delta_h_map", "delta_h_tau_steps"),
     )
     has_cluster_mass = metrics_path is not None and _npz_has_keys(metrics_path, ("cluster_steps", "cluster_mass_prob"))
-    compute_delta_h = need_delta_h and (overwrite or not has_delta_h)
-    compute_cluster_mass = need_cluster_mass and (overwrite or not has_cluster_mass)
+    compute_delta_h = need_delta_h and (overwrite_delta_h or not has_delta_h)
+    compute_cluster_mass = need_cluster_mass and (overwrite_cluster_mass or not has_cluster_mass)
     if not compute_delta_h and not compute_cluster_mass:
         return metrics_path
 
@@ -187,6 +189,7 @@ def _compute_metrics_if_needed(
     flat_args = OmegaConf.to_container(flat, resolve=True)
     if not isinstance(flat_args, dict):
         raise ValueError(f"Could not flatten config: {config_path}")
+    flat_args.update(metric_overrides)
 
     selection_idx = int(row.get("selection_idx", row.get("traj_selection_idx", 0)))
     seed = int(metrics_seed) + selection_idx
@@ -201,7 +204,7 @@ def _compute_metrics_if_needed(
     out_path = metrics_path if metrics_path is not None else preferred_metrics_path
     out_path.parent.mkdir(parents=True, exist_ok=True)
     merged: dict[str, Any] = {}
-    if out_path.exists() and not overwrite:
+    if out_path.exists():
         with np.load(out_path) as old:
             merged.update({key: old[key] for key in old.files})
     merged.update(computed)
@@ -666,6 +669,22 @@ def _fmt_num(value: Any) -> str:
         return str(value)
 
 
+def _parse_optional_int_arg(value: str) -> int | None:
+    text = str(value).strip().lower()
+    if text in {"none", "null", "auto", ""}:
+        return None
+    return int(text)
+
+
+def _metric_cli_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    overrides: dict[str, Any] = {}
+    if args.metric_range_start_steps is not None:
+        overrides["metric_range_start_steps"] = _parse_optional_int_arg(args.metric_range_start_steps)
+    if args.metric_range_end_steps is not None:
+        overrides["metric_range_end_steps"] = _parse_optional_int_arg(args.metric_range_end_steps)
+    return overrides
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Plot deltaH and cluster-mass curves for FlowLenia minibang trajectory datasets."
@@ -682,7 +701,27 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="With --compute-missing, recompute requested metrics even if metrics.npz already has them.",
     )
+    parser.add_argument(
+        "--recompute-delta-h",
+        action="store_true",
+        help="With --compute-missing, recompute deltaH even if metrics.npz already contains delta_h_map.",
+    )
+    parser.add_argument(
+        "--recompute-cluster-mass",
+        action="store_true",
+        help="With --compute-missing, recompute cluster mass metrics even if metrics.npz already contains them.",
+    )
     parser.add_argument("--metrics-seed", type=int, default=12345, help="Base seed for recomputing deltaH.")
+    parser.add_argument(
+        "--metric-range-start-steps",
+        default=None,
+        help="Override metric_range_start_steps when recomputing metrics.",
+    )
+    parser.add_argument(
+        "--metric-range-end-steps",
+        default=None,
+        help="Override metric_range_end_steps when recomputing metrics. Use null/none/auto for rollout end.",
+    )
     parser.add_argument("--start-step", type=int, default=None, help="Optional vertical marker. Defaults to manifest.")
     parser.add_argument("--end-step", type=int, default=None, help="Optional vertical marker. Defaults to manifest.")
     parser.add_argument("--delta-h-cmap", default="magma", help="Matplotlib colormap for deltaH heatmaps.")
@@ -723,6 +762,7 @@ def main() -> None:
     manifest, rows = _load_manifest_rows(dataset_root)
     detect_start_step = args.start_step if args.start_step is not None else _as_optional_int(manifest.get("detect_start_step"))
     detect_end_step = args.end_step if args.end_step is not None else _as_optional_int(manifest.get("detect_end_step"))
+    metric_overrides = _metric_cli_overrides(args)
 
     summary_rows: list[dict[str, Any]] = []
     delta_h_ready: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
@@ -753,9 +793,11 @@ def main() -> None:
                     metrics_path=metrics_path,
                     preferred_metrics_path=preferred_metrics_path,
                     metrics_seed=int(args.metrics_seed),
-                    overwrite=bool(args.overwrite_computed),
+                    overwrite_delta_h=bool(args.overwrite_computed or args.recompute_delta_h),
+                    overwrite_cluster_mass=bool(args.overwrite_computed or args.recompute_cluster_mass),
                     need_delta_h=True,
                     need_cluster_mass=True,
+                    metric_overrides=metric_overrides,
                 )
                 summary["metrics_path"] = str(metrics_path or preferred_metrics_path)
             if metrics_path is None or not metrics_path.exists():

@@ -13,8 +13,8 @@ rollout:
     # mass_clip_eps: 0.0
 
   simulation:
-    rollout_steps: 300000
-    max_steps: 300000
+    rollout_steps: 500000
+    max_steps: 500000
     seed: 0
     img_size: 224
     fps: 250
@@ -51,7 +51,7 @@ rollout:
     metric_window_step_steps: 5000
     metric_tau_steps: 3000
     metric_range_start_steps: 150000
-    metric_range_end_steps: 300000
+    metric_range_end_steps: null
     metric_window_size_frames: null
     metric_window_step_frames: null
 
