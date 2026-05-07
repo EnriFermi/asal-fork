@@ -164,7 +164,12 @@ def intervals_from_mask(
     return intervals
 
 
-def merge_intervals(rows: list[dict[str, Any]], *, gap_steps: int) -> list[dict[str, Any]]:
+def merge_intervals(
+    rows: list[dict[str, Any]],
+    *,
+    gap_steps: int,
+    max_duration_steps: int | None = None,
+) -> list[dict[str, Any]]:
     if not rows:
         return []
     rows_sorted = sorted(rows, key=lambda r: (int(r["start_step"]), int(r["end_step"])))
@@ -174,8 +179,13 @@ def merge_intervals(rows: list[dict[str, Any]], *, gap_steps: int) -> list[dict[
     for row in rows_sorted[1:]:
         start = int(row["start_step"])
         end = int(row["end_step"])
-        if start <= int(cur["end_step"]) + int(gap_steps):
-            cur["end_step"] = max(int(cur["end_step"]), end)
+        merged_end = max(int(cur["end_step"]), end)
+        merged_duration = merged_end - int(cur["start_step"])
+        can_merge = start <= int(cur["end_step"]) + int(gap_steps)
+        if max_duration_steps is not None:
+            can_merge = can_merge and merged_duration <= int(max_duration_steps)
+        if can_merge:
+            cur["end_step"] = merged_end
             cur["score"] = max(float(cur.get("score", 0.0)), float(row.get("score", 0.0)))
             cur["delta_h_z_max"] = max(
                 float(cur.get("delta_h_z_max", 0.0)),
