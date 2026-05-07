@@ -81,7 +81,7 @@ rollout:
 
   metric:
     # Optional rollout-time detection metric overrides can go here.
-    # metric_range_start_steps: 0
+    metric_range_start_steps: 150000
     # metric_range_end_steps: null
 
 minibang:
@@ -90,11 +90,7 @@ minibang:
   n_trajectories: 20
   batch_size: 10 
 
-  selection_seed: 0
-  selection_iter_bins: 10
-  selection_elite_fraction: 0.35
-  selection_pool_min_per_bin: 8
-  selection_best_traj_per_bin: true
+  selection_mode: loss
   include_population: true
   include_best_traj: true
   include_final_best: true
@@ -104,6 +100,7 @@ minibang:
   compute_clusters: true
   metrics_strict: true
   metrics_seed: 12345
+  detect_start_step: 150000
 
   # The optimization config uses trainable_grid; posthoc detection has no optimized
   # tau latent, so the runner evaluates all tau values and takes max_grid by default.
