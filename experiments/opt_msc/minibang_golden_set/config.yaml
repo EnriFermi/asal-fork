@@ -80,9 +80,35 @@ rollout:
     lagrangian_diffusion_scale: 1.0
 
   metric:
-    # Optional rollout-time detection metric overrides can go here.
+    # Explicit posthoc DeltaH/MSC settings used for minibang metrics and plots.
+    # Keep this block explicit so heatmaps are reproducible without relying on
+    # inherited optimization defaults.
+    metric_tau_mode: max_grid
+    metric_tau_grid_steps: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000]
+    metric_window_size_steps: 20000
+    metric_window_step_steps: 5000
+    metric_tau_steps: 3000
     metric_range_start_steps: 150000
-    # metric_range_end_steps: null
+    metric_range_end_steps: 300000
+    metric_window_size_frames: null
+    metric_window_step_frames: null
+
+    metric_m_samples: 48
+    metric_m_min: 4
+    metric_n_proj: 16
+    metric_null_reps: 6
+    metric_particle_samples: 64
+    metric_dirs_seed: 123
+    metric_periodic: null
+    metric_domain_y: null
+    metric_domain_x: null
+
+    metric_preprocess_mode: clip
+    metric_scales: null
+    metric_scale_weights: null
+    metric_alpha: 0.0
+    metric_beta: 1.0
+    metric_eps: 1.0e-12
 
 minibang:
   checkpoint_dir: experiments/opt_msc/checkpoints/test_run_longrun_check
