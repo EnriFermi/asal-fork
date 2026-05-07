@@ -21,6 +21,29 @@ from omegaconf import OmegaConf
 from flowlenia_minibang_common import load_config, resolve_path
 
 
+DELTA_H_CONFIG_KEYS = [
+    "metric_tau_mode",
+    "minibang_metric_tau_mode",
+    "metric_tau_grid_steps",
+    "metric_tau_grid_frames",
+    "metric_tau_steps",
+    "metric_window_size_steps",
+    "metric_window_step_steps",
+    "metric_range_start_steps",
+    "metric_range_end_steps",
+    "metric_m_samples",
+    "metric_m_min",
+    "metric_n_proj",
+    "metric_null_reps",
+    "metric_particle_samples",
+    "metric_preprocess_mode",
+    "metric_alpha",
+    "metric_beta",
+    "metric_eps",
+    "metric_dirs_seed",
+]
+
+
 def _load_manifest_rows(dataset_root: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     manifest_path = dataset_root / "manifest.json"
     if manifest_path.exists():
@@ -143,7 +166,10 @@ def _compute_metrics_if_needed(
     need_delta_h: bool,
     need_cluster_mass: bool,
 ) -> Path | None:
-    has_delta_h = metrics_path is not None and _npz_has_keys(metrics_path, ("delta_h_best",))
+    has_delta_h = metrics_path is not None and _npz_has_keys(
+        metrics_path,
+        ("delta_h_map", "delta_h_tau_steps"),
+    )
     has_cluster_mass = metrics_path is not None and _npz_has_keys(metrics_path, ("cluster_steps", "cluster_mass_prob"))
     compute_delta_h = need_delta_h and (overwrite or not has_delta_h)
     compute_cluster_mass = need_cluster_mass and (overwrite or not has_cluster_mass)
@@ -183,11 +209,13 @@ def _compute_metrics_if_needed(
     return out_path
 
 
-def _load_delta_h(metrics_path: Path) -> dict[str, Any]:
+def _load_delta_h_heatmap(metrics_path: Path) -> dict[str, Any]:
     with np.load(metrics_path) as data:
-        if "delta_h_best" not in data.files:
-            raise KeyError(f"{metrics_path} does not contain delta_h_best")
-        y = np.asarray(data["delta_h_best"], dtype=np.float64).reshape(-1)
+        if "delta_h_map" not in data.files:
+            raise KeyError(f"{metrics_path} does not contain delta_h_map")
+        z = np.asarray(data["delta_h_map"], dtype=np.float64)
+        if z.ndim != 2:
+            raise ValueError(f"delta_h_map must be 2D (tau, window), got {z.shape}")
         if "delta_h_window_center_steps" in data.files:
             x = np.asarray(data["delta_h_window_center_steps"], dtype=np.float64).reshape(-1)
         elif "delta_h_window_start_steps" in data.files and "delta_h_window_end_steps" in data.files:
@@ -195,13 +223,30 @@ def _load_delta_h(metrics_path: Path) -> dict[str, Any]:
             s1 = np.asarray(data["delta_h_window_end_steps"], dtype=np.float64).reshape(-1)
             x = 0.5 * (s0 + s1)
         else:
-            x = np.arange(y.size, dtype=np.float64)
-        if x.size != y.size:
-            x = np.arange(y.size, dtype=np.float64)
-        selected_tau = None
-        if "delta_h_selected_tau_steps" in data.files:
-            selected_tau = int(np.asarray(data["delta_h_selected_tau_steps"]).reshape(-1)[0])
-    return {"steps": x, "delta_h": y, "selected_tau": selected_tau}
+            x = np.arange(z.shape[1], dtype=np.float64)
+        if "delta_h_tau_steps" not in data.files:
+            raise KeyError(f"{metrics_path} does not contain delta_h_tau_steps")
+        tau_steps = np.asarray(data["delta_h_tau_steps"], dtype=np.float64).reshape(-1)
+        if x.size != z.shape[1]:
+            x = np.arange(z.shape[1], dtype=np.float64)
+        if tau_steps.size != z.shape[0]:
+            tau_steps = np.arange(z.shape[0], dtype=np.float64)
+    return {"steps": x, "tau_steps": tau_steps, "delta_h_map": z}
+
+
+def _colors_from_cluster_centers(data: np.lib.npyio.NpzFile, n_clusters: int) -> np.ndarray:
+    if "cluster_centers_raw" not in data.files:
+        return np.ones((n_clusters, 3), dtype=np.float64) * 0.25
+    centers = np.asarray(data["cluster_centers_raw"], dtype=np.float64)
+    if centers.ndim != 2 or centers.shape[0] < n_clusters:
+        return np.ones((n_clusters, 3), dtype=np.float64) * 0.25
+    p = centers[:n_clusters]
+    if p.shape[1] >= 3:
+        rgb = p[:, :3]
+    else:
+        reps = int(np.ceil(3 / max(1, p.shape[1])))
+        rgb = np.tile(p, (1, reps))[:, :3]
+    return np.clip(rgb, 0.0, 1.0)
 
 
 def _load_cluster_mass(metrics_path: Path, *, mode: str) -> dict[str, Any]:
@@ -217,6 +262,7 @@ def _load_cluster_mass(metrics_path: Path, *, mode: str) -> dict[str, Any]:
             raise ValueError(f"{mass_key} must be 2D, got {mass.shape}")
         if steps.size != mass.shape[0]:
             steps = np.arange(mass.shape[0], dtype=np.float64)
+        colors = _colors_from_cluster_centers(data, int(mass.shape[1]))
         tv_lag = None
         if "cluster_tv_lag" in data.files:
             tv_lag = np.asarray(data["cluster_tv_lag"], dtype=np.float64).reshape(-1)
@@ -227,9 +273,69 @@ def _load_cluster_mass(metrics_path: Path, *, mode: str) -> dict[str, Any]:
         "steps": steps,
         "mass": mass,
         "mode": mode,
+        "colors": colors,
         "tv_lag": tv_lag,
         "entropy": entropy,
     }
+
+
+def _scalar_from_npz(data: np.lib.npyio.NpzFile, key: str) -> Any:
+    if key not in data.files:
+        return None
+    arr = np.asarray(data[key])
+    if arr.size == 0:
+        return None
+    return arr.reshape(-1)[0].item()
+
+
+def _list_from_npz(data: np.lib.npyio.NpzFile, key: str) -> list[Any]:
+    if key not in data.files:
+        return []
+    return np.asarray(data[key]).reshape(-1).tolist()
+
+
+def _delta_h_metadata(
+    *,
+    dataset_root: Path,
+    row: dict[str, Any],
+    manifest: dict[str, Any],
+    metrics_path: Path,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "traj_id": _traj_id(row),
+        "metrics_path": str(metrics_path),
+    }
+    config_path = _config_path(dataset_root, row, manifest)
+    if config_path is not None:
+        payload["config_path"] = str(config_path)
+        try:
+            _cfg, flat = load_config(config_path)
+            payload["config_values"] = {
+                key: OmegaConf.to_container(flat.get(key), resolve=True)
+                if OmegaConf.is_config(flat.get(key))
+                else flat.get(key)
+                for key in DELTA_H_CONFIG_KEYS
+                if flat.get(key, None) is not None
+            }
+        except Exception as exc:
+            payload["config_error"] = str(exc)
+
+    with np.load(metrics_path) as data:
+        tau_steps = _list_from_npz(data, "delta_h_tau_steps")
+        window_centers = np.asarray(_list_from_npz(data, "delta_h_window_center_steps"), dtype=np.float64)
+        window_starts = np.asarray(_list_from_npz(data, "delta_h_window_start_steps"), dtype=np.float64)
+        payload["actual_values"] = {
+            "delta_h_tau_steps": tau_steps,
+            "delta_h_window_size_steps": _scalar_from_npz(data, "delta_h_window_size_steps"),
+            "delta_h_sample_every_steps": _scalar_from_npz(data, "delta_h_sample_every_steps"),
+            "n_tau": len(tau_steps),
+            "n_windows": int(window_centers.size),
+            "window_center_min_step": float(np.nanmin(window_centers)) if window_centers.size else None,
+            "window_center_max_step": float(np.nanmax(window_centers)) if window_centers.size else None,
+            "window_start_min_step": float(np.nanmin(window_starts)) if window_starts.size else None,
+            "window_start_max_step": float(np.nanmax(window_starts)) if window_starts.size else None,
+        }
+    return payload
 
 
 def _as_optional_int(value: Any) -> int | None:
@@ -238,7 +344,7 @@ def _as_optional_int(value: Any) -> int | None:
     return int(value)
 
 
-def _plot_one(
+def _plot_delta_h_heatmap_one(
     *,
     plt: Any,
     row: dict[str, Any],
@@ -246,31 +352,44 @@ def _plot_one(
     out_path: Path,
     detect_start_step: int | None,
     detect_end_step: int | None,
-    yscale: str,
+    cmap: str,
+    vmin: float | None,
+    vmax: float | None,
 ) -> dict[str, Any]:
     traj_id = _traj_id(row)
     steps = np.asarray(series["steps"], dtype=np.float64)
-    dh = np.asarray(series["delta_h"], dtype=np.float64)
-    finite = np.isfinite(steps) & np.isfinite(dh)
-    steps_f = steps[finite]
-    dh_f = dh[finite]
-    if dh_f.size == 0:
-        raise ValueError(f"No finite deltaH points for {traj_id}")
+    tau_steps = np.asarray(series["tau_steps"], dtype=np.float64)
+    dh_map = np.asarray(series["delta_h_map"], dtype=np.float64)
+    if dh_map.size == 0 or not np.any(np.isfinite(dh_map)):
+        raise ValueError(f"No finite deltaH map values for {traj_id}")
 
-    max_i = int(np.nanargmax(dh_f))
-    max_step = float(steps_f[max_i])
-    max_dh = float(dh_f[max_i])
-    mean_dh = float(np.nanmean(dh_f))
+    max_tau_i, max_step_i = np.unravel_index(int(np.nanargmax(dh_map)), dh_map.shape)
+    max_step = float(steps[max_step_i])
+    max_tau = float(tau_steps[max_tau_i])
+    max_dh = float(dh_map[max_tau_i, max_step_i])
+    mean_dh = float(np.nanmean(dh_map))
 
-    fig, ax = plt.subplots(figsize=(10.5, 4.5), constrained_layout=True)
-    ax.plot(steps_f, dh_f, color="#1f77b4", linewidth=1.8)
-    ax.scatter([max_step], [max_dh], color="#d62728", s=34, zorder=3, label=f"max {max_dh:.4g}")
+    fig, ax = plt.subplots(figsize=(10.8, 5.0), constrained_layout=True)
+    im = ax.imshow(
+        dh_map,
+        origin="lower",
+        aspect="auto",
+        interpolation="nearest",
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        extent=[
+            float(np.nanmin(steps)),
+            float(np.nanmax(steps)),
+            float(np.nanmin(tau_steps)),
+            float(np.nanmax(tau_steps)),
+        ],
+    )
+    ax.scatter([max_step], [max_tau], color="white", edgecolor="black", s=32, linewidth=0.8, zorder=3)
     if detect_start_step is not None:
         ax.axvline(int(detect_start_step), color="#666666", linestyle="--", linewidth=1.0, alpha=0.65)
     if detect_end_step is not None:
         ax.axvline(int(detect_end_step), color="#666666", linestyle=":", linewidth=1.0, alpha=0.65)
-    if yscale == "log" and np.nanmin(dh_f) > 0.0:
-        ax.set_yscale("log")
 
     subtitle = []
     for key, label in (("loss", "loss"), ("iter", "iter"), ("saturation_T", "T")):
@@ -280,14 +399,13 @@ def _plot_one(
                 subtitle.append(f"{label}={value:.4g}")
             else:
                 subtitle.append(f"{label}={value}")
-    if series.get("selected_tau", None) is not None:
-        subtitle.append(f"tau={series['selected_tau']}")
 
-    ax.set_title(f"{traj_id} deltaH" + (f" ({', '.join(subtitle)})" if subtitle else ""))
+    ax.set_title(f"{traj_id} deltaH heatmap" + (f" ({', '.join(subtitle)})" if subtitle else ""))
     ax.set_xlabel("simulation step")
-    ax.set_ylabel("deltaH best")
-    ax.grid(True, alpha=0.25)
-    ax.legend(loc="best")
+    ax.set_ylabel("tau step")
+    ax.grid(False)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.036, pad=0.02)
+    cbar.set_label("deltaH")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150)
@@ -298,23 +416,27 @@ def _plot_one(
         "status": "ok",
         "delta_h_plot_path": str(out_path),
         "plot_path": str(out_path),
-        "n_points": int(dh_f.size),
-        "step_min": float(np.nanmin(steps_f)),
-        "step_max": float(np.nanmax(steps_f)),
+        "n_points": int(dh_map.size),
+        "step_min": float(np.nanmin(steps)),
+        "step_max": float(np.nanmax(steps)),
         "delta_h_max": max_dh,
         "delta_h_max_step": max_step,
+        "delta_h_max_tau_step": max_tau,
         "delta_h_mean": mean_dh,
-        "delta_h_selected_tau_steps": series.get("selected_tau", ""),
+        "delta_h_n_tau": int(tau_steps.size),
+        "delta_h_tau_grid": ",".join(str(int(x)) if float(x).is_integer() else f"{x:g}" for x in tau_steps),
     }
 
 
-def _plot_grid(
+def _plot_delta_h_heatmap_grid(
     *,
     plt: Any,
     plotted: list[tuple[dict[str, Any], dict[str, Any]]],
     out_path: Path,
     detect_start_step: int | None,
-    yscale: str,
+    cmap: str,
+    vmin: float | None,
+    vmax: float | None,
 ) -> None:
     if not plotted:
         return
@@ -322,25 +444,35 @@ def _plot_grid(
     rows_n = int(math.ceil(len(plotted) / cols))
     fig, axes = plt.subplots(rows_n, cols, figsize=(4.2 * cols, 2.7 * rows_n), constrained_layout=True)
     axes_arr = np.asarray(axes).reshape(-1)
+    last_im = None
     for ax, (row, series) in zip(axes_arr, plotted):
         steps = np.asarray(series["steps"], dtype=np.float64)
-        dh = np.asarray(series["delta_h"], dtype=np.float64)
-        finite = np.isfinite(steps) & np.isfinite(dh)
-        steps_f = steps[finite]
-        dh_f = dh[finite]
-        ax.plot(steps_f, dh_f, color="#1f77b4", linewidth=1.1)
-        if dh_f.size:
-            max_i = int(np.nanargmax(dh_f))
-            ax.scatter([steps_f[max_i]], [dh_f[max_i]], color="#d62728", s=12, zorder=3)
+        tau_steps = np.asarray(series["tau_steps"], dtype=np.float64)
+        dh_map = np.asarray(series["delta_h_map"], dtype=np.float64)
+        last_im = ax.imshow(
+            dh_map,
+            origin="lower",
+            aspect="auto",
+            interpolation="nearest",
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            extent=[
+                float(np.nanmin(steps)),
+                float(np.nanmax(steps)),
+                float(np.nanmin(tau_steps)),
+                float(np.nanmax(tau_steps)),
+            ],
+        )
         if detect_start_step is not None:
             ax.axvline(int(detect_start_step), color="#666666", linestyle="--", linewidth=0.8, alpha=0.55)
-        if yscale == "log" and dh_f.size and np.nanmin(dh_f) > 0.0:
-            ax.set_yscale("log")
         ax.set_title(_traj_id(row), fontsize=9)
-        ax.grid(True, alpha=0.2)
+        ax.grid(False)
     for ax in axes_arr[len(plotted) :]:
         ax.axis("off")
-    fig.suptitle("deltaH by trajectory", fontsize=14)
+    if last_im is not None:
+        fig.colorbar(last_im, ax=axes_arr[: len(plotted)].tolist(), fraction=0.018, pad=0.01)
+    fig.suptitle("deltaH heatmap by trajectory", fontsize=14)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -365,18 +497,20 @@ def _plot_cluster_mass_one(
         raise ValueError(f"No finite cluster mass points for {traj_id}")
 
     n_clusters = int(mass_f.shape[1])
+    colors = np.asarray(series.get("colors", np.ones((n_clusters, 3)) * 0.25), dtype=np.float64)
+    if colors.shape[0] < n_clusters:
+        colors = np.pad(colors, ((0, n_clusters - colors.shape[0]), (0, 0)), constant_values=0.25)
     mean_mass = np.nanmean(mass_f, axis=0)
     dominant_cluster = int(np.nanargmax(mean_mass))
     dominant_mean = float(mean_mass[dominant_cluster])
 
     fig, ax = plt.subplots(figsize=(10.5, 4.8), constrained_layout=True)
-    cmap = plt.get_cmap("tab20", max(n_clusters, 1))
     for i_cluster in range(n_clusters):
         ax.plot(
             steps_f,
             mass_f[:, i_cluster],
-            linewidth=1.35,
-            color=cmap(i_cluster),
+            linewidth=1.65,
+            color=colors[i_cluster, :3],
             label=f"c{i_cluster}",
         )
     if detect_start_step is not None:
@@ -395,7 +529,7 @@ def _plot_cluster_mass_one(
     ax.set_ylabel(mode_label)
     if series.get("mode") == "prob":
         ax.set_ylim(-0.02, 1.02)
-    ax.grid(True, alpha=0.25)
+    ax.grid(True, alpha=0.18)
     ax.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=False, ncol=1)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -436,9 +570,11 @@ def _plot_cluster_mass_grid(
         steps_f = steps[finite]
         mass_f = mass[finite]
         n_clusters = int(mass_f.shape[1]) if mass_f.ndim == 2 else 0
-        cmap = plt.get_cmap("tab20", max(n_clusters, 1))
+        colors = np.asarray(series.get("colors", np.ones((n_clusters, 3)) * 0.25), dtype=np.float64)
+        if colors.shape[0] < n_clusters:
+            colors = np.pad(colors, ((0, n_clusters - colors.shape[0]), (0, 0)), constant_values=0.25)
         for i_cluster in range(n_clusters):
-            ax.plot(steps_f, mass_f[:, i_cluster], linewidth=0.8, color=cmap(i_cluster), alpha=0.9)
+            ax.plot(steps_f, mass_f[:, i_cluster], linewidth=1.0, color=colors[i_cluster, :3], alpha=0.92)
         if detect_start_step is not None:
             ax.axvline(int(detect_start_step), color="#666666", linestyle="--", linewidth=0.8, alpha=0.55)
         if series.get("mode") == "prob":
@@ -465,8 +601,10 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "step_max",
         "delta_h_max",
         "delta_h_max_step",
+        "delta_h_max_tau_step",
         "delta_h_mean",
-        "delta_h_selected_tau_steps",
+        "delta_h_n_tau",
+        "delta_h_tau_grid",
         "cluster_mass_n_points",
         "cluster_mass_n_clusters",
         "cluster_mass_dominant_cluster",
@@ -494,8 +632,8 @@ def _write_index(path: Path, rows: list[dict[str, Any]], delta_grid_path: Path, 
         lines.extend(["## deltaH overview", "", f"![deltaH overview]({delta_grid_path.name})", ""])
     if cluster_grid_path.exists():
         lines.extend(["## cluster mass overview", "", f"![cluster mass overview]({cluster_grid_path.name})", ""])
-    lines.append("| traj | status | max step | max deltaH | mean deltaH | deltaH | cluster mass | message |")
-    lines.append("|---|---|---:|---:|---:|---|---|---|")
+    lines.append("| traj | status | max step | max tau | max deltaH | mean deltaH | deltaH | cluster mass | message |")
+    lines.append("|---|---|---:|---:|---:|---:|---|---|---|")
     for row in rows:
         dh_plot = Path(str(row.get("delta_h_plot_path", ""))).name if row.get("delta_h_plot_path", "") else ""
         dh_plot_link = f"[png]({dh_plot})" if dh_plot else ""
@@ -504,10 +642,11 @@ def _write_index(path: Path, rows: list[dict[str, Any]], delta_grid_path: Path, 
         )
         cluster_plot_link = f"[png]({cluster_plot})" if cluster_plot else ""
         lines.append(
-            "| {traj} | {status} | {step} | {maxv} | {meanv} | {dh_plot} | {cluster_plot} | {message} |".format(
+            "| {traj} | {status} | {step} | {tau} | {maxv} | {meanv} | {dh_plot} | {cluster_plot} | {message} |".format(
                 traj=row.get("traj_id", ""),
                 status=row.get("status", ""),
                 step=_fmt_num(row.get("delta_h_max_step", "")),
+                tau=_fmt_num(row.get("delta_h_max_tau_step", "")),
                 maxv=_fmt_num(row.get("delta_h_max", "")),
                 meanv=_fmt_num(row.get("delta_h_mean", "")),
                 dh_plot=dh_plot_link,
@@ -532,7 +671,7 @@ def parse_args() -> argparse.Namespace:
         description="Plot deltaH and cluster-mass curves for FlowLenia minibang trajectory datasets."
     )
     parser.add_argument("dataset_root", help="Dataset root with manifest.json or traj_* directories.")
-    parser.add_argument("--output-dir", default=None, help="Default: <dataset_root>/delta_h_plots.")
+    parser.add_argument("--output-dir", default=None, help="Default: <dataset_root>/metric_plots.")
     parser.add_argument(
         "--compute-missing",
         action="store_true",
@@ -546,7 +685,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metrics-seed", type=int, default=12345, help="Base seed for recomputing deltaH.")
     parser.add_argument("--start-step", type=int, default=None, help="Optional vertical marker. Defaults to manifest.")
     parser.add_argument("--end-step", type=int, default=None, help="Optional vertical marker. Defaults to manifest.")
-    parser.add_argument("--yscale", choices=["linear", "log"], default="linear")
+    parser.add_argument("--delta-h-cmap", default="magma", help="Matplotlib colormap for deltaH heatmaps.")
+    parser.add_argument(
+        "--delta-h-vmax-quantile",
+        type=float,
+        default=0.995,
+        help="Global finite-value quantile used as heatmap vmax. Use 1.0 for exact max.",
+    )
     parser.add_argument(
         "--cluster-mass-mode",
         choices=["prob", "raw"],
@@ -561,7 +706,7 @@ def main() -> None:
     dataset_root = resolve_path(args.dataset_root)
     if dataset_root is None or not dataset_root.exists():
         raise FileNotFoundError(f"Dataset root not found: {args.dataset_root}")
-    output_dir = resolve_path(args.output_dir, dataset_root) if args.output_dir else dataset_root / "delta_h_plots"
+    output_dir = resolve_path(args.output_dir, dataset_root) if args.output_dir else dataset_root / "metric_plots"
     assert output_dir is not None
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -580,8 +725,10 @@ def main() -> None:
     detect_end_step = args.end_step if args.end_step is not None else _as_optional_int(manifest.get("detect_end_step"))
 
     summary_rows: list[dict[str, Any]] = []
-    delta_h_plotted: list[tuple[dict[str, Any], dict[str, Any]]] = []
-    cluster_mass_plotted: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    delta_h_ready: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+    cluster_mass_ready: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+    delta_h_metadata_rows: list[dict[str, Any]] = []
+    tau_grid_ref: np.ndarray | None = None
     for row in rows:
         traj_id = _traj_id(row)
         metrics_path, preferred_metrics_path = _metrics_path(dataset_root, row)
@@ -616,38 +763,31 @@ def main() -> None:
             summary["metrics_path"] = str(metrics_path)
 
             try:
-                delta_h_series = _load_delta_h(metrics_path)
-                delta_h_plot_path = output_dir / f"{traj_id}_delta_h.png"
-                summary.update(
-                    _plot_one(
-                        plt=plt,
+                delta_h_series = _load_delta_h_heatmap(metrics_path)
+                tau_grid = np.asarray(delta_h_series["tau_steps"], dtype=np.float64)
+                if tau_grid_ref is None:
+                    tau_grid_ref = tau_grid
+                elif tau_grid.shape != tau_grid_ref.shape or not np.allclose(tau_grid, tau_grid_ref):
+                    raise ValueError(
+                        "deltaH tau grid differs from previous trajectories: "
+                        f"{tau_grid.tolist()} != {tau_grid_ref.tolist()}"
+                    )
+                delta_h_metadata_rows.append(
+                    _delta_h_metadata(
+                        dataset_root=dataset_root,
                         row=row,
-                        series=delta_h_series,
-                        out_path=delta_h_plot_path,
-                        detect_start_step=detect_start_step,
-                        detect_end_step=detect_end_step,
-                        yscale=str(args.yscale),
+                        manifest=manifest,
+                        metrics_path=metrics_path,
                     )
                 )
-                delta_h_plotted.append((row, delta_h_series))
+                delta_h_ready.append((row, delta_h_series, summary))
                 plotted_any = True
             except Exception as exc:
                 messages.append(f"deltaH: {exc}")
 
             try:
                 cluster_mass_series = _load_cluster_mass(metrics_path, mode=str(args.cluster_mass_mode))
-                cluster_mass_plot_path = output_dir / f"{traj_id}_cluster_mass.png"
-                summary.update(
-                    _plot_cluster_mass_one(
-                        plt=plt,
-                        row=row,
-                        series=cluster_mass_series,
-                        out_path=cluster_mass_plot_path,
-                        detect_start_step=detect_start_step,
-                        detect_end_step=detect_end_step,
-                    )
-                )
-                cluster_mass_plotted.append((row, cluster_mass_series))
+                cluster_mass_ready.append((row, cluster_mass_series, summary))
                 plotted_any = True
             except Exception as exc:
                 messages.append(f"cluster_mass: {exc}")
@@ -665,13 +805,85 @@ def main() -> None:
             summary_rows.append(summary)
             print(f"[{traj_id}] skipped: {exc}")
 
-    delta_grid_path = output_dir / "delta_h_grid.png"
-    _plot_grid(
+    delta_h_values = []
+    for _row, series, _summary in delta_h_ready:
+        vals = np.asarray(series["delta_h_map"], dtype=np.float64)
+        vals = vals[np.isfinite(vals)]
+        if vals.size:
+            delta_h_values.append(vals)
+    if delta_h_values:
+        all_delta_h = np.concatenate(delta_h_values)
+        vmin = float(np.nanmin(all_delta_h))
+        q = min(max(float(args.delta_h_vmax_quantile), 0.0), 1.0)
+        vmax = float(np.nanquantile(all_delta_h, q))
+        if not np.isfinite(vmax) or vmax <= vmin:
+            vmax = float(np.nanmax(all_delta_h))
+    else:
+        vmin = None
+        vmax = None
+
+    delta_h_plotted: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for row, series, summary in delta_h_ready:
+        traj_id = _traj_id(row)
+        try:
+            delta_h_plot_path = output_dir / f"{traj_id}_delta_h_heatmap.png"
+            summary.update(
+                _plot_delta_h_heatmap_one(
+                    plt=plt,
+                    row=row,
+                    series=series,
+                    out_path=delta_h_plot_path,
+                    detect_start_step=detect_start_step,
+                    detect_end_step=detect_end_step,
+                    cmap=str(args.delta_h_cmap),
+                    vmin=vmin,
+                    vmax=vmax,
+                )
+            )
+            delta_h_plotted.append((row, series))
+        except Exception as exc:
+            summary["status"] = "partial" if summary.get("cluster_mass_plot_path") else "missing_or_failed"
+            summary["message"] = "; ".join([x for x in [summary.get("message", ""), f"deltaH_plot: {exc}"] if x])
+            print(f"[{traj_id}] deltaH heatmap failed: {exc}")
+
+    cluster_mass_plotted: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for row, series, summary in cluster_mass_ready:
+        traj_id = _traj_id(row)
+        try:
+            cluster_mass_plot_path = output_dir / f"{traj_id}_cluster_mass.png"
+            summary.update(
+                _plot_cluster_mass_one(
+                    plt=plt,
+                    row=row,
+                    series=series,
+                    out_path=cluster_mass_plot_path,
+                    detect_start_step=detect_start_step,
+                    detect_end_step=detect_end_step,
+                )
+            )
+            cluster_mass_plotted.append((row, series))
+        except Exception as exc:
+            summary["status"] = "partial" if summary.get("delta_h_plot_path") else "missing_or_failed"
+            summary["message"] = "; ".join([x for x in [summary.get("message", ""), f"cluster_mass_plot: {exc}"] if x])
+            print(f"[{traj_id}] cluster mass plot failed: {exc}")
+
+    for summary in summary_rows:
+        has_dh = bool(summary.get("delta_h_plot_path", ""))
+        has_cluster = bool(summary.get("cluster_mass_plot_path", ""))
+        if has_dh and has_cluster and not summary.get("message", ""):
+            summary["status"] = "ok"
+        elif has_dh or has_cluster:
+            summary["status"] = "partial"
+
+    delta_grid_path = output_dir / "delta_h_heatmap_grid.png"
+    _plot_delta_h_heatmap_grid(
         plt=plt,
         plotted=delta_h_plotted,
         out_path=delta_grid_path,
         detect_start_step=detect_start_step,
-        yscale=str(args.yscale),
+        cmap=str(args.delta_h_cmap),
+        vmin=vmin,
+        vmax=vmax,
     )
     cluster_grid_path = output_dir / "cluster_mass_grid.png"
     _plot_cluster_mass_grid(
@@ -681,9 +893,10 @@ def main() -> None:
         detect_start_step=detect_start_step,
     )
     _write_csv(output_dir / "metric_plot_summary.csv", summary_rows)
+    (output_dir / "delta_h_config.json").write_text(json.dumps(delta_h_metadata_rows, indent=2, sort_keys=True) + "\n")
     _write_index(output_dir / "index.md", summary_rows, delta_grid_path, cluster_grid_path)
     print(
-        f"Wrote {len(delta_h_plotted)} deltaH plots and "
+        f"Wrote {len(delta_h_plotted)} deltaH heatmaps and "
         f"{len(cluster_mass_plotted)} cluster-mass plots to {output_dir}"
     )
     if len(delta_h_plotted) != len(rows) or len(cluster_mass_plotted) != len(rows):
