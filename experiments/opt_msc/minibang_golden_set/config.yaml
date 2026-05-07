@@ -90,7 +90,10 @@ minibang:
   n_trajectories: 20
   batch_size: 10 
 
-  selection_mode: loss
+  selection_mode: loss_quantile_biased
+  selection_keep_top_n: 5
+  selection_loss_bias_gamma: 2.5
+  selection_loss_jitter_frac: 0.15
   include_population: true
   include_best_traj: true
   include_final_best: true

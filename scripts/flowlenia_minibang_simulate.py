@@ -225,6 +225,61 @@ def select_params(checkpoint_dir: Path, args: Any) -> list[dict[str, Any]]:
             if len(selected) >= target_n:
                 break
             add_candidate(row)
+    elif selection_mode in {"loss_quantile_biased", "quantile_biased", "loss_biased"}:
+        unique_rows: list[dict[str, Any]] = []
+        unique_hashes: set[str] = set()
+        for row in sorted(candidates, key=_loss_sort_key):
+            h = _param_hash(np.asarray(row["params"]))
+            if h in unique_hashes:
+                continue
+            unique_hashes.add(h)
+            unique_rows.append(row)
+        sorted_rows = unique_rows
+        top_n = max(0, int(_get(args, "selection_keep_top_n", 5)))
+        bias_gamma = float(_get(args, "selection_loss_bias_gamma", 2.5))
+        if not np.isfinite(bias_gamma) or bias_gamma <= 0.0:
+            raise ValueError(f"selection_loss_bias_gamma must be > 0, got {bias_gamma}.")
+        jitter_frac = float(_get(args, "selection_loss_jitter_frac", 0.15))
+        jitter_frac = float(np.clip(jitter_frac, 0.0, 1.0))
+
+        for row in sorted_rows[:top_n]:
+            if len(selected) >= target_n:
+                break
+            add_candidate(row)
+
+        remaining = max(0, target_n - len(selected))
+        if remaining > 0 and sorted_rows:
+            n = len(sorted_rows)
+            if remaining == 1:
+                base_u = np.asarray([0.5], dtype=np.float64)
+            else:
+                base_u = (np.arange(remaining, dtype=np.float64) + 0.5) / float(remaining)
+            q = np.power(base_u, bias_gamma)
+            base_rank = q * float(max(0, n - 1))
+            bucket_width = float(max(1, n - 1)) / float(max(1, remaining))
+            jitter = rng.uniform(-0.5, 0.5, size=remaining) * jitter_frac * bucket_width
+            rank_targets = np.clip(np.rint(base_rank + jitter).astype(np.int64), 0, max(0, n - 1))
+
+            for rank in rank_targets:
+                if len(selected) >= target_n:
+                    break
+                row = sorted_rows[int(rank)]
+                if add_candidate(row):
+                    continue
+                # If the quantile target lands on an already selected row, walk outward
+                # around that rank before moving to the next target.
+                for offset in range(1, n):
+                    lo = int(rank) - offset
+                    hi = int(rank) + offset
+                    added = False
+                    if lo >= 0:
+                        added = add_candidate(sorted_rows[lo])
+                    if added:
+                        break
+                    if hi < n:
+                        added = add_candidate(sorted_rows[hi])
+                    if added:
+                        break
     elif selection_mode in {"iter_bins", "iteration_bins", "stratified"}:
         iter_bins = int(_get(args, "selection_iter_bins", min(10, target_n)))
         iter_bins = max(1, min(iter_bins, target_n, max(1, n_iters)))
