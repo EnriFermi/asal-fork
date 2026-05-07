@@ -1141,6 +1141,7 @@ def _write_manifest(
             n_trajectories=len(manifest_rows),
             detect_start_step=_get(flat_args, "detect_start_step", None),
             detect_end_step=_get(flat_args, "detect_end_step", None),
+            detect_max_duration_steps=_get(flat_args, "detect_max_duration_steps", None),
             trajectories=manifest_rows,
         ),
     )

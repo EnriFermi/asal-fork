@@ -16,6 +16,7 @@ import numpy as np
 
 from flowlenia_minibang_common import (
     intervals_from_mask,
+    load_config,
     load_frame_times,
     merge_intervals,
     resolve_path,
@@ -34,6 +35,29 @@ def _load_manifest(dataset_root: Path) -> dict[str, Any]:
     if not isinstance(rows, list):
         raise ValueError(f"Invalid manifest format in {path}")
     return payload
+
+
+def _load_detection_defaults_from_config(manifest: dict[str, Any]) -> dict[str, Any]:
+    config_path_raw = manifest.get("config_path", None)
+    if not config_path_raw:
+        return {}
+    config_path = resolve_path(str(config_path_raw))
+    if config_path is None or not config_path.exists():
+        return {}
+    try:
+        _cfg, flat = load_config(config_path)
+    except Exception as exc:
+        print(f"Warning: could not load detection defaults from {config_path}: {exc}")
+        return {}
+    keys = ("detect_start_step", "detect_end_step", "detect_max_duration_steps")
+    return {key: flat.get(key, None) for key in keys if flat.get(key, None) is not None}
+
+
+def _first_int(*values: Any) -> int | None:
+    for value in values:
+        if value is not None:
+            return int(value)
+    return None
 
 
 def _as_float_array(data: np.lib.npyio.NpzFile, key: str) -> np.ndarray | None:
@@ -93,6 +117,7 @@ def detect_for_trajectory(
     pad_steps: int,
     detect_start_step: int | None,
     detect_end_step: int | None,
+    detect_max_duration_steps: int | None,
 ) -> list[dict[str, Any]]:
     traj_dir = Path(str(row.get("traj_dir", "")))
     metrics_path = Path(str(row.get("metrics_path", traj_dir / "metrics.npz")))
@@ -200,7 +225,18 @@ def detect_for_trajectory(
                     )
                 )
 
-    merged = merge_intervals(candidates, gap_steps=int(merge_gap_steps))
+    merged = merge_intervals(
+        candidates,
+        gap_steps=int(merge_gap_steps),
+        max_duration_steps=detect_max_duration_steps,
+    )
+    if detect_max_duration_steps is not None:
+        max_duration = int(detect_max_duration_steps)
+        merged = [
+            cand
+            for cand in merged
+            if int(cand["end_step"]) - int(cand["start_step"]) <= max_duration
+        ]
     out: list[dict[str, Any]] = []
     for idx, cand in enumerate(merged):
         start_step = int(cand["start_step"])
@@ -351,13 +387,19 @@ def parse_args() -> argparse.Namespace:
         "--start-step",
         type=int,
         default=None,
-        help="Ignore candidates before this simulation step. Defaults to manifest.detect_start_step.",
+        help="Ignore candidates before this simulation step. Defaults to config/manifest detect_start_step.",
     )
     parser.add_argument(
         "--end-step",
         type=int,
         default=None,
-        help="Ignore candidates after this simulation step. Defaults to manifest.detect_end_step.",
+        help="Ignore candidates after this simulation step. Defaults to config/manifest detect_end_step.",
+    )
+    parser.add_argument(
+        "--max-duration-steps",
+        type=int,
+        default=None,
+        help="Drop minibang candidates longer than this many simulation steps. Defaults to config/manifest detect_max_duration_steps.",
     )
     return parser.parse_args()
 
@@ -373,12 +415,24 @@ def main() -> None:
 
     manifest = _load_manifest(dataset_root)
     manifest_rows = manifest.get("trajectories", [])
-    detect_start_step = args.start_step
-    if detect_start_step is None and manifest.get("detect_start_step", None) is not None:
-        detect_start_step = int(manifest["detect_start_step"])
-    detect_end_step = args.end_step
-    if detect_end_step is None and manifest.get("detect_end_step", None) is not None:
-        detect_end_step = int(manifest["detect_end_step"])
+    config_defaults = _load_detection_defaults_from_config(manifest)
+    detect_start_step = _first_int(
+        args.start_step,
+        config_defaults.get("detect_start_step", None),
+        manifest.get("detect_start_step", None),
+    )
+    detect_end_step = _first_int(
+        args.end_step,
+        config_defaults.get("detect_end_step", None),
+        manifest.get("detect_end_step", None),
+    )
+    detect_max_duration_steps = _first_int(
+        args.max_duration_steps,
+        config_defaults.get("detect_max_duration_steps", None),
+        manifest.get("detect_max_duration_steps", None),
+    )
+    if detect_max_duration_steps is not None and int(detect_max_duration_steps) <= 0:
+        raise ValueError(f"--max-duration-steps must be positive, got {detect_max_duration_steps}.")
     all_candidates: list[dict[str, Any]] = []
     for row in manifest_rows:
         all_candidates.extend(
@@ -392,6 +446,7 @@ def main() -> None:
                 pad_steps=int(args.pad_steps),
                 detect_start_step=detect_start_step,
                 detect_end_step=detect_end_step,
+                detect_max_duration_steps=detect_max_duration_steps,
             )
         )
 
