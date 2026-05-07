@@ -25,7 +25,7 @@ from flowlenia_minibang_common import (
 )
 
 
-def _load_manifest(dataset_root: Path) -> list[dict[str, Any]]:
+def _load_manifest(dataset_root: Path) -> dict[str, Any]:
     path = dataset_root / "manifest.json"
     if not path.exists():
         raise FileNotFoundError(f"manifest.json not found in {dataset_root}")
@@ -33,7 +33,7 @@ def _load_manifest(dataset_root: Path) -> list[dict[str, Any]]:
     rows = payload.get("trajectories", [])
     if not isinstance(rows, list):
         raise ValueError(f"Invalid manifest format in {path}")
-    return rows
+    return payload
 
 
 def _as_float_array(data: np.lib.npyio.NpzFile, key: str) -> np.ndarray | None:
@@ -51,6 +51,37 @@ def _interval_score(values_z: np.ndarray, i0: int, i1: int) -> float:
     return float(np.nanmax(segment)) if segment.size else 0.0
 
 
+def _range_mask(steps: np.ndarray, start_step: int | None, end_step: int | None) -> np.ndarray:
+    mask = np.ones(np.asarray(steps).shape, dtype=bool)
+    if start_step is not None:
+        mask &= np.asarray(steps) >= int(start_step)
+    if end_step is not None:
+        mask &= np.asarray(steps) <= int(end_step)
+    return mask
+
+
+def _clip_interval(
+    start_step: int,
+    end_step: int,
+    *,
+    detect_start_step: int | None,
+    detect_end_step: int | None,
+) -> tuple[int, int] | None:
+    start = int(start_step)
+    end = int(end_step)
+    if detect_start_step is not None:
+        if end < int(detect_start_step):
+            return None
+        start = max(start, int(detect_start_step))
+    if detect_end_step is not None:
+        if start > int(detect_end_step):
+            return None
+        end = min(end, int(detect_end_step))
+    if end < start:
+        return None
+    return start, end
+
+
 def detect_for_trajectory(
     row: dict[str, Any],
     *,
@@ -60,6 +91,8 @@ def detect_for_trajectory(
     mass_shift_quantile: float,
     merge_gap_steps: int,
     pad_steps: int,
+    detect_start_step: int | None,
+    detect_end_step: int | None,
 ) -> list[dict[str, Any]]:
     traj_dir = Path(str(row.get("traj_dir", "")))
     metrics_path = Path(str(row.get("metrics_path", traj_dir / "metrics.npz")))
@@ -79,16 +112,25 @@ def detect_for_trajectory(
             dh_z_values = robust_z(dh)
             q_thr = np.nanquantile(dh_z_values, float(delta_h_quantile)) if dh_z_values.size else np.inf
             mask = (dh_z_values >= float(delta_h_z)) | ((dh_z_values >= float(q_thr)) & (dh_z_values > 0.0))
+            mask &= _range_mask(dh_steps, detect_start_step, detect_end_step)
             intervals = intervals_from_mask(dh_steps, mask, pad_steps=pad_steps)
             for start, end, i0, i1 in intervals:
                 start_step = int(dh_start[i0]) if dh_start is not None and dh_start.size > i0 else int(start)
                 end_step = int(dh_end[i1]) if dh_end is not None and dh_end.size > i1 else int(end)
+                clipped = _clip_interval(
+                    max(0, start_step - pad_steps),
+                    max(0, end_step + pad_steps),
+                    detect_start_step=detect_start_step,
+                    detect_end_step=detect_end_step,
+                )
+                if clipped is None:
+                    continue
                 score = _interval_score(dh_z_values, i0, i1)
                 candidates.append(
                     dict(
                         traj_id=row.get("traj_id"),
-                        start_step=max(0, start_step - pad_steps),
-                        end_step=max(0, end_step + pad_steps),
+                        start_step=clipped[0],
+                        end_step=clipped[1],
                         score=score,
                         delta_h_z_max=score,
                         mass_shift_z_max=0.0,
@@ -102,14 +144,23 @@ def detect_for_trajectory(
             tv_z_values = robust_z(tv)
             q_thr = np.nanquantile(tv_z_values, float(mass_shift_quantile)) if tv_z_values.size else np.inf
             mask = (tv_z_values >= float(mass_shift_z)) | ((tv_z_values >= float(q_thr)) & (tv_z_values > 0.0))
+            mask &= _range_mask(tv_steps, detect_start_step, detect_end_step)
             intervals = intervals_from_mask(tv_steps, mask, pad_steps=pad_steps)
             for start, end, i0, i1 in intervals:
+                clipped = _clip_interval(
+                    int(start),
+                    int(end),
+                    detect_start_step=detect_start_step,
+                    detect_end_step=detect_end_step,
+                )
+                if clipped is None:
+                    continue
                 score = _interval_score(tv_z_values, i0, i1)
                 candidates.append(
                     dict(
                         traj_id=row.get("traj_id"),
-                        start_step=int(start),
-                        end_step=int(end),
+                        start_step=clipped[0],
+                        end_step=clipped[1],
                         score=score,
                         delta_h_z_max=0.0,
                         mass_shift_z_max=score,
@@ -125,14 +176,23 @@ def detect_for_trajectory(
             dent_z_values = robust_z(dent)
             q_thr = np.nanquantile(dent_z_values, float(mass_shift_quantile)) if dent_z_values.size else np.inf
             mask = (dent_z_values >= float(mass_shift_z)) | ((dent_z_values >= float(q_thr)) & (dent_z_values > 0.0))
+            mask &= _range_mask(entropy_steps, detect_start_step, detect_end_step)
             intervals = intervals_from_mask(entropy_steps, mask, pad_steps=pad_steps)
             for start, end, i0, i1 in intervals:
+                clipped = _clip_interval(
+                    int(start),
+                    int(end),
+                    detect_start_step=detect_start_step,
+                    detect_end_step=detect_end_step,
+                )
+                if clipped is None:
+                    continue
                 score = _interval_score(dent_z_values, i0, i1)
                 candidates.append(
                     dict(
                         traj_id=row.get("traj_id"),
-                        start_step=int(start),
-                        end_step=int(end),
+                        start_step=clipped[0],
+                        end_step=clipped[1],
                         score=score,
                         delta_h_z_max=0.0,
                         mass_shift_z_max=score,
@@ -287,6 +347,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--merge-gap-steps", type=int, default=5000, help="Merge candidate intervals separated by this gap.")
     parser.add_argument("--pad-steps", type=int, default=1000, help="Pad each raw candidate interval.")
+    parser.add_argument(
+        "--start-step",
+        type=int,
+        default=None,
+        help="Ignore candidates before this simulation step. Defaults to manifest.detect_start_step.",
+    )
+    parser.add_argument(
+        "--end-step",
+        type=int,
+        default=None,
+        help="Ignore candidates after this simulation step. Defaults to manifest.detect_end_step.",
+    )
     return parser.parse_args()
 
 
@@ -299,7 +371,14 @@ def main() -> None:
     assert output_dir is not None
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    manifest_rows = _load_manifest(dataset_root)
+    manifest = _load_manifest(dataset_root)
+    manifest_rows = manifest.get("trajectories", [])
+    detect_start_step = args.start_step
+    if detect_start_step is None and manifest.get("detect_start_step", None) is not None:
+        detect_start_step = int(manifest["detect_start_step"])
+    detect_end_step = args.end_step
+    if detect_end_step is None and manifest.get("detect_end_step", None) is not None:
+        detect_end_step = int(manifest["detect_end_step"])
     all_candidates: list[dict[str, Any]] = []
     for row in manifest_rows:
         all_candidates.extend(
@@ -311,6 +390,8 @@ def main() -> None:
                 mass_shift_quantile=float(args.mass_shift_quantile),
                 merge_gap_steps=int(args.merge_gap_steps),
                 pad_steps=int(args.pad_steps),
+                detect_start_step=detect_start_step,
+                detect_end_step=detect_end_step,
             )
         )
 

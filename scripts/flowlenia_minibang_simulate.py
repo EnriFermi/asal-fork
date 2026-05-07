@@ -202,12 +202,7 @@ def select_params(checkpoint_dir: Path, args: Any) -> list[dict[str, Any]]:
         raise ValueError(f"n_trajectories must be >= 1, got {target_n}.")
 
     rng = np.random.default_rng(int(_get(args, "selection_seed", 0)))
-    iter_bins = int(_get(args, "selection_iter_bins", min(10, target_n)))
-    iter_bins = max(1, min(iter_bins, target_n, max(1, n_iters)))
-    elite_fraction = float(_get(args, "selection_elite_fraction", 0.35))
-    elite_fraction = float(np.clip(elite_fraction, 0.0, 1.0))
-    pool_min = int(_get(args, "selection_pool_min_per_bin", 8))
-    best_traj_per_bin = _as_bool(_get(args, "selection_best_traj_per_bin", True), True)
+    selection_mode = str(_get(args, "selection_mode", "iter_bins")).strip().lower().replace("-", "_")
 
     selected: list[dict[str, Any]] = []
     seen_hashes: set[str] = set()
@@ -225,40 +220,57 @@ def select_params(checkpoint_dir: Path, args: Any) -> list[dict[str, Any]]:
         selected.append(row_out)
         return True
 
-    edges = np.linspace(0, n_iters, iter_bins + 1, dtype=np.int64)
-    quotas = np.full((iter_bins,), target_n // iter_bins, dtype=np.int64)
-    quotas[: target_n % iter_bins] += 1
-
-    for i_bin in range(iter_bins):
-        lo = int(edges[i_bin])
-        hi = int(edges[i_bin + 1])
-        if i_bin == iter_bins - 1:
-            hi = max(hi, n_iters)
-        in_bin = [c for c in candidates if lo <= int(c.get("iter", 0)) < hi]
-        if not in_bin:
-            continue
-
-        added_best = False
-        if best_traj_per_bin:
-            best_rows = sorted([c for c in in_bin if c.get("source") == "best_traj"], key=_loss_sort_key)
-            if best_rows and len(selected) < target_n:
-                added_best = add_candidate(best_rows[0])
-
-        in_bin_sorted = sorted(in_bin, key=_loss_sort_key)
-        pool_n = max(pool_min, int(np.ceil(elite_fraction * len(in_bin_sorted))))
-        pool = in_bin_sorted[: min(len(in_bin_sorted), pool_n)]
-        quota_remaining = max(0, int(quotas[i_bin]) - (1 if added_best else 0))
-        if quota_remaining <= 0:
-            continue
-        if len(pool) <= quota_remaining:
-            chosen = pool
-        else:
-            idx = rng.choice(len(pool), size=quota_remaining, replace=False)
-            chosen = [pool[int(i)] for i in idx]
-        for row in chosen:
+    if selection_mode in {"loss", "loss_top", "global_loss"}:
+        for row in sorted(candidates, key=_loss_sort_key):
             if len(selected) >= target_n:
                 break
             add_candidate(row)
+    elif selection_mode in {"iter_bins", "iteration_bins", "stratified"}:
+        iter_bins = int(_get(args, "selection_iter_bins", min(10, target_n)))
+        iter_bins = max(1, min(iter_bins, target_n, max(1, n_iters)))
+        elite_fraction = float(_get(args, "selection_elite_fraction", 0.35))
+        elite_fraction = float(np.clip(elite_fraction, 0.0, 1.0))
+        pool_min = int(_get(args, "selection_pool_min_per_bin", 8))
+        best_traj_per_bin = _as_bool(_get(args, "selection_best_traj_per_bin", True), True)
+
+        edges = np.linspace(0, n_iters, iter_bins + 1, dtype=np.int64)
+        quotas = np.full((iter_bins,), target_n // iter_bins, dtype=np.int64)
+        quotas[: target_n % iter_bins] += 1
+
+        for i_bin in range(iter_bins):
+            lo = int(edges[i_bin])
+            hi = int(edges[i_bin + 1])
+            if i_bin == iter_bins - 1:
+                hi = max(hi, n_iters)
+            in_bin = [c for c in candidates if lo <= int(c.get("iter", 0)) < hi]
+            if not in_bin:
+                continue
+
+            added_best = False
+            if best_traj_per_bin:
+                best_rows = sorted([c for c in in_bin if c.get("source") == "best_traj"], key=_loss_sort_key)
+                if best_rows and len(selected) < target_n:
+                    added_best = add_candidate(best_rows[0])
+
+            in_bin_sorted = sorted(in_bin, key=_loss_sort_key)
+            pool_n = max(pool_min, int(np.ceil(elite_fraction * len(in_bin_sorted))))
+            pool = in_bin_sorted[: min(len(in_bin_sorted), pool_n)]
+            quota_remaining = max(0, int(quotas[i_bin]) - (1 if added_best else 0))
+            if quota_remaining <= 0:
+                continue
+            if len(pool) <= quota_remaining:
+                chosen = pool
+            else:
+                idx = rng.choice(len(pool), size=quota_remaining, replace=False)
+                chosen = [pool[int(i)] for i in idx]
+            for row in chosen:
+                if len(selected) >= target_n:
+                    break
+                add_candidate(row)
+    else:
+        raise ValueError(
+            f"Unknown selection_mode={selection_mode!r}. Use 'loss' or 'iter_bins'."
+        )
 
     if len(selected) < target_n:
         for row in sorted(candidates, key=lambda r: (int(r.get("iter", 0)), *_loss_sort_key(r))):
@@ -1042,7 +1054,14 @@ def simulate_batch(
     return runs
 
 
-def _write_manifest(output_root: Path, selected: list[dict[str, Any]], runs: list[dict[str, Any]], cfg_path: Path, checkpoint_dir: Path) -> None:
+def _write_manifest(
+    output_root: Path,
+    selected: list[dict[str, Any]],
+    runs: list[dict[str, Any]],
+    cfg_path: Path,
+    checkpoint_dir: Path,
+    flat_args: Any,
+) -> None:
     manifest_rows: list[dict[str, Any]] = []
     run_by_id = {run["traj_id"]: run for run in runs}
     for row in selected:
@@ -1065,6 +1084,8 @@ def _write_manifest(output_root: Path, selected: list[dict[str, Any]], runs: lis
             config_path=str(cfg_path),
             checkpoint_dir=str(checkpoint_dir),
             n_trajectories=len(manifest_rows),
+            detect_start_step=_get(flat_args, "detect_start_step", None),
+            detect_end_step=_get(flat_args, "detect_end_step", None),
             trajectories=manifest_rows,
         ),
     )
@@ -1136,7 +1157,7 @@ def main() -> None:
     print(f"Output root: {output_root}")
     if cli.select_only:
         print("select-only requested; stopping before simulation.")
-        _write_manifest(output_root, selected, [], cfg_path, checkpoint_dir)
+        _write_manifest(output_root, selected, [], cfg_path, checkpoint_dir, flat)
         return
 
     batch_size = max(1, int(_get(flat, "batch_size", 2)))
@@ -1152,9 +1173,9 @@ def main() -> None:
             overwrite=bool(cli.overwrite),
         )
         all_runs.extend(runs)
-        _write_manifest(output_root, selected, all_runs, cfg_path, checkpoint_dir)
+        _write_manifest(output_root, selected, all_runs, cfg_path, checkpoint_dir, flat)
 
-    _write_manifest(output_root, selected, all_runs, cfg_path, checkpoint_dir)
+    _write_manifest(output_root, selected, all_runs, cfg_path, checkpoint_dir, flat)
     print(f"Done. Dataset manifest: {output_root / 'manifest.json'}")
 
 
