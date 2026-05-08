@@ -143,7 +143,11 @@ minibang:
   cluster_dp_lambda: 0.18
   cluster_dp_iters: 8
   cluster_dp_max_clusters: 32
-  cluster_merge_rgb_threshold: 0.45
+  cluster_merge_rgb_threshold: 0.0
+  cluster_merge_hue_threshold_deg: 0.0
+  cluster_merge_color_families: true
+  cluster_merge_min_saturation: 0.2
+  cluster_merge_min_value: 0.05
 
   # Used only when cluster_method: kmeans.
   cluster_k: 8
