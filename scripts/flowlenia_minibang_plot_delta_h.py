@@ -729,6 +729,14 @@ def _recompute_cli_overrides(args: argparse.Namespace) -> dict[str, Any]:
         overrides["cluster_dp_max_clusters"] = int(args.cluster_dp_max_clusters)
     if args.cluster_merge_rgb_threshold is not None:
         overrides["cluster_merge_rgb_threshold"] = float(args.cluster_merge_rgb_threshold)
+    if args.cluster_merge_hue_threshold_deg is not None:
+        overrides["cluster_merge_hue_threshold_deg"] = float(args.cluster_merge_hue_threshold_deg)
+    if args.cluster_merge_color_families is not None:
+        overrides["cluster_merge_color_families"] = _parse_optional_bool_arg(args.cluster_merge_color_families)
+    if args.cluster_merge_min_saturation is not None:
+        overrides["cluster_merge_min_saturation"] = float(args.cluster_merge_min_saturation)
+    if args.cluster_merge_min_value is not None:
+        overrides["cluster_merge_min_value"] = float(args.cluster_merge_min_value)
     if args.cluster_standardize is not None:
         overrides["cluster_standardize"] = _parse_optional_bool_arg(args.cluster_standardize)
     return overrides
@@ -781,6 +789,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cluster-dp-iters", type=int, default=None)
     parser.add_argument("--cluster-dp-max-clusters", type=int, default=None)
     parser.add_argument("--cluster-merge-rgb-threshold", type=float, default=None)
+    parser.add_argument("--cluster-merge-hue-threshold-deg", type=float, default=None)
+    parser.add_argument("--cluster-merge-color-families", default=None, help="Override cluster_merge_color_families: true/false.")
+    parser.add_argument("--cluster-merge-min-saturation", type=float, default=None)
+    parser.add_argument("--cluster-merge-min-value", type=float, default=None)
     parser.add_argument("--cluster-standardize", default=None, help="Override cluster_standardize: true/false.")
     parser.add_argument("--start-step", type=int, default=None, help="Optional vertical marker. Defaults to manifest.")
     parser.add_argument("--end-step", type=int, default=None, help="Optional vertical marker. Defaults to manifest.")

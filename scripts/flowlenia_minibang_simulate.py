@@ -678,6 +678,57 @@ def _weighted_group_mean(values: np.ndarray, labels: np.ndarray, weights: np.nda
     return out.astype(np.float32)
 
 
+def _compact_labels(labels: np.ndarray) -> tuple[np.ndarray, int]:
+    lab = np.asarray(labels, dtype=np.int32).reshape(-1)
+    unique = np.unique(lab)
+    remap = {int(old): i for i, old in enumerate(unique.tolist())}
+    compact = np.asarray([remap[int(x)] for x in lab], dtype=np.int32)
+    return compact, int(unique.size)
+
+
+def _rgb_to_hsv(rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    arr = np.clip(np.asarray(rgb, dtype=np.float64), 0.0, 1.0)
+    r, g, b = arr[:, 0], arr[:, 1], arr[:, 2]
+    mx = np.max(arr, axis=1)
+    mn = np.min(arr, axis=1)
+    delta = mx - mn
+    hue = np.zeros((arr.shape[0],), dtype=np.float64)
+    nz = delta > 1e-12
+    mask = nz & (mx == r)
+    hue[mask] = (60.0 * ((g[mask] - b[mask]) / delta[mask]) + 360.0) % 360.0
+    mask = nz & (mx == g)
+    hue[mask] = 60.0 * ((b[mask] - r[mask]) / delta[mask] + 2.0)
+    mask = nz & (mx == b)
+    hue[mask] = 60.0 * ((r[mask] - g[mask]) / delta[mask] + 4.0)
+    sat = np.where(mx > 1e-12, delta / np.maximum(mx, 1e-12), 0.0)
+    return hue.astype(np.float32), sat.astype(np.float32), mx.astype(np.float32)
+
+
+def _color_family_labels(
+    centers_rgb: np.ndarray,
+    *,
+    min_saturation: float,
+    min_value: float,
+) -> np.ndarray:
+    hue, sat, val = _rgb_to_hsv(centers_rgb)
+    labels = np.zeros((hue.shape[0],), dtype=np.int32)
+    low_value = val < float(min_value)
+    low_sat = (~low_value) & (sat < float(min_saturation))
+    labels[low_value] = 0
+    labels[low_sat] = 1
+    chroma = ~(low_value | low_sat)
+    h = hue[chroma]
+    fam = np.empty_like(h, dtype=np.int32)
+    fam[(h < 30.0) | (h >= 330.0)] = 2
+    fam[(h >= 30.0) & (h < 75.0)] = 3
+    fam[(h >= 75.0) & (h < 165.0)] = 4
+    fam[(h >= 165.0) & (h < 200.0)] = 5
+    fam[(h >= 200.0) & (h < 265.0)] = 6
+    fam[(h >= 265.0) & (h < 330.0)] = 7
+    labels[chroma] = fam
+    return labels
+
+
 def _merge_centers_by_rgb(
     centers_z: np.ndarray,
     centers_raw: np.ndarray,
@@ -686,12 +737,14 @@ def _merge_centers_by_rgb(
     sample_weights: np.ndarray,
     *,
     threshold: float,
+    merge_color_families: bool,
+    hue_threshold_deg: float,
+    min_saturation: float,
+    min_value: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    if float(threshold) <= 0.0 or centers_rgb.shape[0] <= 1:
+    if centers_rgb.shape[0] <= 1:
         identity = np.arange(centers_rgb.shape[0], dtype=np.int32)
         return centers_z, centers_raw, centers_rgb, identity
-
-    from evolutionary_metrics import dpmeans_weighted
 
     old_k = int(centers_rgb.shape[0])
     old_weights = np.bincount(
@@ -700,15 +753,56 @@ def _merge_centers_by_rgb(
         minlength=old_k,
     ).astype(np.float32)
     old_weights = np.where(old_weights > 0.0, old_weights, 1.0).astype(np.float32)
-    merge_rgb = dpmeans_weighted(
-        np.asarray(centers_rgb, dtype=np.float32),
-        old_weights,
-        lam=float(threshold),
-        iters=6,
-        max_clusters=old_k,
-    )
-    merge_labels = _assign_kmeans(np.asarray(centers_rgb, dtype=np.float32), merge_rgb)
-    new_k = int(merge_rgb.shape[0])
+
+    if merge_color_families:
+        merge_labels, new_k = _compact_labels(
+            _color_family_labels(
+                centers_rgb,
+                min_saturation=float(min_saturation),
+                min_value=float(min_value),
+            )
+        )
+    elif float(hue_threshold_deg) > 0.0:
+        from evolutionary_metrics import dpmeans_weighted
+
+        hue, sat, val = _rgb_to_hsv(centers_rgb)
+        saturated = (sat >= float(min_saturation)) & (val >= float(min_value))
+        merge_labels = np.arange(old_k, dtype=np.int32)
+        next_label = old_k
+        if np.any(saturated):
+            theta = np.deg2rad(hue[saturated].astype(np.float64))
+            hue_points = np.stack([np.cos(theta), np.sin(theta)], axis=1).astype(np.float32)
+            hue_lam = float(2.0 * np.sin(np.deg2rad(float(hue_threshold_deg)) * 0.5))
+            hue_centers = dpmeans_weighted(
+                hue_points,
+                old_weights[saturated],
+                lam=hue_lam,
+                iters=6,
+                max_clusters=int(np.sum(saturated)),
+            )
+            sat_labels = _assign_kmeans(hue_points, hue_centers)
+            merge_labels[saturated] = sat_labels
+            if np.any(~saturated):
+                merge_labels[~saturated] = np.arange(next_label, next_label + int(np.sum(~saturated)), dtype=np.int32)
+            merge_labels, new_k = _compact_labels(merge_labels)
+        else:
+            merge_labels, new_k = _compact_labels(merge_labels)
+    elif float(threshold) > 0.0:
+        from evolutionary_metrics import dpmeans_weighted
+
+        merge_rgb = dpmeans_weighted(
+            np.asarray(centers_rgb, dtype=np.float32),
+            old_weights,
+            lam=float(threshold),
+            iters=6,
+            max_clusters=old_k,
+        )
+        merge_labels = _assign_kmeans(np.asarray(centers_rgb, dtype=np.float32), merge_rgb)
+        new_k = int(merge_rgb.shape[0])
+    else:
+        identity = np.arange(old_k, dtype=np.int32)
+        return centers_z, centers_raw, centers_rgb, identity
+
     merged_z = _weighted_group_mean(centers_z, merge_labels, old_weights, new_k)
     merged_raw = _weighted_group_mean(centers_raw, merge_labels, old_weights, new_k)
     merged_rgb = _weighted_group_mean(centers_rgb, merge_labels, old_weights, new_k)
@@ -818,6 +912,10 @@ def _compute_cluster_metrics(apf_dir: Path, args: Any, *, seed: int) -> dict[str
     centers_rgb = _cluster_center_rgb(centers_raw, cluster_space=cluster_space)
     premerge_k_eff = int(k_eff)
     merge_rgb_threshold = float(_get(args, "cluster_merge_rgb_threshold", 0.0))
+    merge_hue_threshold_deg = float(_get(args, "cluster_merge_hue_threshold_deg", 0.0))
+    merge_color_families = _as_bool(_get(args, "cluster_merge_color_families", False), False)
+    merge_min_saturation = float(_get(args, "cluster_merge_min_saturation", 0.2))
+    merge_min_value = float(_get(args, "cluster_merge_min_value", 0.05))
     centers_z, centers_raw, centers_rgb, cluster_merge_map = _merge_centers_by_rgb(
         centers_z,
         centers_raw,
@@ -825,6 +923,10 @@ def _compute_cluster_metrics(apf_dir: Path, args: Any, *, seed: int) -> dict[str
         sample_labels,
         W_raw,
         threshold=merge_rgb_threshold,
+        merge_color_families=merge_color_families,
+        hue_threshold_deg=merge_hue_threshold_deg,
+        min_saturation=merge_min_saturation,
+        min_value=merge_min_value,
     )
     k_eff = int(centers_z.shape[0])
 
@@ -886,6 +988,10 @@ def _compute_cluster_metrics(apf_dir: Path, args: Any, *, seed: int) -> dict[str
         cluster_k=np.asarray(k_eff, dtype=np.int32),
         cluster_premerge_k=np.asarray(premerge_k_eff, dtype=np.int32),
         cluster_merge_rgb_threshold=np.asarray(merge_rgb_threshold, dtype=np.float32),
+        cluster_merge_hue_threshold_deg=np.asarray(merge_hue_threshold_deg, dtype=np.float32),
+        cluster_merge_color_families=np.asarray(merge_color_families),
+        cluster_merge_min_saturation=np.asarray(merge_min_saturation, dtype=np.float32),
+        cluster_merge_min_value=np.asarray(merge_min_value, dtype=np.float32),
         cluster_merge_map=cluster_merge_map.astype(np.int32),
         cluster_method=np.asarray(cluster_method),
         cluster_space=np.asarray(cluster_space),
