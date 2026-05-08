@@ -612,17 +612,27 @@ def _fit_dpmeans_weighted(
     return centers_arr, labels_final, inertia
 
 
-def _cluster_features_from_p(p_flat: np.ndarray, *, cluster_space: str) -> np.ndarray:
+def _p_rgb_features(p_flat: np.ndarray) -> np.ndarray:
+    p = np.asarray(p_flat, dtype=np.float32)
+    if p.shape[-1] >= 3:
+        return p[:, :3].astype(np.float32, copy=False)
+    reps = int(np.ceil(3 / max(1, p.shape[-1])))
+    return np.tile(p, (1, reps))[:, :3].astype(np.float32)
+
+
+def _cluster_features_from_apf(p_flat: np.ndarray, mass_flat: np.ndarray | None, *, cluster_space: str) -> np.ndarray:
     mode = str(cluster_space).strip().lower()
     if mode in {"p", "p_full", "full"}:
         return np.asarray(p_flat, dtype=np.float32)
-    if mode in {"pcolor", "p_color", "p_rgb", "rgb"}:
-        p = np.asarray(p_flat, dtype=np.float32)
-        if p.shape[-1] >= 3:
-            return p[:, :3]
-        reps = int(np.ceil(3 / max(1, p.shape[-1])))
-        return np.tile(p, (1, reps))[:, :3].astype(np.float32)
-    raise ValueError(f"Unsupported cluster_space={cluster_space!r}. Use 'p' or 'pcolor'.")
+    if mode in {"p_rgb", "prgb", "raw_rgb"}:
+        return _p_rgb_features(p_flat)
+    if mode in {"pcolor", "p_color", "render", "rendered", "rendered_rgb", "video_rgb", "rgb"}:
+        rgb = _p_rgb_features(p_flat)
+        if mass_flat is None:
+            return np.clip(rgb, 0.0, 1.0).astype(np.float32)
+        inten = np.asarray(mass_flat, dtype=np.float32).reshape(-1, 1)
+        return np.clip(inten * rgb, 0.0, 1.0).astype(np.float32)
+    raise ValueError(f"Unsupported cluster_space={cluster_space!r}. Use 'p', 'p_rgb', or 'pcolor'.")
 
 
 def _cluster_center_rgb(centers_raw: np.ndarray, *, cluster_space: str) -> np.ndarray:
@@ -690,7 +700,7 @@ def _compute_cluster_metrics(apf_dir: Path, args: Any, *, seed: int) -> dict[str
                     chosen = rng.choice(valid_idx, size=n_take, replace=True, p=probs)
                 else:
                     chosen = rng.choice(valid_idx, size=n_take, replace=True)
-                samples.append(_cluster_features_from_p(p_flat[chosen], cluster_space=cluster_space))
+                samples.append(_cluster_features_from_apf(p_flat[chosen], mass[chosen], cluster_space=cluster_space))
                 sample_weights.append(np.ones((chosen.shape[0],), dtype=np.float32))
 
     if not samples:
@@ -746,7 +756,7 @@ def _compute_cluster_metrics(apf_dir: Path, args: Any, *, seed: int) -> dict[str
             steps = np.asarray(data["steps"], dtype=np.int64)
             for i in range(P.shape[0]):
                 mass = np.sum(A[i], axis=-1).reshape(-1).astype(np.float64)
-                X_i = _cluster_features_from_p(P[i].reshape((-1, P.shape[-1])), cluster_space=cluster_space)
+                X_i = _cluster_features_from_apf(P[i].reshape((-1, P.shape[-1])), mass, cluster_space=cluster_space)
                 X_i = ((X_i - center) / scale).astype(np.float32)
                 labels_i = _assign_kmeans(X_i, centers_z)
                 row = np.bincount(labels_i, weights=mass, minlength=k_eff).astype(np.float64)

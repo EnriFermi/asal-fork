@@ -748,7 +748,7 @@ def parse_args() -> argparse.Namespace:
         help="Override metric_range_end_steps when recomputing metrics. Use null/none/auto for rollout end.",
     )
     parser.add_argument("--cluster-method", choices=["kmeans", "dpmeans"], default=None)
-    parser.add_argument("--cluster-space", choices=["p", "pcolor"], default=None)
+    parser.add_argument("--cluster-space", choices=["p", "p_rgb", "pcolor", "rendered"], default=None)
     parser.add_argument("--cluster-dp-lambda", type=float, default=None)
     parser.add_argument("--cluster-dp-iters", type=int, default=None)
     parser.add_argument("--cluster-dp-max-clusters", type=int, default=None)
