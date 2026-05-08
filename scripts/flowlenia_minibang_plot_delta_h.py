@@ -768,6 +768,12 @@ def parse_args() -> argparse.Namespace:
         default="prob",
         help="Plot normalized cluster mass fractions or raw cluster masses.",
     )
+    parser.add_argument(
+        "--max-trials",
+        type=int,
+        default=None,
+        help="Only process the first N trajectories from manifest/traj_*; useful for debugging recomputation.",
+    )
     return parser.parse_args()
 
 
@@ -791,6 +797,12 @@ def main() -> None:
     import matplotlib.pyplot as plt
 
     manifest, rows = _load_manifest_rows(dataset_root)
+    total_rows = len(rows)
+    if args.max_trials is not None:
+        if int(args.max_trials) < 1:
+            raise ValueError("--max-trials must be >= 1")
+        rows = rows[: int(args.max_trials)]
+        print(f"Processing first {len(rows)} of {total_rows} trajectories (--max-trials={args.max_trials})")
     detect_start_step = args.start_step if args.start_step is not None else _as_optional_int(manifest.get("detect_start_step"))
     detect_end_step = args.end_step if args.end_step is not None else _as_optional_int(manifest.get("detect_end_step"))
     metric_overrides = _recompute_cli_overrides(args)
