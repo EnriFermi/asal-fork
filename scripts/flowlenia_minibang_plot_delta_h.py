@@ -485,6 +485,20 @@ def _plot_delta_h_heatmap_grid(
     plt.close(fig)
 
 
+def _cluster_plot_indices(mean_mass: np.ndarray, *, top_k: int | None, min_mean: float) -> np.ndarray:
+    mean = np.asarray(mean_mass, dtype=np.float64).reshape(-1)
+    finite_mean = np.where(np.isfinite(mean), mean, -np.inf)
+    idx = np.arange(mean.size, dtype=np.int32)
+    if float(min_mean) > 0.0:
+        idx = idx[finite_mean >= float(min_mean)]
+    if idx.size == 0 and mean.size:
+        idx = np.asarray([int(np.nanargmax(finite_mean))], dtype=np.int32)
+    idx = idx[np.argsort(-finite_mean[idx])]
+    if top_k is not None:
+        idx = idx[: max(1, int(top_k))]
+    return idx.astype(np.int32, copy=False)
+
+
 def _plot_cluster_mass_one(
     *,
     plt: Any,
@@ -493,6 +507,8 @@ def _plot_cluster_mass_one(
     out_path: Path,
     detect_start_step: int | None,
     detect_end_step: int | None,
+    plot_top_k: int | None,
+    plot_min_mean: float,
 ) -> dict[str, Any]:
     traj_id = _traj_id(row)
     steps = np.asarray(series["steps"], dtype=np.float64)
@@ -510,9 +526,10 @@ def _plot_cluster_mass_one(
     mean_mass = np.nanmean(mass_f, axis=0)
     dominant_cluster = int(np.nanargmax(mean_mass))
     dominant_mean = float(mean_mass[dominant_cluster])
+    plot_idx = _cluster_plot_indices(mean_mass, top_k=plot_top_k, min_mean=plot_min_mean)
 
     fig, ax = plt.subplots(figsize=(10.5, 4.8), constrained_layout=True)
-    for i_cluster in range(n_clusters):
+    for i_cluster in plot_idx:
         ax.plot(
             steps_f,
             mass_f[:, i_cluster],
@@ -549,6 +566,7 @@ def _plot_cluster_mass_one(
         "cluster_mass_plot_path": str(out_path),
         "cluster_mass_n_points": int(mass_f.shape[0]),
         "cluster_mass_n_clusters": n_clusters,
+        "cluster_mass_n_plotted_clusters": int(plot_idx.size),
         "cluster_mass_dominant_cluster": dominant_cluster,
         "cluster_mass_dominant_mean": dominant_mean,
         "cluster_tv_lag_max": float(np.nanmax(tv)) if tv is not None and np.asarray(tv).size else "",
@@ -563,6 +581,8 @@ def _plot_cluster_mass_grid(
     plotted: list[tuple[dict[str, Any], dict[str, Any]]],
     out_path: Path,
     detect_start_step: int | None,
+    plot_top_k: int | None,
+    plot_min_mean: float,
 ) -> None:
     if not plotted:
         return
@@ -580,7 +600,8 @@ def _plot_cluster_mass_grid(
         colors = np.asarray(series.get("colors", np.ones((n_clusters, 3)) * 0.25), dtype=np.float64)
         if colors.shape[0] < n_clusters:
             colors = np.pad(colors, ((0, n_clusters - colors.shape[0]), (0, 0)), constant_values=0.25)
-        for i_cluster in range(n_clusters):
+        mean_mass = np.nanmean(mass_f, axis=0) if mass_f.size else np.zeros((n_clusters,), dtype=np.float64)
+        for i_cluster in _cluster_plot_indices(mean_mass, top_k=plot_top_k, min_mean=plot_min_mean):
             ax.plot(steps_f, mass_f[:, i_cluster], linewidth=1.0, color=colors[i_cluster, :3], alpha=0.92)
         if detect_start_step is not None:
             ax.axvline(int(detect_start_step), color="#666666", linestyle="--", linewidth=0.8, alpha=0.55)
@@ -614,6 +635,7 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "delta_h_tau_grid",
         "cluster_mass_n_points",
         "cluster_mass_n_clusters",
+        "cluster_mass_n_plotted_clusters",
         "cluster_mass_dominant_cluster",
         "cluster_mass_dominant_mean",
         "cluster_tv_lag_max",
@@ -748,7 +770,11 @@ def parse_args() -> argparse.Namespace:
         help="Override metric_range_end_steps when recomputing metrics. Use null/none/auto for rollout end.",
     )
     parser.add_argument("--cluster-method", choices=["kmeans", "dpmeans"], default=None)
-    parser.add_argument("--cluster-space", choices=["p", "p_rgb", "pcolor", "rendered"], default=None)
+    parser.add_argument(
+        "--cluster-space",
+        choices=["p", "p_rgb", "pcolor", "rendered", "pcolor_chroma", "rendered_chroma", "chroma"],
+        default=None,
+    )
     parser.add_argument("--cluster-dp-lambda", type=float, default=None)
     parser.add_argument("--cluster-dp-iters", type=int, default=None)
     parser.add_argument("--cluster-dp-max-clusters", type=int, default=None)
@@ -767,6 +793,18 @@ def parse_args() -> argparse.Namespace:
         choices=["prob", "raw"],
         default="prob",
         help="Plot normalized cluster mass fractions or raw cluster masses.",
+    )
+    parser.add_argument(
+        "--cluster-plot-top-k",
+        type=int,
+        default=None,
+        help="Only draw the top K clusters by mean plotted mass. Metrics are not modified.",
+    )
+    parser.add_argument(
+        "--cluster-plot-min-mean",
+        type=float,
+        default=0.0,
+        help="Only draw clusters whose mean plotted mass is at least this value. Metrics are not modified.",
     )
     parser.add_argument(
         "--max-trials",
@@ -944,6 +982,8 @@ def main() -> None:
                     out_path=cluster_mass_plot_path,
                     detect_start_step=detect_start_step,
                     detect_end_step=detect_end_step,
+                    plot_top_k=args.cluster_plot_top_k,
+                    plot_min_mean=float(args.cluster_plot_min_mean),
                 )
             )
             cluster_mass_plotted.append((row, series))
@@ -976,6 +1016,8 @@ def main() -> None:
         plotted=cluster_mass_plotted,
         out_path=cluster_grid_path,
         detect_start_step=detect_start_step,
+        plot_top_k=args.cluster_plot_top_k,
+        plot_min_mean=float(args.cluster_plot_min_mean),
     )
     _write_csv(output_dir / "metric_plot_summary.csv", summary_rows)
     (output_dir / "delta_h_config.json").write_text(json.dumps(delta_h_metadata_rows, indent=2, sort_keys=True) + "\n")

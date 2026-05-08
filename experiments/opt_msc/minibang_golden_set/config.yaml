@@ -99,11 +99,12 @@ minibang:
   minibang_metric_tau_mode: max_grid
 
   cluster_method: dpmeans
-  # pcolor means the actual rendered Pcolor RGB: clip(sum(A) * P[..., :3], 0, 1).
-  cluster_space: pcolor
-  cluster_dp_lambda: 0.08
+  # pcolor_chroma means chromaticity of the actual rendered Pcolor RGB:
+  # chroma(clip(sum(A) * P[..., :3], 0, 1)). This avoids splitting one color by density/brightness.
+  cluster_space: pcolor_chroma
+  cluster_dp_lambda: 0.18
   cluster_dp_iters: 8
-  cluster_dp_max_clusters: 64
+  cluster_dp_max_clusters: 32
 
   # Used only when cluster_method: kmeans.
   cluster_k: 8
