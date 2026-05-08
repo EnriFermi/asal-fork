@@ -662,6 +662,60 @@ def _cluster_center_rgb(centers_raw: np.ndarray, *, cluster_space: str) -> np.nd
     return np.clip(rgb, 0.0, 1.0).astype(np.float32)
 
 
+def _weighted_group_mean(values: np.ndarray, labels: np.ndarray, weights: np.ndarray, k: int) -> np.ndarray:
+    vals = np.asarray(values, dtype=np.float64)
+    lab = np.asarray(labels, dtype=np.int32).reshape(-1)
+    w = np.asarray(weights, dtype=np.float64).reshape(-1)
+    sums = np.zeros((int(k), vals.shape[1]), dtype=np.float64)
+    sw = np.zeros((int(k),), dtype=np.float64)
+    np.add.at(sums, lab, vals * w[:, None])
+    np.add.at(sw, lab, w)
+    out = np.zeros_like(sums, dtype=np.float64)
+    keep = sw > 0.0
+    out[keep] = sums[keep] / sw[keep, None]
+    if not np.all(keep):
+        out[~keep] = vals[:1]
+    return out.astype(np.float32)
+
+
+def _merge_centers_by_rgb(
+    centers_z: np.ndarray,
+    centers_raw: np.ndarray,
+    centers_rgb: np.ndarray,
+    sample_labels: np.ndarray,
+    sample_weights: np.ndarray,
+    *,
+    threshold: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if float(threshold) <= 0.0 or centers_rgb.shape[0] <= 1:
+        identity = np.arange(centers_rgb.shape[0], dtype=np.int32)
+        return centers_z, centers_raw, centers_rgb, identity
+
+    from evolutionary_metrics import dpmeans_weighted
+
+    old_k = int(centers_rgb.shape[0])
+    old_weights = np.bincount(
+        np.asarray(sample_labels, dtype=np.int32),
+        weights=np.asarray(sample_weights, dtype=np.float64),
+        minlength=old_k,
+    ).astype(np.float32)
+    old_weights = np.where(old_weights > 0.0, old_weights, 1.0).astype(np.float32)
+    merge_rgb = dpmeans_weighted(
+        np.asarray(centers_rgb, dtype=np.float32),
+        old_weights,
+        lam=float(threshold),
+        iters=6,
+        max_clusters=old_k,
+    )
+    merge_labels = _assign_kmeans(np.asarray(centers_rgb, dtype=np.float32), merge_rgb)
+    new_k = int(merge_rgb.shape[0])
+    merged_z = _weighted_group_mean(centers_z, merge_labels, old_weights, new_k)
+    merged_raw = _weighted_group_mean(centers_raw, merge_labels, old_weights, new_k)
+    merged_rgb = _weighted_group_mean(centers_rgb, merge_labels, old_weights, new_k)
+    merged_rgb = np.clip(merged_rgb, 0.0, 1.0).astype(np.float32)
+    return merged_z, merged_raw, merged_rgb, merge_labels.astype(np.int32)
+
+
 def _count_snapshots(apf_dir: Path) -> int:
     total = 0
     for path, _s0, _s1, _idx in list_apf_chunks(apf_dir):
@@ -743,7 +797,7 @@ def _compute_cluster_metrics(apf_dir: Path, args: Any, *, seed: int) -> dict[str
         X = X_raw
 
     if cluster_method == "dpmeans":
-        centers_z, _labels, inertia = _fit_dpmeans_weighted(
+        centers_z, sample_labels, inertia = _fit_dpmeans_weighted(
             X,
             W_raw,
             lam=float(_get(args, "cluster_dp_lambda", 1.5)),
@@ -753,7 +807,7 @@ def _compute_cluster_metrics(apf_dir: Path, args: Any, *, seed: int) -> dict[str
         k_eff = int(centers_z.shape[0])
     else:
         k_eff = max(1, min(cluster_k, X.shape[0]))
-        centers_z, _labels, inertia = _fit_kmeans(
+        centers_z, sample_labels, inertia = _fit_kmeans(
             X,
             k_eff,
             rng=rng,
@@ -762,6 +816,17 @@ def _compute_cluster_metrics(apf_dir: Path, args: Any, *, seed: int) -> dict[str
         )
     centers_raw = centers_z * scale[None, :] + center[None, :]
     centers_rgb = _cluster_center_rgb(centers_raw, cluster_space=cluster_space)
+    premerge_k_eff = int(k_eff)
+    merge_rgb_threshold = float(_get(args, "cluster_merge_rgb_threshold", 0.0))
+    centers_z, centers_raw, centers_rgb, cluster_merge_map = _merge_centers_by_rgb(
+        centers_z,
+        centers_raw,
+        centers_rgb,
+        sample_labels,
+        W_raw,
+        threshold=merge_rgb_threshold,
+    )
+    k_eff = int(centers_z.shape[0])
 
     steps_all: list[np.ndarray] = []
     mass_rows: list[np.ndarray] = []
@@ -819,6 +884,9 @@ def _compute_cluster_metrics(apf_dir: Path, args: Any, *, seed: int) -> dict[str
         cluster_standardize_center=center.astype(np.float32),
         cluster_standardize_scale=scale.astype(np.float32),
         cluster_k=np.asarray(k_eff, dtype=np.int32),
+        cluster_premerge_k=np.asarray(premerge_k_eff, dtype=np.int32),
+        cluster_merge_rgb_threshold=np.asarray(merge_rgb_threshold, dtype=np.float32),
+        cluster_merge_map=cluster_merge_map.astype(np.int32),
         cluster_method=np.asarray(cluster_method),
         cluster_space=np.asarray(cluster_space),
         cluster_kmeans_inertia=np.asarray(inertia, dtype=np.float32),
