@@ -105,6 +105,7 @@ minibang:
   cluster_dp_lambda: 0.18
   cluster_dp_iters: 8
   cluster_dp_max_clusters: 32
+  cluster_merge_rgb_threshold: 0.45
 
   # Used only when cluster_method: kmeans.
   cluster_k: 8

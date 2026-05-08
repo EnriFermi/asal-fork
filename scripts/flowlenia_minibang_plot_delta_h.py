@@ -727,6 +727,8 @@ def _recompute_cli_overrides(args: argparse.Namespace) -> dict[str, Any]:
         overrides["cluster_dp_iters"] = int(args.cluster_dp_iters)
     if args.cluster_dp_max_clusters is not None:
         overrides["cluster_dp_max_clusters"] = int(args.cluster_dp_max_clusters)
+    if args.cluster_merge_rgb_threshold is not None:
+        overrides["cluster_merge_rgb_threshold"] = float(args.cluster_merge_rgb_threshold)
     if args.cluster_standardize is not None:
         overrides["cluster_standardize"] = _parse_optional_bool_arg(args.cluster_standardize)
     return overrides
@@ -778,6 +780,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cluster-dp-lambda", type=float, default=None)
     parser.add_argument("--cluster-dp-iters", type=int, default=None)
     parser.add_argument("--cluster-dp-max-clusters", type=int, default=None)
+    parser.add_argument("--cluster-merge-rgb-threshold", type=float, default=None)
     parser.add_argument("--cluster-standardize", default=None, help="Override cluster_standardize: true/false.")
     parser.add_argument("--start-step", type=int, default=None, help="Optional vertical marker. Defaults to manifest.")
     parser.add_argument("--end-step", type=int, default=None, help="Optional vertical marker. Defaults to manifest.")
