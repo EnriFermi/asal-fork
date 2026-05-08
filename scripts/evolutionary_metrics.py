@@ -2,7 +2,6 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import lax
-import matplotlib.pyplot as plt
 
 
 def build_weighted_rgb_bins(frames_rgb_u8, frames_mass, q=4, min_bin_mass=0.0):
@@ -49,29 +48,40 @@ def build_weighted_rgb_bins(frames_rgb_u8, frames_mass, q=4, min_bin_mass=0.0):
     return pts, w
 
 
-def dpmeans_weighted(points, weights, lam=20.0, iters=8):
+def dpmeans_weighted(points, weights, lam=20.0, iters=8, max_clusters=None):
     """
     Weighted DP-means: creates new cluster if nearest center farther than lam (RGB L2 units).
-    points:  (N,3) float32
+    points:  (N,D) float32
     weights: (N,)  float32
+    max_clusters: optional cap on K
     Returns:
-      centers: (K,3) float32, deterministically ordered => stable label IDs across time
+      centers: (K,D) float32, deterministically ordered => stable label IDs across time
     """
+    points = np.asarray(points, dtype=np.float32)
+    weights = np.asarray(weights, dtype=np.float32).reshape(-1)
+    if points.ndim != 2 or points.shape[0] == 0:
+        raise ValueError("points must be a non-empty (N,D) array")
+    if weights.shape[0] != points.shape[0]:
+        raise ValueError(f"weights shape {weights.shape} does not match points shape {points.shape}")
+    weights = np.where(np.isfinite(weights) & (weights > 0.0), weights, 1.0).astype(np.float32)
+    max_clusters = points.shape[0] if max_clusters is None else max(1, int(max_clusters))
+
     order = np.argsort(-weights)
     X = points[order]
     w = weights[order]
+    D = X.shape[1]
 
     centers = [X[0].copy()]
     lam2 = float(lam) * float(lam)
 
-    for _ in range(iters):
-        C = np.stack(centers, axis=0)  # (K,3)
+    for _ in range(max(1, int(iters))):
+        C = np.stack(centers, axis=0)  # (K,D)
         assign = np.empty(X.shape[0], dtype=np.int32)
 
         for i in range(X.shape[0]):
             d2 = np.sum((C - X[i]) ** 2, axis=1)
             k = int(np.argmin(d2))
-            if d2[k] > lam2:
+            if d2[k] > lam2 and C.shape[0] < max_clusters:
                 centers.append(X[i].copy())
                 C = np.vstack([C, X[i][None, :]])
                 assign[i] = C.shape[0] - 1
@@ -79,16 +89,17 @@ def dpmeans_weighted(points, weights, lam=20.0, iters=8):
                 assign[i] = k
 
         K = int(assign.max()) + 1
-        sums = np.zeros((K, 3), dtype=np.float64)
+        sums = np.zeros((K, D), dtype=np.float64)
         sw = np.zeros(K, dtype=np.float64)
         np.add.at(sums, assign, (X * w[:, None]).astype(np.float64))
         np.add.at(sw, assign, w.astype(np.float64))
-        Cnew = (sums / sw[:, None]).astype(np.float32)
+        keep = sw > 0.0
+        Cnew = (sums[keep] / sw[keep, None]).astype(np.float32)
 
-        centers = [Cnew[k].copy() for k in range(K)]
+        centers = [Cnew[k].copy() for k in range(Cnew.shape[0])]
 
     C = np.stack(centers, axis=0)
-    order = np.lexsort((C[:, 2], C[:, 1], C[:, 0]))  # stable IDs by centroid RGB
+    order = np.lexsort(tuple(C[:, i] for i in range(C.shape[1] - 1, -1, -1)))  # stable IDs by centroid
     return C[order].astype(np.float32)
 
 
@@ -194,6 +205,8 @@ def compute_mass_trajectories(frames_rgb_u8, frames_mass,
 
 def plot_mass_trajectories(masses_T, palette=None, include_void=False, top_k=12,
                            mass_floor=0.0, logy=False, figsize=(12, 6), title=None):
+    import matplotlib.pyplot as plt
+
     """
     masses_T: (T, K+1)
     palette:  (K+1,3) uint8 (optional). If provided, line color matches label color.

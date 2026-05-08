@@ -238,6 +238,10 @@ def _load_delta_h_heatmap(metrics_path: Path) -> dict[str, Any]:
 
 
 def _colors_from_cluster_centers(data: np.lib.npyio.NpzFile, n_clusters: int) -> np.ndarray:
+    if "cluster_centers_rgb" in data.files:
+        colors = np.asarray(data["cluster_centers_rgb"], dtype=np.float64)
+        if colors.ndim == 2 and colors.shape[0] >= n_clusters and colors.shape[1] >= 3:
+            return np.clip(colors[:n_clusters, :3], 0.0, 1.0)
     if "cluster_centers_raw" not in data.files:
         return np.ones((n_clusters, 3), dtype=np.float64) * 0.25
     centers = np.asarray(data["cluster_centers_raw"], dtype=np.float64)
@@ -676,12 +680,33 @@ def _parse_optional_int_arg(value: str) -> int | None:
     return int(text)
 
 
-def _metric_cli_overrides(args: argparse.Namespace) -> dict[str, Any]:
+def _parse_optional_bool_arg(value: str) -> bool:
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Cannot parse boolean value {value!r}.")
+
+
+def _recompute_cli_overrides(args: argparse.Namespace) -> dict[str, Any]:
     overrides: dict[str, Any] = {}
     if args.metric_range_start_steps is not None:
         overrides["metric_range_start_steps"] = _parse_optional_int_arg(args.metric_range_start_steps)
     if args.metric_range_end_steps is not None:
         overrides["metric_range_end_steps"] = _parse_optional_int_arg(args.metric_range_end_steps)
+    if args.cluster_method is not None:
+        overrides["cluster_method"] = str(args.cluster_method)
+    if args.cluster_space is not None:
+        overrides["cluster_space"] = str(args.cluster_space)
+    if args.cluster_dp_lambda is not None:
+        overrides["cluster_dp_lambda"] = float(args.cluster_dp_lambda)
+    if args.cluster_dp_iters is not None:
+        overrides["cluster_dp_iters"] = int(args.cluster_dp_iters)
+    if args.cluster_dp_max_clusters is not None:
+        overrides["cluster_dp_max_clusters"] = int(args.cluster_dp_max_clusters)
+    if args.cluster_standardize is not None:
+        overrides["cluster_standardize"] = _parse_optional_bool_arg(args.cluster_standardize)
     return overrides
 
 
@@ -722,6 +747,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override metric_range_end_steps when recomputing metrics. Use null/none/auto for rollout end.",
     )
+    parser.add_argument("--cluster-method", choices=["kmeans", "dpmeans"], default=None)
+    parser.add_argument("--cluster-space", choices=["p", "pcolor"], default=None)
+    parser.add_argument("--cluster-dp-lambda", type=float, default=None)
+    parser.add_argument("--cluster-dp-iters", type=int, default=None)
+    parser.add_argument("--cluster-dp-max-clusters", type=int, default=None)
+    parser.add_argument("--cluster-standardize", default=None, help="Override cluster_standardize: true/false.")
     parser.add_argument("--start-step", type=int, default=None, help="Optional vertical marker. Defaults to manifest.")
     parser.add_argument("--end-step", type=int, default=None, help="Optional vertical marker. Defaults to manifest.")
     parser.add_argument("--delta-h-cmap", default="magma", help="Matplotlib colormap for deltaH heatmaps.")
@@ -762,7 +793,7 @@ def main() -> None:
     manifest, rows = _load_manifest_rows(dataset_root)
     detect_start_step = args.start_step if args.start_step is not None else _as_optional_int(manifest.get("detect_start_step"))
     detect_end_step = args.end_step if args.end_step is not None else _as_optional_int(manifest.get("detect_end_step"))
-    metric_overrides = _metric_cli_overrides(args)
+    metric_overrides = _recompute_cli_overrides(args)
 
     summary_rows: list[dict[str, Any]] = []
     delta_h_ready: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []

@@ -136,11 +136,18 @@ minibang:
   # tau latent, so the runner evaluates all tau values and takes max_grid by default.
   minibang_metric_tau_mode: max_grid
 
+  cluster_method: dpmeans
+  cluster_space: pcolor
+  cluster_dp_lambda: 0.08
+  cluster_dp_iters: 8
+  cluster_dp_max_clusters: 64
+
+  # Used only when cluster_method: kmeans.
   cluster_k: 8
   cluster_max_samples: 200000
   cluster_samples_per_snapshot: null
   cluster_min_mass: 1.0e-8
-  cluster_standardize: true
+  cluster_standardize: false
   cluster_kmeans_iters: 40
   cluster_kmeans_restarts: 2
   cluster_change_lag_steps: 5000

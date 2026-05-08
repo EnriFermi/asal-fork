@@ -581,6 +581,60 @@ def _fit_kmeans(X: np.ndarray, k: int, *, rng: np.random.Generator, n_iter: int,
     return best_centers, best_labels, best_inertia
 
 
+def _fit_dpmeans_weighted(
+    X: np.ndarray,
+    weights: np.ndarray,
+    *,
+    lam: float,
+    n_iter: int,
+    max_clusters: int,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    from evolutionary_metrics import dpmeans_weighted
+
+    X = np.asarray(X, dtype=np.float32)
+    weights = np.asarray(weights, dtype=np.float64).reshape(-1)
+    if X.shape[0] == 0:
+        raise ValueError("DP-means needs at least one sample.")
+    if weights.shape[0] != X.shape[0]:
+        raise ValueError(f"weights shape {weights.shape} does not match X shape {X.shape}.")
+    weights = np.where(np.isfinite(weights) & (weights > 0.0), weights, 1.0)
+
+    centers_arr = dpmeans_weighted(
+        X,
+        weights.astype(np.float32),
+        lam=float(lam),
+        iters=int(n_iter),
+        max_clusters=int(max_clusters),
+    )
+    labels_final = _assign_kmeans(X, centers_arr)
+    d2 = np.sum((X - centers_arr[labels_final]) ** 2, axis=1)
+    inertia = float(np.average(d2, weights=weights))
+    return centers_arr, labels_final, inertia
+
+
+def _cluster_features_from_p(p_flat: np.ndarray, *, cluster_space: str) -> np.ndarray:
+    mode = str(cluster_space).strip().lower()
+    if mode in {"p", "p_full", "full"}:
+        return np.asarray(p_flat, dtype=np.float32)
+    if mode in {"pcolor", "p_color", "p_rgb", "rgb"}:
+        p = np.asarray(p_flat, dtype=np.float32)
+        if p.shape[-1] >= 3:
+            return p[:, :3]
+        reps = int(np.ceil(3 / max(1, p.shape[-1])))
+        return np.tile(p, (1, reps))[:, :3].astype(np.float32)
+    raise ValueError(f"Unsupported cluster_space={cluster_space!r}. Use 'p' or 'pcolor'.")
+
+
+def _cluster_center_rgb(centers_raw: np.ndarray, *, cluster_space: str) -> np.ndarray:
+    centers = np.asarray(centers_raw, dtype=np.float32)
+    mode = str(cluster_space).strip().lower()
+    if mode in {"pcolor", "p_color", "p_rgb", "rgb"}:
+        rgb = centers[:, :3] if centers.shape[1] >= 3 else np.tile(centers, (1, int(np.ceil(3 / centers.shape[1]))))[:, :3]
+    else:
+        rgb = centers[:, :3] if centers.shape[1] >= 3 else np.tile(centers, (1, int(np.ceil(3 / centers.shape[1]))))[:, :3]
+    return np.clip(rgb, 0.0, 1.0).astype(np.float32)
+
+
 def _count_snapshots(apf_dir: Path) -> int:
     total = 0
     for path, _s0, _s1, _idx in list_apf_chunks(apf_dir):
@@ -598,6 +652,12 @@ def _compute_cluster_metrics(apf_dir: Path, args: Any, *, seed: int) -> dict[str
         raise ValueError(f"No snapshots found in {apf_dir}.")
 
     rng = np.random.default_rng(seed)
+    cluster_method = str(_get(args, "cluster_method", "kmeans")).strip().lower().replace("-", "_")
+    if cluster_method in {"dp", "dp_means"}:
+        cluster_method = "dpmeans"
+    if cluster_method not in {"kmeans", "dpmeans"}:
+        raise ValueError(f"Unsupported cluster_method={cluster_method!r}. Use 'kmeans' or 'dpmeans'.")
+    cluster_space = str(_get(args, "cluster_space", "p")).strip().lower()
     cluster_k = int(_get(args, "cluster_k", 8))
     max_samples = int(_get(args, "cluster_max_samples", 200_000))
     per_snapshot_raw = _get(args, "cluster_samples_per_snapshot", None)
@@ -608,6 +668,7 @@ def _compute_cluster_metrics(apf_dir: Path, args: Any, *, seed: int) -> dict[str
     min_mass = float(_get(args, "cluster_min_mass", 1e-8))
 
     samples: list[np.ndarray] = []
+    sample_weights: list[np.ndarray] = []
     for path, _s0, _s1, _idx in chunks:
         with np.load(path) as data:
             if "P" not in data.files or "A" not in data.files:
@@ -629,14 +690,17 @@ def _compute_cluster_metrics(apf_dir: Path, args: Any, *, seed: int) -> dict[str
                     chosen = rng.choice(valid_idx, size=n_take, replace=True, p=probs)
                 else:
                     chosen = rng.choice(valid_idx, size=n_take, replace=True)
-                samples.append(p_flat[chosen].astype(np.float32, copy=False))
+                samples.append(_cluster_features_from_p(p_flat[chosen], cluster_space=cluster_space))
+                sample_weights.append(np.ones((chosen.shape[0],), dtype=np.float32))
 
     if not samples:
         raise ValueError(f"Could not sample any mass-weighted P vectors from {apf_dir}.")
     X_raw = np.concatenate(samples, axis=0)
+    W_raw = np.concatenate(sample_weights, axis=0)
     if X_raw.shape[0] > max_samples:
         keep = rng.choice(X_raw.shape[0], size=max_samples, replace=False)
         X_raw = X_raw[keep]
+        W_raw = W_raw[keep]
 
     standardize = _as_bool(_get(args, "cluster_standardize", True), True)
     if standardize:
@@ -651,15 +715,26 @@ def _compute_cluster_metrics(apf_dir: Path, args: Any, *, seed: int) -> dict[str
         scale = np.ones((X_raw.shape[1],), dtype=np.float32)
         X = X_raw
 
-    k_eff = max(1, min(cluster_k, X.shape[0]))
-    centers_z, _labels, inertia = _fit_kmeans(
-        X,
-        k_eff,
-        rng=rng,
-        n_iter=int(_get(args, "cluster_kmeans_iters", 40)),
-        restarts=int(_get(args, "cluster_kmeans_restarts", 2)),
-    )
+    if cluster_method == "dpmeans":
+        centers_z, _labels, inertia = _fit_dpmeans_weighted(
+            X,
+            W_raw,
+            lam=float(_get(args, "cluster_dp_lambda", 1.5)),
+            n_iter=int(_get(args, "cluster_dp_iters", 8)),
+            max_clusters=int(_get(args, "cluster_dp_max_clusters", 64)),
+        )
+        k_eff = int(centers_z.shape[0])
+    else:
+        k_eff = max(1, min(cluster_k, X.shape[0]))
+        centers_z, _labels, inertia = _fit_kmeans(
+            X,
+            k_eff,
+            rng=rng,
+            n_iter=int(_get(args, "cluster_kmeans_iters", 40)),
+            restarts=int(_get(args, "cluster_kmeans_restarts", 2)),
+        )
     centers_raw = centers_z * scale[None, :] + center[None, :]
+    centers_rgb = _cluster_center_rgb(centers_raw, cluster_space=cluster_space)
 
     steps_all: list[np.ndarray] = []
     mass_rows: list[np.ndarray] = []
@@ -671,7 +746,7 @@ def _compute_cluster_metrics(apf_dir: Path, args: Any, *, seed: int) -> dict[str
             steps = np.asarray(data["steps"], dtype=np.int64)
             for i in range(P.shape[0]):
                 mass = np.sum(A[i], axis=-1).reshape(-1).astype(np.float64)
-                X_i = P[i].reshape((-1, P.shape[-1])).astype(np.float32)
+                X_i = _cluster_features_from_p(P[i].reshape((-1, P.shape[-1])), cluster_space=cluster_space)
                 X_i = ((X_i - center) / scale).astype(np.float32)
                 labels_i = _assign_kmeans(X_i, centers_z)
                 row = np.bincount(labels_i, weights=mass, minlength=k_eff).astype(np.float64)
@@ -713,9 +788,12 @@ def _compute_cluster_metrics(apf_dir: Path, args: Any, *, seed: int) -> dict[str
         cluster_change_lag_frames=np.asarray(lag_frames, dtype=np.int32),
         cluster_centers_raw=centers_raw.astype(np.float32),
         cluster_centers_z=centers_z.astype(np.float32),
+        cluster_centers_rgb=centers_rgb.astype(np.float32),
         cluster_standardize_center=center.astype(np.float32),
         cluster_standardize_scale=scale.astype(np.float32),
         cluster_k=np.asarray(k_eff, dtype=np.int32),
+        cluster_method=np.asarray(cluster_method),
+        cluster_space=np.asarray(cluster_space),
         cluster_kmeans_inertia=np.asarray(inertia, dtype=np.float32),
         cluster_samples_used=np.asarray(X_raw.shape[0], dtype=np.int32),
     )
