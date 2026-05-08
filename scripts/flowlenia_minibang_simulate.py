@@ -620,6 +620,20 @@ def _p_rgb_features(p_flat: np.ndarray) -> np.ndarray:
     return np.tile(p, (1, reps))[:, :3].astype(np.float32)
 
 
+def _rendered_pcolor_features(p_flat: np.ndarray, mass_flat: np.ndarray | None) -> np.ndarray:
+    rgb = _p_rgb_features(p_flat)
+    if mass_flat is None:
+        return np.clip(rgb, 0.0, 1.0).astype(np.float32)
+    inten = np.asarray(mass_flat, dtype=np.float32).reshape(-1, 1)
+    return np.clip(inten * rgb, 0.0, 1.0).astype(np.float32)
+
+
+def _chroma_features(rgb: np.ndarray) -> np.ndarray:
+    rgb = np.clip(np.asarray(rgb, dtype=np.float32), 0.0, 1.0)
+    denom = np.sum(rgb, axis=1, keepdims=True)
+    return np.where(denom > 1e-8, rgb / np.maximum(denom, 1e-8), 0.0).astype(np.float32)
+
+
 def _cluster_features_from_apf(p_flat: np.ndarray, mass_flat: np.ndarray | None, *, cluster_space: str) -> np.ndarray:
     mode = str(cluster_space).strip().lower()
     if mode in {"p", "p_full", "full"}:
@@ -627,18 +641,21 @@ def _cluster_features_from_apf(p_flat: np.ndarray, mass_flat: np.ndarray | None,
     if mode in {"p_rgb", "prgb", "raw_rgb"}:
         return _p_rgb_features(p_flat)
     if mode in {"pcolor", "p_color", "render", "rendered", "rendered_rgb", "video_rgb", "rgb"}:
-        rgb = _p_rgb_features(p_flat)
-        if mass_flat is None:
-            return np.clip(rgb, 0.0, 1.0).astype(np.float32)
-        inten = np.asarray(mass_flat, dtype=np.float32).reshape(-1, 1)
-        return np.clip(inten * rgb, 0.0, 1.0).astype(np.float32)
-    raise ValueError(f"Unsupported cluster_space={cluster_space!r}. Use 'p', 'p_rgb', or 'pcolor'.")
+        return _rendered_pcolor_features(p_flat, mass_flat)
+    if mode in {"pcolor_chroma", "rendered_chroma", "video_chroma", "chroma", "hue"}:
+        return _chroma_features(_rendered_pcolor_features(p_flat, mass_flat))
+    raise ValueError(f"Unsupported cluster_space={cluster_space!r}. Use 'p', 'p_rgb', 'pcolor', or 'pcolor_chroma'.")
 
 
 def _cluster_center_rgb(centers_raw: np.ndarray, *, cluster_space: str) -> np.ndarray:
     centers = np.asarray(centers_raw, dtype=np.float32)
     mode = str(cluster_space).strip().lower()
-    if mode in {"pcolor", "p_color", "p_rgb", "rgb"}:
+    if mode in {"pcolor_chroma", "rendered_chroma", "video_chroma", "chroma", "hue"}:
+        rgb = centers[:, :3] if centers.shape[1] >= 3 else np.tile(centers, (1, int(np.ceil(3 / centers.shape[1]))))[:, :3]
+        rgb = np.clip(rgb, 0.0, 1.0)
+        maxc = np.max(rgb, axis=1, keepdims=True)
+        rgb = np.where(maxc > 1e-8, rgb / np.maximum(maxc, 1e-8), 0.0)
+    elif mode in {"pcolor", "p_color", "p_rgb", "rgb"}:
         rgb = centers[:, :3] if centers.shape[1] >= 3 else np.tile(centers, (1, int(np.ceil(3 / centers.shape[1]))))[:, :3]
     else:
         rgb = centers[:, :3] if centers.shape[1] >= 3 else np.tile(centers, (1, int(np.ceil(3 / centers.shape[1]))))[:, :3]
