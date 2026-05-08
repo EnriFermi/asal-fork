@@ -137,6 +137,7 @@ minibang:
   minibang_metric_tau_mode: max_grid
 
   cluster_method: dpmeans
+  # pcolor means the actual rendered Pcolor RGB: clip(sum(A) * P[..., :3], 0, 1).
   cluster_space: pcolor
   cluster_dp_lambda: 0.08
   cluster_dp_iters: 8
