@@ -53,6 +53,48 @@ def _load_detection_defaults_from_config(manifest: dict[str, Any]) -> dict[str, 
     return {key: flat.get(key, None) for key in keys if flat.get(key, None) is not None}
 
 
+def _traj_id(row: dict[str, Any]) -> str:
+    if row.get("traj_id", None):
+        return str(row["traj_id"])
+    if row.get("traj_dir", None):
+        return Path(str(row["traj_dir"])).name
+    return f"traj_{int(row.get('selection_idx', 0)):05d}"
+
+
+def _local_traj_dir(dataset_root: Path, row: dict[str, Any]) -> Path:
+    traj_id = _traj_id(row)
+    local = dataset_root / traj_id
+    if local.exists():
+        return local
+    raw = row.get("traj_dir", None)
+    if raw:
+        path = Path(str(raw))
+        if path.exists():
+            return path
+        mapped = dataset_root / path.name
+        if mapped.exists():
+            return mapped
+    return local
+
+
+def _first_existing(paths: list[Path]) -> Path | None:
+    for path in paths:
+        if path.exists():
+            return path
+    return None
+
+
+def _metrics_path(dataset_root: Path, row: dict[str, Any], traj_dir: Path) -> Path:
+    candidates = [traj_dir / "metrics.npz"]
+    raw = row.get("metrics_path", None)
+    if raw:
+        raw_path = Path(str(raw))
+        candidates.append(raw_path)
+        candidates.append(dataset_root / _traj_id(row) / raw_path.name)
+    existing = _first_existing(candidates)
+    return existing if existing is not None else traj_dir / "metrics.npz"
+
+
 def _first_int(*values: Any) -> int | None:
     for value in values:
         if value is not None:
@@ -107,6 +149,7 @@ def _clip_interval(
 
 
 def detect_for_trajectory(
+    dataset_root: Path,
     row: dict[str, Any],
     *,
     delta_h_z: float,
@@ -119,8 +162,8 @@ def detect_for_trajectory(
     detect_end_step: int | None,
     detect_max_duration_steps: int | None,
 ) -> list[dict[str, Any]]:
-    traj_dir = Path(str(row.get("traj_dir", "")))
-    metrics_path = Path(str(row.get("metrics_path", traj_dir / "metrics.npz")))
+    traj_dir = _local_traj_dir(dataset_root, row)
+    metrics_path = _metrics_path(dataset_root, row, traj_dir)
     if not metrics_path.exists():
         print(f"Warning: metrics file missing for {row.get('traj_id')}: {metrics_path}")
         return []
@@ -247,7 +290,7 @@ def detect_for_trajectory(
             dict(
                 traj_id=row.get("traj_id"),
                 candidate_id=f"{row.get('traj_id')}_cand_{idx:03d}",
-                video_path=row.get("video_path", str(traj_dir / "video.mp4")),
+                video_path=str(traj_dir / "video.mp4"),
                 metrics_path=str(metrics_path),
                 optimization_iter=row.get("iter", ""),
                 saturation_T=row.get("saturation_T", ""),
@@ -321,7 +364,7 @@ def _fmt_sec(x: Any) -> str:
     return f"{val:.2f}"
 
 
-def _write_markdown(path: Path, rows: list[dict[str, Any]], manifest_rows: list[dict[str, Any]]) -> None:
+def _write_markdown(path: Path, rows: list[dict[str, Any]], manifest_rows: list[dict[str, Any]], dataset_root: Path) -> None:
     by_traj: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         by_traj.setdefault(str(row["traj_id"]), []).append(row)
@@ -332,8 +375,8 @@ def _write_markdown(path: Path, rows: list[dict[str, Any]], manifest_rows: list[
     lines.append("Times are video seconds, so they can be pasted directly into a player timeline.")
     lines.append("")
     for manifest_row in manifest_rows:
-        traj_id = str(manifest_row.get("traj_id"))
-        video_path = manifest_row.get("video_path", "")
+        traj_id = _traj_id(manifest_row)
+        video_path = str(_local_traj_dir(dataset_root, manifest_row) / "video.mp4")
         cand_rows = by_traj.get(traj_id, [])
         lines.append(f"## {traj_id}")
         lines.append("")
@@ -401,6 +444,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Drop minibang candidates longer than this many simulation steps. Defaults to config/manifest detect_max_duration_steps.",
     )
+    parser.add_argument(
+        "--max-trials",
+        type=int,
+        default=None,
+        help="Only process the first N trajectories from manifest; useful for debugging.",
+    )
     return parser.parse_args()
 
 
@@ -415,6 +464,12 @@ def main() -> None:
 
     manifest = _load_manifest(dataset_root)
     manifest_rows = manifest.get("trajectories", [])
+    total_rows = len(manifest_rows)
+    if args.max_trials is not None:
+        if int(args.max_trials) < 1:
+            raise ValueError("--max-trials must be >= 1")
+        manifest_rows = manifest_rows[: int(args.max_trials)]
+        print(f"Processing first {len(manifest_rows)} of {total_rows} trajectories (--max-trials={args.max_trials})")
     config_defaults = _load_detection_defaults_from_config(manifest)
     detect_start_step = _first_int(
         args.start_step,
@@ -437,6 +492,7 @@ def main() -> None:
     for row in manifest_rows:
         all_candidates.extend(
             detect_for_trajectory(
+                dataset_root,
                 row,
                 delta_h_z=float(args.delta_h_z),
                 delta_h_quantile=float(args.delta_h_quantile),
@@ -453,7 +509,7 @@ def main() -> None:
     all_candidates.sort(key=lambda r: (str(r["traj_id"]), int(r["start_step"])))
     _write_csv(output_dir / "minibang_candidates.csv", all_candidates)
     write_json(output_dir / "minibang_candidates.json", all_candidates)
-    _write_markdown(output_dir / "minibang_candidates.md", all_candidates, manifest_rows)
+    _write_markdown(output_dir / "minibang_candidates.md", all_candidates, manifest_rows, dataset_root)
     print(f"Wrote {len(all_candidates)} candidates to {output_dir}")
 
 
