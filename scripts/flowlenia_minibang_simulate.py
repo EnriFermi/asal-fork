@@ -418,6 +418,22 @@ def _flush_run_buffers(run: dict[str, Any], args: Any) -> None:
     buffers = run["buffers"]
     if not buffers["steps"]:
         return
+    extra_payload = {}
+    for key in (
+        "resume_batch_rng_key",
+        "resume_batch_size",
+        "resume_batch_index",
+        "resume_selection0",
+        "resume_jit_microbatch",
+        "resume_snapshot_interval",
+        "resume_seed",
+        "resume_lagrangian_seed",
+        "state_t",
+        "state_mass_cycle_start",
+    ):
+        if key in buffers and buffers[key]:
+            extra_payload[key] = np.asarray(buffers[key])
+
     run["file_idx"] = save_chunk(
         str(run["apf_dir"]),
         float(run["sim_fps"]),
@@ -436,6 +452,7 @@ def _flush_run_buffers(run: dict[str, Any], args: Any) -> None:
             else None
         ),
         compress=_as_bool(_get(args, "compress", True), True),
+        extra_payload=extra_payload if extra_payload else None,
     )
     for key in buffers:
         buffers[key] = []
@@ -511,6 +528,16 @@ def _init_run_dirs(
                     rgb=[],
                     lagrangian_xy=[],
                     lagrangian_c=[],
+                    resume_batch_rng_key=[],
+                    resume_batch_size=[],
+                    resume_batch_index=[],
+                    resume_selection0=[],
+                    resume_jit_microbatch=[],
+                    resume_snapshot_interval=[],
+                    resume_seed=[],
+                    resume_lagrangian_seed=[],
+                    state_t=[],
+                    state_mass_cycle_start=[],
                 ),
             )
         )
@@ -1182,6 +1209,7 @@ def _capture_snapshot(
     runs: list[dict[str, Any]],
     args: Any,
     capture_fn_cache: dict[tuple[int, int], Any],
+    resume_batch_rng_key: Any | None = None,
 ) -> None:
     _ensure_jax()
     B = int(params_batch.shape[0])
@@ -1190,11 +1218,22 @@ def _capture_snapshot(
     if cache_key not in capture_fn_cache:
         def capture_fn(states_in, params_in, lag_xy_in, lag_ch_in):
             rgb = jax.vmap(lambda st, p: substrate.render_state(st, p, img_size=img_size))(states_in, params_in)
-            return states_in["P"], states_in["A"], states_in["F"], rgb, lag_xy_in, lag_ch_in
+            return (
+                states_in["P"],
+                states_in["A"],
+                states_in["F"],
+                rgb,
+                lag_xy_in,
+                lag_ch_in,
+                states_in["t"],
+                states_in["mass_cycle_start"],
+            )
 
         capture_fn_cache[cache_key] = jax.jit(capture_fn)
 
-    P, A, F, rgb, lag_np, lag_ch_np = jax.device_get(capture_fn_cache[cache_key](states, params_batch, lag_xy, lag_ch))
+    P, A, F, rgb, lag_np, lag_ch_np, state_t_np, state_mass_cycle_start_np = jax.device_get(
+        capture_fn_cache[cache_key](states, params_batch, lag_xy, lag_ch)
+    )
     chunk_size = max(1, int(_get(args, "snapshots_per_file", 200)))
     save_A = _as_bool(_get(args, "save_A", True), True)
     save_F = _as_bool(_get(args, "save_F", True), True)
@@ -1228,6 +1267,17 @@ def _capture_snapshot(
             buffers["lagrangian_xy"].append(np.asarray(lag_np[i]))
             if save_lagrangian_channels:
                 buffers["lagrangian_c"].append(np.asarray(lag_ch_np[i]))
+        if resume_batch_rng_key is not None:
+            buffers["resume_batch_rng_key"].append(np.asarray(resume_batch_rng_key, dtype=np.uint32))
+            buffers["resume_batch_size"].append(np.asarray(run["resume_batch_size"], dtype=np.int32))
+            buffers["resume_batch_index"].append(np.asarray(run["resume_batch_index"], dtype=np.int32))
+            buffers["resume_selection0"].append(np.asarray(run["resume_selection0"], dtype=np.int32))
+            buffers["resume_jit_microbatch"].append(np.asarray(run["resume_jit_microbatch"], dtype=np.int32))
+            buffers["resume_snapshot_interval"].append(np.asarray(run["resume_snapshot_interval"], dtype=np.int32))
+            buffers["resume_seed"].append(np.asarray(run["resume_seed"], dtype=np.int64))
+            buffers["resume_lagrangian_seed"].append(np.asarray(run["resume_lagrangian_seed"], dtype=np.int64))
+            buffers["state_t"].append(np.asarray(state_t_np[i], dtype=np.int32))
+            buffers["state_mass_cycle_start"].append(np.asarray(state_mass_cycle_start_np[i], dtype=np.float32))
         if len(buffers["steps"]) >= chunk_size:
             _flush_run_buffers(run, args)
 
@@ -1339,6 +1389,17 @@ def simulate_batch(
     if max_steps is not None:
         total_steps = min(total_steps, int(max_steps))
     jit_microbatch = max(1, int(_get(args, "jit_microbatch", min(64, snapshot_interval))))
+    lagrangian_seed = int(_get(args, "lagrangian_seed", seed0))
+    for i, run in enumerate(runs):
+        run["resume_batch_size"] = int(B)
+        run["resume_batch_index"] = int(i)
+        run["resume_selection0"] = int(selection0)
+        run["resume_jit_microbatch"] = int(jit_microbatch)
+        run["resume_snapshot_interval"] = int(snapshot_interval)
+        run["resume_seed"] = int(seed0)
+        run["resume_lagrangian_seed"] = int(lagrangian_seed)
+
+    rng = jax.random.PRNGKey(seed0 + 991 * (selection0 + 1))
 
     _capture_snapshot(
         step=0,
@@ -1350,9 +1411,9 @@ def simulate_batch(
         runs=runs,
         args=args,
         capture_fn_cache=capture_cache,
+        resume_batch_rng_key=rng,
     )
 
-    rng = jax.random.PRNGKey(seed0 + 991 * (selection0 + 1))
     steps_done = 0
     pbar = tqdm(total=total_steps, desc=f"batch {runs[0]['traj_id']}..{runs[-1]['traj_id']}")
     try:
@@ -1374,6 +1435,7 @@ def simulate_batch(
                 runs=runs,
                 args=args,
                 capture_fn_cache=capture_cache,
+                resume_batch_rng_key=rng,
             )
     finally:
         pbar.close()

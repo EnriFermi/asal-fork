@@ -18,7 +18,7 @@ for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "scripts")):
 import numpy as np
 from omegaconf import OmegaConf
 
-from flowlenia_minibang_common import load_config, resolve_path
+from flowlenia_minibang_common import load_config, load_frame_times, resolve_path
 
 
 DELTA_H_CONFIG_KEYS = [
@@ -351,6 +351,66 @@ def _as_optional_int(value: Any) -> int | None:
     return int(value)
 
 
+def _video_axis_transforms(
+    frame_times: tuple[np.ndarray, np.ndarray] | None,
+) -> tuple[Any, Any] | None:
+    if frame_times is None:
+        return None
+    steps, secs = frame_times
+    steps = np.asarray(steps, dtype=np.float64).reshape(-1)
+    secs = np.asarray(secs, dtype=np.float64).reshape(-1)
+    finite = np.isfinite(steps) & np.isfinite(secs)
+    steps = steps[finite]
+    secs = secs[finite]
+    if steps.size < 2 or secs.size < 2:
+        return None
+
+    order = np.argsort(steps)
+    steps = steps[order]
+    secs = secs[order]
+    step_keep = np.concatenate(([True], np.diff(steps) > 0.0))
+    steps = steps[step_keep]
+    secs = secs[step_keep]
+    if steps.size < 2:
+        return None
+
+    sec_order = np.argsort(secs)
+    secs_inv = secs[sec_order]
+    steps_inv = steps[sec_order]
+    sec_keep = np.concatenate(([True], np.diff(secs_inv) > 0.0))
+    secs_inv = secs_inv[sec_keep]
+    steps_inv = steps_inv[sec_keep]
+    if secs_inv.size < 2:
+        return None
+
+    def step_to_sec(x: Any) -> np.ndarray:
+        arr = np.asarray(x, dtype=np.float64)
+        return np.interp(arr, steps, secs, left=secs[0], right=secs[-1])
+
+    def sec_to_step(x: Any) -> np.ndarray:
+        arr = np.asarray(x, dtype=np.float64)
+        return np.interp(arr, secs_inv, steps_inv, left=steps_inv[0], right=steps_inv[-1])
+
+    return step_to_sec, sec_to_step
+
+
+def _add_video_seconds_axis(
+    ax: Any,
+    frame_times: tuple[np.ndarray, np.ndarray] | None,
+    *,
+    label: str | None = "video seconds",
+    tick_labelsize: float | None = None,
+) -> None:
+    transforms = _video_axis_transforms(frame_times)
+    if transforms is None:
+        return
+    secax = ax.secondary_xaxis("top", functions=transforms)
+    if label:
+        secax.set_xlabel(label)
+    if tick_labelsize is not None:
+        secax.tick_params(axis="x", labelsize=tick_labelsize)
+
+
 def _plot_delta_h_heatmap_one(
     *,
     plt: Any,
@@ -410,6 +470,7 @@ def _plot_delta_h_heatmap_one(
     ax.set_title(f"{traj_id} deltaH heatmap" + (f" ({', '.join(subtitle)})" if subtitle else ""))
     ax.set_xlabel("simulation step")
     ax.set_ylabel("tau step")
+    _add_video_seconds_axis(ax, series.get("frame_times"))
     ax.grid(False)
     cbar = fig.colorbar(im, ax=ax, fraction=0.036, pad=0.02)
     cbar.set_label("deltaH")
@@ -474,6 +535,7 @@ def _plot_delta_h_heatmap_grid(
         if detect_start_step is not None:
             ax.axvline(int(detect_start_step), color="#666666", linestyle="--", linewidth=0.8, alpha=0.55)
         ax.set_title(_traj_id(row), fontsize=9)
+        _add_video_seconds_axis(ax, series.get("frame_times"), label=None, tick_labelsize=6)
         ax.grid(False)
     for ax in axes_arr[len(plotted) :]:
         ax.axis("off")
@@ -551,6 +613,7 @@ def _plot_cluster_mass_one(
     ax.set_title(f"{traj_id} cluster mass" + (f" ({', '.join(subtitle)})" if subtitle else ""))
     ax.set_xlabel("simulation step")
     ax.set_ylabel(mode_label)
+    _add_video_seconds_axis(ax, series.get("frame_times"))
     if series.get("mode") == "prob":
         ax.set_ylim(-0.02, 1.02)
     ax.grid(True, alpha=0.18)
@@ -608,6 +671,7 @@ def _plot_cluster_mass_grid(
         if series.get("mode") == "prob":
             ax.set_ylim(-0.02, 1.02)
         ax.set_title(_traj_id(row), fontsize=9)
+        _add_video_seconds_axis(ax, series.get("frame_times"), label=None, tick_labelsize=6)
         ax.grid(True, alpha=0.2)
     for ax in axes_arr[len(plotted) :]:
         ax.axis("off")
@@ -899,9 +963,11 @@ def main() -> None:
             if metrics_path is None or not metrics_path.exists():
                 raise FileNotFoundError("metrics.npz not found")
             summary["metrics_path"] = str(metrics_path)
+            frame_times = load_frame_times(_local_traj_dir(dataset_root, row))
 
             try:
                 delta_h_series = _load_delta_h_heatmap(metrics_path)
+                delta_h_series["frame_times"] = frame_times
                 tau_grid = np.asarray(delta_h_series["tau_steps"], dtype=np.float64)
                 if tau_grid_ref is None:
                     tau_grid_ref = tau_grid
@@ -925,6 +991,7 @@ def main() -> None:
 
             try:
                 cluster_mass_series = _load_cluster_mass(metrics_path, mode=str(args.cluster_mass_mode))
+                cluster_mass_series["frame_times"] = frame_times
                 cluster_mass_ready.append((row, cluster_mass_series, summary))
                 plotted_any = True
             except Exception as exc:

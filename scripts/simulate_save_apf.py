@@ -181,6 +181,7 @@ def save_chunk(
     snaps_lagrangian: Optional[List[np.ndarray]] = None,
     snaps_lagrangian_c: Optional[List[np.ndarray]] = None,
     compress: bool = True,
+    extra_payload: Optional[dict[str, Any]] = None,
 ) -> int:
     if not steps:
         return file_idx
@@ -217,6 +218,9 @@ def save_chunk(
         payload["lagrangian_xy"] = np.stack(snaps_lagrangian, axis=0).astype(np.float32, copy=False)
     if snaps_lagrangian_c is not None:
         payload["lagrangian_c"] = np.stack(snaps_lagrangian_c, axis=0).astype(np.int32, copy=False)
+    if extra_payload:
+        for key, value in extra_payload.items():
+            payload[str(key)] = np.asarray(value)
 
     if compress:
         np.savez_compressed(path, **payload)
@@ -233,6 +237,8 @@ def save_chunk(
         saved.append("lagrangian_xy")
     if snaps_lagrangian_c is not None:
         saved.append("lagrangian_c")
+    if extra_payload:
+        saved.extend(str(key) for key in extra_payload.keys())
     print(f"Saved {len(steps)} snapshots ({','.join(saved)}) to {path}")
     return file_idx + 1
 
