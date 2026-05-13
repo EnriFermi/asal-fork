@@ -154,6 +154,50 @@ def _npz_has_keys(path: Path, keys: tuple[str, ...]) -> bool:
         return False
 
 
+def _scalar_array(value: Any, *, dtype: Any = np.float32) -> np.ndarray:
+    arr = np.asarray(value)
+    if arr.size == 0:
+        return np.asarray(np.nan, dtype=dtype)
+    return np.asarray(arr.reshape(-1)[0], dtype=dtype)
+
+
+def _add_delta_h_longrun_aliases(metrics_path: Path) -> Path:
+    if not metrics_path.exists():
+        return metrics_path
+    with np.load(metrics_path) as old:
+        merged: dict[str, Any] = {key: old[key] for key in old.files}
+
+    updates: dict[str, Any] = {}
+    if "delta_h_score_scalar" in merged:
+        score = float(_scalar_array(merged["delta_h_score_scalar"], dtype=np.float64))
+        loss = np.asarray(-score, dtype=np.float32)
+        updates["delta_h_loss_scalar"] = loss
+        updates["longrun_metric_loss"] = loss
+        updates["longrun_metric_score"] = np.asarray(score, dtype=np.float32)
+    if "delta_h_score_by_tau" in merged:
+        score_by_tau = np.asarray(merged["delta_h_score_by_tau"], dtype=np.float32)
+        updates["longrun_metric_score_by_tau"] = score_by_tau
+        updates["longrun_metric_loss_by_tau"] = -score_by_tau
+    if "delta_h_amp_by_tau" in merged:
+        updates["longrun_amp_by_tau"] = np.asarray(merged["delta_h_amp_by_tau"], dtype=np.float32)
+    if "delta_h_msc_scalar" in merged:
+        updates["longrun_msc_t"] = _scalar_array(merged["delta_h_msc_scalar"], dtype=np.float32)
+    if "delta_h_msc_by_tau" in merged:
+        updates["longrun_msc_t_by_tau"] = np.asarray(merged["delta_h_msc_by_tau"], dtype=np.float32)
+    if "delta_h_tau_steps" in merged:
+        updates["longrun_tau_steps"] = np.asarray(merged["delta_h_tau_steps"], dtype=np.int32)
+    if "delta_h_selected_tau_steps" in merged:
+        updates["longrun_selected_tau_steps"] = _scalar_array(merged["delta_h_selected_tau_steps"], dtype=np.int32)
+    if "delta_h_selected_tau_idx" in merged:
+        updates["longrun_selected_tau_idx"] = _scalar_array(merged["delta_h_selected_tau_idx"], dtype=np.int32)
+
+    changed = any(key not in merged or not np.array_equal(np.asarray(merged[key]), np.asarray(value)) for key, value in updates.items())
+    if changed:
+        merged.update(updates)
+        np.savez_compressed(metrics_path, **merged)
+    return metrics_path
+
+
 def _compute_metrics_if_needed(
     *,
     dataset_root: Path,
@@ -172,10 +216,24 @@ def _compute_metrics_if_needed(
         metrics_path,
         ("delta_h_map", "delta_h_tau_steps"),
     )
+    has_delta_h_longrun_aliases = metrics_path is not None and _npz_has_keys(
+        metrics_path,
+        (
+            "delta_h_loss_scalar",
+            "longrun_metric_loss",
+            "longrun_metric_score_by_tau",
+            "longrun_metric_loss_by_tau",
+            "longrun_msc_t_by_tau",
+            "longrun_tau_steps",
+        ),
+    )
     has_cluster_mass = metrics_path is not None and _npz_has_keys(metrics_path, ("cluster_steps", "cluster_mass_prob"))
     compute_delta_h = need_delta_h and (overwrite_delta_h or not has_delta_h)
     compute_cluster_mass = need_cluster_mass and (overwrite_cluster_mass or not has_cluster_mass)
+    add_delta_h_loss = bool(need_delta_h and has_delta_h and not has_delta_h_longrun_aliases)
     if not compute_delta_h and not compute_cluster_mass:
+        if add_delta_h_loss and metrics_path is not None:
+            return _add_delta_h_longrun_aliases(metrics_path)
         return metrics_path
 
     apf_dir = _apf_dir(dataset_root, row)
@@ -209,6 +267,8 @@ def _compute_metrics_if_needed(
             merged.update({key: old[key] for key in old.files})
     merged.update(computed)
     np.savez_compressed(out_path, **merged)
+    if need_delta_h:
+        _add_delta_h_longrun_aliases(out_path)
     return out_path
 
 
@@ -234,7 +294,18 @@ def _load_delta_h_heatmap(metrics_path: Path) -> dict[str, Any]:
             x = np.arange(z.shape[1], dtype=np.float64)
         if tau_steps.size != z.shape[0]:
             tau_steps = np.arange(z.shape[0], dtype=np.float64)
-    return {"steps": x, "tau_steps": tau_steps, "delta_h_map": z}
+        scalars = {}
+        for key in (
+            "delta_h_loss_scalar",
+            "longrun_metric_loss",
+            "longrun_metric_score",
+            "longrun_msc_t",
+            "delta_h_score_scalar",
+            "delta_h_msc_scalar",
+        ):
+            if key in data.files:
+                scalars[key] = float(_scalar_array(data[key], dtype=np.float64))
+    return {"steps": x, "tau_steps": tau_steps, "delta_h_map": z, **scalars}
 
 
 def _colors_from_cluster_centers(data: np.lib.npyio.NpzFile, n_clusters: int) -> np.ndarray:
@@ -335,6 +406,12 @@ def _delta_h_metadata(
             "delta_h_tau_steps": tau_steps,
             "delta_h_window_size_steps": _scalar_from_npz(data, "delta_h_window_size_steps"),
             "delta_h_sample_every_steps": _scalar_from_npz(data, "delta_h_sample_every_steps"),
+            "delta_h_loss_scalar": _scalar_from_npz(data, "delta_h_loss_scalar"),
+            "longrun_metric_loss": _scalar_from_npz(data, "longrun_metric_loss"),
+            "longrun_metric_score": _scalar_from_npz(data, "longrun_metric_score"),
+            "longrun_msc_t": _scalar_from_npz(data, "longrun_msc_t"),
+            "delta_h_score_scalar": _scalar_from_npz(data, "delta_h_score_scalar"),
+            "delta_h_msc_scalar": _scalar_from_npz(data, "delta_h_msc_scalar"),
             "n_tau": len(tau_steps),
             "n_windows": int(window_centers.size),
             "window_center_min_step": float(np.nanmin(window_centers)) if window_centers.size else None,
@@ -493,6 +570,12 @@ def _plot_delta_h_heatmap_one(
         "delta_h_mean": mean_dh,
         "delta_h_n_tau": int(tau_steps.size),
         "delta_h_tau_grid": ",".join(str(int(x)) if float(x).is_integer() else f"{x:g}" for x in tau_steps),
+        "delta_h_loss_scalar": series.get("delta_h_loss_scalar", ""),
+        "longrun_metric_loss": series.get("longrun_metric_loss", ""),
+        "longrun_metric_score": series.get("longrun_metric_score", ""),
+        "longrun_msc_t": series.get("longrun_msc_t", ""),
+        "delta_h_score_scalar": series.get("delta_h_score_scalar", ""),
+        "delta_h_msc_scalar": series.get("delta_h_msc_scalar", ""),
     }
 
 
@@ -695,6 +778,12 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "delta_h_max_step",
         "delta_h_max_tau_step",
         "delta_h_mean",
+        "delta_h_loss_scalar",
+        "longrun_metric_loss",
+        "longrun_metric_score",
+        "longrun_msc_t",
+        "delta_h_score_scalar",
+        "delta_h_msc_scalar",
         "delta_h_n_tau",
         "delta_h_tau_grid",
         "cluster_mass_n_points",
@@ -725,8 +814,8 @@ def _write_index(path: Path, rows: list[dict[str, Any]], delta_grid_path: Path, 
         lines.extend(["## deltaH overview", "", f"![deltaH overview]({delta_grid_path.name})", ""])
     if cluster_grid_path.exists():
         lines.extend(["## cluster mass overview", "", f"![cluster mass overview]({cluster_grid_path.name})", ""])
-    lines.append("| traj | status | max step | max tau | max deltaH | mean deltaH | deltaH | cluster mass | message |")
-    lines.append("|---|---|---:|---:|---:|---:|---|---|---|")
+    lines.append("| traj | status | longrun loss | longrun MSC-T | max step | max tau | max deltaH | mean deltaH | deltaH | cluster mass | message |")
+    lines.append("|---|---|---:|---:|---:|---:|---:|---:|---|---|---|")
     for row in rows:
         dh_plot = Path(str(row.get("delta_h_plot_path", ""))).name if row.get("delta_h_plot_path", "") else ""
         dh_plot_link = f"[png]({dh_plot})" if dh_plot else ""
@@ -735,9 +824,11 @@ def _write_index(path: Path, rows: list[dict[str, Any]], delta_grid_path: Path, 
         )
         cluster_plot_link = f"[png]({cluster_plot})" if cluster_plot else ""
         lines.append(
-            "| {traj} | {status} | {step} | {tau} | {maxv} | {meanv} | {dh_plot} | {cluster_plot} | {message} |".format(
+            "| {traj} | {status} | {loss} | {msc} | {step} | {tau} | {maxv} | {meanv} | {dh_plot} | {cluster_plot} | {message} |".format(
                 traj=row.get("traj_id", ""),
                 status=row.get("status", ""),
+                loss=_fmt_num(row.get("longrun_metric_loss", row.get("delta_h_loss_scalar", ""))),
+                msc=_fmt_num(row.get("longrun_msc_t", row.get("delta_h_msc_scalar", ""))),
                 step=_fmt_num(row.get("delta_h_max_step", "")),
                 tau=_fmt_num(row.get("delta_h_max_tau_step", "")),
                 maxv=_fmt_num(row.get("delta_h_max", "")),
@@ -966,6 +1057,7 @@ def main() -> None:
             frame_times = load_frame_times(_local_traj_dir(dataset_root, row))
 
             try:
+                _add_delta_h_longrun_aliases(metrics_path)
                 delta_h_series = _load_delta_h_heatmap(metrics_path)
                 delta_h_series["frame_times"] = frame_times
                 tau_grid = np.asarray(delta_h_series["tau_steps"], dtype=np.float64)

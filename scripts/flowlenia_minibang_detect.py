@@ -49,7 +49,12 @@ def _load_detection_defaults_from_config(manifest: dict[str, Any]) -> dict[str, 
     except Exception as exc:
         print(f"Warning: could not load detection defaults from {config_path}: {exc}")
         return {}
-    keys = ("detect_start_step", "detect_end_step", "detect_max_duration_steps")
+    keys = (
+        "detect_start_step",
+        "detect_end_step",
+        "detect_max_duration_steps",
+        "detect_delta_h_derivative_lag_steps",
+    )
     return {key: flat.get(key, None) for key in keys if flat.get(key, None) is not None}
 
 
@@ -117,6 +122,50 @@ def _interval_score(values_z: np.ndarray, i0: int, i1: int) -> float:
     return float(np.nanmax(segment)) if segment.size else 0.0
 
 
+def _finite_difference_by_step(
+    values: np.ndarray,
+    steps: np.ndarray,
+    *,
+    lag_steps: int,
+) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    steps = np.asarray(steps, dtype=np.float64).reshape(-1)
+    out = np.full(values.shape, np.nan, dtype=np.float64)
+    if values.size != steps.size or values.size < 2 or int(lag_steps) <= 0:
+        return out
+    order_ok = np.all(np.diff(steps) >= 0.0)
+    if not order_ok:
+        return out
+    for i, step in enumerate(steps):
+        j = int(np.searchsorted(steps, step - float(lag_steps), side="right") - 1)
+        if j < 0 or j >= i:
+            continue
+        dt = float(steps[i] - steps[j])
+        if dt <= 0.0 or not np.isfinite(dt):
+            continue
+        out[i] = (float(values[i]) - float(values[j])) / dt
+    return out
+
+
+def _centered_interval(
+    center_step: float,
+    *,
+    duration_steps: int,
+    detect_start_step: int | None,
+    detect_end_step: int | None,
+) -> tuple[int, int] | None:
+    duration = max(1, int(duration_steps))
+    center = int(round(float(center_step)))
+    start = center - duration // 2
+    end = start + duration
+    return _clip_interval(
+        max(0, start),
+        max(0, end),
+        detect_start_step=detect_start_step,
+        detect_end_step=detect_end_step,
+    )
+
+
 def _range_mask(steps: np.ndarray, start_step: int | None, end_step: int | None) -> np.ndarray:
     mask = np.ones(np.asarray(steps).shape, dtype=bool)
     if start_step is not None:
@@ -154,6 +203,9 @@ def detect_for_trajectory(
     *,
     delta_h_z: float,
     delta_h_quantile: float,
+    delta_h_derivative_z: float,
+    delta_h_derivative_quantile: float,
+    delta_h_derivative_lag_steps: int | None,
     mass_shift_z: float,
     mass_shift_quantile: float,
     merge_gap_steps: int,
@@ -201,10 +253,62 @@ def detect_for_trajectory(
                         end_step=clipped[1],
                         score=score,
                         delta_h_z_max=score,
+                        delta_h_derivative_z_max=0.0,
                         mass_shift_z_max=0.0,
                         reasons=["delta_h_spike"],
                     )
                 )
+
+            if delta_h_derivative_lag_steps is not None and int(delta_h_derivative_lag_steps) > 0:
+                deriv = _finite_difference_by_step(
+                    dh,
+                    dh_steps,
+                    lag_steps=int(delta_h_derivative_lag_steps),
+                )
+                deriv_abs = np.abs(deriv)
+                deriv_z_values = robust_z(deriv_abs)
+                q_thr = (
+                    np.nanquantile(deriv_z_values, float(delta_h_derivative_quantile))
+                    if deriv_z_values.size
+                    else np.inf
+                )
+                mask = (deriv_z_values >= float(delta_h_derivative_z)) | (
+                    (deriv_z_values >= float(q_thr)) & (deriv_z_values > 0.0)
+                )
+                mask &= np.isfinite(deriv)
+                mask &= _range_mask(dh_steps, detect_start_step, detect_end_step)
+                intervals = intervals_from_mask(dh_steps, mask, pad_steps=0)
+                duration = int(delta_h_derivative_lag_steps) + 2 * int(pad_steps)
+                if detect_max_duration_steps is not None:
+                    duration = min(duration, int(detect_max_duration_steps))
+                for _start, _end, i0, i1 in intervals:
+                    segment = deriv_z_values[i0 : i1 + 1]
+                    if segment.size == 0:
+                        continue
+                    local_peak = int(np.nanargmax(segment))
+                    peak_i = i0 + local_peak
+                    clipped = _centered_interval(
+                        float(dh_steps[peak_i]),
+                        duration_steps=duration,
+                        detect_start_step=detect_start_step,
+                        detect_end_step=detect_end_step,
+                    )
+                    if clipped is None:
+                        continue
+                    score = float(deriv_z_values[peak_i])
+                    reason = "delta_h_drop" if float(deriv[peak_i]) < 0.0 else "delta_h_rise"
+                    candidates.append(
+                        dict(
+                            traj_id=row.get("traj_id"),
+                            start_step=clipped[0],
+                            end_step=clipped[1],
+                            score=score,
+                            delta_h_z_max=0.0,
+                            delta_h_derivative_z_max=score,
+                            mass_shift_z_max=0.0,
+                            reasons=[reason],
+                        )
+                    )
 
         tv = _as_float_array(data, "cluster_tv_lag")
         tv_steps = _as_float_array(data, "cluster_steps")
@@ -231,6 +335,7 @@ def detect_for_trajectory(
                         end_step=clipped[1],
                         score=score,
                         delta_h_z_max=0.0,
+                        delta_h_derivative_z_max=0.0,
                         mass_shift_z_max=score,
                         reasons=["cluster_mass_shift"],
                     )
@@ -263,6 +368,7 @@ def detect_for_trajectory(
                         end_step=clipped[1],
                         score=score,
                         delta_h_z_max=0.0,
+                        delta_h_derivative_z_max=0.0,
                         mass_shift_z_max=score,
                         reasons=["cluster_entropy_change"],
                     )
@@ -305,6 +411,7 @@ def detect_for_trajectory(
                 else float("nan"),
                 score=float(cand.get("score", 0.0)),
                 delta_h_z_max=float(cand.get("delta_h_z_max", 0.0)),
+                delta_h_derivative_z_max=float(cand.get("delta_h_derivative_z_max", 0.0)),
                 mass_shift_z_max=float(cand.get("mass_shift_z_max", 0.0)),
                 reasons=";".join(cand.get("reasons", [])),
             )
@@ -325,6 +432,7 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
             "end_step",
             "score",
             "delta_h_z_max",
+            "delta_h_derivative_z_max",
             "mass_shift_z_max",
             "reasons",
             "optimization_iter",
@@ -344,6 +452,7 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
             "end_step",
             "score",
             "delta_h_z_max",
+            "delta_h_derivative_z_max",
             "mass_shift_z_max",
             "reasons",
         ]
@@ -386,17 +495,20 @@ def _write_markdown(path: Path, rows: list[dict[str, Any]], manifest_rows: list[
         lines.append(f"- candidates: `{len(cand_rows)}`")
         lines.append("")
         if cand_rows:
-            lines.append("| candidate | video start | video end | steps | score | reasons |")
-            lines.append("|---|---:|---:|---:|---:|---|")
+            lines.append("| candidate | video start | video end | steps | score | deltaH | d/dt deltaH | mass shift | reasons |")
+            lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---|")
             for cand in cand_rows:
                 lines.append(
-                    "| {candidate_id} | {start} | {end} | {s0}-{s1} | {score:.2f} | {reasons} |".format(
+                    "| {candidate_id} | {start} | {end} | {s0}-{s1} | {score:.2f} | {dh:.2f} | {ddh:.2f} | {mass:.2f} | {reasons} |".format(
                         candidate_id=cand["candidate_id"],
                         start=_fmt_sec(cand["start_video_sec"]),
                         end=_fmt_sec(cand["end_video_sec"]),
                         s0=int(cand["start_step"]),
                         s1=int(cand["end_step"]),
                         score=float(cand["score"]),
+                        dh=float(cand.get("delta_h_z_max", 0.0)),
+                        ddh=float(cand.get("delta_h_derivative_z_max", 0.0)),
+                        mass=float(cand.get("mass_shift_z_max", 0.0)),
                         reasons=cand["reasons"],
                     )
                 )
@@ -416,6 +528,27 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.90,
         help="Also require at least this within-trajectory deltaH robust-z quantile.",
+    )
+    parser.add_argument(
+        "--delta-h-derivative-z",
+        type=float,
+        default=2.5,
+        help="Robust z threshold for finite-difference abs(deltaH derivative) peaks.",
+    )
+    parser.add_argument(
+        "--delta-h-derivative-quantile",
+        type=float,
+        default=0.90,
+        help="Also accept finite-difference deltaH derivative peaks in this within-trajectory robust-z quantile.",
+    )
+    parser.add_argument(
+        "--delta-h-derivative-lag-steps",
+        type=int,
+        default=None,
+        help=(
+            "Step lag for finite-difference deltaH derivative. Defaults to "
+            "config/manifest detect_delta_h_derivative_lag_steps, then detect_max_duration_steps."
+        ),
     )
     parser.add_argument("--mass-shift-z", type=float, default=2.0, help="Robust z threshold for cluster shifts.")
     parser.add_argument(
@@ -488,6 +621,16 @@ def main() -> None:
     )
     if detect_max_duration_steps is not None and int(detect_max_duration_steps) <= 0:
         raise ValueError(f"--max-duration-steps must be positive, got {detect_max_duration_steps}.")
+    delta_h_derivative_lag_steps = _first_int(
+        args.delta_h_derivative_lag_steps,
+        config_defaults.get("detect_delta_h_derivative_lag_steps", None),
+        manifest.get("detect_delta_h_derivative_lag_steps", None),
+        detect_max_duration_steps,
+    )
+    if delta_h_derivative_lag_steps is not None and int(delta_h_derivative_lag_steps) <= 0:
+        raise ValueError(
+            f"--delta-h-derivative-lag-steps must be positive, got {delta_h_derivative_lag_steps}."
+        )
     all_candidates: list[dict[str, Any]] = []
     for row in manifest_rows:
         all_candidates.extend(
@@ -496,6 +639,9 @@ def main() -> None:
                 row,
                 delta_h_z=float(args.delta_h_z),
                 delta_h_quantile=float(args.delta_h_quantile),
+                delta_h_derivative_z=float(args.delta_h_derivative_z),
+                delta_h_derivative_quantile=float(args.delta_h_derivative_quantile),
+                delta_h_derivative_lag_steps=delta_h_derivative_lag_steps,
                 mass_shift_z=float(args.mass_shift_z),
                 mass_shift_quantile=float(args.mass_shift_quantile),
                 merge_gap_steps=int(args.merge_gap_steps),
