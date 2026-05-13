@@ -112,9 +112,9 @@ rollout:
 
 minibang:
   checkpoint_dir: experiments/opt_msc/checkpoints/test_run_longrun_check
-  output_root: experiments/opt_msc/checkpoints/minibang_golden_set/test_run_longrun_check_v2
-  n_trajectories: 20
-  batch_size: 10 
+  output_root: experiments/opt_msc/checkpoints/minibang_golden_set/run_longrun_check_v2
+  n_trajectories: 100
+  batch_size: 20 
 
   selection_mode: loss_quantile_biased
   selection_keep_top_n: 5
@@ -137,24 +137,32 @@ minibang:
   minibang_metric_tau_mode: max_grid
 
   cluster_method: dpmeans
-  # pcolor_chroma means chromaticity of the actual rendered Pcolor RGB:
-  # chroma(clip(sum(A) * P[..., :3], 0, 1)). This avoids splitting one color by density/brightness.
+
+  # 1) берем rendered Pcolor:
+  #    clip(sum(A) * P[..., :3], 0, 1)
+  # 2) переводим в chroma, чтобы не дробить один цвет по brightness
   cluster_space: pcolor_chroma
+
+  # DP сначала может найти более тонкие оттенки
   cluster_dp_lambda: 0.18
   cluster_dp_iters: 8
   cluster_dp_max_clusters: 32
+
+  # Потом склеиваем DP-кластеры в грубые цветовые семьи:
+  # black/gray/red/yellow/green/cyan/blue/magenta
+  cluster_merge_color_families: true
   cluster_merge_rgb_threshold: 0.0
   cluster_merge_hue_threshold_deg: 0.0
-  cluster_merge_color_families: true
   cluster_merge_min_saturation: 0.2
   cluster_merge_min_value: 0.05
 
-  # Used only when cluster_method: kmeans.
-  cluster_k: 8
   cluster_max_samples: 200000
   cluster_samples_per_snapshot: null
   cluster_min_mass: 1.0e-8
   cluster_standardize: false
+  cluster_change_lag_steps: 5000
+
+  # Игнорируется при cluster_method: dpmeans, можно оставить для backward compatibility.
+  cluster_k: 8
   cluster_kmeans_iters: 40
   cluster_kmeans_restarts: 2
-  cluster_change_lag_steps: 5000
