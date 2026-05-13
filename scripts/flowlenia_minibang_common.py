@@ -191,6 +191,10 @@ def merge_intervals(
                 float(cur.get("delta_h_z_max", 0.0)),
                 float(row.get("delta_h_z_max", 0.0)),
             )
+            cur["delta_h_derivative_z_max"] = max(
+                float(cur.get("delta_h_derivative_z_max", 0.0)),
+                float(row.get("delta_h_derivative_z_max", 0.0)),
+            )
             cur["mass_shift_z_max"] = max(
                 float(cur.get("mass_shift_z_max", 0.0)),
                 float(row.get("mass_shift_z_max", 0.0)),

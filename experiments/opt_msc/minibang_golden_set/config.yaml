@@ -131,6 +131,7 @@ minibang:
   metrics_seed: 12345
   detect_start_step: 150000
   detect_max_duration_steps: 30000
+  detect_delta_h_derivative_lag_steps: 30000
 
   # The optimization config uses trainable_grid; posthoc detection has no optimized
   # tau latent, so the runner evaluates all tau values and takes max_grid by default.
