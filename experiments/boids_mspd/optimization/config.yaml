@@ -1,0 +1,68 @@
+meta:
+  seed: 1
+  save_dir: experiments/boids_mspd/checkpoints/longrun_check
+  resume: true
+
+substrate:
+  substrate: boids
+  rollout_steps: 200000
+  n_boids: 128
+  n_nbrs: 16
+  visual_range: 0.1
+  speed: 0.5
+  controller: network
+  dt: 0.01
+  bird_render_size: 0.015
+  bird_render_sharpness: 40.0
+  space_size: 1.0
+  red_boid: true
+  border: wall
+
+evaluation:
+  sample_every_steps: 50
+  log_clip_evolution: false
+
+optimization:
+  params_init: substrate_default
+  bs: 1
+  pop_batch: 8
+  pop_size: 8
+  n_iters: 100
+  sigma: 0.2
+
+logging:
+  wandb_project: asal
+  pca_every: 0
+
+metric:
+  metric_trajectory_source: state_x
+  metric_unwrap_state_x: true
+  metric_tau_mode: trainable_grid
+  metric_tau_grid_steps: [100, 200, 400, 800, 1200, 1600, 2000, 3000, 4000]
+  metric_window_size_steps: 20000
+  metric_window_step_steps: 5000
+  metric_tau_steps: 800
+  metric_range_start_steps: 50000
+  metric_range_end_steps: 200000
+  metric_window_size_frames: null
+  metric_window_step_frames: null
+  metric_tau_frames: null
+  metric_tau_grid_frames: null
+
+  metric_m_samples: 48
+  metric_m_min: 4
+  metric_n_proj: 16
+  metric_null_reps: 6
+  metric_particle_samples: 64
+  metric_dirs_seed: 123
+  metric_periodic: null
+  metric_domain_y: null
+  metric_domain_x: null
+
+  metric_preprocess_mode: clip
+  metric_scales: null
+  metric_scale_weights: null
+
+  metric_alpha: 0.0
+  metric_beta: 1.0
+  metric_eps: 1.0e-12

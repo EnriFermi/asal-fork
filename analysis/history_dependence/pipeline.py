@@ -35,10 +35,10 @@ from .utils import resolve_config_path
 DEFAULT_CONFIG: dict[str, Any] = {
     "source": {
         "type": "history_dependence_eval",
-        "path": "experiments/frustration/checkpoints/history_dependence_opt1_best",
+        "path": "experiments/legacy/frustration/checkpoints/history_dependence_opt1_best",
     },
     "output": {
-        "dir": "experiments/frustration/checkpoints/history_dependence_opt1_best/offline_analysis",
+        "dir": "experiments/legacy/frustration/checkpoints/history_dependence_opt1_best/offline_analysis",
     },
     "embeddings": {
         "enabled": True,

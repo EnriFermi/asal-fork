@@ -198,6 +198,57 @@ def _load_manifest_metadata(dataset_root: Path | None) -> dict[str, dict[str, An
     return out
 
 
+def _parse_float_or_none(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    return out if math.isfinite(out) else None
+
+
+def _parse_int_or_none(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        out = int(float(value))
+    except Exception:
+        return None
+    return out
+
+
+def _load_metric_plot_metadata(dataset_root: Path | None) -> dict[str, dict[str, Any]]:
+    if dataset_root is None:
+        return {}
+    path = dataset_root / "metric_plots" / "metric_plot_summary.csv"
+    if not path.exists():
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    with path.open(newline="") as f:
+        for row in csv.DictReader(f):
+            traj_id = row.get("traj_id", "")
+            if not traj_id:
+                continue
+            out[traj_id] = {
+                "longrun_metric_loss": _parse_float_or_none(row.get("longrun_metric_loss")),
+                "longrun_metric_score": _parse_float_or_none(row.get("longrun_metric_score")),
+                "longrun_msc_t": _parse_float_or_none(row.get("longrun_msc_t")),
+                "delta_h_loss_scalar": _parse_float_or_none(row.get("delta_h_loss_scalar")),
+                "delta_h_score_scalar": _parse_float_or_none(row.get("delta_h_score_scalar")),
+                "delta_h_msc_scalar": _parse_float_or_none(row.get("delta_h_msc_scalar")),
+                "delta_h_max": _parse_float_or_none(row.get("delta_h_max")),
+                "delta_h_mean": _parse_float_or_none(row.get("delta_h_mean")),
+                "delta_h_max_step": _parse_float_or_none(row.get("delta_h_max_step")),
+                "delta_h_max_tau_step": _parse_float_or_none(row.get("delta_h_max_tau_step")),
+                "cluster_tv_lag_max": _parse_float_or_none(row.get("cluster_tv_lag_max")),
+                "cluster_entropy_norm_min": _parse_float_or_none(row.get("cluster_entropy_norm_min")),
+                "cluster_entropy_norm_max": _parse_float_or_none(row.get("cluster_entropy_norm_max")),
+                "cluster_mass_n_clusters": _parse_int_or_none(row.get("cluster_mass_n_clusters")),
+            }
+    return out
+
+
 def _summary(values: list[float]) -> dict[str, Any]:
     if not values:
         return {
@@ -321,8 +372,10 @@ def _correlation(rows: list[tuple[Any, Any]]) -> dict[str, Any]:
         "n": len(xs),
         "pearson_r": pearson,
         "spearman_r": spearman,
+        "kendall_tau": None,
         "pearson_p": None,
         "spearman_p": None,
+        "kendall_p": None,
     }
     try:
         from scipy import stats as scipy_stats  # type: ignore
@@ -330,13 +383,111 @@ def _correlation(rows: list[tuple[Any, Any]]) -> dict[str, Any]:
         if len(xs) >= 2 and len(set(xs)) > 1 and len(set(ys)) > 1:
             pr = scipy_stats.pearsonr(xs, ys)
             sr = scipy_stats.spearmanr(xs, ys)
+            kr = scipy_stats.kendalltau(xs, ys)
             result["pearson_r"] = float(pr.statistic)
             result["pearson_p"] = float(pr.pvalue)
             result["spearman_r"] = float(sr.statistic)
             result["spearman_p"] = float(sr.pvalue)
+            result["kendall_tau"] = float(kr.statistic)
+            result["kendall_p"] = float(kr.pvalue)
     except Exception:
         pass
     return result
+
+
+def _roc_curve(labels_raw: list[Any], scores_raw: list[Any]) -> dict[str, Any]:
+    labels: list[int] = []
+    scores: list[float] = []
+    for raw_label, raw_score in zip(labels_raw, scores_raw):
+        try:
+            label = 1 if int(raw_label) > 0 else 0
+            score = float(raw_score)
+        except Exception:
+            continue
+        if math.isfinite(score):
+            labels.append(label)
+            scores.append(score)
+
+    positives = int(sum(labels))
+    negatives = int(len(labels) - positives)
+    if positives == 0 or negatives == 0:
+        return {
+            "n": len(labels),
+            "positives": positives,
+            "negatives": negatives,
+            "auc": None,
+            "fpr": [],
+            "tpr": [],
+            "thresholds": [],
+        }
+
+    order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+    fpr = [0.0]
+    tpr = [0.0]
+    thresholds = [float("inf")]
+    tp = 0
+    fp = 0
+    i = 0
+    while i < len(order):
+        score = scores[order[i]]
+        j = i
+        while j < len(order) and scores[order[j]] == score:
+            if labels[order[j]]:
+                tp += 1
+            else:
+                fp += 1
+            j += 1
+        fpr.append(fp / negatives)
+        tpr.append(tp / positives)
+        thresholds.append(score)
+        i = j
+
+    auc = 0.0
+    for i in range(1, len(fpr)):
+        auc += (fpr[i] - fpr[i - 1]) * 0.5 * (tpr[i] + tpr[i - 1])
+
+    return {
+        "n": len(labels),
+        "positives": positives,
+        "negatives": negatives,
+        "auc": float(auc),
+        "fpr": fpr,
+        "tpr": tpr,
+        "thresholds": thresholds,
+    }
+
+
+def _roc_auc_for_trials(trials: list[dict[str, Any]]) -> dict[str, Any]:
+    labels = [1 if len(trial["minibangs"]) > 0 else 0 for trial in trials]
+
+    def values(field: str, sign: float = 1.0) -> list[float | None]:
+        out: list[float | None] = []
+        for trial in trials:
+            value = _parse_float_or_none(trial.get(field))
+            out.append(None if value is None else sign * value)
+        return out
+
+    specs = [
+        ("optimization_iter", "optimization_iter", 1.0),
+        ("minus_loss", "loss", -1.0),
+        ("saturation_T", "saturation_T", 1.0),
+        ("minus_longrun_metric_loss", "longrun_metric_loss", -1.0),
+        ("longrun_metric_score", "longrun_metric_score", 1.0),
+        ("longrun_msc_t", "longrun_msc_t", 1.0),
+        ("delta_h_max", "delta_h_max", 1.0),
+        ("cluster_tv_lag_max", "cluster_tv_lag_max", 1.0),
+    ]
+    curves: dict[str, Any] = {}
+    for name, field, sign in specs:
+        curve = _roc_curve(labels, values(field, sign))
+        curve["source_field"] = field
+        curve["score_transform"] = "negate" if sign < 0 else "identity"
+        curves[name] = curve
+    return {
+        "target": "has_minibang",
+        "positive_definition": "minibang_count > 0",
+        "curves": curves,
+    }
 
 
 def _make_stats(markup: dict[str, Any]) -> dict[str, Any]:
@@ -354,6 +505,11 @@ def _make_stats(markup: dict[str, Any]) -> dict[str, Any]:
     iter_count_rows = [(trial.get("optimization_iter"), len(trial["minibangs"])) for trial in trials]
     loss_count_rows = [(trial.get("loss"), len(trial["minibangs"])) for trial in trials]
     saturation_count_rows = [(trial.get("saturation_T"), len(trial["minibangs"])) for trial in trials]
+    longrun_loss_count_rows = [(trial.get("longrun_metric_loss"), len(trial["minibangs"])) for trial in trials]
+    longrun_score_count_rows = [(trial.get("longrun_metric_score"), len(trial["minibangs"])) for trial in trials]
+    longrun_msc_t_count_rows = [(trial.get("longrun_msc_t"), len(trial["minibangs"])) for trial in trials]
+    delta_h_max_count_rows = [(trial.get("delta_h_max"), len(trial["minibangs"])) for trial in trials]
+    cluster_tv_count_rows = [(trial.get("cluster_tv_lag_max"), len(trial["minibangs"])) for trial in trials]
 
     video_durations = [
         float(trial["video_duration_sec"])
@@ -411,11 +567,18 @@ def _make_stats(markup: dict[str, Any]) -> dict[str, Any]:
             "optimization_iter_vs_minibang_count": _correlation(iter_count_rows),
             "loss_vs_minibang_count": _correlation(loss_count_rows),
             "saturation_T_vs_minibang_count": _correlation(saturation_count_rows),
+            "longrun_metric_loss_vs_minibang_count": _correlation(longrun_loss_count_rows),
+            "longrun_metric_score_vs_minibang_count": _correlation(longrun_score_count_rows),
+            "longrun_msc_t_vs_minibang_count": _correlation(longrun_msc_t_count_rows),
+            "delta_h_max_vs_minibang_count": _correlation(delta_h_max_count_rows),
+            "cluster_tv_lag_max_vs_minibang_count": _correlation(cluster_tv_count_rows),
             "notes": [
                 "loss is copied from optimization manifest; lower loss is better.",
                 "saturation_T is metadata derived from optimization iteration.",
+                "longrun metrics are loaded from metric_plots/metric_plot_summary.csv when available.",
             ],
         },
+        "roc_auc": _roc_auc_for_trials(trials),
         "n_interesting_non_minibang_ranges": sum(len(trial["interesting_non_minibangs"]) for trial in trials),
         "n_trials_with_interesting_text": sum(1 for trial in trials if trial.get("interesting_text", "").strip()),
         "parse_warnings": markup["parse_warnings"],
@@ -447,6 +610,12 @@ def _write_stats_md(path: Path, stats: dict[str, Any]) -> None:
     iter_corr = opt_corr.get("optimization_iter_vs_minibang_count", {})
     loss_corr = opt_corr.get("loss_vs_minibang_count", {})
     sat_corr = opt_corr.get("saturation_T_vs_minibang_count", {})
+    longrun_loss_corr = opt_corr.get("longrun_metric_loss_vs_minibang_count", {})
+    longrun_score_corr = opt_corr.get("longrun_metric_score_vs_minibang_count", {})
+    longrun_msc_corr = opt_corr.get("longrun_msc_t_vs_minibang_count", {})
+    dh_max_corr = opt_corr.get("delta_h_max_vs_minibang_count", {})
+    tv_corr = opt_corr.get("cluster_tv_lag_max_vs_minibang_count", {})
+    roc_curves = stats.get("roc_auc", {}).get("curves", {})
     lines = [
         "# Minibang Markup Stats",
         "",
@@ -484,29 +653,97 @@ def _write_stats_md(path: Path, stats: dict[str, Any]) -> None:
         "",
         "## Optimization Correlations",
         "",
-        "| x | y | n | Pearson r | Pearson p | Spearman r | Spearman p |",
-        "|---|---|---:|---:|---:|---:|---:|",
+        "| x | y | n | Pearson r | Pearson p | Spearman r | Spearman p | Kendall tau | Kendall p |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|",
         (
             f"| optimization_iter | minibang_count | {iter_corr.get('n', '')} | "
             f"{_fmt(iter_corr.get('pearson_r'))} | {_fmt(iter_corr.get('pearson_p'))} | "
-            f"{_fmt(iter_corr.get('spearman_r'))} | {_fmt(iter_corr.get('spearman_p'))} |"
+            f"{_fmt(iter_corr.get('spearman_r'))} | {_fmt(iter_corr.get('spearman_p'))} | "
+            f"{_fmt(iter_corr.get('kendall_tau'))} | {_fmt(iter_corr.get('kendall_p'))} |"
         ),
         (
             f"| loss | minibang_count | {loss_corr.get('n', '')} | "
             f"{_fmt(loss_corr.get('pearson_r'))} | {_fmt(loss_corr.get('pearson_p'))} | "
-            f"{_fmt(loss_corr.get('spearman_r'))} | {_fmt(loss_corr.get('spearman_p'))} |"
+            f"{_fmt(loss_corr.get('spearman_r'))} | {_fmt(loss_corr.get('spearman_p'))} | "
+            f"{_fmt(loss_corr.get('kendall_tau'))} | {_fmt(loss_corr.get('kendall_p'))} |"
         ),
         (
             f"| saturation_T | minibang_count | {sat_corr.get('n', '')} | "
             f"{_fmt(sat_corr.get('pearson_r'))} | {_fmt(sat_corr.get('pearson_p'))} | "
-            f"{_fmt(sat_corr.get('spearman_r'))} | {_fmt(sat_corr.get('spearman_p'))} |"
+            f"{_fmt(sat_corr.get('spearman_r'))} | {_fmt(sat_corr.get('spearman_p'))} | "
+            f"{_fmt(sat_corr.get('kendall_tau'))} | {_fmt(sat_corr.get('kendall_p'))} |"
         ),
+        (
+            f"| longrun_metric_loss | minibang_count | {longrun_loss_corr.get('n', '')} | "
+            f"{_fmt(longrun_loss_corr.get('pearson_r'))} | {_fmt(longrun_loss_corr.get('pearson_p'))} | "
+            f"{_fmt(longrun_loss_corr.get('spearman_r'))} | {_fmt(longrun_loss_corr.get('spearman_p'))} | "
+            f"{_fmt(longrun_loss_corr.get('kendall_tau'))} | {_fmt(longrun_loss_corr.get('kendall_p'))} |"
+        ),
+        (
+            f"| longrun_metric_score | minibang_count | {longrun_score_corr.get('n', '')} | "
+            f"{_fmt(longrun_score_corr.get('pearson_r'))} | {_fmt(longrun_score_corr.get('pearson_p'))} | "
+            f"{_fmt(longrun_score_corr.get('spearman_r'))} | {_fmt(longrun_score_corr.get('spearman_p'))} | "
+            f"{_fmt(longrun_score_corr.get('kendall_tau'))} | {_fmt(longrun_score_corr.get('kendall_p'))} |"
+        ),
+        (
+            f"| longrun_msc_t | minibang_count | {longrun_msc_corr.get('n', '')} | "
+            f"{_fmt(longrun_msc_corr.get('pearson_r'))} | {_fmt(longrun_msc_corr.get('pearson_p'))} | "
+            f"{_fmt(longrun_msc_corr.get('spearman_r'))} | {_fmt(longrun_msc_corr.get('spearman_p'))} | "
+            f"{_fmt(longrun_msc_corr.get('kendall_tau'))} | {_fmt(longrun_msc_corr.get('kendall_p'))} |"
+        ),
+        (
+            f"| delta_h_max | minibang_count | {dh_max_corr.get('n', '')} | "
+            f"{_fmt(dh_max_corr.get('pearson_r'))} | {_fmt(dh_max_corr.get('pearson_p'))} | "
+            f"{_fmt(dh_max_corr.get('spearman_r'))} | {_fmt(dh_max_corr.get('spearman_p'))} | "
+            f"{_fmt(dh_max_corr.get('kendall_tau'))} | {_fmt(dh_max_corr.get('kendall_p'))} |"
+        ),
+        (
+            f"| cluster_tv_lag_max | minibang_count | {tv_corr.get('n', '')} | "
+            f"{_fmt(tv_corr.get('pearson_r'))} | {_fmt(tv_corr.get('pearson_p'))} | "
+            f"{_fmt(tv_corr.get('spearman_r'))} | {_fmt(tv_corr.get('spearman_p'))} | "
+            f"{_fmt(tv_corr.get('kendall_tau'))} | {_fmt(tv_corr.get('kendall_p'))} |"
+        ),
+        "",
+        "## ROC-AUC",
+        "",
+        "Positive label: `minibang_count > 0`.",
+        "",
+        "| score | n | positives | negatives | AUC | transform |",
+        "|---|---:|---:|---:|---:|---|",
+    ]
+    for name, curve in sorted(
+        roc_curves.items(),
+        key=lambda kv: (float("-inf") if kv[1].get("auc") is None else -float(kv[1]["auc"]), kv[0]),
+    ):
+        lines.append(
+            f"| {name} | {curve.get('n', '')} | {curve.get('positives', '')} | "
+            f"{curve.get('negatives', '')} | {_fmt(curve.get('auc'))} | {curve.get('score_transform', '')} |"
+        )
+    if stats.get("roc_auc", {}).get("plot_path"):
+        lines.extend(["", f"![ROC curves]({Path(str(stats['roc_auc']['plot_path'])).name})"])
+    if stats.get("msc_t_kde", {}).get("plot_path"):
+        kde = stats["msc_t_kde"]
+        lines.extend(
+            [
+                "",
+                "## MSC-T KDE",
+                "",
+                f"- score: `{kde.get('score', 'longrun_msc_t')}`",
+                f"- positive trials: `{kde.get('n_positive_trials', '')}`",
+                f"- negative trials: `{kde.get('n_negative_trials', '')}`",
+                "",
+                f"![MSC-T KDE]({Path(str(kde['plot_path'])).name})",
+            ]
+        )
+    lines.extend(
+        [
         "",
         "## Minibangs Per Trial",
         "",
         "| minibangs | trials |",
         "|---:|---:|",
-    ]
+        ]
+    )
     for count, n_trials in stats["minibangs_per_trial"]["count_distribution"].items():
         lines.append(f"| {count} | {n_trials} |")
     if stats["parse_warnings"]:
@@ -530,10 +767,11 @@ def build_markup(xlsx_path: Path, dataset_root: Path | None) -> dict[str, Any]:
     traj_ids = [f"traj_{idx:05d}" for idx, _raw, _row in raw_trials]
     video_durations = _load_video_durations(dataset_root, traj_ids)
     manifest_metadata = _load_manifest_metadata(dataset_root)
+    metric_plot_metadata = _load_metric_plot_metadata(dataset_root)
 
     for idx, raw_trial_id, row in raw_trials:
         traj_id = f"traj_{idx:05d}"
-        meta = manifest_metadata.get(traj_id, {})
+        meta = {**manifest_metadata.get(traj_id, {}), **metric_plot_metadata.get(traj_id, {})}
         minibang_text = row[1] if len(row) > 1 else ""
         interesting_text = row[2] if len(row) > 2 else ""
         notes = row[3] if len(row) > 3 else ""
@@ -549,6 +787,20 @@ def build_markup(xlsx_path: Path, dataset_root: Path | None) -> dict[str, Any]:
                 "source": meta.get("source", ""),
                 "selection_idx": meta.get("selection_idx"),
                 "param_hash": meta.get("param_hash", ""),
+                "longrun_metric_loss": meta.get("longrun_metric_loss"),
+                "longrun_metric_score": meta.get("longrun_metric_score"),
+                "longrun_msc_t": meta.get("longrun_msc_t"),
+                "delta_h_loss_scalar": meta.get("delta_h_loss_scalar"),
+                "delta_h_score_scalar": meta.get("delta_h_score_scalar"),
+                "delta_h_msc_scalar": meta.get("delta_h_msc_scalar"),
+                "delta_h_max": meta.get("delta_h_max"),
+                "delta_h_mean": meta.get("delta_h_mean"),
+                "delta_h_max_step": meta.get("delta_h_max_step"),
+                "delta_h_max_tau_step": meta.get("delta_h_max_tau_step"),
+                "cluster_tv_lag_max": meta.get("cluster_tv_lag_max"),
+                "cluster_entropy_norm_min": meta.get("cluster_entropy_norm_min"),
+                "cluster_entropy_norm_max": meta.get("cluster_entropy_norm_max"),
+                "cluster_mass_n_clusters": meta.get("cluster_mass_n_clusters"),
                 "minibang_text": str(minibang_text or "").strip(),
                 "interesting_text": str(interesting_text or "").strip(),
                 "notes": str(notes or "").strip(),
@@ -582,6 +834,20 @@ def build_markup(xlsx_path: Path, dataset_root: Path | None) -> dict[str, Any]:
                     "source": trial.get("source", ""),
                     "selection_idx": trial.get("selection_idx"),
                     "param_hash": trial.get("param_hash", ""),
+                    "longrun_metric_loss": trial.get("longrun_metric_loss"),
+                    "longrun_metric_score": trial.get("longrun_metric_score"),
+                    "longrun_msc_t": trial.get("longrun_msc_t"),
+                    "delta_h_loss_scalar": trial.get("delta_h_loss_scalar"),
+                    "delta_h_score_scalar": trial.get("delta_h_score_scalar"),
+                    "delta_h_msc_scalar": trial.get("delta_h_msc_scalar"),
+                    "delta_h_max": trial.get("delta_h_max"),
+                    "delta_h_mean": trial.get("delta_h_mean"),
+                    "delta_h_max_step": trial.get("delta_h_max_step"),
+                    "delta_h_max_tau_step": trial.get("delta_h_max_tau_step"),
+                    "cluster_tv_lag_max": trial.get("cluster_tv_lag_max"),
+                    "cluster_entropy_norm_min": trial.get("cluster_entropy_norm_min"),
+                    "cluster_entropy_norm_max": trial.get("cluster_entropy_norm_max"),
+                    "cluster_mass_n_clusters": trial.get("cluster_mass_n_clusters"),
                     **event,
                 }
                 rows_out.append(item)
@@ -612,7 +878,129 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-json", type=Path, default=None)
     parser.add_argument("--stats-json", type=Path, default=None)
     parser.add_argument("--stats-md", type=Path, default=None)
+    parser.add_argument("--roc-png", type=Path, default=None)
+    parser.add_argument("--kde-png", type=Path, default=None)
     return parser.parse_args()
+
+
+def _ensure_matplotlib_cache() -> None:
+    import os
+    import tempfile
+
+    mpl_cache = Path(tempfile.gettempdir()) / "flowlenia_matplotlib_cache"
+    mpl_cache.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(mpl_cache))
+    os.environ.setdefault("XDG_CACHE_HOME", str(mpl_cache))
+
+
+def _write_roc_plot(path: Path, stats: dict[str, Any]) -> None:
+    curves = stats.get("roc_auc", {}).get("curves", {})
+    curves = {
+        name: curve
+        for name, curve in curves.items()
+        if curve.get("auc") is not None and curve.get("fpr") and curve.get("tpr")
+    }
+    if not curves:
+        return
+    _ensure_matplotlib_cache()
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    ordered = sorted(curves.items(), key=lambda kv: -float(kv[1]["auc"]))
+    fig, ax = plt.subplots(figsize=(7.6, 6.0), constrained_layout=True)
+    for name, curve in ordered:
+        ax.plot(
+            curve["fpr"],
+            curve["tpr"],
+            linewidth=1.8,
+            label=f"{name} (AUC={float(curve['auc']):.3f})",
+        )
+    ax.plot([0.0, 1.0], [0.0, 1.0], color="#777777", linestyle="--", linewidth=1.0)
+    ax.set_xlabel("False positive rate")
+    ax.set_ylabel("True positive rate")
+    ax.set_title("ROC: has minibang")
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_ylim(-0.02, 1.02)
+    ax.grid(True, alpha=0.2)
+    ax.legend(loc="lower right", frameon=False, fontsize=8)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def _write_msc_t_kde_plot(path: Path, markup: dict[str, Any]) -> dict[str, Any]:
+    rows: list[tuple[float, int]] = []
+    for trial in markup.get("trials", []):
+        score = _parse_float_or_none(trial.get("longrun_msc_t"))
+        if score is not None:
+            rows.append((score, len(trial.get("minibangs", []))))
+
+    positives = [score for score, count in rows if count > 0]
+    negatives = [score for score, count in rows if count == 0]
+    summary: dict[str, Any] = {
+        "score": "longrun_msc_t",
+        "n": len(rows),
+        "n_positive_trials": len(positives),
+        "n_negative_trials": len(negatives),
+        "plot_path": str(path),
+    }
+    if len(rows) < 3 or len(positives) < 2 or len(negatives) < 2:
+        summary["status"] = "not_enough_points"
+        return summary
+
+    _ensure_matplotlib_cache()
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from scipy.stats import gaussian_kde  # type: ignore
+
+    all_scores = np.asarray([score for score, _count in rows], dtype=np.float64)
+    x_min = float(np.nanmin(all_scores))
+    x_max = float(np.nanmax(all_scores))
+    pad = 0.08 * max(x_max - x_min, 1e-9)
+    xs = np.linspace(x_min - pad, x_max + pad, 512)
+
+    kde_neg = gaussian_kde(np.asarray(negatives, dtype=np.float64))
+    kde_pos = gaussian_kde(np.asarray(positives, dtype=np.float64))
+    ys_neg = kde_neg(xs)
+    ys_pos = kde_pos(xs)
+
+    fig, ax = plt.subplots(figsize=(8.8, 5.4), constrained_layout=True)
+    ax.fill_between(xs, ys_neg, color="#4c78a8", alpha=0.22)
+    ax.plot(xs, ys_neg, color="#4c78a8", linewidth=2.0, label=f"no minibang (n={len(negatives)})")
+    ax.fill_between(xs, ys_pos, color="#f58518", alpha=0.25)
+    ax.plot(xs, ys_pos, color="#f58518", linewidth=2.0, label=f"has minibang (n={len(positives)})")
+
+    weighted_scores = np.asarray([score for score, count in rows for _ in range(count)], dtype=np.float64)
+    if weighted_scores.size >= 2 and np.nanstd(weighted_scores) > 0.0:
+        kde_weighted = gaussian_kde(weighted_scores)
+        ax.plot(
+            xs,
+            kde_weighted(xs),
+            color="#e45756",
+            linestyle="--",
+            linewidth=2.0,
+            label=f"minibang-count weighted (events={weighted_scores.size})",
+        )
+
+    ax.set_title("KDE of minibang markup by longrun MSC-T")
+    ax.set_xlabel("longrun_msc_t")
+    ax.set_ylabel("density")
+    ax.grid(True, alpha=0.2)
+    ax.legend(frameon=False)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=170)
+    plt.close(fig)
+
+    summary["status"] = "ok"
+    summary["positive_score_summary"] = _summary(positives)
+    summary["negative_score_summary"] = _summary(negatives)
+    return summary
 
 
 def main() -> None:
@@ -621,17 +1009,24 @@ def main() -> None:
     output_json = args.output_json or xlsx_path.with_suffix(".json")
     stats_json = args.stats_json or xlsx_path.with_name(f"{xlsx_path.stem}_stats.json")
     stats_md = args.stats_md or xlsx_path.with_name(f"{xlsx_path.stem}_stats.md")
+    roc_png = args.roc_png or stats_json.with_name(f"{stats_json.stem}_roc.png")
+    kde_png = args.kde_png or stats_json.with_name(f"{stats_json.stem}_msc_t_kde.png")
 
     markup = build_markup(xlsx_path, args.dataset_root)
     stats = _make_stats(markup)
+    stats["roc_auc"]["plot_path"] = str(roc_png)
+    stats["msc_t_kde"] = _write_msc_t_kde_plot(kde_png, markup)
 
     output_json.write_text(json.dumps(markup, indent=2, sort_keys=False) + "\n")
     stats_json.write_text(json.dumps(stats, indent=2, sort_keys=False) + "\n")
+    _write_roc_plot(roc_png, stats)
     _write_stats_md(stats_md, stats)
 
     print(f"Wrote markup JSON: {output_json}")
     print(f"Wrote stats JSON:  {stats_json}")
     print(f"Wrote stats MD:    {stats_md}")
+    print(f"Wrote ROC plot:    {roc_png}")
+    print(f"Wrote KDE plot:    {kde_png}")
     print(
         f"Parsed {stats['n_minibangs']} minibangs across "
         f"{stats['n_trials_with_minibangs']}/{stats['n_trials']} trials."

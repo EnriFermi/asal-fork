@@ -1,0 +1,11 @@
+python scripts/simulate_after_training_cli.py --seed=618 \
+  --save_dir="./data/lockheed_1" --substrate="lenia_flow" \
+  --rollout_steps=512 \
+  --grid_size=512 --C=3 --k=27 --kernel_components=15 \
+  --M="3,3,3;3,3,3;3,3,3" \
+  --dd=5 --dt=0.2 --sigma=0.65 --border="wall" --mix_rule="stoch_gene_wise" --sobel_impl="lax_legacy" \
+  --base_seed=0 --seed_patch_size=20 --p_constant_per_patch=1 --render_mode="Pcolor" \
+  --mutations --mutation_p=0.2 --mutation_sz=40 --mutation_scale=3.0 \
+  --n_seeds=24 --seed_mode="random_patches" \
+  --img_size=300 --max_steps=512 \
+  --output "volcano__lockheed_1__1_5m.mp4"

@@ -1,0 +1,14 @@
+# Copy this file into experiments/paper_check_<substrate>/config.yaml and replace placeholders.
+paper_check:
+  substrate_name: <substrate_name>
+  output_root: experiments/paper_check_<substrate>/checkpoints
+  num_optimizations: 5
+  num_random_baselines: 3
+
+optimization:
+  script: scripts/run_paper_check_optimization.py
+  base_config: optimization/config_longrun_check.yaml
+
+frustration:
+  script: scripts/run_paper_check_frustration.py
+  base_config: frustration_simulation/config.yaml

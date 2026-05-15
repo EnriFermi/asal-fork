@@ -1,0 +1,79 @@
+meta:
+  seed: 1
+  save_dir: experiments/legacy/opt_1/checkpoints/clip_oe_run
+  resume: true
+
+substrate:
+  substrate: lenia_flow
+  rollout_steps: 300000
+  grid_size: 128
+  C: 3
+  k: 9
+  kernel_components: 3
+  M: "2,1,0;0,2,1;1,0,2"
+  dd: 5
+  dt: 0.2
+  sigma: 0.65
+  border: wall
+  mix_rule: stoch
+  base_seed: 0
+  seed_patch_size: 20
+  seed_n_patches: 4
+  seed_mode: random_patches
+  p_constant_per_patch: 1
+  render_mode: Pcolor
+  clip1: .inf
+  clip2: .inf
+  mutations: true
+  mutation_sz: 40
+  mutation_p: 0.05
+  mutation_scale: 1.0
+  optimize_mutation_scale: false
+  volcano: false
+  volcano_sz: 30
+  volcano_p: 0.01
+  volcano_delta: 5.0
+  food: false
+  food_interval: 128
+  food_n: 3
+  food_sz: 16
+  food_amount: 1.0
+  food_consume_rate: 0.05
+  food_bonus: 1.0
+  mass_decay: 0.0
+  food_channel: 1
+  food_auto_size: false
+  food_auto_scale: 1.0
+  food_conv_mode: scalar
+  food_vis_scale: 1.0
+  food_vis_color: "0.6,0.3,0.0"
+  food_diffusion_alpha: 0.0
+  mass_clip_eps: 0.0
+  mass_renorm: false
+
+evaluation:
+  foundation_model: clip   # clip | siglip2 | google/siglip2-so400m-patch16-384-jax
+  time_sampling: 32
+  prompts: "a biological cell"
+  coef_prompt: 0.0
+  coef_softmax: 0.0
+  coef_oe: 1.0
+  coef_smooth: 0.0
+
+optimization:
+  optimizer: Sep-CMA-ES      # Sep-CMA-ES | LM_MA_ES
+  params_init: strategy_default  # strategy_default | substrate_default
+  bs: 2
+  pop_size: 16
+  n_iters: 200
+  sigma: 0.2
+  eval_splits: 1
+
+logging:
+  wandb_project: asal
+  save_every: 5
+  pca_every: 25
+  pca_history: 100
+  full_video_interval: 0
+  full_video_rollout_steps: 4000
+  full_video_img_size: 140
