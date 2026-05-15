@@ -1,28 +1,31 @@
 meta:
-  save_dir: experiments/opt_msc_plife_plus/checkpoints/longrun_check
+  save_dir: experiments/opt_msc_plife_plus/checkpoints/clip_oe_longrun
 
 substrate:
   substrate: plife_plus
-  rollout_steps: 200000
+  rollout_steps: 20000
   n_particles: 1000
   n_colors: 6
-  dt: 0.02
+  n_dims: 2
+  x_dist_bins: 7
   beta: 0.3
   mass: 0.1
+  dt: 0.02
   half_life: 0.04
   rmax: 0.1
   render_radius: 0.04
   sharpness: 30.0
   update_colors: true
   world_size: 1.0
-  border: wall
+  border: torus
+  neighbor_mode: dense
   background_color: black
 
 simulation:
   time_sampling: video
   img_size: 160
   seed: 0
-  output: experiments/opt_msc_plife_plus/figures/best_simulation.mp4
+  output: experiments/opt_msc_plife_plus/figures/best_simulation_oe.mp4
   fps: 60
   codec: libx264
   macro_block_size: null

@@ -1,9 +1,9 @@
 meta:
-  save_dir: experiments/opt_msc_boids/checkpoints/longrun_check
+  save_dir: experiments/paper_check_boids/checkpoints/optimization/run_000
 
 substrate:
   substrate: boids
-  rollout_steps: 200000
+  rollout_steps: 50000
   n_boids: 128
   n_nbrs: 16
   visual_range: 0.1
@@ -14,7 +14,7 @@ substrate:
   bird_render_sharpness: 40.0
   space_size: 1.0
   red_boid: true
-  border: wall
+  border: torus
 
 simulation:
   time_sampling: video
@@ -26,7 +26,7 @@ simulation:
   macro_block_size: null
   batch_steps: 512
   jit_microbatch: 128
-  max_steps: 20000
+  max_steps: 50000
   mass_plot: experiments/opt_msc_boids/figures/best_mass.png
   log_mass_every: 1000
   traj_iter: null

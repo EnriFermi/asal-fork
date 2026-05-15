@@ -1,10 +1,10 @@
 meta:
-  save_dir: experiments/opt_msc/checkpoints/random_baseline_2
-  output_dir: experiments/opt_msc/checkpoints/random_baseline_2/apf_logs
+  save_dir: experiments/opt_msc/checkpoints/random_baseline_3
+  output_dir: experiments/opt_msc/checkpoints/random_baseline_3/apf_logs
 
 substrate:
   substrate: lenia_flow
-  rollout_steps: 1000000
+  rollout_steps: 500000
   grid_size: 384
   C: 3
   k: 9
@@ -50,8 +50,8 @@ substrate:
   mass_clip_eps: 0.0
 
 simulation:
-  rollout_steps: 1000000
-  max_steps: 1000000
+  rollout_steps: 500000
+  max_steps: 500000
   seed: 0
   batch_steps: 512
   jit_microbatch: 64

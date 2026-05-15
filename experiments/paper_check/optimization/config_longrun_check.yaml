@@ -4,7 +4,7 @@ meta:
 
 substrate:
   substrate: lenia_flow
-  rollout_steps: 200000
+  rollout_steps: 300000
   grid_size: 128
   C: 3
   k: 9
@@ -68,6 +68,7 @@ logging:
   # pca_history: 100
 
 metric:
+  metric_trajectory_source: lagrangian
   metric_tau_mode: trainable_grid
   metric_tau_grid_steps: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000]
   # Windowing and lag (physical steps). If *_frames are set, they override *_steps.
@@ -75,7 +76,7 @@ metric:
   metric_window_step_steps: 5000
   metric_tau_steps: 3000
   metric_range_start_steps: 50000
-  metric_range_end_steps: 200000
+  metric_range_end_steps: 300000
   metric_window_size_frames: null
   metric_window_step_frames: null
   # metric_tau_frames: null

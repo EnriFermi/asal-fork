@@ -13,7 +13,7 @@ if [ "$#" -gt 0 ]; then
   dataset_root="$1"
   shift
 else
-  dataset_root="experiments/opt_msc/checkpoints/test_run_longrun_check/minibang_golden_set"
+  dataset_root="experiments/opt_msc/checkpoints/minibang_golden_set/test_run_longrun_check_v2"
 fi
 
 cd "${repo_root}"

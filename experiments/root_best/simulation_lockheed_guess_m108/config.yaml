@@ -2,13 +2,15 @@ meta:
   save_dir: data/lockheed_1
 
 substrate:
+  sobel_impl: scipy
+  mass_renorm: true
   substrate: lenia_flow
   rollout_steps: 500
   grid_size: 512
   C: 3
   k: 27
   kernel_components: 15
-  M: "3,3,3;3,3,3;3,3,3"  # hypothesis: symmetric 3x3 with sum(M)=108
+  M: "3,3,3;3,3,3;3,3,3"
   dd: 5
   dt: 0.2
   sigma: 0.65
@@ -25,7 +27,7 @@ substrate:
   mutations: true
   mutation_sz: 40
   mutation_p: 0.2
-  mutation_scale: 3.0
+  mutation_scale: 1.0
   optimize_mutation_scale: false
   volcano: false
   volcano_sz: 30
@@ -47,7 +49,6 @@ substrate:
   food_vis_color: "0.6,0.3,0.0"
   food_diffusion_alpha: 0.0
   mass_clip_eps: 0.0
-  mass_renorm: false
 
 simulation:
   time_sampling: video
@@ -63,7 +64,7 @@ simulation:
   macro_block_size: null
   batch_steps: 256
   jit_microbatch: 64
-  max_steps: 100000
+  max_steps: 10000000
   mass_plot: experiments/root_best/simulation_lockheed_guess_m108/root_best__lockheed_guess_m108__mass.png
   log_mass_every: 1024
   traj_iter: null

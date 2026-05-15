@@ -1,16 +1,7 @@
-meta:
-  seed: 0
-  save_dir: experiments/frustration/checkpoints/history_dependence_opt1_best
-
-source:
-  checkpoint_dir: experiments/opt_msc/checkpoints/test_run_longer_opt
-  params_name: best
-  params_path: null
-
 substrate:
   substrate: lenia_flow
   grid_size: 384
-  rollout_steps: 1000000
+  rollout_steps: 1200000
   C: 3
   k: 9
   kernel_components: 3
@@ -55,9 +46,9 @@ substrate:
   mass_clip_eps: 0.0
 
 protocol:
-  grid_split: 2
+  grid_split: 3
   warmup_steps: 500000
-  total_steps: 1000000
+  total_steps: 1200000
   wall_pad: 5
 
 evaluation:
@@ -67,8 +58,8 @@ evaluation:
   foundation_model: clip
   clip_img_size: 224
   time_sampling: 8
-  late_window_start_steps: 800000
-  late_window_end_steps: 1000000
+  late_window_start_steps: 1000000
+  late_window_end_steps: 1200000
   late_window_size_steps: null
   distance_metric: cosine_mean
   resume: true
@@ -76,7 +67,7 @@ evaluation:
   save_lagrangian_tracks: true
 
 metric:
-  sample_every_steps: 1000
+  sample_every_steps: 50
   metric_window_size_steps: 20000
   metric_window_step_steps: 5000
   metric_tau_steps: 3000
@@ -97,7 +88,7 @@ metric:
   metric_periodic: null
   metric_domain_y: null
   metric_domain_x: null
-  metric_lagrangian_n_particles: 256
+  metric_lagrangian_n_particles: 8192
   metric_lagrangian_init_mode: mass
   metric_lagrangian_flow_channel: -1
   metric_lagrangian_flow_reduce: mass_weighted
