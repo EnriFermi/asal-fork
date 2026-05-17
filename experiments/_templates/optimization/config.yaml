@@ -1,0 +1,20 @@
+# Copy this file into a concrete experiment directory and replace placeholders.
+optimizer:
+  seed: 0
+  num_iters: 100
+  popsize: 32
+  save_dir: experiments/<experiment_family>/checkpoints/<run_name>
+
+substrate:
+  name: <substrate_name>
+
+metric:
+  metric_name: msc
+  metric_tau_mode: trainable_grid
+  metric_tau_grid: [1000, 2000, 3000, 5000, 8000]
+  metric_alpha: 0.0
+  metric_beta: 1.0
+
+logging:
+  wandb_project: <wandb_project>
+  wandb_run_name: <run_name>

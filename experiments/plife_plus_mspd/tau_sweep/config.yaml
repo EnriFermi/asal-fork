@@ -1,0 +1,121 @@
+meta:
+  output_dir: analysis/results/opt_msc_plife_plus_tau_sweep
+  seed: 0
+  metric_seed_base: 123000
+  save_trajectories: true
+  reuse_saved_trajectories: true
+
+substrate:
+  substrate: plife_plus
+  rollout_steps: 10000
+  n_particles: 1000
+  n_colors: 6
+  n_dims: 2
+  x_dist_bins: 7
+  beta: 0.3
+  alpha: 0.0
+  mass: 0.1
+  dt: 0.02
+  half_life: 0.04
+  rmax: 0.1
+  render_radius: 0.04
+  sharpness: 30.0
+  update_colors: true
+  world_size: 1.0
+  border: torus
+  neighbor_mode: dense
+  background_color: black
+
+simulation:
+  metric_trajectory_source: state_x
+  metric_unwrap_state_x: true
+  sample_every_steps: 1
+
+metric:
+  metric_tau_mode: max_grid
+  metric_tau_grid_steps: [5, 10, 15, 20, 25]
+  metric_window_size_steps: 100
+  metric_window_step_steps: 50
+  metric_tau_steps: 25
+  metric_range_start_steps: 0
+  metric_range_end_steps: null
+  metric_window_size_frames: null
+  metric_window_step_frames: null
+  metric_tau_frames: null
+  metric_tau_grid_frames: null
+
+  metric_m_samples: 48
+  metric_m_min: 4
+  metric_n_proj: 16
+  metric_null_reps: 6
+  metric_particle_samples: 64
+  metric_dirs_seed: 123
+  metric_periodic: null
+  metric_domain_y: null
+  metric_domain_x: null
+
+  metric_preprocess_mode: clip
+  metric_scales: null
+  metric_scale_weights: null
+
+  metric_alpha: 0.0
+  metric_beta: 1.0
+  metric_eps: 1.0e-6
+
+runs:
+  # Duplicate entries inside a group if you want several runs averaged into one curve.
+  # If trajectory_path exists, the script loads it directly and skips the rollout.
+  - run_id: oe_000
+    group: oe
+    label: OE optimized
+    checkpoint_dir: experiments/opt_msc_plife_plus/checkpoints/clip_oe_longrun
+    params_name: best
+    params_path: null
+    trajectory_path: null
+    seed: 0
+
+  - run_id: msc_000
+    group: msc
+    label: MSC optimized
+    checkpoint_dir: experiments/plife_plus_mspd/checkpoints/longrun_check_fixed
+    params_name: best
+    params_path: null
+    trajectory_path: null
+    seed: 0
+
+  - run_id: random_000
+    group: random
+    label: Random
+    checkpoint_dir: experiments/plife_plus_mspd/checkpoints/random_init
+    params_name: best
+    params_path: null
+    trajectory_path: null
+    seed: 0
+
+plot:
+  value_key: score_by_tau
+  title: MSC score vs tau on shared rollouts
+  ylabel: MSC score
+  y_scale: linear
+  log_floor: 1.0e-12
+  delta_h_heatmaps: true
+  delta_h_heatmap_cmap: coolwarm
+  delta_h_heatmap_center_zero: true
+  delta_h_heatmap_aggregate: mean
+  group_order: [oe, msc, random]
+  colors:
+    oe: "#C44E52"
+    msc: "#4C72B0"
+    random: "#55A868"
+  linewidths:
+    oe: 2.5
+    msc: 2.5
+    random: 2.5
+  individual_linewidths:
+    oe: 1.2
+    msc: 1.2
+    random: 1.2
+  show_individual: true
+  individual_alpha: 0.22
+  summary_stat: mean
+  error_band: std

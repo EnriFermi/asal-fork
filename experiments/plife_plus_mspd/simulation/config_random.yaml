@@ -1,0 +1,48 @@
+meta:
+  save_dir: experiments/plife_plus_mspd/checkpoints/random_init
+
+substrate:
+  substrate: plife_plus
+  rollout_steps: 200000
+  n_particles: 1000
+  n_colors: 6
+  dt: 0.02
+  beta: 0.3
+  mass: 0.1
+  half_life: 0.04
+  rmax: 0.1
+  render_radius: 0.04
+  sharpness: 30.0
+  update_colors: true
+  world_size: 1.0
+  border: wall
+  background_color: black
+
+simulation:
+  time_sampling: video
+  img_size: 160
+  seed: 0
+  output: experiments/plife_plus_mspd/figures/random_simulation.mp4
+  fps: 60
+  codec: libx264
+  macro_block_size: null
+  batch_steps: 64
+  jit_microbatch: 1
+  max_steps: 20000
+  mass_plot: experiments/plife_plus_mspd/figures/random_mass.png
+  log_mass_every: 1000
+  traj_iter: null
+  compute_oe: false
+  oe_every: 100
+  oe_plot: experiments/plife_plus_mspd/figures/random_oe.png
+
+logging:
+  wandb_project: asal
+
+random_best:
+  seed: 1
+  fitness: 0.0
+  init_mode: sep_cma_es_ask_substrate_default   # initial CMA-ES ask population around substrate.default_params
+  cma_sigma_init: 0.2
+  cma_pop_size: 8
+  cma_member_idx: 0

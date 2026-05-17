@@ -68,7 +68,7 @@ def _build_run_config(paper_cfg, config_path: Path, run_idx: int):
     paper_section = paper_cfg.get("paper_check", {})
     run_seed = int(paper_section.get("optimization_seed_base", 0)) + int(run_idx)
 
-    save_root_rel = Path(str(stage_cfg.get("save_root", "experiments/paper_check/checkpoints/optimization")))
+    save_root_rel = Path(str(stage_cfg.get("save_root", "experiments/paper_check_flow_lenia/checkpoints/optimization")))
     run_save_dir_rel = save_root_rel / f"run_{int(run_idx):03d}"
     run_save_dir_abs = resolve_path(run_save_dir_rel, repo_root())
     ensure_dir(run_save_dir_abs)

@@ -1,0 +1,168 @@
+base_config: experiments/flow_lenia_mspd/optimization/config_longrun_check.yaml
+
+rollout:
+  # Explicit posthoc rollout layer. These values override base_config for
+  # simulation/metric generation only; the optimization checkpoint stays intact.
+  substrate:
+    substrate: lenia_flow
+    rollout_steps: 500000
+    grid_size: 128
+    C: 3
+    k: 9
+    kernel_components: 3
+    M: "2,1,0;0,2,1;1,0,2"
+    dd: 5
+    dt: 0.2
+    sigma: 0.65
+    border: wall
+    mix_rule: stoch
+    base_seed: 0
+    seed_patch_size: 20
+    seed_n_patches: 4
+    seed_mode: random_patches
+    p_constant_per_patch: 1
+    render_mode: Pcolor
+    clip1: .inf
+    clip2: .inf
+    mutations: true
+    mutation_sz: 40
+    mutation_p: 0.05
+    mutation_scale: 1.0
+    optimize_mutation_scale: false
+    volcano: false
+    volcano_sz: 30
+    volcano_p: 0.01
+    volcano_delta: 5.0
+    food: false
+    food_interval: 128
+    food_n: 3
+    food_sz: 16
+    food_amount: 1.0
+    food_consume_rate: 0.05
+    food_bonus: 1.0
+    mass_decay: 0.0
+    food_channel: 1
+    food_auto_size: false
+    food_auto_scale: 1.0
+    food_conv_mode: scalar
+    food_vis_scale: 1.0
+    food_vis_color: "0.6,0.3,0.0"
+    food_diffusion_alpha: 0.0
+    mass_clip_eps: 0.0
+
+  simulation:
+    rollout_steps: 500000
+    max_steps: 500000
+    seed: 0
+    img_size: 224
+    fps: 250
+    video_fps: 30
+    codec: libx264
+    macro_block_size: 1
+    jit_microbatch: 64
+
+  logging:
+    snapshot_interval: 100
+    snapshots_per_file: 50
+    save_A: true
+    save_F: true
+    save_rgb: false
+    save_fp16: true
+    compress: true
+    save_lagrangian: true
+    save_lagrangian_channels: true
+    lagrangian_n_particles: 8192
+    lagrangian_init_mode: mass
+    lagrangian_flow_channel: -1
+    lagrangian_flow_reduce: mass_weighted
+    lagrangian_channel_mode: resample
+    lagrangian_noise_model: rt_box
+    lagrangian_diffusion_scale: 1.0
+
+  metric:
+    # Explicit posthoc DeltaH/MSC settings used for minibang metrics and plots.
+    # Keep this block explicit so heatmaps are reproducible without relying on
+    # inherited optimization defaults.
+    metric_tau_mode: max_grid
+    metric_tau_grid_steps: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000]
+    metric_window_size_steps: 20000
+    metric_window_step_steps: 5000
+    metric_tau_steps: 3000
+    metric_range_start_steps: 150000
+    metric_range_end_steps: 500000
+    metric_window_size_frames: null
+    metric_window_step_frames: null
+
+    metric_m_samples: 48
+    metric_m_min: 4
+    metric_n_proj: 16
+    metric_null_reps: 6
+    metric_particle_samples: 64
+    metric_dirs_seed: 123
+    metric_periodic: null
+    metric_domain_y: null
+    metric_domain_x: null
+
+    metric_preprocess_mode: clip
+    metric_scales: null
+    metric_scale_weights: null
+    metric_alpha: 0.0
+    metric_beta: 1.0
+    metric_eps: 1.0e-12
+
+minibang:
+  checkpoint_dir: experiments/opt_msc/checkpoints/test_run_longrun_check
+  output_root: experiments/opt_msc/checkpoints/minibang_golden_set/run_longrun_check_v2
+  n_trajectories: 100
+  batch_size: 20 
+  selection_mode: loss_quantile_biased
+  selection_keep_top_n: 5
+  selection_loss_bias_gamma: 2.5
+  selection_loss_jitter_frac: 0.15
+  include_population: true
+  include_best_traj: true
+  include_final_best: true
+
+  compute_metrics: true
+  compute_delta_h: true
+  compute_clusters: true
+  metrics_strict: true
+  metrics_seed: 12345
+  detect_start_step: 150000
+  detect_max_duration_steps: 30000
+  detect_delta_h_derivative_lag_steps: 30000
+
+  # The optimization config uses trainable_grid; posthoc detection has no optimized
+  # tau latent, so the runner evaluates all tau values and takes max_grid by default.
+  minibang_metric_tau_mode: max_grid
+
+  cluster_method: dpmeans
+
+  # 1) берем rendered Pcolor:
+  #    clip(sum(A) * P[..., :3], 0, 1)
+  # 2) переводим в chroma, чтобы не дробить один цвет по brightness
+  cluster_space: pcolor_chroma
+
+  # DP сначала может найти более тонкие оттенки
+  cluster_dp_lambda: 0.18
+  cluster_dp_iters: 8
+  cluster_dp_max_clusters: 32
+
+  # Потом склеиваем DP-кластеры в грубые цветовые семьи:
+  # black/gray/red/yellow/green/cyan/blue/magenta
+  cluster_merge_color_families: true
+  cluster_merge_rgb_threshold: 0.0
+  cluster_merge_hue_threshold_deg: 0.0
+  cluster_merge_min_saturation: 0.2
+  cluster_merge_min_value: 0.05
+
+  cluster_max_samples: 200000
+  cluster_samples_per_snapshot: null
+  cluster_min_mass: 1.0e-8
+  cluster_standardize: false
+  cluster_change_lag_steps: 5000
+
+  # Игнорируется при cluster_method: dpmeans, можно оставить для backward compatibility.
+  cluster_k: 8
+  cluster_kmeans_iters: 40
+  cluster_kmeans_restarts: 2

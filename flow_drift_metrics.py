@@ -19,7 +19,7 @@ from flow_drift_metrics import compute_drift_timeseries
 
 # For NPZ chunks logged by simulate_save_apf.py
 out = compute_drift_timeseries(
-    "experiments/log_apf/checkpoints/2602021501",
+    "experiments/flow_lenia_apf_rollouts/checkpoints/2602021501",
     t1=0,
     t2=20000,
     log_format="npz",   # or "auto"

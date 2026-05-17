@@ -175,5 +175,39 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
+# Local machine noise and generated experiment artifacts
+.DS_Store
+artifacts/
+runs/
+segmentation/
+segmentation_prof/
+analysis/results/
+experiments/**/checkpoints/
+experiments/**/outputs/
+experiments/**/figures/
+
 data/
 wandb/
+run_tracker1_fixed3_junkfix_binsplit_trackgc_labelsane_profileframes.py
+run_tracker1_fixed3_junkfix_binsplit_trackgc_labelsane.py
+run_tracker1_fixed3_junkfix_binsplit.py
+run_tracker1_fixed3_junkfix_colorsplit3.py
+run_tracker1_fixed3_junkfix_trackgc.py
+run_tracker1_fixed3_junkfix.py
+run_tracker1_fixed3_patched.py
+run_tracker1_fixed3.py
+run_tracker1.py
+fltrack/__init__.py
+fltrack/config.py
+fltrack/detect.py
+fltrack/merge.py
+fltrack/render.py
+fltrack/split.py
+fltrack/stitch.py
+fltrack/track.py
+fltrack/videoio.py
+output.mp4
+requirements.txt
+run_fltrack.sh
+run_tracker.py
+try.mp4

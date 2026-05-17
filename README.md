@@ -38,8 +38,11 @@ If you are looking for a PyTorch implementation, check [this](https://github.com
 The important code is here:
 - [foundation_models/__init__.py](foundation_models/__init__.py) has the code to create a foundation model.
 - [substrates/__init__.py](substrates/__init__.py) has the code to create a substrate.
-- [rollout.py](rollout.py) has the code to rollout a simulation efficiently.
-- [asal_metrics.py](asal_metrics.py) has the code to compute the metrics from ASAL.
+- [scripts/rollout.py](scripts/rollout.py) has the code to rollout a simulation efficiently.
+- [scripts/asal_metrics.py](scripts/asal_metrics.py) has the code to compute the metrics from ASAL.
+- [experiments/](experiments/) contains reproducible experiment configs.
+- [analysis/](analysis/) contains notebooks and offline analysis code.
+- [docs/repository_layout.md](docs/repository_layout.md) documents the fork-specific layout.
 
 Here is some minimal code to sample some random simulation parameters and run the simulation and evaluate how open-ended it is:
 ```python
@@ -47,8 +50,8 @@ import jax
 from functools import partial
 import substrates
 import foundation_models
-from rollout import rollout_simulation
-import asal_metrics
+from scripts.rollout import rollout_simulation
+from scripts import asal_metrics
 
 fm = foundation_models.create_foundation_model('clip')
 substrate = substrates.create_substrate('lenia')
@@ -77,17 +80,17 @@ We have already implemented the following ALife substrates:
 You can find the code for these substrates at [substrates/](substrates/)
 
 The main files to run the entire ASAL pipeline are the following:
-- [main_opt.py](main_opt.py)
+- [scripts/main_opt.py](scripts/main_opt.py)
   - Run this for supervised target and open-endedness
   - Search algorithm: Sep-CMA-ES (from evosax)
-- [main_illuminate.py](main_illuminate.py)
+- [scripts/main_illuminate.py](scripts/main_illuminate.py)
   - Run this for illumination
   - Search algorithm: custom genetic algorithm
-- [main_sweep_gol.py](main_sweep_gol.py)
+- [scripts/main_sweep_gol.py](scripts/main_sweep_gol.py)
   - Run this for open-endedness in Game of Life substrate (b/c discrete search space)
   - Search algorithm: brute force search
 
-[asal.ipynb](asal.ipynb) goes through everything you need to know.
+[analysis/asal.ipynb](analysis/asal.ipynb) goes through everything you need to know.
 
 ## Running on Google Colab
 <!-- Check out the [Google Colab](here). -->
@@ -115,7 +118,7 @@ python -m pip install -r requirements.txt
 However, if you want GPU acceleration (trust me, you do), please [manually install jax](https://github.com/jax-ml/jax?tab=readme-ov-file#installation) according to your system's CUDA version.
 
 ### Running ASAL
-Check out [asal.ipynb](asal.ipynb) to learn how to run the files and visualize the results.
+Check out [analysis/asal.ipynb](analysis/asal.ipynb) to learn how to run the files and visualize the results.
 
 ### Loading Our Dataset of Simulations
 You can view our dataset of simulations at:
@@ -128,7 +131,7 @@ You can download the datasets from:
 - https://pub.sakana.ai/asal/data/illumination_plife.npz
 - https://pub.sakana.ai/asal/data/sweep_gol.npz
 
-Directions on how to load these simulations are shown in [asal.ipynb](asal.ipynb).
+Directions on how to load these simulations are shown in [analysis/asal.ipynb](analysis/asal.ipynb).
 
 ## Reproducing Results from the Paper
 Everything you need is already in this repo.
@@ -145,4 +148,3 @@ To cite our work, you can use the following:
   url = {https://asal.sakana.ai/}
 }
 ```
-

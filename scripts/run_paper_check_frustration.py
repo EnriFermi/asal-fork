@@ -251,7 +251,7 @@ def main() -> int:
     batch_eval_script = repo / "scripts" / "paper_check_frustration_batch_eval.py"
 
     stage_cfg = paper_cfg.get("frustration_simulation", {})
-    save_root_rel = Path(str(stage_cfg.get("save_root", "experiments/paper_check/checkpoints/frustration_simulation")))
+    save_root_rel = Path(str(stage_cfg.get("save_root", "experiments/paper_check_flow_lenia/checkpoints/frustration_simulation")))
     save_root_abs = resolve_path(save_root_rel, repo)
     ensure_dir(save_root_abs)
     trial_batch_size = int(stage_cfg.get("trial_batch_size", 1))
@@ -260,7 +260,7 @@ def main() -> int:
 
     base_hist_cfg, _ = load_stage_base_config(stage_cfg, config_path.parent)
     opt_stage_cfg = paper_cfg.get("optimization", {})
-    opt_save_root_rel = Path(str(opt_stage_cfg.get("save_root", "experiments/paper_check/checkpoints/optimization")))
+    opt_save_root_rel = Path(str(opt_stage_cfg.get("save_root", "experiments/paper_check_flow_lenia/checkpoints/optimization")))
     opt_save_root_abs = resolve_path(opt_save_root_rel, repo)
 
     opt_base_cfg, _ = load_stage_base_config(opt_stage_cfg, config_path.parent)

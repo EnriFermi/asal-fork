@@ -1,0 +1,402 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{fontspec}
+\setmainfont{Times New Roman}
+\setsansfont{Arial}
+\setmonofont{Menlo}
+
+\usepackage[a4paper,margin=24mm]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{xurl}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  urlcolor=blue,
+  citecolor=black
+}
+
+\setlist[itemize]{leftmargin=*,topsep=3pt,itemsep=2pt}
+\setlist[enumerate]{leftmargin=*,topsep=3pt,itemsep=2pt}
+\renewcommand{\arraystretch}{1.18}
+\emergencystretch=3em
+
+\title{\textbf{Формальное описание работы Particle Life Plus}}
+\author{Описание по реализации в репозитории ASAL}
+\date{11 апреля 2026}
+
+\begin{document}
+\maketitle
+
+\section*{Область действия документа}
+
+Документ формализует субстрат \texttt{ParticleLifePlus}.
+Основная реализация находится в \path{substrates/plife_plus.py}.
+Для сравнения используется классический \texttt{ParticleLife} из
+\path{substrates/plife.py}. Параметры запуска \texttt{plife\_plus} в фабрике
+субстратов задаются в \path{substrates/__init__.py}, а CLI-параметры перечислены
+в \path{scripts/util.py}.
+
+Particle Life Plus является системой из $N$ частиц в двумерной области. В отличие
+от классического Particle Life, где цвет частицы является дискретным классом,
+здесь цвет является непрерывным вектором. Пара взаимодействующих цветовых
+векторов подается в небольшую нейросеть, которая одновременно задает амплитуду
+механического взаимодействия и локальное изменение цвета.
+
+\section*{1. Обозначения}
+
+Пусть:
+\begin{itemize}
+  \item $N$ --- число частиц, \texttt{n\_particles};
+  \item $K$ --- размерность цветового пространства, \texttt{n\_colors};
+  \item $d=2$ --- размерность физического пространства;
+  \item $L$ --- размер стороны квадратной области, \texttt{world\_size};
+  \item $m>0$ --- масса частицы, \texttt{mass};
+  \item $\Delta t>0$ --- шаг интегрирования, \texttt{dt};
+  \item $h>0$ --- период полураспада скорости, \texttt{half\_life};
+  \item $r_{\max}>0$ --- радиус взаимодействия, \texttt{rmax};
+  \item $\beta\in(0,1)$ --- граница внутренней зоны отталкивания, \texttt{beta};
+  \item $\theta$ --- параметры нейросети \texttt{PLifeNetwork}.
+\end{itemize}
+
+Состояние системы в дискретный момент $n$:
+\[
+S_n=\{(x_i^n,v_i^n,c_i^n)\}_{i=1}^{N},
+\]
+где
+\[
+x_i^n\in[0,L]^2,\qquad v_i^n\in\mathbb{R}^2,\qquad
+c_i^n\in\mathbb{R}^K,\qquad \|c_i^n\|_2=1.
+\]
+
+\section*{2. Инициализация}
+
+Для каждой частицы независимо генерируются:
+\[
+\xi_i \sim \mathcal{N}(0,I_K),\qquad
+c_i^0=\frac{\xi_i}{\|\xi_i\|_2},
+\]
+\[
+x_i^0 \sim \mathrm{Uniform}([0,L]^2),\qquad
+v_i^0=0.
+\]
+
+Параметры $\theta$ нейросети создаются стандартной инициализацией Flax Linen:
+\[
+\theta = \mathrm{init}_{\mathrm{Flax}}(\mathrm{PLifeNetwork}).
+\]
+
+\section*{3. Нейросеть взаимодействия}
+
+Для упорядоченной пары частиц $(i,j)$ нейросеть получает конкатенацию двух
+цветовых векторов:
+\[
+z_{ij} = [c_i,c_j]\in\mathbb{R}^{2K}.
+\]
+
+Архитектура \texttt{PLifeNetwork}:
+\[
+\mathbb{R}^{2K}
+\xrightarrow{\mathrm{Dense}(8),\,\tanh}
+\mathbb{R}^{8}
+\xrightarrow{\mathrm{Dense}(8),\,\tanh}
+\mathbb{R}^{8}
+\xrightarrow{\mathrm{Dense}(8),\,\tanh}
+\mathbb{R}^{8}
+\xrightarrow{\mathrm{Dense}(1+K)}
+\mathbb{R}^{1+K}.
+\]
+
+Пусть последний слой выдает вектор
+\[
+y_{ij}=(y_{ij}^{(0)},y_{ij}^{(1:K)}).
+\]
+Тогда используются две величины:
+\[
+\alpha_{ij}=1.5\,\tanh(y_{ij}^{(0)})\in[-1.5,1.5],
+\]
+\[
+g_{ij}=\tanh(y_{ij}^{(1:K)})\in[-1,1]^K.
+\]
+
+Здесь $\alpha_{ij}$ управляет амплитудой силы в средней зоне взаимодействия, а
+$g_{ij}$ задает направление изменения цвета частицы $i$ под влиянием частицы $j$.
+
+\section*{4. Геометрия пары частиц}
+
+Для пары $(i,j)$ сначала вычисляется вектор смещения:
+\[
+\delta_{ij}=x_j-x_i.
+\]
+
+Если граница \texttt{border='torus'}, применяется правило минимального образа
+покомпонентно:
+\[
+\delta_{ij,k}=
+\begin{cases}
+\delta_{ij,k}-L, & \delta_{ij,k}>L/2,\\
+\delta_{ij,k}+L, & \delta_{ij,k}<-L/2,\\
+\delta_{ij,k}, & \text{иначе}.
+\end{cases}
+\]
+
+Если граница \texttt{border='wall'}, при вычислении парной силы используется
+обычное смещение $x_j-x_i$ без периодической поправки.
+
+Далее:
+\[
+\rho_{ij}=\|\delta_{ij}\|_2,\qquad
+e_{ij}=\frac{\delta_{ij}}{\rho_{ij}+\varepsilon},
+\]
+где в коде $\varepsilon=10^{-8}$.
+
+\section*{5. Граф силы}
+
+Вводится безразмерная дистанция
+\[
+q_{ij}=\frac{\rho_{ij}}{r_{\max}}.
+\]
+
+Скалярный граф силы:
+\[
+\Phi(q;\alpha,\beta)=
+\begin{cases}
+\dfrac{q}{\beta}-1, & q<\beta,\\[8pt]
+\alpha\left(1-\dfrac{|2q-1-\beta|}{1-\beta}\right), & \beta<q<1,\\[8pt]
+0, & \text{иначе}.
+\end{cases}
+\]
+
+Интерпретация:
+\begin{itemize}
+  \item при $q<\beta$ значение отрицательное: это зона ближнего отталкивания;
+  \item при $\beta<q<1$ сила имеет треугольный профиль с амплитудой $\alpha$;
+  \item при $q\ge 1$ взаимодействие обнуляется;
+  \item если $\alpha>0$, средняя зона притягивает частицу $i$ к частице $j$;
+  \item если $\alpha<0$, средняя зона отталкивает.
+\end{itemize}
+
+Парная сила, действующая на частицу $i$ со стороны частицы $j$:
+\[
+F_{ij}=r_{\max}\,\Phi(q_{ij};\alpha_{ij},\beta)\,e_{ij}.
+\]
+
+\section*{6. Изменение цвета}
+
+Парный вклад в изменение цвета частицы $i$:
+\[
+\Delta c_{ij}=g_{ij}\,\max\left(0,1-\frac{\rho_{ij}}{r_{\max}}\right).
+\]
+
+Цвет меняется только внутри радиуса $r_{\max}$ и линейно затухает к нулю на
+границе радиуса взаимодействия.
+
+Важная деталь реализации: в суммирование входят также пары $i=j$. Для силы
+самовклад фактически равен нулю, потому что $\delta_{ii}=0$ и $e_{ii}=0$.
+Для цвета самовклад может быть ненулевым:
+\[
+\Delta c_{ii}=g_\theta(c_i,c_i).
+\]
+
+\section*{7. Агрегирование взаимодействий}
+
+Для каждой частицы:
+\[
+a_i=\frac{1}{m}\sum_{j=1}^{N}F_{ij},
+\]
+\[
+\dot{c}_i=\sum_{j=1}^{N}\Delta c_{ij}.
+\]
+
+В текущей реализации $m$, $\beta$, $h$, $r_{\max}$ и $\Delta t$ являются
+скалярными фиксированными параметрами экземпляра \texttt{ParticleLifePlus}, а не
+матрицами или векторами по цветам.
+
+\section*{8. Интегрирование движения}
+
+Скорость демпфируется через коэффициент:
+\[
+\mu=0.5^{\Delta t/h}.
+\]
+
+Обновление скорости и положения:
+\[
+v_i^{n+1}=\mu v_i^n+\Delta t\,a_i^n,
+\]
+\[
+\tilde{x}_i^{n+1}=x_i^n+\Delta t\,v_i^{n+1}.
+\]
+
+Это полуявная схема Эйлера: положение обновляется уже новой скоростью.
+
+\section*{9. Граничные условия}
+
+После вычисления $\tilde{x}^{n+1}$ применяется одно из двух правил.
+
+\subsection*{Тор}
+
+Для \texttt{border='torus'}:
+\[
+x_i^{n+1}=\tilde{x}_i^{n+1}\bmod L,\qquad
+v_i^{n+1}\ \text{не изменяется}.
+\]
+
+\subsection*{Стенки}
+
+Для \texttt{border='wall'} покомпонентно:
+\[
+\tilde{x}_{i,k}<0 \Rightarrow
+x_{i,k}^{n+1}=-\tilde{x}_{i,k},\quad
+v_{i,k}^{n+1}=-v_{i,k}^{n+1},
+\]
+\[
+\tilde{x}_{i,k}>L \Rightarrow
+x_{i,k}^{n+1}=2L-\tilde{x}_{i,k},\quad
+v_{i,k}^{n+1}=-v_{i,k}^{n+1}.
+\]
+
+Затем координата дополнительно обрезается в интервал $[0,L]$.
+
+\section*{10. Интегрирование цвета}
+
+Если \texttt{update\_colors=True}, цвет обновляется как:
+\[
+\tilde{c}_i^{n+1}=c_i^n+\Delta t\,\dot{c}_i^n,
+\]
+\[
+c_i^{n+1}=
+\frac{\tilde{c}_i^{n+1}}{\|\tilde{c}_i^{n+1}\|_2}.
+\]
+
+Если \texttt{update\_colors=False}, то:
+\[
+c_i^{n+1}=c_i^n.
+\]
+
+Нормировка удерживает цветовые состояния на единичной сфере
+$\mathbb{S}^{K-1}$, если численно не возникает нулевой вектор.
+
+\section*{11. Полный шаг системы}
+
+Один шаг \texttt{step\_state} можно записать как отображение:
+\[
+S_{n+1}=T_\theta(S_n),
+\]
+где $T_\theta$ определяется следующей последовательностью:
+\begin{enumerate}
+  \item для всех упорядоченных пар $(i,j)$ вычислить $\delta_{ij}$, $\rho_{ij}$ и $e_{ij}$;
+  \item применить нейросеть к $(c_i,c_j)$ и получить $(\alpha_{ij},g_{ij})$;
+  \item вычислить $F_{ij}$ и $\Delta c_{ij}$;
+  \item просуммировать силы и цветовые вклады по $j$;
+  \item обновить скорость с демпфированием;
+  \item обновить положение;
+  \item применить граничные условия;
+  \item при необходимости обновить и нормировать цвет.
+\end{enumerate}
+
+Вызов \texttt{step\_state} принимает \texttt{rng}, но в текущей реализации
+случайность в шаге не используется. После инициализации динамика детерминирована
+при фиксированных $\theta$ и начальном состоянии.
+
+\section*{12. Рендеринг}
+
+Рендеринг строит RGB-изображение размера \texttt{img\_size}$\times$\texttt{img\_size}.
+Фон задается строкой \texttt{background\_color}. Для Particle Life Plus текущая
+палитра \texttt{color\_palette} в рендеринге не используется.
+
+Цвет частицы берется из первых трех компонент непрерывного цветового вектора:
+\[
+\mathrm{rgb}_i=\frac{c_i^{1:3}+1}{2}.
+\]
+
+Радиус отрисовки:
+\[
+R_i=\sqrt{m}\,r_{\mathrm{render}},
+\]
+где $r_{\mathrm{render}}=\texttt{render\_radius}$.
+
+Для пикселя с координатой $p$ и расстоянием $d_i(p)=\|p-x_i\|_2$ коэффициент
+смешивания:
+\[
+w_i(p)=1-\frac{1}{1+\exp(-s(d_i(p)-R_i))},
+\qquad
+s=\frac{\texttt{sharpness}}{r_{\mathrm{render}}}.
+\]
+Эквивалентно, $w_i(p)$ близок к $1$ внутри круга и к $0$ вне круга.
+
+Частицы последовательно накладываются на изображение:
+\[
+I_{\mathrm{new}}(p)=w_i(p)\,\mathrm{rgb}_i+
+(1-w_i(p))\,I_{\mathrm{old}}(p).
+\]
+
+\section*{13. Отличие от классического Particle Life}
+
+\begin{longtable}{@{}p{0.30\linewidth}p{0.32\linewidth}p{0.32\linewidth}@{}}
+\toprule
+Аспект & Particle Life & Particle Life Plus \\
+\midrule
+\endhead
+Цвет & Дискретный индекс $c_i\in\{1,\ldots,K\}$ & Непрерывный нормированный вектор $c_i\in\mathbb{S}^{K-1}$ \\
+Параметры силы & Таблицы $\alpha_{c_i,c_j}$, $\beta_{c_i}$, $r_{\max,c_i}$ & Нейросеть $\theta(c_i,c_j)$ возвращает $\alpha_{ij}$ \\
+Эволюция цвета & Цвет не меняется & Цвет меняется через $g_\theta(c_i,c_j)$ \\
+Инициализация позиций & Может зависеть от распределения по бинам \texttt{x\_dist} & Равномерная по всей области $[0,L]^2$ \\
+Масса & Может зависеть от цвета & Один фиксированный скаляр $m$ \\
+Граница & Периодическая & Тор или отражающие стенки \\
+\bottomrule
+\end{longtable}
+
+\section*{14. Вычислительная сложность}
+
+Реализация явно строит все парные взаимодействия через двойной \texttt{vmap}.
+Поэтому на один шаг:
+\[
+\text{время}=O(N^2),\qquad
+\text{память}=O(N^2(d+K)).
+\]
+
+Пространственная индексация, отсечение соседей до запуска нейросети или
+разреженное хранение взаимодействий в текущей версии не используются.
+
+\section*{15. Практические значения по умолчанию}
+
+У самого класса \texttt{ParticleLifePlus} значения по умолчанию:
+\[
+N=5000,\quad K=6,\quad \Delta t=0.002,\quad h=0.04,\quad
+r_{\max}=0.1,\quad m=0.1,\quad \beta=0.3,\quad L=1.
+\]
+
+В фабрике ASAL для имени субстрата \texttt{plife\_plus} используются другие
+рабочие значения:
+\[
+N=1000,\quad \Delta t=0.02,\quad
+r_{\mathrm{render}}=0.04,\quad
+\texttt{sharpness}=30,\quad
+\texttt{border='torus'}.
+\]
+
+\section*{16. Краткая формула модели}
+
+Particle Life Plus можно сжато определить как нейронно-параметризованную
+частичную систему:
+\[
+\boxed{
+\begin{aligned}
+\alpha_{ij},g_{ij} &= f_\theta(c_i,c_j),\\
+F_{ij} &= r_{\max}\,\Phi(\|x_j-x_i\|/r_{\max};\alpha_{ij},\beta)\,
+\frac{x_j-x_i}{\|x_j-x_i\|+\varepsilon},\\
+\dot{c}_i &= \sum_j g_{ij}\max(0,1-\|x_j-x_i\|/r_{\max}),\\
+v_i^{n+1} &= 0.5^{\Delta t/h}v_i^n+\frac{\Delta t}{m}\sum_j F_{ij},\\
+x_i^{n+1} &= \mathrm{boundary}(x_i^n+\Delta t\,v_i^{n+1}),\\
+c_i^{n+1} &= \mathrm{normalize}(c_i^n+\Delta t\,\dot{c}_i).
+\end{aligned}}
+\]
+
+При тороидальной границе во всех формулах расстояние $x_j-x_i$ понимается как
+минимальный периодический образ.
+
+\end{document}
