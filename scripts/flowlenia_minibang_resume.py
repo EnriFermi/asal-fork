@@ -84,6 +84,52 @@ def _reconstruct_state(substrate: Any, params: np.ndarray, snapshot: dict[str, A
     return state
 
 
+def _apply_resume_perturbation(
+    *,
+    state: dict[str, Any],
+    lag_xy: jax.Array,
+    rng: jax.Array,
+    seed: int,
+    a_std: float,
+    p_std: float,
+    lag_xy_std: float,
+    border: str,
+    sigma: float,
+) -> tuple[dict[str, Any], jax.Array, jax.Array]:
+    if a_std <= 0.0 and p_std <= 0.0 and lag_xy_std <= 0.0:
+        if seed >= 0:
+            rng = jax.random.fold_in(rng, int(seed))
+        return state, lag_xy, rng
+
+    rs = np.random.default_rng(int(seed if seed >= 0 else 0))
+    out = dict(state)
+    if a_std > 0.0:
+        A = np.asarray(jax.device_get(out["A"]), dtype=np.float32)
+        A = np.clip(A + rs.normal(0.0, float(a_std), size=A.shape).astype(np.float32), 0.0, np.inf)
+        out["A"] = jnp.asarray(A)
+    if p_std > 0.0:
+        P = np.asarray(jax.device_get(out["P"]), dtype=np.float32)
+        P = P + rs.normal(0.0, float(p_std), size=P.shape).astype(np.float32)
+        out["P"] = jnp.asarray(P)
+    lag_out = lag_xy
+    if lag_xy_std > 0.0:
+        pts = np.asarray(jax.device_get(lag_xy), dtype=np.float32)
+        pts = pts + rs.normal(0.0, float(lag_xy_std), size=pts.shape).astype(np.float32)
+        A_shape = np.asarray(jax.device_get(out["A"])).shape
+        sy, sx = int(A_shape[0]), int(A_shape[1])
+        if str(border) == "torus":
+            pts[:, 0] = np.mod(pts[:, 0] - 0.5, sy) + 0.5
+            pts[:, 1] = np.mod(pts[:, 1] - 0.5, sx) + 0.5
+        else:
+            lo = float(sigma)
+            pts[:, 0] = np.clip(pts[:, 0], lo, sy - lo)
+            pts[:, 1] = np.clip(pts[:, 1], lo, sx - lo)
+        lag_out = jnp.asarray(pts)
+    if seed >= 0:
+        rng = jax.random.fold_in(rng, int(seed))
+    return out, lag_out, rng
+
+
 def _make_stepper(
     *,
     substrate: Any,
@@ -228,6 +274,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overwrite", action="store_true", help="Regenerate output directory if it exists.")
     parser.add_argument("--config", default=None, help="Override config path. Defaults to <traj_dir>/config.yaml.")
     parser.add_argument("--params", default=None, help="Override params path. Defaults to <traj_dir>/params.npy.")
+    parser.add_argument("--branch-seed", type=int, default=-1, help="Fold this seed into the resumed RNG and perturbation RNG.")
+    parser.add_argument("--perturb-a-std", type=float, default=0.0, help="Small Gaussian perturbation std for A before resuming.")
+    parser.add_argument("--perturb-p-std", type=float, default=0.0, help="Small Gaussian perturbation std for P before resuming.")
+    parser.add_argument("--perturb-lagrangian-xy-std", type=float, default=0.0, help="Small Gaussian perturbation std for lagrangian points.")
     return parser.parse_args()
 
 
@@ -279,6 +329,17 @@ def main() -> None:
     lag_ch = jnp.asarray(np.asarray(snapshot["lagrangian_c"], dtype=np.int32))
     rng = jnp.asarray(np.asarray(snapshot["resume_batch_rng_key"], dtype=np.uint32))
     params_j = jnp.asarray(params, dtype=jnp.float32)
+    state, lag_xy, rng = _apply_resume_perturbation(
+        state=state,
+        lag_xy=lag_xy,
+        rng=rng,
+        seed=int(cli.branch_seed),
+        a_std=float(cli.perturb_a_std),
+        p_std=float(cli.perturb_p_std),
+        lag_xy_std=float(cli.perturb_lagrangian_xy_std),
+        border=str(getattr(rt, "border", "wall")),
+        sigma=float(getattr(rt, "sigma", 0.0)),
+    )
 
     original_batch_size = int(_scalar(snapshot, "resume_batch_size", 1))
     original_batch_index = int(_scalar(snapshot, "resume_batch_index", 0))
@@ -359,6 +420,10 @@ def main() -> None:
         "original_batch_index": int(original_batch_index),
         "snapshot_interval": int(snapshot_interval),
         "jit_microbatch": int(jit_microbatch),
+        "branch_seed": int(cli.branch_seed),
+        "perturb_a_std": float(cli.perturb_a_std),
+        "perturb_p_std": float(cli.perturb_p_std),
+        "perturb_lagrangian_xy_std": float(cli.perturb_lagrangian_xy_std),
     }
     write_json(output_dir / "resume_metadata.json", metadata)
 

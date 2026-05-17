@@ -1,0 +1,239 @@
+meta:
+  output_root: analysis/results/paper_suite
+  conda_env: onerec
+  wandb_mode: disabled
+
+synthetic:
+  families: [S0, S1, S3, S4, S5, S6, S7]
+  seeds: 1
+  seed_base: 100
+  n_particles: 64
+  time_steps: 240
+  domain_size: 1.0
+  tau_grid_steps: [1, 2, 4, 8, 12, 16]
+  metric_window_size_steps: 60
+  metric_window_step_steps: 20
+  metric_range_start_steps: 0
+  metric_m_samples: 8
+  metric_m_min: 4
+  metric_n_proj: 4
+  metric_null_reps: 1
+  metric_particle_samples: 32
+  metric_dirs_seed: 123
+  metric_seed: 12345
+
+datasets:
+  flow_lenia:
+    enabled: true
+    required: true
+    frustration_root: experiments/paper_check_flow_lenia/checkpoints/frustration_simulation
+    c1:
+      metric:
+        metric_tau_mode: max_grid
+        metric_tau_grid_steps: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000]
+        metric_tau_steps: 3000
+        metric_window_size_steps: 20000
+        metric_window_step_steps: 5000
+        metric_range_start_steps: 0
+        metric_m_samples: 48
+        metric_m_min: 4
+        metric_n_proj: 16
+        metric_null_reps: 6
+        metric_particle_samples: 64
+        metric_periodic: false
+        metric_domain_y: 384.0
+        metric_domain_x: 384.0
+    c5:
+      metric:
+        metric_tau_mode: max_grid
+        metric_tau_grid_steps: [1000, 3000, 5000, 7000, 9000]
+        metric_tau_steps: 3000
+        fixed_tau_distribution_steps: 3000
+        metric_window_size_steps: 20000
+        metric_window_step_steps: 5000
+        metric_range_start_steps: 0
+        metric_m_samples: 48
+        metric_m_min: 4
+        metric_n_proj: 16
+        metric_null_reps: 6
+        metric_particle_samples: 64
+        metric_periodic: false
+        metric_domain_y: 384.0
+        metric_domain_x: 384.0
+
+  plife_plus:
+    enabled: true
+    required: true
+    frustration_root: experiments/paper_check_plife_plus/checkpoints/frustration_simulation
+    analysis_config: experiments/paper_check_plife_plus/frustration_simulation/analysis_config.yaml
+    c1:
+      metric:
+        metric_tau_mode: max_grid
+        metric_tau_grid_steps: [100, 200, 400, 800, 1200, 1600, 2000, 3000, 4000]
+        metric_tau_steps: 800
+        metric_window_size_steps: 20000
+        metric_window_step_steps: 5000
+        metric_range_start_steps: 0
+        metric_m_samples: 48
+        metric_m_min: 4
+        metric_n_proj: 16
+        metric_null_reps: 6
+        metric_particle_samples: 64
+        metric_periodic: false
+        metric_domain_y: 1.0
+        metric_domain_x: 1.0
+    c5:
+      metric:
+        metric_tau_mode: max_grid
+        metric_tau_grid_steps: [100, 200, 400, 800, 1200, 1600, 2000, 3000, 4000]
+        metric_tau_steps: 800
+        fixed_tau_distribution_steps: 800
+        metric_window_size_steps: 20000
+        metric_window_step_steps: 5000
+        metric_range_start_steps: 0
+        metric_m_samples: 48
+        metric_m_min: 4
+        metric_n_proj: 16
+        metric_null_reps: 6
+        metric_particle_samples: 64
+
+  boids:
+    enabled: true
+    required: false
+    frustration_root: experiments/paper_check_boids/checkpoints/frustration_simulation
+    analysis_config: experiments/paper_check_boids/frustration_simulation/analysis_config.yaml
+    c1:
+      metric:
+        metric_tau_mode: max_grid
+        metric_tau_grid_steps: [100, 200, 400, 800, 1200, 1600, 2000, 3000, 4000]
+        metric_tau_steps: 800
+        metric_window_size_steps: 20000
+        metric_window_step_steps: 5000
+        metric_range_start_steps: 0
+        metric_m_samples: 48
+        metric_m_min: 4
+        metric_n_proj: 16
+        metric_null_reps: 6
+        metric_particle_samples: 64
+        metric_periodic: false
+        metric_domain_y: 1.0
+        metric_domain_x: 1.0
+    c5:
+      metric:
+        metric_tau_mode: max_grid
+        metric_tau_grid_steps: [100, 200, 400, 800, 1200, 1600, 2000, 3000, 4000]
+        metric_tau_steps: 800
+        fixed_tau_distribution_steps: 800
+        metric_window_size_steps: 20000
+        metric_window_step_steps: 5000
+        metric_range_start_steps: 0
+        metric_m_samples: 48
+        metric_m_min: 4
+        metric_n_proj: 16
+        metric_null_reps: 6
+        metric_particle_samples: 64
+
+c2:
+  required: false
+  minibang_root: experiments/flow_lenia_mspd/checkpoints/test_run_longrun_check/minibang_golden_set
+  branching:
+    enabled: true
+    required: false
+    branch_root: analysis/results/paper_suite/c2_branching/branches
+    max_trajectories: 2
+    m_pairs: 2
+    branches_per_time: 3
+    horizon_steps: 1000
+    refractory_steps: 5000
+    high_quantile: 0.85
+    low_quantile: 0.35
+    feature_max_apf_chunks: 4
+    feature_max_snapshots_per_chunk: 8
+    perturb:
+      a_std: 0.0001
+      p_std: 0.0001
+      lagrangian_xy_std: 0.01
+
+simulation:
+  reuse_existing: true
+  allow_optimization_rerun: false
+  commands:
+    - name: flow_lenia_paper_check_frustration
+      task: paper_check
+      enabled: true
+      required: true
+      heavy: true
+      command: ["{python}", "scripts/run_paper_check_frustration.py", "experiments/paper_check_flow_lenia/config.yaml"]
+      expected_paths:
+        - experiments/paper_check_flow_lenia/checkpoints/frustration_simulation/trial_results.csv
+      expected_globs:
+        - experiments/paper_check_flow_lenia/checkpoints/frustration_simulation/trial_data/trial_*_lagrangian.npz
+        - experiments/paper_check_flow_lenia/checkpoints/frustration_simulation/trial_data/trial_*_embeddings.npz
+
+    - name: plife_plus_paper_check_frustration
+      task: paper_check
+      enabled: true
+      required: true
+      heavy: true
+      command: ["{python}", "scripts/run_paper_check_frustration.py", "experiments/paper_check_plife_plus/config.yaml"]
+      expected_paths:
+        - experiments/paper_check_plife_plus/checkpoints/frustration_simulation/trial_results.csv
+      expected_globs:
+        - experiments/paper_check_plife_plus/checkpoints/frustration_simulation/trial_data/trial_*_lagrangian.npz
+        - experiments/paper_check_plife_plus/checkpoints/frustration_simulation/trial_data/trial_*_embeddings.npz
+
+    - name: boids_paper_check_frustration
+      task: paper_check
+      enabled: true
+      required: false
+      heavy: true
+      command: ["{python}", "scripts/run_paper_check_frustration.py", "experiments/paper_check_boids/config.yaml"]
+      expected_paths:
+        - experiments/paper_check_boids/checkpoints/frustration_simulation/trial_results.csv
+      expected_globs:
+        - experiments/paper_check_boids/checkpoints/frustration_simulation/trial_data/trial_*_lagrangian.npz
+        - experiments/paper_check_boids/checkpoints/frustration_simulation/trial_data/trial_*_embeddings.npz
+
+    - name: flow_lenia_minibang_apf_trajectory_logging
+      task: apf
+      enabled: true
+      required: false
+      heavy: true
+      command: ["{python}", "scripts/flowlenia_minibang_simulate.py", "experiments/flow_lenia_mspd/minibang_golden_set/config.yaml"]
+      expected_paths:
+        - experiments/flow_lenia_mspd/checkpoints/test_run_longrun_check/minibang_golden_set/manifest.json
+      expected_globs:
+        - experiments/flow_lenia_mspd/checkpoints/test_run_longrun_check/minibang_golden_set/traj_*/apf_logs/P_steps_*.npz
+      expected_npz_keys: [A, P, F, lagrangian_xy, lagrangian_c, resume_batch_rng_key, state_t, state_mass_cycle_start]
+      npz_key_check_limit: 3
+
+    - name: flow_lenia_minibang_event_detection
+      task: c2
+      enabled: true
+      required: false
+      heavy: false
+      command: ["{python}", "scripts/flowlenia_minibang_detect.py", "experiments/flow_lenia_mspd/checkpoints/test_run_longrun_check/minibang_golden_set"]
+      expected_paths:
+        - experiments/flow_lenia_mspd/checkpoints/test_run_longrun_check/minibang_golden_set/detections/minibang_candidates.csv
+
+smoke:
+  meta:
+    output_root: analysis/results/paper_suite_smoke
+  synthetic:
+    seeds: 1
+    n_particles: 32
+    time_steps: 96
+    tau_grid_steps: [1, 2, 4, 8]
+    metric_window_size_steps: 32
+    metric_window_step_steps: 16
+    metric_m_samples: 6
+    metric_n_proj: 4
+    metric_null_reps: 2
+    metric_particle_samples: 24
+  c2:
+    branching:
+      branch_root: analysis/results/paper_suite_smoke/c2_branching/branches
+      max_trajectories: 1
+      m_pairs: 2
+      branches_per_time: 3
+      horizon_steps: 64
