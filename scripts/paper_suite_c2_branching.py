@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import shutil
 import sys
 from itertools import combinations
 from pathlib import Path
@@ -173,7 +174,19 @@ def _branch_output_ok(branch_dir: Path) -> bool:
     if (branch_dir / "branch_feature.npz").exists() or (branch_dir / "metrics.npz").exists():
         return True
     apf_dir = branch_dir / "apf_logs"
-    return apf_dir.exists() and bool(list_apf_chunks(apf_dir))
+    metadata_path = branch_dir / "resume_metadata.json"
+    if not apf_dir.exists() or not metadata_path.exists():
+        return False
+    chunks = list_apf_chunks(apf_dir)
+    if not chunks:
+        return False
+    try:
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+        end_step = int(metadata["end_step"])
+    except Exception:
+        return False
+    return int(chunks[-1][2]) >= end_step
 
 
 def _make_resume_command(
@@ -349,6 +362,8 @@ def simulation(
                 for branch_id in range(branches_per_time):
                     branch_seed = int(1000003 + 1009 * int(pair["pair_id"]) + 131 * branch_id + (0 if condition == "high" else 7919))
                     branch_dir = branch_root / traj_id / f"pair_{int(pair['pair_id']):03d}_{condition}_step_{step}" / f"branch_{branch_id:02d}"
+                    branch_ready = _branch_output_ok(branch_dir)
+                    overwrite_incomplete = branch_dir.exists() and not branch_ready
                     cmd = _make_resume_command(
                         source_traj_dir=source_traj_dir,
                         step=step,
@@ -358,13 +373,19 @@ def simulation(
                         perturb_a_std=perturb_a_std,
                         perturb_p_std=perturb_p_std,
                         perturb_lag_xy_std=perturb_lag_xy_std,
-                        force=force,
+                        force=force or overwrite_incomplete,
                     )
-                    if _branch_output_ok(branch_dir) and not force:
+                    if branch_ready and not force:
                         status = "exists"
                     elif not allow_heavy:
                         status = "skipped_heavy"
                     else:
+                        if overwrite_incomplete:
+                            log_event(
+                                f"C2 branching simulation removing incomplete branch output {branch_dir}",
+                                component="c2-branch",
+                            )
+                            shutil.rmtree(branch_dir)
                         log_event(
                             f"C2 branching simulation running traj={traj_id} pair={pair['pair_id']} condition={condition} branch={branch_id} step={step}",
                             component="c2-branch",

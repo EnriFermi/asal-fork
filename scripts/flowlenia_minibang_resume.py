@@ -67,7 +67,10 @@ def _scalar(snapshot: dict[str, Any], key: str, default: Any) -> Any:
 
 def _reconstruct_state(substrate: Any, params: np.ndarray, snapshot: dict[str, Any]) -> dict[str, Any]:
     params_j = jnp.asarray(params, dtype=jnp.float32)
-    state = dict(substrate.seed_state(jax.random.PRNGKey(0), params_j))
+    # Use init_state rather than seed_state as the template because Flow-Lenia's
+    # first step drops latent-only seed keys such as fcr from the carried state.
+    # lax.scan requires the carry pytree to keep exactly this post-step shape.
+    state = dict(substrate.init_state(jax.random.PRNGKey(0), params_j))
     A_np = np.asarray(snapshot["A"], dtype=np.float32)
     state["A"] = jnp.asarray(A_np)
     state["P"] = jnp.asarray(np.asarray(snapshot["P"], dtype=np.float32))
