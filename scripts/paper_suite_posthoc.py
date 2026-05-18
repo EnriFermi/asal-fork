@@ -46,6 +46,12 @@ from paper_suite_common import (
 warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
 
 
+def _source_root_label(root: Path) -> str:
+    root = Path(root)
+    label = root.parent.name if root.name == "frustration_simulation" else root.name
+    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in label) or "root"
+
+
 def _resolve_frustration_root(root: Path) -> Path:
     root = Path(root)
     if (root / "trial_results.csv").exists() or (root / "trial_data").exists():
@@ -71,7 +77,7 @@ def _load_trial_rows(root: Path) -> pd.DataFrame:
     df = df.copy()
     df["frustration_root"] = str(fs_root)
     df["source_root"] = str(root)
-    df["source_root_name"] = Path(root).name
+    df["source_root_name"] = _source_root_label(root)
     for col in df.columns:
         if df[col].dtype == object:
             try:
@@ -95,12 +101,40 @@ def _dedupe_trial_rows(rows: pd.DataFrame) -> pd.DataFrame:
         out["candidate_idx"] = 0
     if "optimized_run_idx" not in out.columns:
         out["optimized_run_idx"] = out.get("trial_idx", np.arange(out.shape[0]))
-    key_cols = ["optimized_run_idx", "candidate_kind_canon", "candidate_idx"]
+    if "source_root_rank" not in out.columns:
+        out["source_root_rank"] = 0
+    if "source_optimized_run_idx" not in out.columns:
+        out["source_optimized_run_idx"] = out["optimized_run_idx"]
+    key_cols = ["source_root_rank", "source_optimized_run_idx", "candidate_kind_canon", "candidate_idx"]
     for col in key_cols:
         if col not in out.columns:
             return out
     out["_dedupe_key"] = [tuple(row[col] for col in key_cols) for _, row in out.iterrows()]
     out = out.drop_duplicates("_dedupe_key", keep="first").drop(columns=["_dedupe_key"])
+    return out.reset_index(drop=True)
+
+
+def _reindex_optimized_groups(rows: pd.DataFrame) -> pd.DataFrame:
+    if rows.empty:
+        return rows
+    out = rows.copy()
+    if "source_optimized_run_idx" not in out.columns:
+        out["source_optimized_run_idx"] = out.get("optimized_run_idx", np.arange(out.shape[0]))
+    keys = (
+        out[["source_root_rank", "source_optimized_run_idx"]]
+        .drop_duplicates()
+        .sort_values(["source_root_rank", "source_optimized_run_idx"], na_position="last")
+        .reset_index(drop=True)
+    )
+    group_map = {
+        (row["source_root_rank"], row["source_optimized_run_idx"]): int(i)
+        for i, row in keys.iterrows()
+    }
+    out["suite_optimized_run_idx"] = [
+        group_map[(row["source_root_rank"], row["source_optimized_run_idx"])]
+        for _, row in out.iterrows()
+    ]
+    out["optimized_run_idx"] = out["suite_optimized_run_idx"]
     return out.reset_index(drop=True)
 
 
@@ -118,12 +152,24 @@ def _load_trial_rows_many(roots: list[Path]) -> pd.DataFrame:
     if not frames:
         raise FileNotFoundError("No usable paper-check roots found. Errors: " + "; ".join(errors))
     merged = pd.concat(frames, ignore_index=True, sort=False)
+    merged["source_optimized_run_idx"] = merged["optimized_run_idx"]
+    rows_before = int(merged.shape[0])
+    source_groups_before = int(merged[["source_root_rank", "source_optimized_run_idx"]].drop_duplicates().shape[0])
     merged = merged.sort_values(["source_root_rank", "optimized_run_idx", "candidate_kind_canon", "candidate_idx"], na_position="last")
     merged = _dedupe_trial_rows(merged)
+    rows_after_dedupe = int(merged.shape[0])
+    merged = _reindex_optimized_groups(merged)
+    groups_after = int(merged["optimized_run_idx"].nunique()) if "optimized_run_idx" in merged.columns else 0
+    log_event(
+        "merged paper-check roots "
+        f"rows_before={rows_before} source_groups_before={source_groups_before} "
+        f"rows_after_root_local_dedupe={rows_after_dedupe} suite_groups={groups_after}",
+        component="posthoc",
+    )
     merged["trial_uid"] = [
-        f"{Path(str(row['source_root'])).name}_trial_{int(row['trial_idx']):05d}"
+        f"root{int(row['source_root_rank']):02d}_{row.get('source_root_name', _source_root_label(Path(str(row['source_root']))))}_trial_{int(row['trial_idx']):05d}"
         if "trial_idx" in row and not pd.isna(row["trial_idx"])
-        else f"{Path(str(row['source_root'])).name}_{idx:05d}"
+        else f"root{int(row['source_root_rank']):02d}_{row.get('source_root_name', _source_root_label(Path(str(row['source_root']))))}_{idx:05d}"
         for idx, row in merged.iterrows()
     ]
     return merged.reset_index(drop=True)
@@ -348,6 +394,9 @@ def _compute_c1(dataset_name: str, rows: pd.DataFrame, ds_cfg: Any, output_dir: 
                 "trial_idx": int(row["trial_idx"]),
                 "trial_uid": trial_uid,
                 "source_root": str(row.get("source_root", "")),
+                "source_root_rank": int(row.get("source_root_rank", -1)),
+                "source_root_name": str(row.get("source_root_name", "")),
+                "source_optimized_run_idx": int(row.get("source_optimized_run_idx", row["optimized_run_idx"])),
                 "optimized_run_idx": int(row["optimized_run_idx"]),
                 "candidate_kind": row["candidate_kind_canon"],
                 "candidate_idx": int(row.get("candidate_idx", 0)),
@@ -487,7 +536,15 @@ def _compute_c5(dataset_name: str, rows: pd.DataFrame, ds_cfg: Any, output_dir: 
         randoms = group[group["candidate_kind_canon"] == "random"]
         if opt.empty or randoms.empty:
             continue
-        row_out = {"dataset": dataset_name, "optimized_run_idx": int(group_idx), "n_random": int(randoms.shape[0])}
+        opt0 = opt.iloc[0]
+        row_out = {
+            "dataset": dataset_name,
+            "optimized_run_idx": int(group_idx),
+            "source_root_rank": int(opt0.get("source_root_rank", -1)),
+            "source_root_name": str(opt0.get("source_root_name", "")),
+            "source_optimized_run_idx": int(opt0.get("source_optimized_run_idx", group_idx)),
+            "n_random": int(randoms.shape[0]),
+        }
         for col in metric_cols:
             opt_value = safe_float(opt.iloc[0][col])
             rand_median = nanmedian(randoms[col].tolist())
