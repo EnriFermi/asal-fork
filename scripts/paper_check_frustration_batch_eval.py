@@ -791,6 +791,7 @@ def _run_control_lanes(
                         state["mode"] = "global"
                         if z_all_host is not None:
                             state["late_steps"].append(next_step)
+                            state.setdefault("z_late_steps", []).append(next_step)
                             state["z_late"].append(np.asarray(z_all_host[local_idx], dtype=np.float32))
                         if need_full and lane["full_embeddings_enabled"] and z_all_host is not None:
                             state["full_steps"].append(next_step)
@@ -831,8 +832,10 @@ def _run_control_lanes(
                     state["current_step"] = next_step
                     if z_all_host is not None:
                         state["late_steps"].append(next_step)
+                        state.setdefault("z_late_steps", []).append(next_step)
                         state["z_late"].append(np.asarray(z_all_host[local_idx], dtype=np.float32))
                     if xy_host is not None:
+                        state.setdefault("xy_late_steps", []).append(next_step)
                         state["xy_late"].append(np.asarray(xy_host[local_idx], dtype=np.float32))
                     if need_full and lane["full_embeddings_enabled"] and z_all_host is not None:
                         state["full_steps"].append(next_step)
@@ -1001,6 +1004,7 @@ def _run_walls_lanes(
                         state["mode"] = "global"
                         if need_late:
                             state["late_steps"].append(next_step)
+                            state.setdefault("z_late_steps", []).append(next_step)
                             state["z_late"].append(np.asarray(z_all_host[local_idx], dtype=np.float32))
 
             elif mode == "lag":
@@ -1032,7 +1036,9 @@ def _run_walls_lanes(
                     state["current_step"] = next_step
                     if need_late:
                         state["late_steps"].append(next_step)
+                        state.setdefault("z_late_steps", []).append(next_step)
                         state["z_late"].append(np.asarray(z_all_host[local_idx], dtype=np.float32))
+                        state.setdefault("xy_late_steps", []).append(next_step)
                         state["xy_late"].append(np.asarray(xy_host[local_idx], dtype=np.float32))
                     if need_full:
                         state["full_steps"].append(next_step)
