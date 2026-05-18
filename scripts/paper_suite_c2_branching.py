@@ -56,9 +56,16 @@ def _branch_root(cfg: Any, output_root: Path) -> Path:
     return ensure_dir(path if path is not None else output_root / "c2_branching" / "branches")
 
 
-def _iter_metric_paths(root: Path) -> list[Path]:
+def _trajectory_root(c2_cfg: Any) -> Path | None:
+    raw = _get(c2_cfg, "trajectory_root", None)
+    if raw is None:
+        raw = _get(c2_cfg, "minibang_root", "experiments/flow_lenia_mspd/checkpoints/test_run_longrun_check/minibang_golden_set")
+    return resolve_path(raw)
+
+
+def _iter_metric_items(root: Path) -> list[dict[str, Any]]:
     manifest = root / "manifest.json"
-    paths: list[Path] = []
+    items: list[dict[str, Any]] = []
     if manifest.exists():
         payload = json.loads(manifest.read_text())
         for row in payload.get("trajectories", []):
@@ -68,15 +75,19 @@ def _iter_metric_paths(root: Path) -> list[Path]:
                 if not path.is_absolute():
                     path = root / str(row.get("traj_id", "")) / path.name
                 if path.exists():
-                    paths.append(path)
+                    traj_dir_raw = row.get("traj_dir", None)
+                    traj_dir = Path(str(traj_dir_raw)) if traj_dir_raw else path.parent
+                    if not traj_dir.is_absolute():
+                        traj_dir = root / traj_dir
+                    items.append({"traj_id": str(row.get("traj_id", path.parent.name)), "metrics_path": path, "traj_dir": traj_dir})
             traj_id = row.get("traj_id")
             if traj_id:
                 candidate = root / str(traj_id) / "metrics.npz"
-                if candidate.exists() and candidate not in paths:
-                    paths.append(candidate)
-    if not paths:
-        paths = sorted(root.glob("traj_*/metrics.npz"))
-    return paths
+                if candidate.exists() and all(candidate != item["metrics_path"] for item in items):
+                    items.append({"traj_id": str(traj_id), "metrics_path": candidate, "traj_dir": candidate.parent})
+    if not items:
+        items = [{"traj_id": path.parent.name, "metrics_path": path, "traj_dir": path.parent} for path in sorted(root.glob("traj_*/metrics.npz"))]
+    return items
 
 
 def _safe_arr(data: np.lib.npyio.NpzFile, key: str, default=None):
@@ -253,13 +264,21 @@ def simulation(
         return {"status": "ok", "n_branches": len(read_csv(plan)), "plan": str(plan)}
 
     c2_cfg = cfg.get("c2", {})
-    minibang_root = resolve_path(_get(c2_cfg, "minibang_root", "experiments/flow_lenia_mspd/checkpoints/test_run_longrun_check/minibang_golden_set"))
-    if minibang_root is None or not minibang_root.exists():
-        summary = {"status": "skipped", "reason": f"missing minibang root {minibang_root}"}
+    trajectory_root = _trajectory_root(c2_cfg)
+    if trajectory_root is None or not trajectory_root.exists():
+        summary = {"status": "skipped", "reason": f"missing trajectory root {trajectory_root}"}
         write_json(output_root / "c2_branching_simulation_summary.json", summary)
         return summary
 
-    metric_paths = _iter_metric_paths(minibang_root)
+    metric_items = _iter_metric_items(trajectory_root)
+    if not metric_items:
+        summary = {
+            "status": "skipped",
+            "reason": f"no metrics.npz found under {trajectory_root}; run the C2 metrics layer after APF simulation first",
+        }
+        write_json(output_root / "c2_branching_simulation_summary.json", summary)
+        return summary
+
     max_trajectories = int(_get(bcfg, "max_trajectories", 2))
     m_pairs = int(_get(bcfg, "m_pairs", 2))
     branches_per_time = int(_get(bcfg, "branches_per_time", 3))
@@ -272,16 +291,18 @@ def simulation(
     perturb_p_std = float(_get(perturb, "p_std", 1e-4))
     perturb_lag_xy_std = float(_get(perturb, "lagrangian_xy_std", 0.01))
 
-    ranked: list[tuple[float, Path, np.ndarray, np.ndarray]] = []
-    for path in metric_paths:
+    ranked: list[tuple[float, dict[str, Any], np.ndarray, np.ndarray]] = []
+    for item in metric_items:
+        path = Path(item["metrics_path"])
         centers, dh = _load_delta_h(path)
-        ranked.append((float(np.nanmax(dh)), path, centers, dh))
+        ranked.append((float(np.nanmax(dh)), item, centers, dh))
     ranked.sort(key=lambda x: -x[0])
 
     rows: list[dict[str, Any]] = []
-    for _peak, metrics_path, centers, dh in ranked[:max_trajectories]:
-        source_traj_dir = metrics_path.parent
-        traj_id = source_traj_dir.name
+    for _peak, item, centers, dh in ranked[:max_trajectories]:
+        metrics_path = Path(item["metrics_path"])
+        source_traj_dir = Path(item["traj_dir"])
+        traj_id = str(item["traj_id"])
         pairs = _select_events(
             centers=centers,
             dh=dh,

@@ -33,13 +33,13 @@ Outputs:
 
 - Synthetic trajectory files under `analysis/results/paper_suite/synthetic_calibration/simulation/`.
 - Paper-check A/B/C artifacts under each substrate's `experiments/paper_check_*/checkpoints/frustration_simulation/`.
-- Flow-Lenia APF/minibang artifacts under the configured APF output root.
+- Flow-Lenia C2 high-resolution APF artifacts under the configured C2 trajectory root.
 - C2 branching plan and optional resumed branch trajectories under `analysis/results/paper_suite/c2_branching/`.
 
 Required reusable logs:
 
 - For paper-check frustration: `trial_XXXXX_lagrangian.npz` and `trial_XXXXX_embeddings.npz`.
-- For APF/minibang C2 work: `P_steps_*.npz` chunks containing `A`, `P`, `F`, `lagrangian_xy`, `lagrangian_c`, `resume_batch_rng_key`, `state_t`, and `state_mass_cycle_start` where possible.
+- For C2 APF work: `P_steps_*.npz` chunks containing `A`, `P`, `F`, `lagrangian_xy`, `lagrangian_c`, `resume_batch_rng_key`, `state_t`, and `state_mass_cycle_start` where possible.
 - For C2 branching: `branch_plan.csv` plus one branch output directory per selected high/low time and branch seed. Branch outputs are resume-capable APF directories or compact `branch_feature.npz` smoke fixtures.
 
 Policy:
@@ -71,6 +71,10 @@ Outputs:
 - Cross-substrate summary:
   - `cross_substrate_summary.csv`
   - `paper_suite_metrics_summary.json`
+- C2 high-resolution Flow-Lenia APF posthoc metrics:
+  - `flow_opt_run_*/traj_*/metrics.npz`
+  - `flow_opt_run_*/traj_*/metrics_summary.json`
+  - `c2_highres_metrics/c2_highres_metrics_manifest.csv`
 - C2 branching:
   - `c2_branching/branching_scores.csv`
   - `c2_branching/branching_pair_contrasts.csv`
@@ -80,6 +84,7 @@ Rules:
 
 - C1 tau selection is posthoc and selection-adjusted: every optimized and random checkpoint gets the same right to select tau on `control_a`/selection windows, then the reported score is measured on `control_b`/held-out windows.
 - C5 frustration is computed as `d(control_a, walls) - d(control_a, control_b)` for embedding and Delta-H map axes.
+- C2 high-resolution rollout metrics are computed from saved APF chunks only. Missing `metrics.npz` must not trigger resimulation if APF/config/params are present.
 - C2 branching computes `B(high Delta-H) - B(matched low Delta-H)` from saved branch continuations only.
 - The metrics layer must not invoke Flow-Lenia/Boids/PLife simulators.
 
@@ -137,6 +142,19 @@ Metrics:
 
 ## C2 Branching Sensitivity
 
+Primary C2 source:
+
+- Do not use the old minibang golden set as primary C2 evidence; it is kept only as legacy/debug fallback.
+- Generate high-resolution Flow-Lenia C2 rollouts from paper-check optimized checkpoints.
+- Input optimized checkpoint roots:
+  - `experiments/paper_check/checkpoints/optimization`
+  - `experiments/paper_check/checkpoints_0/optimization`
+  - `experiments/paper_check/checkpoints_reference/optimization`
+- Dedupe by `run_XXX`, first valid root wins, max 5 optimized runs by default.
+- Rollout config: `experiments/paper_suite/c2_flowlenia_highres_rollout.yaml`.
+- Output root: `experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts`.
+- Rollout profile: paper-check Flow-Lenia optimization config with `grid_size: 384` and `rollout_steps/max_steps: 500000`.
+
 Default local-safe target:
 
 - `max_trajectories: 2`.
@@ -149,18 +167,22 @@ Paper-quality target on A100 can be raised in config to the document's suggested
 
 Layer behavior:
 
-- Simulation layer selects high Delta-H and matched low/mid Delta-H times from existing minibang `metrics.npz`, writes `branch_plan.csv`, and optionally launches `flowlenia_minibang_resume.py` with small perturbations.
-- Metrics layer loads branch outputs, summarizes future APF/metric trajectories into compact features, computes pairwise branch divergence, and reports paired high-low contrasts.
+- Simulation layer creates/reuses C2 high-resolution APF/lagrangian rollouts and treats them as ready when APF chunks, `config.yaml`, and `params.npy` are present. It does not require `metrics.npz`.
+- Metrics layer first computes/recomputes high-resolution C2 `metrics.npz` from the saved APF chunks, then writes the C2 event summary.
+- After C2 metrics exist, branch simulation selects high Delta-H and matched low/mid Delta-H times from `metrics.npz`, writes `branch_plan.csv`, and optionally launches `flowlenia_minibang_resume.py` with small perturbations.
+- Branch metrics load branch outputs, summarize future APF/metric trajectories into compact features, compute pairwise branch divergence, and report paired high-low contrasts.
 - Visualization layer reads only `branching_scores.csv` and `branching_pair_contrasts.csv`.
 
 ## C1 / C5 / C6 Artifact Expectations
 
 Flow-Lenia required:
 
-- `experiments/paper_check_flow_lenia/checkpoints/optimization/run_000/best.pkl` etc.
-- `experiments/paper_check_flow_lenia/checkpoints/frustration_simulation/trial_results.csv` or `trial_data/trial_*.json`.
-- `trial_XXXXX_lagrangian.npz`.
-- `trial_XXXXX_embeddings.npz`.
+- Frustration artifacts are read from the three valid legacy roots:
+  `experiments/paper_check/checkpoints/frustration_simulation`,
+  `experiments/paper_check/checkpoints_0/frustration_simulation`,
+  and `experiments/paper_check/checkpoints_reference/frustration_simulation`.
+- Do not include `experiments/paper_check/checkpoints3` or `experiments/paper_check/checkpoints4`.
+- Each root must contain `trial_results.csv` or `trial_data/trial_*.json`, plus matching `trial_XXXXX_lagrangian.npz` and `trial_XXXXX_embeddings.npz`.
 
 Particle Life++ required for C6 primary:
 
