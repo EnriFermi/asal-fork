@@ -91,9 +91,9 @@ def _task_matches(requested: str, entry_task: str) -> bool:
     if requested == "all":
         return True
     if requested == "paper_check":
-        return entry_task == "paper_check"
+        return entry_task in {"paper_check", "paper_check_apf"}
     if requested == "c2":
-        return entry_task in {"c2", "apf"}
+        return entry_task in {"c2", "apf", "paper_check_apf"}
     return requested == entry_task
 
 
@@ -108,9 +108,21 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
 
     if task in {"all", "synthetic"}:
         log_event("simulation synthetic start", component="simulation")
-        result = simulate_synthetic(config_path, smoke=smoke, force=force)
-        rows.append({"name": "synthetic_calibration", "layer": "simulation", "status": "ok", "message": str(result), "command": ""})
-        log_event(f"simulation synthetic done result={result}", component="simulation")
+        if dry_run:
+            rows.append(
+                {
+                    "name": "synthetic_calibration",
+                    "layer": "simulation",
+                    "status": "dry_run",
+                    "message": "synthetic simulation skipped by --dry-run",
+                    "command": "",
+                }
+            )
+            log_event("simulation synthetic dry run skipped", component="simulation")
+        else:
+            result = simulate_synthetic(config_path, smoke=smoke, force=force)
+            rows.append({"name": "synthetic_calibration", "layer": "simulation", "status": "ok", "message": str(result), "command": ""})
+            log_event(f"simulation synthetic done result={result}", component="simulation")
 
     if task in {"all", "paper_check", "apf", "c2"}:
         sim_cfg = cfg.get("simulation", {})
@@ -132,7 +144,9 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
             heavy = bool(entry.get("heavy", True))
             pre_status, pre_msg = _validate_expected(entry)
             always_run = bool(entry.get("always_run", False))
-            if pre_status == "ok" and not force and not always_run:
+            force_policy = str(entry.get("force_policy", "normal")).strip().lower()
+            reuse_existing_on_force = force_policy in {"reuse_existing", "skip_existing", "no_force"}
+            if pre_status == "ok" and not always_run and (not force or reuse_existing_on_force):
                 rows.append({"name": name, "layer": "simulation", "status": "exists", "message": "expected outputs already present", "command": ""})
                 log_event(f"simulation {name} exists", component="simulation")
                 continue

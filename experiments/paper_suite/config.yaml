@@ -240,6 +240,7 @@ simulation:
       enabled: true
       required: true
       heavy: true
+      force_policy: reuse_existing
       command: ["{python}", "scripts/run_paper_check_frustration.py", "experiments/paper_check_flow_lenia/config.yaml"]
       expected_paths:
         - experiments/paper_check/checkpoints/frustration_simulation/trial_results.csv
@@ -254,7 +255,7 @@ simulation:
         - experiments/paper_check/checkpoints_reference/frustration_simulation/trial_data/trial_*_embeddings.npz
 
     - name: flow_lenia_arun_lagrangian_apf_500k
-      task: paper_check
+      task: paper_check_apf
       enabled: true
       required: true
       heavy: true
@@ -274,6 +275,7 @@ simulation:
       enabled: true
       required: true
       heavy: true
+      force_policy: reuse_existing
       command: ["{python}", "scripts/run_paper_check_frustration.py", "experiments/paper_check_plife_plus/config.yaml"]
       expected_paths:
         - experiments/paper_check_plife_plus/checkpoints/frustration_simulation/trial_results.csv
@@ -286,6 +288,7 @@ simulation:
       enabled: false
       required: false
       heavy: true
+      force_policy: reuse_existing
       command: ["{python}", "scripts/run_paper_check_frustration.py", "experiments/paper_check_boids/config.yaml"]
       expected_paths:
         - experiments/paper_check_boids/checkpoints/frustration_simulation/trial_results.csv

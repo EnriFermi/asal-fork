@@ -97,6 +97,23 @@ def _iter_trajectories(root: Path) -> list[dict[str, Any]]:
     if items:
         return items
 
+    for idx, traj_dir in enumerate(sorted(root.glob("flow_opt_*"))):
+        if not traj_dir.is_dir() or not (traj_dir / "apf_logs").is_dir():
+            continue
+        items.append(
+            {
+                "traj_id": traj_dir.name,
+                "selection_idx": idx,
+                "run_idx": -1,
+                "traj_dir": traj_dir,
+                "apf_dir": traj_dir / "apf_logs",
+                "metrics_path": traj_dir / "metrics.npz",
+                "manifest_row": {},
+            }
+        )
+    if items:
+        return items
+
     for idx, traj_dir in enumerate(sorted(root.glob("flow_opt_*/traj_*"))):
         if not traj_dir.is_dir():
             continue
