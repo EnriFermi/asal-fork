@@ -150,30 +150,123 @@ def _resolve_artifact(row: pd.Series | dict[str, Any], field: str) -> Path | Non
     return root / path
 
 
+def _cfg_list(value: Any) -> list[Any] | None:
+    if value is None:
+        return None
+    return as_list(value)
+
+
+def _infer_lagrangian_timing(data: np.lib.npyio.NpzFile, xy: np.ndarray) -> tuple[int, int]:
+    scalar_sample_every = int(np.asarray(data["sample_every_steps"]).item()) if "sample_every_steps" in data.files else None
+    inferred_sample_every: int | None = None
+    sample_steps: np.ndarray | None = None
+    for key in ("xy_late_sample_steps", "sample_offsets_steps"):
+        if key not in data.files:
+            continue
+        arr = np.asarray(data[key], dtype=np.int64).reshape(-1)
+        if arr.size != int(xy.shape[0]):
+            continue
+        diffs = np.diff(arr)
+        positive = diffs[diffs > 0]
+        if positive.size:
+            inferred_sample_every = int(round(float(np.median(positive))))
+            sample_steps = arr
+            break
+
+    sample_every = int(inferred_sample_every or scalar_sample_every or 1)
+    if "trajectory_window_steps" in data.files:
+        rollout_steps = int(np.asarray(data["trajectory_window_steps"]).item())
+    elif sample_steps is not None and sample_steps.size:
+        rollout_steps = int(sample_steps[-1] - sample_steps[0] + sample_every)
+    else:
+        rollout_steps = int(xy.shape[0] * sample_every)
+    return sample_every, rollout_steps
+
+
+def _safe_metric_timing(metric_cfg_raw: Any, *, rollout_steps: int, sample_every: int) -> dict[str, Any]:
+    sample_every = max(1, int(sample_every))
+    rollout_steps = max(sample_every, int(rollout_steps))
+    time_sampling = max(1, rollout_steps // sample_every)
+    m_min = max(1, int(cfg_get(metric_cfg_raw, "metric_m_min", 4)))
+
+    win_frames_raw = cfg_get(metric_cfg_raw, "metric_window_size_frames", None)
+    if win_frames_raw is not None:
+        win_frames = int(win_frames_raw)
+    else:
+        win_steps_raw = int(cfg_get(metric_cfg_raw, "metric_window_size_steps", 20000))
+        win_frames = int(max(1, round(float(win_steps_raw) / float(sample_every))))
+    win_frames = max(1, min(int(win_frames), int(time_sampling)))
+    win_steps = int(win_frames * sample_every)
+
+    step_frames_raw = cfg_get(metric_cfg_raw, "metric_window_step_frames", None)
+    if step_frames_raw is not None:
+        step_frames = int(step_frames_raw)
+    else:
+        step_steps_raw = int(cfg_get(metric_cfg_raw, "metric_window_step_steps", 5000))
+        step_frames = int(max(1, round(float(step_steps_raw) / float(sample_every))))
+    step_frames = max(1, min(int(step_frames), int(win_frames)))
+    step_steps = int(step_frames * sample_every)
+
+    max_tau_frames = max(1, int(win_frames) - int(m_min))
+    tau_frames_raw = cfg_get(metric_cfg_raw, "metric_tau_frames", None)
+    if tau_frames_raw is not None:
+        tau_frames = int(tau_frames_raw)
+    else:
+        tau_steps_raw = int(cfg_get(metric_cfg_raw, "metric_tau_steps", 3000))
+        tau_frames = int(max(1, round(float(tau_steps_raw) / float(sample_every))))
+    tau_frames = max(1, min(int(tau_frames), int(max_tau_frames)))
+    tau_steps = int(tau_frames * sample_every)
+
+    grid_frames_raw = cfg_get(metric_cfg_raw, "metric_tau_grid_frames", None)
+    if grid_frames_raw is not None:
+        grid_frames = [int(x) for x in (_cfg_list(grid_frames_raw) or [])]
+    else:
+        grid_steps_raw = cfg_get(metric_cfg_raw, "metric_tau_grid_steps", None)
+        grid_frames = [
+            int(max(1, round(float(x) / float(sample_every))))
+            for x in (_cfg_list(grid_steps_raw) or [])
+        ]
+    grid_frames = sorted({int(x) for x in grid_frames if 0 < int(x) <= int(max_tau_frames)})
+    if not grid_frames:
+        grid_frames = [tau_frames]
+    grid_steps = [int(x * sample_every) for x in grid_frames]
+
+    range_end_raw = cfg_get(metric_cfg_raw, "metric_range_end_steps", None)
+    range_end = None if range_end_raw is None else min(int(range_end_raw), int(rollout_steps))
+
+    return {
+        "metric_window_size_steps": win_steps,
+        "metric_window_step_steps": step_steps,
+        "metric_tau_steps": tau_steps,
+        "metric_tau_grid_steps": grid_steps,
+        "metric_window_size_frames": None,
+        "metric_window_step_frames": None,
+        "metric_tau_frames": None,
+        "metric_tau_grid_frames": None,
+        "metric_range_end_steps": range_end,
+    }
+
+
 def _metric_config_from_lagrangian(path: Path, metric_cfg_raw: Any) -> dict[str, Any]:
     with np.load(path, allow_pickle=False) as data:
         xy = np.asarray(data["xy_control_a"], dtype=np.float32)
-        sample_every = int(np.asarray(data["sample_every_steps"]).item()) if "sample_every_steps" in data.files else 1
-        rollout_steps = (
-            int(np.asarray(data["trajectory_window_steps"]).item())
-            if "trajectory_window_steps" in data.files
-            else int(xy.shape[0] * sample_every)
-        )
+        sample_every, rollout_steps = _infer_lagrangian_timing(data, xy)
+    timing = _safe_metric_timing(metric_cfg_raw, rollout_steps=rollout_steps, sample_every=sample_every)
     args = SimpleNamespace(
         rollout_steps=rollout_steps,
         sample_every_steps=sample_every,
         time_sampling=None,
-        metric_window_size_steps=int(cfg_get(metric_cfg_raw, "metric_window_size_steps", 20000)),
-        metric_window_step_steps=int(cfg_get(metric_cfg_raw, "metric_window_step_steps", 5000)),
+        metric_window_size_steps=timing["metric_window_size_steps"],
+        metric_window_step_steps=timing["metric_window_step_steps"],
         metric_tau_mode=str(cfg_get(metric_cfg_raw, "metric_tau_mode", "max_grid")),
-        metric_tau_steps=int(cfg_get(metric_cfg_raw, "metric_tau_steps", 3000)),
-        metric_tau_grid_steps=cfg_get(metric_cfg_raw, "metric_tau_grid_steps", [1000, 3000, 5000, 7000, 9000]),
-        metric_window_size_frames=cfg_get(metric_cfg_raw, "metric_window_size_frames", None),
-        metric_window_step_frames=cfg_get(metric_cfg_raw, "metric_window_step_frames", None),
-        metric_tau_frames=cfg_get(metric_cfg_raw, "metric_tau_frames", None),
-        metric_tau_grid_frames=cfg_get(metric_cfg_raw, "metric_tau_grid_frames", None),
+        metric_tau_steps=timing["metric_tau_steps"],
+        metric_tau_grid_steps=timing["metric_tau_grid_steps"],
+        metric_window_size_frames=timing["metric_window_size_frames"],
+        metric_window_step_frames=timing["metric_window_step_frames"],
+        metric_tau_frames=timing["metric_tau_frames"],
+        metric_tau_grid_frames=timing["metric_tau_grid_frames"],
         metric_range_start_steps=int(cfg_get(metric_cfg_raw, "metric_range_start_steps", 0)),
-        metric_range_end_steps=cfg_get(metric_cfg_raw, "metric_range_end_steps", None),
+        metric_range_end_steps=timing["metric_range_end_steps"],
         metric_m_samples=int(cfg_get(metric_cfg_raw, "metric_m_samples", 48)),
         metric_m_min=int(cfg_get(metric_cfg_raw, "metric_m_min", 4)),
         metric_n_proj=int(cfg_get(metric_cfg_raw, "metric_n_proj", 16)),

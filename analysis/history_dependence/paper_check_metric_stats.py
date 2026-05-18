@@ -134,9 +134,111 @@ def _infer_lag_meta(lagrangian_path: Path) -> dict[str, Any]:
                 meta[key] = arr.item()
         for key in ("xy_control_a", "xy_control_b", "xy_walls"):
             if key in data.files:
-                meta["time_sampling"] = int(np.asarray(data[key]).shape[0])
+                xy_len = int(np.asarray(data[key]).shape[0])
+                meta["time_sampling"] = xy_len
+                break
+        for key in ("xy_late_sample_steps", "sample_offsets_steps"):
+            if key not in data.files:
+                continue
+            steps = np.asarray(data[key], dtype=np.int64).reshape(-1)
+            if steps.size != int(meta.get("time_sampling", steps.size)):
+                continue
+            positive = np.diff(steps)
+            positive = positive[positive > 0]
+            if positive.size:
+                meta["sample_every_steps"] = int(round(float(np.median(positive))))
+                if "trajectory_window_steps" not in meta and steps.size:
+                    meta["trajectory_window_steps"] = int(steps[-1] - steps[0] + int(meta["sample_every_steps"]))
                 break
     return meta
+
+
+def _cfg_list(value: Any) -> list[Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return [x.strip() for x in text.split(",") if x.strip()] if text else None
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    try:
+        if hasattr(value, "__iter__") and not isinstance(value, (bytes, bytearray, dict)):
+            return list(value)
+    except Exception:
+        pass
+    return [value]
+
+
+def _safe_metric_timing(
+    traj_cfg: dict[str, Any],
+    lag_meta: dict[str, Any],
+    source_metric: dict[str, Any],
+    *,
+    rollout_steps: int,
+    sample_every_steps: int,
+) -> dict[str, Any]:
+    sample_every_steps = max(1, int(sample_every_steps))
+    rollout_steps = max(sample_every_steps, int(rollout_steps))
+    time_sampling = max(1, rollout_steps // sample_every_steps)
+    m_min = max(1, int(traj_cfg.get("metric_m_min", 4)))
+
+    win_frames_raw = traj_cfg.get("metric_window_size_frames", source_metric.get("window_size_frames"))
+    if win_frames_raw is not None:
+        win_frames = int(win_frames_raw)
+    else:
+        win_steps_raw = traj_cfg.get("metric_window_size_steps", lag_meta.get("metric_window_size_steps"))
+        if win_steps_raw is None:
+            win_steps_raw = source_metric.get("window_size_steps", 20_000)
+        win_frames = int(max(1, round(float(win_steps_raw) / float(sample_every_steps))))
+    win_frames = max(1, min(int(win_frames), int(time_sampling)))
+    win_steps = int(win_frames * sample_every_steps)
+
+    step_frames_raw = traj_cfg.get("metric_window_step_frames", source_metric.get("window_step_frames"))
+    if step_frames_raw is not None:
+        step_frames = int(step_frames_raw)
+    else:
+        step_steps_raw = traj_cfg.get("metric_window_step_steps", lag_meta.get("metric_window_step_steps"))
+        if step_steps_raw is None:
+            step_steps_raw = source_metric.get("window_step_steps", 5_000)
+        step_frames = int(max(1, round(float(step_steps_raw) / float(sample_every_steps))))
+    step_frames = max(1, min(int(step_frames), int(win_frames)))
+    step_steps = int(step_frames * sample_every_steps)
+
+    max_tau_frames = max(1, int(win_frames) - int(m_min))
+    tau_frames_raw = traj_cfg.get("metric_tau_frames", source_metric.get("tau_frames"))
+    if tau_frames_raw is not None:
+        tau_frames = int(tau_frames_raw)
+    else:
+        tau_steps_raw = traj_cfg.get("metric_tau_steps", lag_meta.get("metric_tau_steps", source_metric.get("tau_steps", 3_000)))
+        tau_frames = int(max(1, round(float(tau_steps_raw) / float(sample_every_steps))))
+    tau_frames = max(1, min(int(tau_frames), int(max_tau_frames)))
+    tau_steps = int(tau_frames * sample_every_steps)
+
+    grid_frames_raw = traj_cfg.get("metric_tau_grid_frames")
+    if grid_frames_raw is not None:
+        grid_frames = [int(x) for x in (_cfg_list(grid_frames_raw) or [])]
+    else:
+        grid_steps_raw = traj_cfg.get("metric_tau_grid_steps")
+        grid_frames = [
+            int(max(1, round(float(x) / float(sample_every_steps))))
+            for x in (_cfg_list(grid_steps_raw) or [])
+        ]
+    grid_frames = sorted({int(x) for x in grid_frames if 0 < int(x) <= int(max_tau_frames)})
+    if not grid_frames:
+        grid_frames = [tau_frames]
+    grid_steps = [int(x * sample_every_steps) for x in grid_frames]
+
+    range_end = traj_cfg.get("metric_range_end_steps", source_metric.get("range_end_steps"))
+    if range_end is not None:
+        range_end = min(int(range_end), int(rollout_steps))
+
+    return {
+        "metric_window_size_steps": win_steps,
+        "metric_window_step_steps": step_steps,
+        "metric_tau_steps": tau_steps,
+        "metric_tau_grid_steps": grid_steps,
+        "metric_range_end_steps": range_end,
+    }
 
 
 def _resolve_fixed_tau_index(
@@ -236,22 +338,29 @@ def _build_metric_cfg(
             f"Could not derive trajectory metric config for {lagrangian_path}: "
             f"rollout_steps={rollout_steps}, sample_every_steps={sample_every_steps}"
         )
+    timing = _safe_metric_timing(
+        traj_cfg,
+        lag_meta,
+        source_metric,
+        rollout_steps=int(rollout_steps),
+        sample_every_steps=int(sample_every_steps),
+    )
 
     args = SimpleNamespace(
         rollout_steps=int(rollout_steps),
         sample_every_steps=int(sample_every_steps),
         time_sampling=None if time_sampling is None else int(time_sampling),
-        metric_window_size_frames=traj_cfg.get("metric_window_size_frames", source_metric.get("window_size_frames")),
-        metric_window_size_steps=traj_cfg.get("metric_window_size_steps", lag_meta.get("metric_window_size_steps")),
-        metric_window_step_frames=traj_cfg.get("metric_window_step_frames", source_metric.get("window_step_frames")),
-        metric_window_step_steps=traj_cfg.get("metric_window_step_steps", lag_meta.get("metric_window_step_steps")),
+        metric_window_size_frames=None,
+        metric_window_size_steps=timing["metric_window_size_steps"],
+        metric_window_step_frames=None,
+        metric_window_step_steps=timing["metric_window_step_steps"],
         metric_tau_mode=traj_cfg.get("metric_tau_mode", source_metric.get("tau_mode", "fixed")),
-        metric_tau_frames=traj_cfg.get("metric_tau_frames", source_metric.get("tau_frames")),
-        metric_tau_steps=traj_cfg.get("metric_tau_steps", lag_meta.get("metric_tau_steps", source_metric.get("tau_steps"))),
-        metric_tau_grid_frames=traj_cfg.get("metric_tau_grid_frames"),
-        metric_tau_grid_steps=traj_cfg.get("metric_tau_grid_steps"),
+        metric_tau_frames=None,
+        metric_tau_steps=timing["metric_tau_steps"],
+        metric_tau_grid_frames=None,
+        metric_tau_grid_steps=timing["metric_tau_grid_steps"],
         metric_range_start_steps=traj_cfg.get("metric_range_start_steps", source_metric.get("range_start_steps")),
-        metric_range_end_steps=traj_cfg.get("metric_range_end_steps", source_metric.get("range_end_steps")),
+        metric_range_end_steps=timing["metric_range_end_steps"],
         metric_m_samples=traj_cfg.get("metric_m_samples", source_metric.get("m_count", 48)),
         metric_m_min=traj_cfg.get("metric_m_min", 4),
         metric_n_proj=traj_cfg.get("metric_n_proj", source_metric.get("n_proj", 16)),
