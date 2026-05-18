@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from functools import lru_cache
 from types import SimpleNamespace
 from typing import Any
 
@@ -145,6 +147,25 @@ def derive_metric_config(cfg: dict[str, Any], run_collection) -> dict[str, Any] 
     return resolve_metric_config(args)
 
 
+def _json_default(value: Any):
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    raise TypeError(f"Cannot JSON-serialize {type(value).__name__}")
+
+
+@lru_cache(maxsize=32)
+def _cached_metric_eval(metric_cfg_json: str):
+    metric_cfg = json.loads(metric_cfg_json)
+    return jax.jit(make_metric_loss_fn(metric_cfg, include_maps=True))
+
+
+def _metric_eval(metric_cfg: dict[str, Any]):
+    key = json.dumps(metric_cfg, sort_keys=True, default=_json_default)
+    return _cached_metric_eval(key)
+
+
 def compute_delta_h_summary(
     xy_seq: np.ndarray,
     metric_cfg: dict[str, Any],
@@ -163,7 +184,7 @@ def compute_delta_h_summary(
         desc = progress_desc or "Delta-H"
         print(f"[{desc}] scoring with scripts.clip_deltah_msc_metric.make_metric_loss_fn")
 
-    metric_eval = jax.jit(make_metric_loss_fn(metric_cfg, include_maps=True))
+    metric_eval = _metric_eval(metric_cfg)
     rng_seed = int(metric_cfg["dirs_seed"]) if metric_rng_seed is None else int(metric_rng_seed)
     rng = jax.random.PRNGKey(rng_seed)
     if metric_rng_fold_in is not None:

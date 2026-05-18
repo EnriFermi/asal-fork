@@ -1,3 +1,10 @@
+# DEPRECATED PROTOCOL NOTE
+
+Этот файл является историческим claim-audit draft, а не текущим протоколом
+paper-suite. Current protocol: C3 не является main paper claim, C4 deferred,
+species/color/object-count metrics не используются как main evidence. Активный
+протокол: `agents.md` и `experiments/paper_suite/README.md`.
+
 # Claims и proof package для статьи про MSPD Complexity Metric
 
 Опираюсь на загруженный `main (1).tex`; прошлого контекста по MSPD у меня не подтянулось, поэтому ниже — только claims из черновика.

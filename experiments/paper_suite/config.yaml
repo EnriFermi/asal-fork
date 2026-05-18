@@ -7,12 +7,12 @@ synthetic:
   families: [S0, S1, S3, S4, S5, S6, S7]
   seeds: 1
   seed_base: 100
-  n_particles: 64
-  time_steps: 240
+  n_particles: 48
+  time_steps: 512
   domain_size: 1.0
-  tau_grid_steps: [1, 2, 4, 8, 12, 16]
-  metric_window_size_steps: 60
-  metric_window_step_steps: 20
+  tau_grid_steps: [4, 6, 8, 10]
+  metric_window_size_steps: 16
+  metric_window_step_steps: 8
   metric_range_start_steps: 0
   metric_m_samples: 8
   metric_m_min: 4
@@ -21,6 +21,21 @@ synthetic:
   metric_particle_samples: 32
   metric_dirs_seed: 123
   metric_seed: 12345
+  metric_delta_h_floor: 0.001
+  render:
+    enabled: true
+    fps: 18
+    size_px: 512
+    max_frames: 512
+    trail_steps: 16
+    particle_radius_px: 3
+    particle_stride: 1
+    max_particles: null
+    codec: mp4v
+  visualization:
+    heatmaps_enabled: true
+    heatmap_cmap: coolwarm
+    heatmap_max_runs: null
 
 datasets:
   flow_lenia:
@@ -157,8 +172,10 @@ c2:
       - experiments/paper_check/checkpoints/optimization
       - experiments/paper_check/checkpoints_0/optimization
       - experiments/paper_check/checkpoints_reference/optimization
-    dedupe_by_run_idx: true
-    max_checkpoints: 5
+    # Keep run_XXX identity root-local. The three valid roots can contain the
+    # same local run index, and those are distinct optimized checkpoints.
+    dedupe_by_run_idx: false
+    max_checkpoints: null
   branching:
     enabled: true
     required: false
@@ -172,6 +189,13 @@ c2:
     low_quantile: 0.35
     feature_max_apf_chunks: 4
     feature_max_snapshots_per_chunk: 8
+    future_field_weights:
+      A: 1.0
+      P: 0.25
+      F: 0.25
+    future_field_scales: [1, 2, 4]
+    future_max_frames: 32
+    allow_debug_feature_fallback: false
     perturb:
       a_std: 0.0001
       p_std: 0.0001
@@ -228,11 +252,14 @@ simulation:
       enabled: true
       required: true
       heavy: true
+      # Idempotent builder: always run when heavy simulation is allowed so a
+      # stale manifest with only a subset of roots cannot mask missing APF logs.
+      always_run: true
       command: ["{python}", "scripts/paper_suite_c2_flowlenia_highres.py", "{config}"]
       expected_paths:
         - experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts/manifest.json
       expected_globs:
-        - experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts/flow_opt_run_*/traj_*/apf_logs/P_steps_*.npz
+        - experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts/flow_opt_*/traj_*/apf_logs/P_steps_*.npz
       expected_npz_keys: [A, P, F, lagrangian_xy, lagrangian_c, resume_batch_rng_key, state_t, state_mass_cycle_start]
       npz_key_check_limit: 3
 
@@ -249,16 +276,25 @@ smoke:
   meta:
     output_root: analysis/results/paper_suite_smoke
   synthetic:
-    seeds: 1
-    n_particles: 32
-    time_steps: 96
-    tau_grid_steps: [1, 2, 4, 8]
+    seeds: 20
+    n_particles: 256
+    time_steps: 512
+    tau_grid_steps: [8, 16, 32, 64, 128]
     metric_window_size_steps: 32
-    metric_window_step_steps: 16
-    metric_m_samples: 6
-    metric_n_proj: 4
+    metric_window_step_steps: 8
+    metric_m_samples: 12
+    metric_n_proj: 8
     metric_null_reps: 2
-    metric_particle_samples: 24
+    metric_particle_samples: 32
+    render:
+      enabled: true
+      size_px: 384
+      fps: 12
+      max_frames: 512
+      trail_steps: 8
+      particle_radius_px: 8
+    visualization:
+      heatmap_max_runs: null
   c2:
     branching:
       branch_root: analysis/results/paper_suite_smoke/c2_branching/branches

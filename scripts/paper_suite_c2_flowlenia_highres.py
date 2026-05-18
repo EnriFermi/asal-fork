@@ -78,7 +78,7 @@ def _discover_checkpoints(section: Any) -> list[dict[str, Any]]:
                 "checkpoint_dir": path,
                 "source_root": path.parent,
                 "source_root_rank": len(rows),
-                "run_idx": -1 if idx is None else int(idx),
+                "source_run_idx": -1 if idx is None else int(idx),
             }
         )
 
@@ -98,21 +98,36 @@ def _discover_checkpoints(section: Any) -> list[dict[str, Any]]:
                     "checkpoint_dir": path,
                     "source_root": root,
                     "source_root_rank": int(root_rank),
-                    "run_idx": int(idx),
+                    "source_run_idx": int(idx),
                 }
             )
 
-    rows.sort(key=lambda r: (int(r["source_root_rank"]), int(r["run_idx"]), str(r["checkpoint_dir"])))
-    if bool(_get(section, "dedupe_by_run_idx", True)):
+    rows.sort(key=lambda r: (int(r["source_root_rank"]), int(r["source_run_idx"]), str(r["checkpoint_dir"])))
+    deduped: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for row in rows:
+        key = str(Path(row["checkpoint_dir"]).resolve())
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        deduped.append(row)
+    rows = deduped
+
+    if bool(_get(section, "dedupe_by_run_idx", False)):
+        # Legacy compatibility option. Keep it root-local so runs with the same
+        # local run_XXX index from different checkpoint roots are not collapsed.
         deduped: list[dict[str, Any]] = []
-        seen: set[int] = set()
+        seen: set[tuple[int, int]] = set()
         for row in rows:
-            idx = int(row["run_idx"])
-            if idx in seen:
+            key = (int(row["source_root_rank"]), int(row["source_run_idx"]))
+            if key in seen:
                 continue
-            seen.add(idx)
+            seen.add(key)
             deduped.append(row)
         rows = deduped
+
+    for suite_idx, row in enumerate(rows):
+        row["run_idx"] = int(suite_idx)
 
     max_checkpoints = _get(section, "max_checkpoints", None)
     if max_checkpoints is not None:
@@ -121,10 +136,12 @@ def _discover_checkpoints(section: Any) -> list[dict[str, Any]]:
 
 
 def _traj_id(row: dict[str, Any]) -> str:
-    idx = int(row["run_idx"])
-    if idx >= 0:
-        return f"flow_opt_run_{idx:03d}"
-    return f"{_root_label(Path(row['source_root']))}_{Path(row['checkpoint_dir']).name}"
+    source_idx = int(row.get("source_run_idx", row.get("run_idx", -1)))
+    if source_idx >= 0 and int(row.get("source_root_rank", 0)) == 0:
+        return f"flow_opt_run_{source_idx:03d}"
+    if source_idx >= 0:
+        return f"flow_opt_root{int(row['source_root_rank']):02d}_{_root_label(Path(row['source_root']))}_run_{source_idx:03d}"
+    return f"flow_opt_root{int(row['source_root_rank']):02d}_{_root_label(Path(row['source_root']))}_{Path(row['checkpoint_dir']).name}"
 
 
 def _run_output_paths(output_root: Path, traj_id: str) -> dict[str, Path]:
@@ -207,6 +224,7 @@ def _write_aggregate_manifest(
             "source_root": str(row["source_root"]),
             "source_root_rank": int(row["source_root_rank"]),
             "run_idx": int(row["run_idx"]),
+            "source_run_idx": int(row.get("source_run_idx", row["run_idx"])),
             "traj_dir": str(paths["traj_dir"]),
             "apf_dir": str(paths["apf_dir"]),
             "metrics_path": str(paths["metrics_path"]),

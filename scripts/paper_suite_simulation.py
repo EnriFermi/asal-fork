@@ -131,7 +131,8 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
                 continue
             heavy = bool(entry.get("heavy", True))
             pre_status, pre_msg = _validate_expected(entry)
-            if pre_status == "ok" and not force:
+            always_run = bool(entry.get("always_run", False))
+            if pre_status == "ok" and not force and not always_run:
                 rows.append({"name": name, "layer": "simulation", "status": "exists", "message": "expected outputs already present", "command": ""})
                 log_event(f"simulation {name} exists", component="simulation")
                 continue

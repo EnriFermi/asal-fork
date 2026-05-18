@@ -81,11 +81,13 @@ def _c2_branching_metrics(config: str, *, smoke: bool) -> None:
     _call("paper_suite_c2_branching.py", config, *args)
 
 
-def _visualization(config: str, task: str, *, smoke: bool) -> None:
+def _visualization(config: str, task: str, *, smoke: bool, force: bool) -> None:
     vis_task = task if task in {"synthetic", "c1", "c2", "c5", "c6"} else "all"
     args = ["--task", vis_task]
     if smoke:
         args.append("--smoke")
+    if force:
+        args.append("--force")
     _call("paper_suite_visualize.py", config, *args)
 
 
@@ -131,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
         _c2_branching_metrics(args.config, smoke=args.smoke)
     if args.layer in {"visualization", "all"}:
         log_event("starting visualization layer", component="runner")
-        _visualization(args.config, args.task, smoke=args.smoke)
+        _visualization(args.config, args.task, smoke=args.smoke, force=args.force)
     log_event("paper suite finished", component="runner")
     return 0
 

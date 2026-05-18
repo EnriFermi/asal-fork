@@ -326,6 +326,9 @@ def resolve_metric_config(args: Any) -> dict[str, Any]:
         raise ValueError(
             f"metric_preprocess_mode must be one of ['clip','shift','none'], got {mode!r}."
         )
+    delta_h_floor = float(getattr(args, "metric_delta_h_floor", 0.0) or 0.0)
+    if delta_h_floor < 0.0:
+        raise ValueError(f"metric_delta_h_floor must be >= 0, got {delta_h_floor}.")
 
     scales, weight_map, pairs = _resolve_scales(
         W=W,
@@ -365,6 +368,7 @@ def resolve_metric_config(args: Any) -> dict[str, Any]:
         null_reps=null_reps,
         particle_samples=particle_samples,
         preprocess_mode=mode,
+        delta_h_floor=delta_h_floor,
         scales=scales,
         scale_weights={int(k): float(v) for k, v in weight_map.items()},
         scale_pairs=pairs,
@@ -413,6 +417,7 @@ def metric_summary(cfg: dict[str, Any]) -> dict[str, Any]:
         domain_y=float(cfg["domain_y"]),
         domain_x=float(cfg["domain_x"]),
         preprocess_mode=str(cfg["preprocess_mode"]),
+        delta_h_floor=float(cfg.get("delta_h_floor", 0.0)),
         scales=list(cfg["scales"]),
         scale_pairs=[(int(r), float(w)) for r, w in cfg["scale_pairs"]],
         alpha=float(cfg["alpha"]),
@@ -451,6 +456,7 @@ def make_metric_loss_fn(cfg: dict[str, Any], *, include_maps: bool = False):
     null_reps = int(cfg["null_reps"])
     particle_samples = int(cfg["particle_samples"])
     mode = str(cfg["preprocess_mode"])
+    delta_h_floor = float(cfg.get("delta_h_floor", 0.0))
     scale_pairs = [(int(r), float(w)) for r, w in cfg["scale_pairs"]]
     alpha = float(cfg["alpha"])
     beta = float(cfg["beta"])
@@ -465,10 +471,15 @@ def make_metric_loss_fn(cfg: dict[str, Any], *, include_maps: bool = False):
 
     def _preprocess(h: jnp.ndarray) -> jnp.ndarray:
         if mode == "clip":
-            return jnp.maximum(h, 0.0)
-        if mode == "shift":
-            return h - jnp.min(h)
-        return h
+            out = jnp.maximum(h, 0.0)
+        elif mode == "shift":
+            out = h - jnp.min(h)
+        else:
+            out = h
+        if delta_h_floor > 0.0:
+            floor = jnp.asarray(delta_h_floor, dtype=out.dtype)
+            out = jnp.where(out >= floor, out, jnp.zeros_like(out))
+        return out
 
     def _signature_from_increments(v_s: jnp.ndarray, dirs: jnp.ndarray) -> jnp.ndarray:
         # v_s: (m_count, S, 2)
@@ -568,7 +579,7 @@ def make_metric_loss_fn(cfg: dict[str, Any], *, include_maps: bool = False):
             position_range_mean=jnp.mean(jnp.max(pos_flat, axis=0) - jnp.min(pos_flat, axis=0)),
         )
 
-    def _score_from_h(h: jnp.ndarray, dtype: jnp.dtype) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    def _score_from_h(h: jnp.ndarray, dtype: jnp.dtype) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         h_pos = _preprocess(h)
         amp = jnp.mean(h_pos)
         msc = jnp.array(0.0, dtype=dtype)
@@ -591,7 +602,7 @@ def make_metric_loss_fn(cfg: dict[str, Any], *, include_maps: bool = False):
             )
             msc = msc + (wr * d_r)
         score = alpha * amp + beta * msc
-        return score, amp, msc
+        return score, amp, msc, h_pos
 
     def metric_loss_fn(rng_metric: jax.Array, xy_seq: jnp.ndarray, tau_selector: jax.Array | None = None):
         tau_count = len(tau_frames_list)
@@ -609,6 +620,7 @@ def make_metric_loss_fn(cfg: dict[str, Any], *, include_maps: bool = False):
         speed_component_std_mean_list = []
         position_std_mean_list = []
         position_range_mean_list = []
+        h_processed_list = []
         score_list = []
         amp_list = []
         msc_list = []
@@ -628,7 +640,7 @@ def make_metric_loss_fn(cfg: dict[str, Any], *, include_maps: bool = False):
                 )
             )(starts, keys_w)
             h = window_diag["delta_h"]
-            score, amp, msc = _score_from_h(h, xy_seq.dtype)
+            score, amp, msc, h_processed = _score_from_h(h, xy_seq.dtype)
             h_list.append(h)
             h_real_list.append(window_diag["h_real"])
             h_null_list.append(window_diag["h_null"])
@@ -641,11 +653,13 @@ def make_metric_loss_fn(cfg: dict[str, Any], *, include_maps: bool = False):
             speed_component_std_mean_list.append(window_diag["speed_component_std_mean"])
             position_std_mean_list.append(window_diag["position_std_mean"])
             position_range_mean_list.append(window_diag["position_range_mean"])
+            h_processed_list.append(h_processed)
             score_list.append(score)
             amp_list.append(amp)
             msc_list.append(msc)
 
         h_all = jnp.stack(h_list, axis=0)  # (Ktau, W)
+        h_processed_all = jnp.stack(h_processed_list, axis=0)
         h_real_all = jnp.stack(h_real_list, axis=0)
         h_null_all = jnp.stack(h_null_list, axis=0)
         dx_norm_mean_all = jnp.stack(dx_norm_mean_list, axis=0)
@@ -672,6 +686,7 @@ def make_metric_loss_fn(cfg: dict[str, Any], *, include_maps: bool = False):
         amp = amp_all[best_idx]
         msc = msc_all[best_idx]
         h_best = h_all[best_idx]
+        h_processed_best = h_processed_all[best_idx]
         h_real_best = h_real_all[best_idx]
         h_null_best = h_null_all[best_idx]
         dx_norm_mean_best = dx_norm_mean_all[best_idx]
@@ -706,6 +721,11 @@ def make_metric_loss_fn(cfg: dict[str, Any], *, include_maps: bool = False):
             delta_h_max=jnp.max(h_best),
             delta_h_abs_mean=jnp.mean(jnp.abs(h_best)),
             delta_h_positive_frac=jnp.mean((h_best > 0.0).astype(xy_seq.dtype)),
+            delta_h_processed_mean=jnp.mean(h_processed_best),
+            delta_h_processed_std=jnp.std(h_processed_best),
+            delta_h_processed_min=jnp.min(h_processed_best),
+            delta_h_processed_max=jnp.max(h_processed_best),
+            delta_h_processed_positive_frac=jnp.mean((h_processed_best > 0.0).astype(xy_seq.dtype)),
             h_real_mean=jnp.mean(h_real_best),
             h_real_std=jnp.std(h_real_best),
             h_real_min=jnp.min(h_real_best),
@@ -728,6 +748,7 @@ def make_metric_loss_fn(cfg: dict[str, Any], *, include_maps: bool = False):
             position_range_mean=jnp.mean(position_range_mean_best),
             delta_h_tau_mean=jnp.mean(h_all),
             delta_h_tau_abs_mean=jnp.mean(jnp.abs(h_all)),
+            delta_h_processed_tau_mean=jnp.mean(h_processed_all),
             h_real_tau_mean=jnp.mean(h_real_all),
             h_null_tau_mean=jnp.mean(h_null_all),
             dx_norm_tau_mean=jnp.mean(dx_norm_mean_all),
@@ -750,6 +771,8 @@ def make_metric_loss_fn(cfg: dict[str, Any], *, include_maps: bool = False):
             info.update(
                 delta_h_map=h_all,
                 delta_h_best=h_best,
+                delta_h_processed_map=h_processed_all,
+                delta_h_processed_best=h_processed_best,
                 score_by_tau=score_all,
                 amp_by_tau=amp_all,
                 msc_by_tau=msc_all,

@@ -1,3 +1,11 @@
+# DEPRECATED PROTOCOL NOTE
+
+Этот файл является исторической картой экспериментов. Он перечисляет старые
+C3/C4/species/color/human-markup routes как возможные направления, но они не
+являются активным main protocol. Current protocol: C3 не main claim, C4
+deferred, species/color/object-count metrics не main evidence. Активный
+протокол: `agents.md` и `experiments/paper_suite/README.md`.
+
 # Карта экспериментов из кода для claims
 
 Дата анализа: 2026-05-14.
