@@ -295,9 +295,14 @@ def _safe_metric_timing(metric_cfg_raw: Any, *, rollout_steps: int, sample_every
 
 
 def _metric_config_from_lagrangian(path: Path, metric_cfg_raw: Any) -> dict[str, Any]:
-    with np.load(path, allow_pickle=False) as data:
-        xy = np.asarray(data["xy_control_a"], dtype=np.float32)
-        sample_every, rollout_steps = _infer_lagrangian_timing(data, xy)
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            if "xy_control_a" not in data.files:
+                raise KeyError(f"missing xy_control_a; available keys={list(data.files)}")
+            xy = np.asarray(data["xy_control_a"], dtype=np.float32)
+            sample_every, rollout_steps = _infer_lagrangian_timing(data, xy)
+    except Exception as exc:
+        raise ValueError(f"invalid lagrangian npz used for metric config path={path} {_file_probe(path)} error={type(exc).__name__}: {exc}") from exc
     timing = _safe_metric_timing(metric_cfg_raw, rollout_steps=rollout_steps, sample_every=sample_every)
     args = SimpleNamespace(
         rollout_steps=rollout_steps,
@@ -338,7 +343,39 @@ def _score_maps(metric_eval, metric_seed: int, xy: np.ndarray) -> dict[str, np.n
     return {key: np.asarray(jax.device_get(value)) for key, value in info.items()}
 
 
-def _compute_c1(dataset_name: str, rows: pd.DataFrame, ds_cfg: Any, output_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+def _file_probe(path: Path) -> str:
+    try:
+        size = path.stat().st_size
+    except Exception as exc:
+        return f"stat_error={type(exc).__name__}: {exc}"
+    try:
+        with path.open("rb") as f:
+            head = f.read(16)
+        ascii_head = "".join(chr(b) if 32 <= b < 127 else "." for b in head)
+        return f"size_bytes={size} first16_hex={head.hex()} first16_ascii={ascii_head!r}"
+    except Exception as exc:
+        return f"size_bytes={size} read_error={type(exc).__name__}: {exc}"
+
+
+def _load_npz_arrays(path: Path, keys: list[str], *, context: str) -> dict[str, np.ndarray]:
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            missing = [key for key in keys if key not in data.files]
+            if missing:
+                raise KeyError(f"missing keys {missing}; available keys={list(data.files)}")
+            return {key: np.asarray(data[key]) for key in keys}
+    except Exception as exc:
+        raise ValueError(f"{context}: invalid npz artifact path={path} {_file_probe(path)} error={type(exc).__name__}: {exc}") from exc
+
+
+def _compute_c1(
+    dataset_name: str,
+    rows: pd.DataFrame,
+    ds_cfg: Any,
+    output_dir: Path,
+    *,
+    force: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     metric_cfg_raw = cfg_get(cfg_get(ds_cfg, "c1", {}), "metric", {})
     available = rows.copy()
     available["lagrangian_abs_path"] = [_resolve_artifact(row, "lagrangian_path") for _, row in available.iterrows()]
@@ -349,6 +386,9 @@ def _compute_c1(dataset_name: str, rows: pd.DataFrame, ds_cfg: Any, output_dir: 
     metric_cfg = _metric_config_from_lagrangian(Path(available.iloc[0]["lagrangian_abs_path"]), metric_cfg_raw)
     metric_eval = jax.jit(make_metric_loss_fn(metric_cfg, include_maps=True))
     maps_dir = ensure_dir(output_dir / "c1_delta_h_maps")
+    if force:
+        for stale in maps_dir.glob("*_c1_maps.npz"):
+            stale.unlink()
     score_rows: list[dict[str, Any]] = []
     total = int(available.shape[0])
     log_event(f"{dataset_name}: C1 start n_lagrangian={total}", component="posthoc")
@@ -359,24 +399,28 @@ def _compute_c1(dataset_name: str, rows: pd.DataFrame, ds_cfg: Any, output_dir: 
                 f"{dataset_name}: C1 scoring {idx}/{total} trial_idx={row.get('trial_idx', 'na')} path={lag_path}",
                 component="posthoc",
             )
-        with np.load(lag_path, allow_pickle=False) as data:
-            xy_sel = np.asarray(data["xy_control_a"], dtype=np.float32)
-            xy_eval = np.asarray(data["xy_control_b"], dtype=np.float32)
+        arrays = _load_npz_arrays(
+            lag_path,
+            ["xy_control_a", "xy_control_b"],
+            context=f"{dataset_name}: C1 trial_idx={row.get('trial_idx', 'na')} row={idx}/{total}",
+        )
+        xy_sel = np.asarray(arrays["xy_control_a"], dtype=np.float32)
+        xy_eval = np.asarray(arrays["xy_control_b"], dtype=np.float32)
         metric_seed = int(row.get("metric_seed", row.get("seed_x", 0) + 10_000_000))
         sel_info = _score_maps(metric_eval, metric_seed, xy_sel)
         eval_info = _score_maps(metric_eval, metric_seed + 1, xy_eval)
         sel_map = np.asarray(sel_info["delta_h_map"], dtype=np.float64)
         eval_map = np.asarray(eval_info["delta_h_map"], dtype=np.float64)
-        W = sel_map.shape[1]
-        sel_cols = np.arange(W) % 2 == 0
-        eval_cols = ~sel_cols
-        if not np.any(eval_cols):
-            eval_cols = sel_cols
-        select_score_by_tau = np.nanmedian(sel_map[:, sel_cols], axis=1)
-        selected_idx = int(np.nanargmax(select_score_by_tau))
+        sel_score_by_tau = np.asarray(sel_info["score_by_tau"], dtype=np.float64).reshape(-1)
+        eval_score_by_tau = np.asarray(eval_info["score_by_tau"], dtype=np.float64).reshape(-1)
+        sel_amp_by_tau = np.asarray(sel_info["amp_by_tau"], dtype=np.float64).reshape(-1)
+        eval_amp_by_tau = np.asarray(eval_info["amp_by_tau"], dtype=np.float64).reshape(-1)
+        sel_msc_by_tau = np.asarray(sel_info["msc_by_tau"], dtype=np.float64).reshape(-1)
+        eval_msc_by_tau = np.asarray(eval_info["msc_by_tau"], dtype=np.float64).reshape(-1)
+        selected_idx = int(np.nanargmax(sel_score_by_tau))
         tau_steps = np.asarray(sel_info["tau_steps"], dtype=np.int32)
-        eval_values = eval_map[selected_idx, eval_cols]
-        eval_score = float(np.nanmedian(eval_values))
+        eval_values = eval_map[selected_idx]
+        eval_score_mspd = float(eval_score_by_tau[selected_idx])
         trial_uid = str(row.get("trial_uid", f"trial_{int(row['trial_idx']):05d}"))
         maps_path = maps_dir / f"{trial_uid}_c1_maps.npz"
         np.savez_compressed(
@@ -385,8 +429,13 @@ def _compute_c1(dataset_name: str, rows: pd.DataFrame, ds_cfg: Any, output_dir: 
             delta_h_eval=eval_map,
             tau_steps=tau_steps,
             window_start_steps=np.asarray(sel_info["window_start_steps"], dtype=np.int32),
-            selection_mask=sel_cols.astype(np.bool_),
-            eval_mask=eval_cols.astype(np.bool_),
+            selection_score_by_tau=sel_score_by_tau,
+            eval_score_by_tau=eval_score_by_tau,
+            selection_amp_by_tau=sel_amp_by_tau,
+            eval_amp_by_tau=eval_amp_by_tau,
+            selection_msc_by_tau=sel_msc_by_tau,
+            eval_msc_by_tau=eval_msc_by_tau,
+            selected_tau_idx=np.asarray(selected_idx, dtype=np.int32),
         )
         score_rows.append(
             {
@@ -402,15 +451,20 @@ def _compute_c1(dataset_name: str, rows: pd.DataFrame, ds_cfg: Any, output_dir: 
                 "candidate_idx": int(row.get("candidate_idx", 0)),
                 "selected_tau_idx": selected_idx,
                 "selected_tau_steps": int(tau_steps[selected_idx]),
-                "selection_score": float(select_score_by_tau[selected_idx]),
-                "eval_score": eval_score,
+                "selection_score_mspd": float(sel_score_by_tau[selected_idx]),
+                "selection_amp": float(sel_amp_by_tau[selected_idx]),
+                "selection_msc": float(sel_msc_by_tau[selected_idx]),
+                "eval_score_mspd": eval_score_mspd,
+                "eval_amp": float(eval_amp_by_tau[selected_idx]),
+                "eval_msc": float(eval_msc_by_tau[selected_idx]),
                 "eval_delta_h_mean": float(np.nanmean(eval_values)),
+                "eval_delta_h_median": float(np.nanmedian(eval_values)),
                 "eval_delta_h_std": float(np.nanstd(eval_values)),
                 "maps_path": str(maps_path),
             }
         )
     score_df = pd.DataFrame(score_rows)
-    contrast_df = _group_contrasts(score_df, "eval_score")
+    contrast_df = _group_contrasts(score_df, "eval_score_mspd")
     score_df.to_csv(output_dir / "checkpoint_scores.csv", index=False)
     contrast_df.to_csv(output_dir / "group_contrasts.csv", index=False)
     log_event(
@@ -576,7 +630,8 @@ def _compute_c5(dataset_name: str, rows: pd.DataFrame, ds_cfg: Any, output_dir: 
 def _write_smoke_dataset(output_root: Path, dataset_name: str) -> dict[str, Any]:
     root = ensure_dir(output_root / "smoke_inputs" / dataset_name / "frustration_simulation")
     trial_data = ensure_dir(root / "trial_data")
-    rng = np.random.default_rng(700 + abs(hash(dataset_name)) % 1000)
+    stable_name_seed = sum((idx + 1) * ord(ch) for idx, ch in enumerate(dataset_name))
+    rng = np.random.default_rng(700 + stable_name_seed % 1000)
     T, N = 72, 36
 
     def make_xy(kind: str, seed: int) -> np.ndarray:
@@ -715,9 +770,9 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
             log_event(f"{dataset_name}: loaded n_trials={rows.shape[0]}", component="posthoc")
             status = {"status": "ok", "n_trials": int(rows.shape[0]), "frustration_roots": [str(x) for x in fs_roots]}
             if task in {"all", "c1", "c6"}:
-                _scores, contrasts, c1_summary = _compute_c1(dataset_name, rows, ds, ds_out)
+                _scores, contrasts, c1_summary = _compute_c1(dataset_name, rows, ds, ds_out, force=force)
                 status["c1"] = c1_summary
-                cross_rows.append({"dataset": dataset_name, "claim": "C1/C6", "metric": "selection_adjusted_eval_score", **c1_summary})
+                cross_rows.append({"dataset": dataset_name, "claim": "C1/C6", "metric": "eval_score_mspd", **c1_summary})
             if task in {"all", "c5", "c6"}:
                 _run_df, _summary_df, c5_summary = _compute_c5(dataset_name, rows, ds, ds_out)
                 status["c5"] = c5_summary

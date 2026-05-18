@@ -216,16 +216,31 @@ def _write_smoke_fixture(output_root: Path, branch_root: Path) -> Path:
     out_dir = ensure_dir(output_root / "c2_branching")
     rows: list[dict[str, Any]] = []
     rng = np.random.default_rng(123)
+    yy, xx = np.mgrid[0:8, 0:8].astype(np.float32)
+    base_a = ((yy + xx) / 14.0)[None, :, :, None]
+    base_p = np.repeat(base_a, 3, axis=-1)
+    base_f = np.concatenate([base_a, 1.0 - base_a], axis=-1)
     for pair_id in range(2):
         for condition, step, dh, spread in (
             ("high", 100 + pair_id * 100, 1.0 + 0.2 * pair_id, 0.35),
             ("low", 150 + pair_id * 100, 0.1 + 0.05 * pair_id, 0.04),
         ):
-            center = rng.normal(0.0, 0.05, size=8)
+            center = rng.normal(0.0, 0.05, size=(1, 1, 1, 1)).astype(np.float32)
             for branch_id in range(3):
                 branch_dir = ensure_dir(branch_root / "smoke_traj" / f"pair_{pair_id:03d}_{condition}" / f"branch_{branch_id:02d}")
-                feature = center + rng.normal(0.0, spread, size=8)
-                np.savez_compressed(branch_dir / "branch_feature.npz", feature=feature.astype(np.float32))
+                apf_dir = ensure_dir(branch_dir / "apf_logs")
+                drift = center + np.float32(branch_id * spread)
+                noise = rng.normal(0.0, spread * 0.02, size=(6, 8, 8, 1)).astype(np.float32)
+                a = np.clip(base_a + drift + noise, 0.0, 1.0).astype(np.float32)
+                p = np.clip(base_p + np.repeat(noise, 3, axis=-1), 0.0, 1.0).astype(np.float32)
+                f = (base_f + np.repeat(noise[..., :1], 2, axis=-1)).astype(np.float32)
+                np.savez_compressed(
+                    apf_dir / "P_steps_000000000_000000006__secs_0.000_0.006__idx_000000.npz",
+                    A=a,
+                    P=p,
+                    F=f,
+                    state_t=np.arange(6, dtype=np.int32),
+                )
                 rows.append(
                     {
                         "traj_id": "smoke_traj",
@@ -461,6 +476,156 @@ def _pairwise_mean_distance(features: list[np.ndarray]) -> float:
     return float(np.mean(dists)) if dists else float("nan")
 
 
+def _field_weights(raw: Any) -> dict[str, float]:
+    if raw is None:
+        return {"A": 1.0, "P": 0.25, "F": 0.25}
+    try:
+        items = raw.items()
+    except Exception:
+        return {"A": 1.0, "P": 0.25, "F": 0.25}
+    out: dict[str, float] = {}
+    for key, value in items:
+        weight = float(value)
+        if weight > 0.0:
+            out[str(key)] = weight
+    return out or {"A": 1.0}
+
+
+def _pool_spatial(arr: np.ndarray, scale: int) -> np.ndarray:
+    x = np.asarray(arr, dtype=np.float32)
+    scale = int(scale)
+    if scale <= 1 or x.ndim < 4:
+        return x
+    if x.ndim == 4:
+        y_axis, x_axis = 1, 2
+    else:
+        y_axis, x_axis = x.ndim - 3, x.ndim - 2
+    h = int(x.shape[y_axis])
+    w = int(x.shape[x_axis])
+    h2 = (h // scale) * scale
+    w2 = (w // scale) * scale
+    if h2 < scale or w2 < scale:
+        return x
+    slicer = [slice(None)] * x.ndim
+    slicer[y_axis] = slice(0, h2)
+    slicer[x_axis] = slice(0, w2)
+    x = x[tuple(slicer)]
+    if x.ndim == 4:
+        t, _h, _w = x.shape[:3]
+        rest = x.shape[3:]
+        return x.reshape((t, h2 // scale, scale, w2 // scale, scale) + rest).mean(axis=(2, 4))
+    prefix = x.shape[:y_axis]
+    suffix = x.shape[x_axis + 1 :]
+    return x.reshape(prefix + (h2 // scale, scale, w2 // scale, scale) + suffix).mean(axis=(y_axis + 1, y_axis + 3))
+
+
+def _field_l2(a: np.ndarray, b: np.ndarray, *, scales: list[int]) -> float:
+    aa = np.asarray(a, dtype=np.float32)
+    bb = np.asarray(b, dtype=np.float32)
+    n = min(int(aa.shape[0]), int(bb.shape[0]))
+    if n < 1:
+        return float("nan")
+    aa = aa[:n]
+    bb = bb[:n]
+    vals = []
+    for scale in scales:
+        pa = _pool_spatial(aa, int(scale))
+        pb = _pool_spatial(bb, int(scale))
+        diff = np.asarray(pa, dtype=np.float32) - np.asarray(pb, dtype=np.float32)
+        vals.append(float(np.sqrt(np.mean(diff * diff))))
+    finite = [v for v in vals if np.isfinite(v)]
+    return float(np.mean(finite)) if finite else float("nan")
+
+
+def _branch_field_series(
+    branch_dir: Path,
+    *,
+    weights: dict[str, float],
+    max_chunks: int,
+    max_frames: int,
+) -> dict[str, np.ndarray]:
+    apf_dir = branch_dir / "apf_logs"
+    chunks = list_apf_chunks(apf_dir)
+    if not chunks:
+        raise FileNotFoundError(f"No APF chunks found in {apf_dir}")
+    selected = chunks[: max(1, int(max_chunks))]
+    series: dict[str, list[np.ndarray]] = {key: [] for key in weights}
+    for path, _s0, _s1, _idx in selected:
+        with np.load(path, allow_pickle=False) as data:
+            for key in weights:
+                if key not in data.files:
+                    continue
+                arr = np.asarray(data[key], dtype=np.float32)
+                if arr.ndim < 3 or arr.shape[0] < 1:
+                    continue
+                series[key].append(arr)
+    out: dict[str, np.ndarray] = {}
+    for key, parts in series.items():
+        if not parts:
+            continue
+        arr = np.concatenate(parts, axis=0)
+        if max_frames > 0 and arr.shape[0] > max_frames:
+            idxs = np.linspace(0, arr.shape[0] - 1, int(max_frames)).astype(int)
+            arr = arr[idxs]
+        out[key] = arr
+    if not out:
+        raise ValueError(f"No weighted APF fields {sorted(weights)} found in {apf_dir}")
+    return out
+
+
+def _pairwise_future_field_divergence(
+    branch_dirs: list[Path],
+    *,
+    weights: dict[str, float],
+    scales: list[int],
+    max_chunks: int,
+    max_frames: int,
+) -> tuple[float, dict[str, Any]]:
+    fields = []
+    used_dirs = []
+    for branch_dir in branch_dirs:
+        try:
+            fields.append(
+                _branch_field_series(
+                    branch_dir,
+                    weights=weights,
+                    max_chunks=max_chunks,
+                    max_frames=max_frames,
+                )
+            )
+            used_dirs.append(branch_dir)
+        except Exception:
+            continue
+    if len(fields) < 2:
+        return float("nan"), {"metric": "future_apf_multiscale_l2", "n_branches": len(fields), "n_pairs": 0}
+    pair_vals = []
+    key_vals: dict[str, list[float]] = {key: [] for key in weights}
+    for i, j in combinations(range(len(fields)), 2):
+        common = [key for key in weights if key in fields[i] and key in fields[j]]
+        weighted = []
+        for key in common:
+            d = _field_l2(fields[i][key], fields[j][key], scales=scales)
+            if np.isfinite(d):
+                key_vals[key].append(d)
+                weighted.append(float(weights[key]) * d)
+        if weighted:
+            denom = sum(float(weights[key]) for key in common)
+            pair_vals.append(float(sum(weighted) / max(denom, 1e-12)))
+    score = float(np.mean(pair_vals)) if pair_vals else float("nan")
+    detail: dict[str, Any] = {
+        "metric": "future_apf_multiscale_l2",
+        "n_branches": len(fields),
+        "n_pairs": len(pair_vals),
+        "field_keys": ",".join(key for key in weights if key_vals.get(key)),
+        "scales": ",".join(str(int(s)) for s in scales),
+        "max_future_frames": int(max_frames),
+    }
+    for key, vals in key_vals.items():
+        if vals:
+            detail[f"{key}_divergence"] = float(np.mean(vals))
+    return score, detail
+
+
 def metrics(config_path: str | Path, *, smoke: bool = False) -> dict[str, Any]:
     cfg, _ = load_config(config_path, smoke=smoke)
     output_root = _output_root(cfg)
@@ -479,6 +644,10 @@ def metrics(config_path: str | Path, *, smoke: bool = False) -> dict[str, Any]:
 
     max_chunks = int(_get(bcfg, "feature_max_apf_chunks", 4))
     max_snapshots = int(_get(bcfg, "feature_max_snapshots_per_chunk", 8))
+    max_future_frames = int(_get(bcfg, "future_max_frames", max_snapshots))
+    field_scales = [int(x) for x in _get(bcfg, "future_field_scales", [1, 2, 4])]
+    weights = _field_weights(_get(bcfg, "future_field_weights", None))
+    allow_feature_fallback = bool(smoke or _get(bcfg, "allow_debug_feature_fallback", False))
     plan_rows = read_csv(plan_path)
     groups: dict[tuple[str, str, str], list[dict[str, str]]] = {}
     for row in plan_rows:
@@ -494,30 +663,55 @@ def metrics(config_path: str | Path, *, smoke: bool = False) -> dict[str, Any]:
                 f"C2 branching metrics group {group_idx}/{len(group_items)} traj={traj_id} pair={pair_id} condition={condition}",
                 component="c2-branch",
             )
-        features = []
-        used = []
-        for row in rows:
-            branch_dir = Path(str(row["branch_dir"]))
-            try:
-                features.append(_feature_from_branch(branch_dir, max_chunks=max_chunks, max_snapshots_per_chunk=max_snapshots))
-                used.append(row)
-            except Exception:
-                continue
-        if len(features) < 2:
+        branch_dirs = [Path(str(row["branch_dir"])) for row in rows]
+        score, detail = _pairwise_future_field_divergence(
+            branch_dirs,
+            weights=weights,
+            scales=field_scales,
+            max_chunks=max_chunks,
+            max_frames=max_future_frames,
+        )
+        used = [row for row in rows if _branch_output_ok(Path(str(row["branch_dir"])))]
+        metric_name = str(detail.get("metric", "future_apf_multiscale_l2"))
+        fallback_used = False
+        if not np.isfinite(score) and allow_feature_fallback:
+            features = []
+            used = []
+            for row in rows:
+                branch_dir = Path(str(row["branch_dir"]))
+                try:
+                    features.append(_feature_from_branch(branch_dir, max_chunks=max_chunks, max_snapshots_per_chunk=max_snapshots))
+                    used.append(row)
+                except Exception:
+                    continue
+            if len(features) >= 2:
+                score = _pairwise_mean_distance(features)
+                metric_name = "debug_compact_feature_l2"
+                fallback_used = True
+                detail = {"metric": metric_name, "n_branches": len(features), "n_pairs": int(len(features) * (len(features) - 1) // 2)}
+        if not np.isfinite(score):
             continue
+        if not used:
+            used = rows
         delta_h_vals = [float(row.get("delta_h", "nan")) for row in used]
         step_vals = [float(row.get("step", "nan")) for row in used]
-        score_rows.append(
-            {
-                "traj_id": traj_id,
-                "pair_id": int(float(pair_id)),
-                "condition": condition,
-                "step": float(np.nanmedian(step_vals)),
-                "delta_h": float(np.nanmedian(delta_h_vals)),
-                "branching_score": _pairwise_mean_distance(features),
-                "n_branches": len(features),
-            }
-        )
+        row_out = {
+            "traj_id": traj_id,
+            "pair_id": int(float(pair_id)),
+            "condition": condition,
+            "step": float(np.nanmedian(step_vals)),
+            "delta_h": float(np.nanmedian(delta_h_vals)),
+            "branching_score": float(score),
+            "branching_metric": metric_name,
+            "used_debug_feature_fallback": bool(fallback_used),
+            "n_branches": int(detail.get("n_branches", len(used))),
+            "n_branch_pairs": int(detail.get("n_pairs", 0)),
+        }
+        for key, value in detail.items():
+            if key in row_out:
+                continue
+            row_out[str(key)] = value
+        score_rows.append(row_out)
 
     contrast_rows: list[dict[str, Any]] = []
     by_pair: dict[tuple[str, int], dict[str, dict[str, Any]]] = {}

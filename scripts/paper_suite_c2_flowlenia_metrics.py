@@ -97,7 +97,7 @@ def _iter_trajectories(root: Path) -> list[dict[str, Any]]:
     if items:
         return items
 
-    for idx, traj_dir in enumerate(sorted(root.glob("flow_opt_run_*/traj_*"))):
+    for idx, traj_dir in enumerate(sorted(root.glob("flow_opt_*/traj_*"))):
         if not traj_dir.is_dir():
             continue
         items.append(

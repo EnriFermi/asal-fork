@@ -14,6 +14,12 @@ cd /Users/enrifermi/Projects/asal-fork
 conda run -n onerec python --version
 ```
 
+Python dependencies are listed in:
+
+```text
+requirements_paper_suite.txt
+```
+
 Главный entry point:
 
 ```bash
@@ -107,6 +113,20 @@ Synthetic calibration:
 conda run -n onerec python scripts/run_paper_suite.py experiments/paper_suite/config.yaml --layer all --task synthetic
 ```
 
+Быстрый локальный цикл только для synthetic calibration, без C1/C2/C5/C6:
+
+```bash
+conda run -n onerec python scripts/paper_suite_synthetic.py experiments/paper_suite/config.yaml --layer simulation --smoke --force
+conda run -n onerec python scripts/paper_suite_synthetic.py experiments/paper_suite/config.yaml --layer metrics --smoke --force
+conda run -n onerec python scripts/paper_suite_synthetic.py experiments/paper_suite/config.yaml --layer visualization --smoke --force
+```
+
+То же самое одной командой:
+
+```bash
+conda run -n onerec python scripts/paper_suite_synthetic.py experiments/paper_suite/config.yaml --layer all --smoke --force
+```
+
 C1:
 
 ```bash
@@ -160,16 +180,39 @@ Metrics layer считает:
 - event localization for `S5/S6`.
 - S7 selected-scale sanity check.
 
+Small positive Delta-H values can be suppressed with:
+
+```yaml
+synthetic:
+  metric_delta_h_floor: 0.0
+```
+
+This threshold is applied after `metric_preprocess_mode` and before `amp`/`msc`/`score` and `tau` selection. The stored raw `delta_h_map` remains raw for diagnostics and heatmaps; the exact thresholded values are saved as `delta_h_processed_map`.
+
+Simulation layer также сразу рендерит trajectory videos:
+
+- `analysis/results/paper_suite/synthetic_calibration/videos/S*_seed_*.mp4`
+
+Visualization layer для synthetic calibration читает только готовые metrics tables/npz и строит:
+
+- aggregate grid `analysis/results/paper_suite/figures/synthetic_calibration_grid.png`;
+- per-run Delta-H heatmaps by tau under `analysis/results/paper_suite/synthetic_calibration/figures/delta_h_heatmaps/`;
+- family median Delta-H heatmaps and combined overview `analysis/results/paper_suite/figures/synthetic_delta_h_heatmaps.png`.
+
 Основные outputs:
 
 ```text
 analysis/results/paper_suite/synthetic_calibration/simulation/
 analysis/results/paper_suite/synthetic_calibration/metrics/
+analysis/results/paper_suite/synthetic_calibration/videos/
+analysis/results/paper_suite/synthetic_calibration/figures/delta_h_heatmaps/
 analysis/results/paper_suite/synthetic_calibration/per_family_scores.csv
 analysis/results/paper_suite/synthetic_calibration/tau_profiles.csv
 analysis/results/paper_suite/synthetic_calibration/role_recovery.csv
 analysis/results/paper_suite/synthetic_calibration/event_localization.csv
 analysis/results/paper_suite/synthetic_calibration/synthetic_calibration_summary.json
+analysis/results/paper_suite/synthetic_calibration/delta_h_heatmap_manifest.csv
+analysis/results/paper_suite/synthetic_calibration/visualization_summary.json
 ```
 
 Default synthetic settings intentionally small for local CPU/M5:
@@ -313,8 +356,13 @@ Simulation layer:
 Metrics layer:
 
 - читает готовые branch directories;
-- строит compact branch features из `branch_feature.npz`, `metrics.npz` или APF chunks;
-- считает pairwise branch divergence внутри каждого selected time;
+- primary metric считает explicit future divergence между branch trajectories
+  по APF/field frames over horizon;
+- default distance is multi-scale L2 over `A`, plus `P/F` when present with
+  smaller weights;
+- compact `branch_feature.npz` path оставлен только как smoke/debug fallback,
+  not main evidence;
+- считает mean pairwise branch divergence внутри каждого selected time;
 - считает paired contrast:
 
 ```text
@@ -337,6 +385,9 @@ max_trajectories: 2
 m_pairs: 2
 branches_per_time: 3
 horizon_steps: 1000
+future_field_weights: {A: 1.0, P: 0.25, F: 0.25}
+future_field_scales: [1, 2, 4]
+future_max_frames: 32
 ```
 
 For the paper-quality C2-B run on A100, increase to the design-doc target, e.g. `m_pairs: 5`, `branches_per_time: 4`, and top `2-3` MSPD-opt trajectories.
