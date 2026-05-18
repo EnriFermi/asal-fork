@@ -135,6 +135,7 @@ def _write_manifest(
                 "run_seed": int(row.get("run_seed", -1)),
                 "traj_dir": str(paths["traj_dir"]),
                 "apf_dir": str(paths["apf_dir"]),
+                "metrics_path": str(paths["metrics_path"]),
                 "config_path": str(paths["config_path"]),
                 "params_path": str(paths["params_path"]),
                 "video_path": str(paths["video_path"]),
