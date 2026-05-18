@@ -13,7 +13,7 @@ for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "scripts")):
 
 import numpy as np
 
-from paper_suite_common import ensure_dir, load_config, resolve_path, write_csv, write_json
+from paper_suite_common import ensure_dir, load_config, log_event, resolve_path, write_csv, write_json
 
 
 def _get(cfg: Any, key: str, default: Any = None) -> Any:
@@ -101,17 +101,22 @@ def run(config_path: str | Path, *, smoke: bool = False) -> dict[str, Any]:
     output_root = ensure_dir(resolve_path(cfg.get("meta", {}).get("output_root", "analysis/results/paper_suite")) or Path("analysis/results/paper_suite"))
     c2_cfg = cfg.get("c2", {})
     root = _write_smoke_minibang(output_root) if smoke else _trajectory_root(c2_cfg)
+    log_event(f"C2 events start smoke={smoke} root={root}", component="c2-events")
     if root is None or not root.exists():
         required = bool(_get(c2_cfg, "required", False))
         if required:
             raise FileNotFoundError(f"C2 trajectory root not found: {root}")
         summary = {"status": "skipped", "reason": f"missing trajectory root {root}"}
         write_json(output_root / "c2_event_summary.json", summary)
+        log_event(f"C2 events skipped missing root={root}", component="c2-events")
         return summary
     metric_items = _iter_metric_items(root)
+    log_event(f"C2 events found n_metric_items={len(metric_items)}", component="c2-events")
     rows = []
-    for item in metric_items:
+    for idx, item in enumerate(metric_items, start=1):
         path = Path(item["metrics_path"])
+        if idx == 1 or idx == len(metric_items) or idx % 5 == 0:
+            log_event(f"C2 events reading {idx}/{len(metric_items)} traj={item['traj_id']} metrics={path}", component="c2-events")
         with np.load(path, allow_pickle=False) as data:
             dh = _safe_arr(data, "delta_h_best")
             if dh is None:
@@ -144,6 +149,7 @@ def run(config_path: str | Path, *, smoke: bool = False) -> dict[str, Any]:
     write_csv(out_dir / "c2_event_summary.csv", rows)
     summary = {"status": "ok", "n_trajectories": len(rows), "trajectory_root": str(root), "table": str(out_dir / "c2_event_summary.csv")}
     write_json(output_root / "c2_event_summary.json", summary)
+    log_event(f"C2 events done n_trajectories={len(rows)} table={out_dir / 'c2_event_summary.csv'}", component="c2-events")
     return summary
 
 

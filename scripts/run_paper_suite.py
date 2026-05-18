@@ -9,7 +9,7 @@ for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "scripts")):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-from paper_suite_common import current_python, run_subprocess
+from paper_suite_common import current_python, init_suite_logging, log_event, run_subprocess
 
 
 def _call(script: str, config: str, *args: str) -> None:
@@ -110,11 +110,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="Print heavy simulation commands without running them.")
     args = parser.parse_args(argv)
 
+    master_log = init_suite_logging(args.config, smoke=args.smoke, layer=args.layer, task=args.task)
+    log_event(f"master log: {master_log}", component="runner")
     if args.layer in {"simulation", "all"}:
+        log_event("starting simulation layer", component="runner")
         _simulation(args.config, args.task, smoke=args.smoke, force=args.force, allow_heavy=args.allow_heavy, dry_run=args.dry_run)
     if args.layer in {"metrics", "all"}:
+        log_event("starting metrics layer", component="runner")
         _metrics(args.config, args.task, smoke=args.smoke, force=args.force)
     if args.layer == "all" and args.task in {"all", "c2"}:
+        log_event("starting C2 branch simulation after C2 metrics", component="runner")
         _c2_branching_simulation(
             args.config,
             smoke=args.smoke,
@@ -122,9 +127,12 @@ def main(argv: list[str] | None = None) -> int:
             allow_heavy=args.allow_heavy,
             dry_run=args.dry_run,
         )
+        log_event("starting C2 branch metrics", component="runner")
         _c2_branching_metrics(args.config, smoke=args.smoke)
     if args.layer in {"visualization", "all"}:
+        log_event("starting visualization layer", component="runner")
         _visualization(args.config, args.task, smoke=args.smoke)
+    log_event("paper suite finished", component="runner")
     return 0
 
 

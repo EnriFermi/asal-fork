@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from clip_deltah_msc_metric import make_metric_loss_fn, resolve_metric_config
-from paper_suite_common import ensure_dir, load_config, resolve_path, sign_test_greater, to_plain, write_csv, write_json
+from paper_suite_common import ensure_dir, load_config, log_event, resolve_path, sign_test_greater, to_plain, write_csv, write_json
 
 
 FAMILIES = ("S0", "S1", "S3", "S4", "S5", "S6", "S7")
@@ -220,6 +220,10 @@ def simulate(config_path: str | Path, *, smoke: bool = False, force: bool = Fals
     seeds = _cfg_int(syn, "seeds", 3)
     families = [str(x) for x in (syn.get("families", list(FAMILIES)) or list(FAMILIES))]
     manifest_rows = []
+    log_event(
+        f"synthetic simulation start smoke={smoke} force={force} families={families} seeds={seeds} T={T} N={N}",
+        component="synthetic",
+    )
     for family in families:
         if family not in SIMULATORS:
             raise ValueError(f"Unknown synthetic family {family!r}. Expected one of {sorted(SIMULATORS)}.")
@@ -243,8 +247,10 @@ def simulate(config_path: str | Path, *, smoke: bool = False, force: bool = Fals
                 np.savez_compressed(out_path, **save_payload)
                 status = "rewritten_stale" if had_existing and not force else "written"
             manifest_rows.append({"family": family, "seed": seed, "path": str(out_path), "status": status})
+            log_event(f"synthetic simulation {family} seed={seed} status={status}", component="synthetic")
     write_csv(dirs["root"] / "simulation_manifest.csv", manifest_rows)
     write_json(dirs["root"] / "simulation_summary.json", {"n_runs": len(manifest_rows), "time_steps": T, "n_particles": N})
+    log_event(f"synthetic simulation done n_runs={len(manifest_rows)} manifest={dirs['root'] / 'simulation_manifest.csv'}", component="synthetic")
     return {"simulation_manifest": str(dirs["root"] / "simulation_manifest.csv"), "n_runs": len(manifest_rows)}
 
 
@@ -407,6 +413,7 @@ def metrics(config_path: str | Path, *, smoke: bool = False, force: bool = False
     dirs = _synthetic_dirs(cfg)
     families = [str(x) for x in (syn.get("families", list(FAMILIES)) or list(FAMILIES))]
     seeds = _cfg_int(syn, "seeds", 3)
+    log_event(f"synthetic metrics start smoke={smoke} force={force} families={families} seeds={seeds}", component="synthetic")
     sim_files = [dirs["simulation"] / f"{family}_seed_{seed:03d}.npz" for family in families for seed in range(seeds)]
     missing = [str(path) for path in sim_files if not path.exists()]
     if missing:
@@ -426,7 +433,7 @@ def metrics(config_path: str | Path, *, smoke: bool = False, force: bool = False
     role_rows: list[dict[str, Any]] = []
     event_rows: list[dict[str, Any]] = []
 
-    for path in sim_files:
+    for idx, path in enumerate(sim_files, start=1):
         with np.load(path, allow_pickle=False) as data:
             xy = np.asarray(data["xy"], dtype=np.float32)
             labels = np.asarray(data["labels"], dtype=np.int32)
@@ -443,12 +450,14 @@ def metrics(config_path: str | Path, *, smoke: bool = False, force: bool = False
         else:
             info_np = {}
         if not info_np:
-            print(f"[synthetic/metrics] computing {family} seed={seed} from {path.name}", flush=True)
+            log_event(f"synthetic metrics computing {idx}/{len(sim_files)} {family} seed={seed} from {path.name}", component="synthetic")
             rng = jax.random.PRNGKey(_cfg_int(syn, "metric_seed", 12345) + seed)
             _loss, info = metric_eval(rng, jnp.asarray(xy))
             info_np = {key: np.asarray(jax.device_get(value)) for key, value in info.items()}
             info_np.update(_metric_cache_payload(metric_cfg=metric_cfg, trajectory_path=path, trajectory_metadata=metadata, xy=xy))
             np.savez_compressed(metrics_path, **info_np)
+        else:
+            log_event(f"synthetic metrics exists {idx}/{len(sim_files)} {family} seed={seed} metrics={metrics_path}", component="synthetic")
 
         tau_steps = np.asarray(info_np["tau_steps"], dtype=np.int32)
         score_by_tau = np.asarray(info_np["score_by_tau"], dtype=np.float64)
@@ -527,6 +536,7 @@ def metrics(config_path: str | Path, *, smoke: bool = False, force: bool = False
         aris = [float(row["ari"]) for row in role_rows if row.get("ari") not in ("", None)]
         summary["role_recovery"] = sign_test_greater(aris)
     write_json(dirs["root"] / "synthetic_calibration_summary.json", summary)
+    log_event(f"synthetic metrics done n_runs={len(score_rows)} summary={dirs['root'] / 'synthetic_calibration_summary.json'}", component="synthetic")
     return {"n_runs": len(score_rows), "summary_path": str(dirs["root"] / "synthetic_calibration_summary.json")}
 
 

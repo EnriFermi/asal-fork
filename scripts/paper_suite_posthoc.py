@@ -34,6 +34,7 @@ from paper_suite_common import (
     dataset_items,
     ensure_dir,
     load_config,
+    log_event,
     nanmedian,
     resolve_path,
     safe_float,
@@ -303,8 +304,15 @@ def _compute_c1(dataset_name: str, rows: pd.DataFrame, ds_cfg: Any, output_dir: 
     metric_eval = jax.jit(make_metric_loss_fn(metric_cfg, include_maps=True))
     maps_dir = ensure_dir(output_dir / "c1_delta_h_maps")
     score_rows: list[dict[str, Any]] = []
-    for _, row in available.iterrows():
+    total = int(available.shape[0])
+    log_event(f"{dataset_name}: C1 start n_lagrangian={total}", component="posthoc")
+    for idx, (_, row) in enumerate(available.iterrows(), start=1):
         lag_path = Path(row["lagrangian_abs_path"])
+        if idx == 1 or idx == total or idx % 5 == 0:
+            log_event(
+                f"{dataset_name}: C1 scoring {idx}/{total} trial_idx={row.get('trial_idx', 'na')} path={lag_path}",
+                component="posthoc",
+            )
         with np.load(lag_path, allow_pickle=False) as data:
             xy_sel = np.asarray(data["xy_control_a"], dtype=np.float32)
             xy_eval = np.asarray(data["xy_control_b"], dtype=np.float32)
@@ -356,6 +364,10 @@ def _compute_c1(dataset_name: str, rows: pd.DataFrame, ds_cfg: Any, output_dir: 
     contrast_df = _group_contrasts(score_df, "eval_score")
     score_df.to_csv(output_dir / "checkpoint_scores.csv", index=False)
     contrast_df.to_csv(output_dir / "group_contrasts.csv", index=False)
+    log_event(
+        f"{dataset_name}: C1 done n_scores={len(score_df)} n_contrasts={len(contrast_df)} output={output_dir}",
+        component="posthoc",
+    )
     return score_df, contrast_df, sign_test_greater(contrast_df["delta_vs_random_median"].tolist())
 
 
@@ -448,10 +460,14 @@ def _derive_anchor_columns(rows: pd.DataFrame, base_names: list[str]) -> pd.Data
 def _compute_c5(dataset_name: str, rows: pd.DataFrame, ds_cfg: Any, output_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     fs_root = Path(str(rows.iloc[0]["frustration_root"]))
     analysis_config = _write_analysis_config(output_dir, ds_cfg, fs_root)
+    log_event(
+        f"{dataset_name}: C5 start n_trials={len(rows)} root={fs_root} analysis_config={analysis_config}",
+        component="posthoc",
+    )
     augmented, _effect_cols, base_names = augment_rows_with_history_dependence_distances(
         rows,
         analysis_config_path=analysis_config,
-        show_progress=False,
+        show_progress=True,
     )
     augmented = _derive_anchor_columns(augmented, base_names)
     augmented.to_csv(output_dir / "frustration_trial_metrics.csv", index=False)
@@ -493,6 +509,10 @@ def _compute_c5(dataset_name: str, rows: pd.DataFrame, ds_cfg: Any, output_dir: 
     primary_metric = "embedding_cloud_chamfer_cosine__anchor_effect_minus_baseline"
     primary = summary_df[summary_df["metric"] == primary_metric]
     primary_summary = primary.iloc[0].to_dict() if not primary.empty else (summary_rows[0] if summary_rows else {})
+    log_event(
+        f"{dataset_name}: C5 done n_run_rows={len(run_df)} n_summary_rows={len(summary_df)} primary_metric={primary_summary.get('metric', 'none')}",
+        component="posthoc",
+    )
     return run_df, summary_df, primary_summary
 
 
@@ -564,6 +584,10 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
     cfg, _ = load_config(config_path, smoke=smoke)
     output_root = ensure_dir(resolve_path(cfg.get("meta", {}).get("output_root", "analysis/results/paper_suite")) or Path("analysis/results/paper_suite"))
     datasets = dataset_items(cfg)
+    log_event(
+        f"posthoc start task={task} smoke={smoke} output_root={output_root} n_config_datasets={len(datasets)}",
+        component="posthoc",
+    )
     if smoke:
         datasets = []
         for name in ("flow_lenia", "plife_plus", "boids"):
@@ -611,6 +635,7 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
     overview: dict[str, Any] = {}
     for dataset_name, ds in datasets:
         ds_out = ensure_dir(output_root / dataset_name)
+        log_event(f"{dataset_name}: dataset start output={ds_out}", component="posthoc")
         roots_raw = cfg_get(ds, "frustration_roots", None)
         if roots_raw is not None:
             fs_roots = [resolve_path(x) for x in as_list(roots_raw)]
@@ -625,9 +650,12 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
             if bool(cfg_get(ds, "required", False)):
                 raise ValueError(f"{dataset_name}: no existing frustration_root/frustration_roots configured.")
             overview[dataset_name] = {"status": "skipped", "reason": "no root configured"}
+            log_event(f"{dataset_name}: skipped no root configured", component="posthoc")
             continue
         try:
+            log_event(f"{dataset_name}: loading roots {[str(x) for x in fs_roots]}", component="posthoc")
             rows = _load_trial_rows_many(fs_roots)
+            log_event(f"{dataset_name}: loaded n_trials={rows.shape[0]}", component="posthoc")
             status = {"status": "ok", "n_trials": int(rows.shape[0]), "frustration_roots": [str(x) for x in fs_roots]}
             if task in {"all", "c1", "c6"}:
                 _scores, contrasts, c1_summary = _compute_c1(dataset_name, rows, ds, ds_out)
@@ -640,13 +668,20 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
                     cross_rows.append({"dataset": dataset_name, "claim": "C5/C6", "metric": c5_summary.get("metric", "frustration"), **c5_summary})
             write_json(ds_out / "dataset_summary.json", status)
             overview[dataset_name] = status
+            log_event(f"{dataset_name}: dataset done summary={ds_out / 'dataset_summary.json'}", component="posthoc")
         except Exception as exc:
             if bool(cfg_get(ds, "required", False)):
+                log_event(f"{dataset_name}: failed required dataset error={exc}", component="posthoc")
                 raise
             overview[dataset_name] = {"status": "skipped", "reason": str(exc)}
+            log_event(f"{dataset_name}: skipped optional dataset error={exc}", component="posthoc")
     if cross_rows:
         write_csv(output_root / "cross_substrate_summary.csv", cross_rows)
     write_json(output_root / "paper_suite_metrics_summary.json", overview)
+    log_event(
+        f"posthoc done n_cross_rows={len(cross_rows)} summary={output_root / 'paper_suite_metrics_summary.json'}",
+        component="posthoc",
+    )
     return overview
 
 

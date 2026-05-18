@@ -511,6 +511,28 @@ conda run -n onerec python scripts/run_paper_suite.py experiments/paper_suite/co
 
 ## Troubleshooting
 
+Every `scripts/run_paper_suite.py` run now creates timestamped logs under:
+
+```bash
+analysis/results/paper_suite/logs/
+```
+
+The main file is `*_master.log`; every subprocess also gets its own `*_paper_suite_*.log`.
+Watch the current run with:
+
+```bash
+tail -f analysis/results/paper_suite/logs/*_master.log
+```
+
+Watch the quiet posthoc stage specifically:
+
+```bash
+tail -f analysis/results/paper_suite/logs/*_paper_suite_posthoc.log
+```
+
+The posthoc and C2 stages print progress lines for dataset loading, C1 trial scoring,
+C5 history-distance rows, C2 APF metrics, event extraction, and branching metrics.
+
 Check active paper-suite processes:
 
 ```bash

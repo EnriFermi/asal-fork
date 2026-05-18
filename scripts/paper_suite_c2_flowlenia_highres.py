@@ -20,6 +20,7 @@ from paper_suite_common import (
     current_python,
     ensure_dir,
     load_config,
+    log_event,
     resolve_path,
     run_subprocess,
     write_json,
@@ -239,6 +240,7 @@ def run(
     cfg, _ = load_config(config_path)
     section = _section(cfg)
     if not bool(_get(section, "enabled", True)):
+        log_event("C2 highres rollout disabled", component="c2-highres")
         return {"status": "disabled"}
 
     output_root = resolve_path(_get(section, "output_root", _get(cfg.get("c2", {}), "trajectory_root", None)))
@@ -246,22 +248,25 @@ def run(
         output_root = resolve_path("experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts")
     assert output_root is not None
     output_root = ensure_dir(output_root)
+    log_event(f"C2 highres rollout start force={force} dry_run={dry_run} output_root={output_root}", component="c2-highres")
 
     rollout_config = resolve_path(_get(section, "rollout_config", "experiments/paper_suite/c2_flowlenia_highres_rollout.yaml"))
     if rollout_config is None or not rollout_config.exists():
         raise FileNotFoundError(f"C2 highres rollout_config not found: {rollout_config}")
 
     selected = _discover_checkpoints(section)
+    log_event(f"C2 highres rollout discovered n_checkpoints={len(selected)}", component="c2-highres")
     if not selected:
         if bool(_get(section, "required", True)):
             raise FileNotFoundError("No Flow-Lenia paper-check optimized checkpoints found for C2 highres rollouts.")
         summary = {"status": "skipped", "reason": "no optimized checkpoints found"}
         write_json(output_root / "manifest.json", {"source_kind": "paper_check_flow_lenia_optimized_highres", "trajectories": []})
         write_json(output_root / "simulation_summary.json", summary)
+        log_event("C2 highres rollout skipped no optimized checkpoints", component="c2-highres")
         return summary
 
     command_rows: list[dict[str, Any]] = []
-    for row in selected:
+    for idx, row in enumerate(selected, start=1):
         traj_id = _traj_id(row)
         paths = _run_output_paths(output_root, traj_id)
         cmd = _command(rollout_config, Path(row["checkpoint_dir"]), paths["run_root"], force=force)
@@ -269,11 +274,17 @@ def run(
         if pre_ready and not force:
             status = "exists"
             message = ""
+            log_event(f"C2 highres rollout {idx}/{len(selected)} traj={traj_id} exists", component="c2-highres")
         else:
+            log_event(
+                f"C2 highres rollout {idx}/{len(selected)} traj={traj_id} running checkpoint={row['checkpoint_dir']} pre_status={pre_message}",
+                component="c2-highres",
+            )
             run_subprocess(cmd, dry_run=dry_run)
             post_ready, post_message = _apf_status(paths)
             status = "dry_run" if dry_run else ("exists" if post_ready else "missing_apf")
             message = pre_message if dry_run else post_message
+            log_event(f"C2 highres rollout {idx}/{len(selected)} traj={traj_id} status={status} message={message}", component="c2-highres")
         command_rows.append(
             {
                 "traj_id": traj_id,
@@ -302,7 +313,12 @@ def run(
     write_json(output_root / "simulation_summary.json", summary)
     _write_aggregate_manifest(output_root, rollout_config=rollout_config, selected=selected, command_rows=command_rows)
     if not dry_run and n_apf_ready < len(selected) and bool(_get(section, "required", True)):
+        log_event(f"C2 highres rollout incomplete n_apf_ready={n_apf_ready}/{len(selected)}", component="c2-highres")
         raise RuntimeError(f"C2 highres APF rollout generation incomplete: {n_apf_ready}/{len(selected)} ready.")
+    log_event(
+        f"C2 highres rollout done status={summary['status']} n_apf_ready={n_apf_ready}/{len(selected)} manifest={output_root / 'manifest.json'}",
+        component="c2-highres",
+    )
     return summary
 
 
