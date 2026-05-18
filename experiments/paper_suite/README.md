@@ -42,14 +42,14 @@ Claims:
 - C2: Delta-H marks transition-sensitive states.
 - C5: blockwise frustration / history dependence.
 - C6: transfer to Particle Life++; Boids secondary.
-- N0: mandatory synthetic calibration `S0/S1/S3/S4/S5/S6/S7`.
+- N0: mandatory synthetic calibration `S0/S1/S3/S4/S5/S6/S7/S8`.
 
 Не запускаются как paper claims:
 
 - C3.
 - C4.
 
-Важно: `S7` включен в synthetic calibration, но не используется как C3 claim.
+Важно: `S7/S8` включены в synthetic calibration, но не используются как C3 claim.
 
 ## Безопасные команды
 
@@ -170,15 +170,16 @@ Simulation layer генерирует synthetic trajectories:
 - `S5`: synchronous global switch.
 - `S6`: partial/staggered switch.
 - `S7`: multi-scale moving blobs.
+- `S8`: one moving blob splits into multiple blobs with different directions, an S3-to-S7 transition.
 
 Metrics layer считает:
 
 - MSPD score `D(tau)`.
 - selected tau.
 - Delta-H maps.
-- role recovery ARI for `S4/S6/S7`.
-- event localization for `S5/S6`.
-- S7 selected-scale sanity check.
+- role recovery ARI for `S4/S6/S7/S8`.
+- event localization for `S5/S6/S8`.
+- S7/S8 selected-scale sanity check.
 
 Small positive Delta-H values can be suppressed with:
 
@@ -255,6 +256,22 @@ Datasets:
 - `plife_plus` required.
 - `boids` optional secondary substrate.
 
+Дополнительный Flow-Lenia A-run APF/lagrangian logging для paper-check diagnostics запускается simulation layer отдельно от C1/C5 metrics:
+
+```bash
+conda run -n onerec python scripts/run_paper_suite.py experiments/paper_suite/config.yaml --layer simulation --task c1 --allow-heavy
+```
+
+Он читает те же optimized checkpoint roots, что и paper-check Flow-Lenia/C2, использует параметры `paper_check_flow_lenia/frustration_simulation/config.yaml`, ограничивает rollout `500000` шагами и пишет batched sparse APF + lagrangian chunks:
+
+```text
+experiments/paper_check_flow_lenia/checkpoints/arun_lagrangian_apf_500k/flow_opt_*/apf_logs/P_steps_*.npz
+```
+
+Batch size задается в `simulation.flow_lenia_arun_lagrangian_apf.batch_size`.
+Инициализация использует paper-check control-A seed convention:
+`run_seed_base + 2 * source_run_idx`.
+
 ### C2 event summary
 
 Скрипт:
@@ -276,7 +293,7 @@ experiments/paper_check/checkpoints_reference/optimization
 The dedicated rollout config is:
 
 ```text
-experiments/paper_suite/c2_flowlenia_highres_rollout.yaml
+experiments/paper_suite/flowlenia_arun_apf_500k.yaml
 ```
 
 It uses the paper-check Flow-Lenia optimization config with:
@@ -290,13 +307,13 @@ max_steps: 500000
 The output trajectory root is:
 
 ```text
-experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts
+experiments/paper_check_flow_lenia/checkpoints/arun_lagrangian_apf_500k
 ```
 
 The simulation layer writes reusable APF chunks first:
 
 ```text
-experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts/flow_opt_run_*/traj_*/apf_logs/P_steps_*.npz
+experiments/paper_check_flow_lenia/checkpoints/arun_lagrangian_apf_500k/flow_opt_*/apf_logs/P_steps_*.npz
 ```
 
 Those chunks are the durable source for C2 posthoc work. A rollout is treated
@@ -313,7 +330,7 @@ scripts/paper_suite_c2_flowlenia_metrics.py
 It reads APF chunks and writes:
 
 ```text
-experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts/flow_opt_run_*/traj_*/metrics.npz
+experiments/paper_check_flow_lenia/checkpoints/arun_lagrangian_apf_500k/flow_opt_*/metrics.npz
 analysis/results/paper_suite/c2_highres_metrics/c2_highres_metrics_manifest.csv
 ```
 
@@ -491,20 +508,20 @@ experiments/paper_check_boids/checkpoints/frustration_simulation/trial_data/tria
 experiments/paper_check_boids/checkpoints/frustration_simulation/trial_data/trial_*_embeddings.npz
 ```
 
-C2 high-res APF artifacts:
+C2 / Flow-Lenia paper-check control-A APF artifacts:
 
 ```text
-experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts/manifest.json
-experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts/flow_opt_run_*/traj_*/config.yaml
-experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts/flow_opt_run_*/traj_*/params.npy
-experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts/flow_opt_run_*/traj_*/apf_logs/P_steps_*.npz
+experiments/paper_check_flow_lenia/checkpoints/arun_lagrangian_apf_500k/manifest.json
+experiments/paper_check_flow_lenia/checkpoints/arun_lagrangian_apf_500k/flow_opt_*/config.yaml
+experiments/paper_check_flow_lenia/checkpoints/arun_lagrangian_apf_500k/flow_opt_*/params.npy
+experiments/paper_check_flow_lenia/checkpoints/arun_lagrangian_apf_500k/flow_opt_*/apf_logs/P_steps_*.npz
 ```
 
 C2 high-res posthoc metric artifacts:
 
 ```text
-experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts/flow_opt_run_*/traj_*/metrics.npz
-experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts/flow_opt_run_*/traj_*/metrics_summary.json
+experiments/paper_check_flow_lenia/checkpoints/arun_lagrangian_apf_500k/flow_opt_*/metrics.npz
+experiments/paper_check_flow_lenia/checkpoints/arun_lagrangian_apf_500k/flow_opt_*/metrics_summary.json
 analysis/results/paper_suite/c2_highres_metrics/c2_highres_metrics_manifest.csv
 ```
 

@@ -4,11 +4,11 @@ meta:
   wandb_mode: disabled
 
 synthetic:
-  families: [S0, S1, S3, S4, S5, S6, S7]
+  families: [S0, S1, S3, S4, S5, S6, S7, S8]
   seeds: 1
   seed_base: 100
   n_particles: 48
-  time_steps: 512
+  time_steps: 16384
   domain_size: 1.0
   tau_grid_steps: [4, 6, 8, 10]
   metric_window_size_steps: 16
@@ -21,7 +21,15 @@ synthetic:
   metric_particle_samples: 32
   metric_dirs_seed: 123
   metric_seed: 12345
-  metric_delta_h_floor: 0.001
+  # Delta-H preprocessing cutoff: values below this are zeroed before MSC.
+  metric_delta_h_floor: 0.0
+  # Synthetic MSC denominator floor in mean(g^2) + metric_msc_floor^2 + eps.
+  metric_msc_floor: 0.01
+  metric_eps: 1.0e-12
+  # Synthetic-only MSC scoring. Real C1/C5/C2 posthoc keeps the legacy overlap
+  # score unless explicitly configured otherwise in its own metric block.
+  metric_msc_term: floor_reconstruction_error
+  metric_msc_normalize_by_weight_sum: true
   render:
     enabled: true
     fps: 18
@@ -36,6 +44,9 @@ synthetic:
     heatmaps_enabled: true
     heatmap_cmap: coolwarm
     heatmap_max_runs: null
+    # null means: visualize MSC_r at each run's selected tau. Set an integer
+    # tau step to force a common tau across synthetic families.
+    msc_r_tau_steps: null
 
 datasets:
   flow_lenia:
@@ -159,13 +170,13 @@ c2:
   # Primary C2 source. The old minibang golden set is intentionally not used
   # as primary evidence because its 128x128 substrate is too noisy for the
   # transition-sensitivity claim.
-  trajectory_root: experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts
+  trajectory_root: experiments/paper_check_flow_lenia/checkpoints/arun_lagrangian_apf_500k
   legacy_minibang_root: experiments/flow_lenia_mspd/checkpoints/minibang_golden_set/run_longrun_check_v2
   flow_lenia_highres:
-    enabled: true
-    required: true
-    rollout_config: experiments/paper_suite/c2_flowlenia_highres_rollout.yaml
-    output_root: experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts
+    enabled: false
+    required: false
+    rollout_config: experiments/paper_suite/flowlenia_arun_apf_500k.yaml
+    output_root: experiments/paper_check_flow_lenia/checkpoints/arun_lagrangian_apf_500k
     # Valid paper-check Flow-Lenia optimized roots. checkpoints3/checkpoints4
     # are intentionally excluded.
     optimized_checkpoint_roots:
@@ -204,6 +215,25 @@ c2:
 simulation:
   reuse_existing: true
   allow_optimization_rerun: false
+  flow_lenia_arun_lagrangian_apf:
+    enabled: true
+    required: true
+    rollout_config: experiments/paper_suite/flowlenia_arun_apf_500k.yaml
+    output_root: experiments/paper_check_flow_lenia/checkpoints/arun_lagrangian_apf_500k
+    rollout_steps: 500000
+    n_trajectories_per_checkpoint: 1
+    # Match paper_check control-A seed_x = pair_seed_base + 2 * group_idx.
+    run_seed_base: 400000
+    run_seed_mode: source_run_idx
+    # Batched inside one JAX process. Keep this conservative; raise on A100 if
+    # memory telemetry is clean.
+    batch_size: 4
+    optimized_checkpoint_roots:
+      - experiments/paper_check/checkpoints/optimization
+      - experiments/paper_check/checkpoints_0/optimization
+      - experiments/paper_check/checkpoints_reference/optimization
+    dedupe_by_run_idx: false
+    max_checkpoints: null
   commands:
     - name: flow_lenia_paper_check_frustration
       task: paper_check
@@ -222,6 +252,22 @@ simulation:
         - experiments/paper_check/checkpoints_0/frustration_simulation/trial_data/trial_*_embeddings.npz
         - experiments/paper_check/checkpoints_reference/frustration_simulation/trial_data/trial_*_lagrangian.npz
         - experiments/paper_check/checkpoints_reference/frustration_simulation/trial_data/trial_*_embeddings.npz
+
+    - name: flow_lenia_arun_lagrangian_apf_500k
+      task: paper_check
+      enabled: true
+      required: true
+      heavy: true
+      # Always enter the idempotent builder when heavy simulation is allowed so
+      # a stale manifest cannot hide missing checkpoint roots or APF chunks.
+      always_run: true
+      command: ["{python}", "scripts/paper_suite_flowlenia_arun_apf.py", "{config}"]
+      expected_paths:
+        - experiments/paper_check_flow_lenia/checkpoints/arun_lagrangian_apf_500k/manifest.json
+      expected_globs:
+        - experiments/paper_check_flow_lenia/checkpoints/arun_lagrangian_apf_500k/flow_opt_*/apf_logs/P_steps_*.npz
+      expected_npz_keys: [A, P, F, lagrangian_xy, lagrangian_c, resume_batch_rng_key, state_t, state_mass_cycle_start]
+      npz_key_check_limit: 3
 
     - name: plife_plus_paper_check_frustration
       task: paper_check
@@ -249,8 +295,8 @@ simulation:
 
     - name: flow_lenia_c2_highres_rollouts
       task: c2
-      enabled: true
-      required: true
+      enabled: false
+      required: false
       heavy: true
       # Idempotent builder: always run when heavy simulation is allowed so a
       # stale manifest with only a subset of roots cannot mask missing APF logs.
@@ -286,6 +332,11 @@ smoke:
     metric_n_proj: 8
     metric_null_reps: 2
     metric_particle_samples: 32
+    metric_delta_h_floor: 0.01
+    metric_msc_floor: 0.01
+    metric_eps: 1.0e-12
+    metric_msc_term: floor_reconstruction_error
+    metric_msc_normalize_by_weight_sum: true
     render:
       enabled: true
       size_px: 384
@@ -295,6 +346,7 @@ smoke:
       particle_radius_px: 8
     visualization:
       heatmap_max_runs: null
+      msc_r_tau_steps: null
   c2:
     branching:
       branch_root: analysis/results/paper_suite_smoke/c2_branching/branches

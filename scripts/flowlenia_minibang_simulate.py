@@ -1268,7 +1268,10 @@ def _capture_snapshot(
             if save_lagrangian_channels:
                 buffers["lagrangian_c"].append(np.asarray(lag_ch_np[i]))
         if resume_batch_rng_key is not None:
-            buffers["resume_batch_rng_key"].append(np.asarray(resume_batch_rng_key, dtype=np.uint32))
+            resume_key_np = np.asarray(resume_batch_rng_key, dtype=np.uint32)
+            if resume_key_np.ndim >= 2 and int(resume_key_np.shape[0]) == B:
+                resume_key_np = resume_key_np[i]
+            buffers["resume_batch_rng_key"].append(resume_key_np)
             buffers["resume_batch_size"].append(np.asarray(run["resume_batch_size"], dtype=np.int32))
             buffers["resume_batch_index"].append(np.asarray(run["resume_batch_index"], dtype=np.int32))
             buffers["resume_selection0"].append(np.asarray(run["resume_selection0"], dtype=np.int32))
@@ -1307,9 +1310,24 @@ def simulate_batch(
     params_batch = jnp.asarray(params_np)
     seed0 = int(_get(args, "seed", 0))
     selection0 = int(selected_batch[0]["selection_idx"])
-    init_keys = jax.random.split(jax.random.PRNGKey(seed0 + 1009 * (selection0 + 1)), B)
-    lag_keys = jax.random.split(jax.random.PRNGKey(int(_get(args, "lagrangian_seed", seed0)) + 9173 * (selection0 + 1)), B)
-    ch_keys = jax.random.split(jax.random.PRNGKey(int(_get(args, "lagrangian_seed", seed0)) + 1877 * (selection0 + 1)), B)
+    run_seed_values = [row.get("run_seed", None) for row in selected_batch]
+    use_run_seed_batch = all(seed is not None for seed in run_seed_values)
+    if use_run_seed_batch:
+        seeds = [int(seed) for seed in run_seed_values]
+        init_pairs = [jax.random.split(jax.random.PRNGKey(seed), 2) for seed in seeds]
+        rng_batch = jnp.stack([pair[0] for pair in init_pairs], axis=0)
+        init_keys = jnp.stack([pair[1] for pair in init_pairs], axis=0)
+        lag_pairs = [
+            jax.random.split(jax.random.fold_in(jax.random.PRNGKey(seed), jnp.uint32(0x4D5343)), 2)
+            for seed in seeds
+        ]
+        lag_keys = jnp.stack([pair[0] for pair in lag_pairs], axis=0)
+        ch_keys = jnp.stack([pair[1] for pair in lag_pairs], axis=0)
+    else:
+        init_keys = jax.random.split(jax.random.PRNGKey(seed0 + 1009 * (selection0 + 1)), B)
+        lag_keys = jax.random.split(jax.random.PRNGKey(int(_get(args, "lagrangian_seed", seed0)) + 9173 * (selection0 + 1)), B)
+        ch_keys = jax.random.split(jax.random.PRNGKey(int(_get(args, "lagrangian_seed", seed0)) + 1877 * (selection0 + 1)), B)
+        rng_batch = None
 
     init_states = jax.jit(lambda keys, params: jax.vmap(substrate.init_state)(keys, params))
     states = init_states(init_keys, params_batch)
@@ -1339,40 +1357,73 @@ def simulate_batch(
 
     lag_xy, lag_ch = jax.jit(lambda A0, kp, kc: jax.vmap(init_lag_one)(A0, kp, kc))(states["A"], lag_keys, ch_keys)
 
-    stepper_cache: dict[tuple[int, int], Any] = {}
+    stepper_cache: dict[tuple[int, int, bool], Any] = {}
 
     def get_stepper(n_steps: int):
-        key = (int(n_steps), B)
+        key = (int(n_steps), B, bool(use_run_seed_batch))
         if key in stepper_cache:
             return stepper_cache[key]
 
-        def advance(states_in, lag_xy_in, lag_ch_in, params_in, rng_in):
-            rngs = jax.random.split(rng_in, int(n_steps) * B).reshape((int(n_steps), B, 2))
+        if use_run_seed_batch:
+            def advance(states_in, lag_xy_in, lag_ch_in, params_in, rng_batch_in):
+                split = jax.vmap(lambda key_in: jax.random.split(key_in, 2))(rng_batch_in)
+                rng_next = split[:, 0]
+                chunk_keys = split[:, 1]
+                rngs = jax.vmap(lambda key_in: jax.random.split(key_in, int(n_steps)))(chunk_keys)
+                rngs = jnp.swapaxes(rngs, 0, 1)
 
-            def scan_body(carry, keys_step):
-                st, pts, ch = carry
+                def scan_body(carry, keys_step):
+                    st, pts, ch = carry
 
-                def one_step(key_i, st_i, pts_i, ch_i, params_i):
-                    st_next = substrate.step_state(key_i, st_i, params_i)
-                    lag_key = jax.random.fold_in(key_i, jnp.uint32(0x4C4147))
-                    pts_next, ch_next = rt.advect_particles(
-                        points=pts_i,
-                        F=st_next["F"],
-                        A=st_next["A"],
-                        channel=lag_flow_channel,
-                        reduce=lag_flow_reduce,
-                        point_channels=ch_i,
-                        channel_mode=lag_channel_mode,
-                        key=lag_key,
-                        noise_model=lag_noise_model,
-                        diffusion_scale=lag_diffusion_scale,
-                    )
-                    return st_next, pts_next, ch_next
+                    def one_step(key_i, st_i, pts_i, ch_i, params_i):
+                        st_next = substrate.step_state(key_i, st_i, params_i)
+                        lag_key = jax.random.fold_in(key_i, jnp.uint32(0x4C4147))
+                        pts_next, ch_next = rt.advect_particles(
+                            points=pts_i,
+                            F=st_next["F"],
+                            A=st_next["A"],
+                            channel=lag_flow_channel,
+                            reduce=lag_flow_reduce,
+                            point_channels=ch_i,
+                            channel_mode=lag_channel_mode,
+                            key=lag_key,
+                            noise_model=lag_noise_model,
+                            diffusion_scale=lag_diffusion_scale,
+                        )
+                        return st_next, pts_next, ch_next
 
-                return jax.vmap(one_step)(keys_step, st, pts, ch, params_in), None
+                    return jax.vmap(one_step)(keys_step, st, pts, ch, params_in), None
 
-            (st_out, pts_out, ch_out), _ = jax.lax.scan(scan_body, (states_in, lag_xy_in, lag_ch_in), rngs)
-            return st_out, pts_out, ch_out
+                (st_out, pts_out, ch_out), _ = jax.lax.scan(scan_body, (states_in, lag_xy_in, lag_ch_in), rngs)
+                return st_out, pts_out, ch_out, rng_next
+        else:
+            def advance(states_in, lag_xy_in, lag_ch_in, params_in, rng_in):
+                rngs = jax.random.split(rng_in, int(n_steps) * B).reshape((int(n_steps), B, 2))
+
+                def scan_body(carry, keys_step):
+                    st, pts, ch = carry
+
+                    def one_step(key_i, st_i, pts_i, ch_i, params_i):
+                        st_next = substrate.step_state(key_i, st_i, params_i)
+                        lag_key = jax.random.fold_in(key_i, jnp.uint32(0x4C4147))
+                        pts_next, ch_next = rt.advect_particles(
+                            points=pts_i,
+                            F=st_next["F"],
+                            A=st_next["A"],
+                            channel=lag_flow_channel,
+                            reduce=lag_flow_reduce,
+                            point_channels=ch_i,
+                            channel_mode=lag_channel_mode,
+                            key=lag_key,
+                            noise_model=lag_noise_model,
+                            diffusion_scale=lag_diffusion_scale,
+                        )
+                        return st_next, pts_next, ch_next
+
+                    return jax.vmap(one_step)(keys_step, st, pts, ch, params_in), None
+
+                (st_out, pts_out, ch_out), _ = jax.lax.scan(scan_body, (states_in, lag_xy_in, lag_ch_in), rngs)
+                return st_out, pts_out, ch_out
 
         stepper_cache[key] = jax.jit(advance)
         return stepper_cache[key]
@@ -1391,15 +1442,17 @@ def simulate_batch(
     jit_microbatch = max(1, int(_get(args, "jit_microbatch", min(64, snapshot_interval))))
     lagrangian_seed = int(_get(args, "lagrangian_seed", seed0))
     for i, run in enumerate(runs):
+        run_seed_i = int(run_seed_values[i]) if use_run_seed_batch else int(seed0)
         run["resume_batch_size"] = int(B)
         run["resume_batch_index"] = int(i)
         run["resume_selection0"] = int(selection0)
         run["resume_jit_microbatch"] = int(jit_microbatch)
         run["resume_snapshot_interval"] = int(snapshot_interval)
-        run["resume_seed"] = int(seed0)
-        run["resume_lagrangian_seed"] = int(lagrangian_seed)
+        run["resume_seed"] = int(run_seed_i)
+        run["resume_lagrangian_seed"] = int(run_seed_i if use_run_seed_batch else lagrangian_seed)
 
     rng = jax.random.PRNGKey(seed0 + 991 * (selection0 + 1))
+    resume_rng_key = rng_batch if use_run_seed_batch else rng
 
     _capture_snapshot(
         step=0,
@@ -1411,7 +1464,7 @@ def simulate_batch(
         runs=runs,
         args=args,
         capture_fn_cache=capture_cache,
-        resume_batch_rng_key=rng,
+        resume_batch_rng_key=resume_rng_key,
     )
 
     steps_done = 0
@@ -1421,10 +1474,14 @@ def simulate_batch(
             target_next_snapshot = min(total_steps, ((steps_done // snapshot_interval) + 1) * snapshot_interval)
             while steps_done < target_next_snapshot:
                 n = min(jit_microbatch, target_next_snapshot - steps_done)
-                rng, subkey = jax.random.split(rng)
-                states, lag_xy, lag_ch = get_stepper(n)(states, lag_xy, lag_ch, params_batch, subkey)
+                if use_run_seed_batch:
+                    states, lag_xy, lag_ch, rng_batch = get_stepper(n)(states, lag_xy, lag_ch, params_batch, rng_batch)
+                else:
+                    rng, subkey = jax.random.split(rng)
+                    states, lag_xy, lag_ch = get_stepper(n)(states, lag_xy, lag_ch, params_batch, subkey)
                 steps_done += n
                 pbar.update(n)
+            resume_rng_key = rng_batch if use_run_seed_batch else rng
             _capture_snapshot(
                 step=steps_done,
                 states=states,
@@ -1435,7 +1492,7 @@ def simulate_batch(
                 runs=runs,
                 args=args,
                 capture_fn_cache=capture_cache,
-                resume_batch_rng_key=rng,
+                resume_batch_rng_key=resume_rng_key,
             )
     finally:
         pbar.close()

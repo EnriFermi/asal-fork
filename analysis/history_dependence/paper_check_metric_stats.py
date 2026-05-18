@@ -56,6 +56,7 @@ _MSC_SCALAR_COLUMNS = (
     "msc_metric_periodic",
     "msc_metric_positions_unwrapped",
     "msc_metric_scale_weight_sum",
+    "msc_metric_normalized_by_scale_weight_sum",
     "msc_metric_eps",
     "msc_metric_alpha",
     "msc_metric_beta",
@@ -611,7 +612,10 @@ def _msc_scalar_metrics_from_summaries(
         "msc_metric_rng_seed_base": np.nan if metric_seed_base is None else float(metric_seed_base),
         "msc_metric_periodic": float(bool(metric_cfg["periodic"])),
         "msc_metric_positions_unwrapped": float(bool(metric_cfg.get("positions_unwrapped", False))),
-        "msc_metric_scale_weight_sum": float(sum(float(w) for _, w in metric_cfg["scale_pairs"])),
+        "msc_metric_scale_weight_sum": float(metric_cfg.get("scale_weight_sum", sum(float(w) for _, w in metric_cfg["scale_pairs"]))),
+        "msc_metric_normalized_by_scale_weight_sum": float(
+            str(metric_cfg.get("scale_normalization", "sum_weight_r")) == "sum_weight_r"
+        ),
         "msc_metric_eps": float(metric_cfg["eps"]),
         "msc_metric_alpha": float(metric_cfg["alpha"]),
         "msc_metric_beta": float(metric_cfg["beta"]),

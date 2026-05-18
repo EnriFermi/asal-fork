@@ -37,7 +37,7 @@ from paper_suite_common import (
 )
 
 
-FAMILIES = ("S0", "S1", "S3", "S4", "S5", "S6", "S7")
+FAMILIES = ("S0", "S1", "S3", "S4", "S5", "S6", "S7", "S8")
 
 
 def _cfg_int(cfg: Any, key: str, default: int) -> int:
@@ -255,6 +255,77 @@ def _simulate_s7(rng: np.random.Generator, *, T: int, N: int, L: float) -> dict[
     }
 
 
+def _simulate_s8(rng: np.random.Generator, *, T: int, N: int, L: float) -> dict[str, Any]:
+    specs = [
+        {"radius": 0.10, "speed": 0.0017, "direction": np.asarray([1.0, 0.15], dtype=np.float32)},
+        {"radius": 0.045, "speed": 0.0054, "direction": np.asarray([-0.35, 1.0], dtype=np.float32)},
+        {"radius": 0.030, "speed": 0.0092, "direction": np.asarray([-0.9, -0.45], dtype=np.float32)},
+    ]
+    n_groups = len(specs)
+    labels = np.arange(N, dtype=np.int32) % n_groups
+    rng.shuffle(labels)
+
+    if T <= 1:
+        split_start = 0
+        split_end = 0
+    else:
+        split_start = int(np.clip(round(0.42 * T), 1, T - 1))
+        split_end = int(min(T - 1, split_start + max(2, int(round(0.16 * T)))))
+
+    pre_radius = 0.085
+    pre_direction = np.asarray([0.75, 0.45], dtype=np.float32)
+    pre_direction = pre_direction / np.linalg.norm(pre_direction)
+    pre_speed = 0.0018
+    center0 = rng.uniform(0.25, 0.75, size=(2,)).astype(np.float32)
+    common_offsets = _random_unit_vectors(rng, N) * rng.uniform(0.0, pre_radius, size=(N, 1)).astype(np.float32)
+    group_offsets = np.zeros((N, 2), dtype=np.float32)
+    for group, spec in enumerate(specs):
+        idx = np.flatnonzero(labels == group)
+        if idx.size:
+            group_offsets[idx] = _random_unit_vectors(rng, idx.size) * rng.uniform(0.0, spec["radius"], size=(idx.size, 1)).astype(np.float32)
+
+    split_origin = center0 + pre_direction * pre_speed * float(split_start)
+    xy = np.empty((T, N, 2), dtype=np.float32)
+    labels_t = np.empty((T, N), dtype=np.int8)
+    denom = max(1, split_end - split_start)
+    for t in range(T):
+        raw_phase = np.clip((float(t) - float(split_start)) / float(denom), 0.0, 1.0)
+        phase = raw_phase * raw_phase * (3.0 - 2.0 * raw_phase)
+        common_center = center0 + pre_direction * pre_speed * float(t)
+        labels_t[t] = np.zeros(N, dtype=np.int8) if t < split_start else labels.astype(np.int8)
+        frame = np.empty((N, 2), dtype=np.float32)
+        dt = max(0.0, float(t - split_start))
+        for group, spec in enumerate(specs):
+            idx = np.flatnonzero(labels == group)
+            if not idx.size:
+                continue
+            direction = spec["direction"] / np.linalg.norm(spec["direction"])
+            branch_center = split_origin + direction * float(spec["speed"]) * dt
+            center = (1.0 - phase) * common_center + phase * branch_center
+            offsets = (1.0 - phase) * common_offsets[idx] + phase * group_offsets[idx]
+            jitter_sigma = (1.0 - phase) * 0.0013 + phase * 0.0010
+            frame[idx] = center[None, :] + offsets + rng.normal(0.0, jitter_sigma, size=(idx.size, 2)).astype(np.float32)
+        xy[t] = np.mod(frame, L)
+
+    crosses = [float(spec["radius"]) / max(float(spec["speed"]), 1e-12) for spec in specs]
+    return {
+        "xy": xy,
+        "labels": labels,
+        "labels_t": labels_t,
+        "metadata": {
+            "expected": "split_transition_s3_to_s7",
+            "event_interval": [int(split_start), int(split_end)],
+            "split_step": int(split_start),
+            "split_complete_step": int(split_end),
+            "pre_split_family": "S3",
+            "post_split_family": "S7",
+            "n_post_split_blobs": int(n_groups),
+            "scale_range": [float(min(crosses)), float(max(crosses))],
+            "crossing_times": crosses,
+        },
+    }
+
+
 SIMULATORS = {
     "S0": _simulate_s0,
     "S1": _simulate_s1,
@@ -263,6 +334,7 @@ SIMULATORS = {
     "S5": _simulate_s5,
     "S6": _simulate_s6,
     "S7": _simulate_s7,
+    "S8": _simulate_s8,
 }
 
 
@@ -643,11 +715,14 @@ def _build_metric_cfg(syn_cfg: Any, T: int) -> dict[str, Any]:
         metric_domain_x=_cfg_float(syn_cfg, "domain_size", 1.0),
         metric_preprocess_mode="clip",
         metric_delta_h_floor=_cfg_float(syn_cfg, "metric_delta_h_floor", 0.0),
+        metric_msc_floor=_cfg_float(syn_cfg, "metric_msc_floor", _cfg_float(syn_cfg, "metric_delta_h_floor", 0.0)),
         metric_scales=None,
         metric_scale_weights=None,
+        metric_msc_normalize_by_weight_sum=_cfg_bool(syn_cfg, "metric_msc_normalize_by_weight_sum", True),
+        metric_msc_term=str(syn_cfg.get("metric_msc_term", "floor_reconstruction_error")),
         metric_alpha=0.0,
         metric_beta=1.0,
-        metric_eps=1e-12,
+        metric_eps=_cfg_float(syn_cfg, "metric_eps", 1e-12),
     )
     cfg = resolve_metric_config(args)
     # Synthetic trajectories are stored wrapped on the torus. Delta-H must see
@@ -771,7 +846,7 @@ def _metric_cache_payload(
     labels: np.ndarray,
 ) -> dict[str, np.ndarray]:
     return {
-        "_paper_suite_cache_version": np.asarray(3, dtype=np.int32),
+        "_paper_suite_cache_version": np.asarray(7, dtype=np.int32),
         "_metric_config_json": np.asarray(json.dumps(to_plain(metric_cfg), sort_keys=True)),
         "_metric_seed": np.asarray(int(metric_seed), dtype=np.int64),
         "_trajectory_path": np.asarray(str(trajectory_path)),
@@ -811,7 +886,7 @@ def _metric_cache_matches(
         return False
     try:
         return (
-            int(np.asarray(cached["_paper_suite_cache_version"]).item()) == 3
+            int(np.asarray(cached["_paper_suite_cache_version"]).item()) == 7
             and str(np.asarray(cached["_metric_config_json"]).item()) == json.dumps(to_plain(metric_cfg), sort_keys=True)
             and int(np.asarray(cached["_metric_seed"]).item()) == int(metric_seed)
             and str(np.asarray(cached["_trajectory_path"]).item()) == str(trajectory_path)
@@ -854,6 +929,7 @@ def metrics(config_path: str | Path, *, smoke: bool = False, force: bool = False
 
     score_rows: list[dict[str, Any]] = []
     tau_rows: list[dict[str, Any]] = []
+    msc_scale_rows: list[dict[str, Any]] = []
     role_rows: list[dict[str, Any]] = []
     event_rows: list[dict[str, Any]] = []
 
@@ -913,6 +989,16 @@ def metrics(config_path: str | Path, *, smoke: bool = False, force: bool = False
         score_by_tau = np.asarray(info_np["score_by_tau"], dtype=np.float64)
         amp_by_tau = np.asarray(info_np["amp_by_tau"], dtype=np.float64)
         msc_by_tau = np.asarray(info_np["msc_by_tau"], dtype=np.float64)
+        msc_scale_r = np.asarray(info_np.get("msc_scale_r", np.asarray([], dtype=np.int32)), dtype=np.int32).reshape(-1)
+        msc_scale_weight = np.asarray(info_np.get("msc_scale_weight", np.asarray([], dtype=np.float32)), dtype=np.float64).reshape(-1)
+        msc_raw_by_scale_by_tau = np.asarray(
+            info_np.get("msc_raw_by_scale_by_tau", np.zeros((len(tau_steps), 0), dtype=np.float64)),
+            dtype=np.float64,
+        )
+        msc_by_scale_by_tau = np.asarray(
+            info_np.get("msc_by_scale_by_tau", np.zeros((len(tau_steps), 0), dtype=np.float64)),
+            dtype=np.float64,
+        )
         delta_h_map = np.asarray(info_np["delta_h_map"], dtype=np.float64)
         delta_h_processed_map = np.asarray(info_np.get("delta_h_processed_map", delta_h_map), dtype=np.float64)
         best_idx = int(np.asarray(info_np["tau_selected_idx"]).item())
@@ -954,6 +1040,29 @@ def metrics(config_path: str | Path, *, smoke: bool = False, force: bool = False
                     "selected": bool(i == best_idx),
                 }
             )
+            if (
+                msc_scale_r.size
+                and msc_scale_weight.size == msc_scale_r.size
+                and msc_raw_by_scale_by_tau.shape == (len(tau_steps), msc_scale_r.size)
+                and msc_by_scale_by_tau.shape == (len(tau_steps), msc_scale_r.size)
+            ):
+                for scale_idx, r in enumerate(msc_scale_r):
+                    msc_scale_rows.append(
+                        {
+                            "family": family,
+                            "seed": seed,
+                            "tau_steps": int(tau),
+                            "scale_r": int(r),
+                            "scale_weight": float(msc_scale_weight[scale_idx]),
+                            "msc_r_raw": float(msc_raw_by_scale_by_tau[i, scale_idx]),
+                            "msc_r_weighted_unnormalized": float(
+                                msc_raw_by_scale_by_tau[i, scale_idx] * msc_scale_weight[scale_idx]
+                            ),
+                            "msc_r_weighted": float(msc_by_scale_by_tau[i, scale_idx]),
+                            "msc_by_tau": float(msc_by_tau[i]),
+                            "selected": bool(i == best_idx),
+                        }
+                    )
 
         rec = _role_recovery(xy_metric, labels, best_tau, seed=seed, domain=domain, positions_unwrapped=True)
         if rec is not None:
@@ -987,6 +1096,7 @@ def metrics(config_path: str | Path, *, smoke: bool = False, force: bool = False
 
     write_csv(dirs["root"] / "per_family_scores.csv", score_rows)
     write_csv(dirs["root"] / "tau_profiles.csv", tau_rows)
+    write_csv(dirs["root"] / "msc_scale_profiles.csv", msc_scale_rows)
     write_csv(dirs["root"] / "role_recovery.csv", role_rows)
     write_csv(dirs["root"] / "event_localization.csv", event_rows)
 
@@ -1134,6 +1244,122 @@ def _plot_synthetic_grid_from_tables(
     _save_figure_to_many(fig, [out_suite, out_local])
     plt.close(fig)
     return {"synthetic_calibration_grid": str(out_suite), "synthetic_calibration_grid_local": str(out_local)}, []
+
+
+def _selected_mask(series: Any) -> np.ndarray:
+    return np.asarray([str(x).strip().lower() in {"1", "true", "yes", "on"} for x in series], dtype=bool)
+
+
+def _plot_synthetic_msc_by_scale_from_table(
+    *,
+    dirs: dict[str, Path],
+    suite_figures: Path,
+    tau_steps: int | None,
+    force: bool,
+) -> tuple[dict[str, str], list[dict[str, Any]]]:
+    msc_path = dirs["root"] / "msc_scale_profiles.csv"
+    out_suite = suite_figures / "synthetic_msc_by_scale.png"
+    out_local = dirs["figures"] / "synthetic_msc_by_scale.png"
+    if not msc_path.exists():
+        return {}, [
+            {
+                "artifact": "synthetic_msc_by_scale",
+                "status": "missing_inputs",
+                "message": str(msc_path),
+                "path": str(out_suite),
+            }
+        ]
+    if _figure_fresh(out_suite, [msc_path], force=force) and _figure_fresh(out_local, [msc_path], force=force):
+        return {"synthetic_msc_by_scale": str(out_suite), "synthetic_msc_by_scale_local": str(out_local)}, []
+
+    import pandas as pd
+
+    df = pd.read_csv(msc_path)
+    if df.empty:
+        return {}, [
+            {
+                "artifact": "synthetic_msc_by_scale",
+                "status": "empty_inputs",
+                "message": str(msc_path),
+                "path": str(out_suite),
+            }
+        ]
+    required = {"family", "seed", "tau_steps", "scale_r", "msc_r_raw", "msc_r_weighted", "selected"}
+    missing = required - set(df.columns)
+    if missing:
+        return {}, [
+            {
+                "artifact": "synthetic_msc_by_scale",
+                "status": "missing_columns",
+                "message": ",".join(sorted(missing)),
+                "path": str(out_suite),
+            }
+        ]
+
+    if tau_steps is None:
+        plot_df = df[_selected_mask(df["selected"])].copy()
+        title_suffix = "selected tau"
+    else:
+        plot_df = df[df["tau_steps"].astype(int) == int(tau_steps)].copy()
+        title_suffix = f"tau={int(tau_steps)}"
+    if plot_df.empty:
+        return {}, [
+            {
+                "artifact": "synthetic_msc_by_scale",
+                "status": "empty_selection",
+                "message": "selected tau" if tau_steps is None else f"tau_steps={int(tau_steps)}",
+                "path": str(out_suite),
+            }
+        ]
+
+    plt = _ensure_matplotlib()
+    families = [f for f in FAMILIES if f in set(plot_df["family"])]
+    fig, axes = plt.subplots(len(families), 1, figsize=(8.4, max(2.2, 1.85 * len(families))), squeeze=False)
+    for row_idx, family in enumerate(families):
+        ax = axes[row_idx, 0]
+        sub = plot_df[plot_df["family"] == family].copy()
+        sub["scale_r"] = sub["scale_r"].astype(int)
+        sub["msc_r_raw"] = sub["msc_r_raw"].astype(float)
+        sub["msc_r_weighted"] = sub["msc_r_weighted"].astype(float)
+        grouped = (
+            sub.groupby("scale_r")
+            .agg(
+                weighted_median=("msc_r_weighted", "median"),
+                weighted_min=("msc_r_weighted", "min"),
+                weighted_max=("msc_r_weighted", "max"),
+                raw_median=("msc_r_raw", "median"),
+                tau_median=("tau_steps", "median"),
+            )
+            .reset_index()
+            .sort_values("scale_r")
+        )
+        x = np.arange(grouped.shape[0])
+        y = grouped["weighted_median"].to_numpy(dtype=float)
+        ax.bar(x, y, color="#3b73a8", alpha=0.78, label="weighted / sum weights")
+        if grouped.shape[0]:
+            yerr = np.vstack(
+                [
+                    y - grouped["weighted_min"].to_numpy(dtype=float),
+                    grouped["weighted_max"].to_numpy(dtype=float) - y,
+                ]
+            )
+            ax.errorbar(x, y, yerr=yerr, fmt="none", ecolor="#1f1f1f", linewidth=0.8, capsize=2)
+            ax.plot(x, grouped["raw_median"].to_numpy(dtype=float), color="#c43c39", marker="o", linewidth=1.2, label="raw")
+        for seed, seed_df in sub.groupby("seed"):
+            seed_df = seed_df.sort_values("scale_r")
+            xpos = [int(np.flatnonzero(grouped["scale_r"].to_numpy(dtype=int) == int(r))[0]) for r in seed_df["scale_r"]]
+            ax.scatter(xpos, seed_df["msc_r_weighted"].astype(float), s=12, color="#222222", alpha=0.35)
+        ax.set_xticks(x, [str(int(v)) for v in grouped["scale_r"]])
+        ax.set_ylabel(family)
+        tau_note = "" if tau_steps is not None else f"; median tau={float(grouped['tau_median'].median()):.0f}"
+        ax.set_title(f"MSC_r by scale ({title_suffix}{tau_note})")
+        ax.set_xlabel("r")
+        if row_idx == 0:
+            ax.legend(frameon=False, loc="best")
+    fig.tight_layout()
+    _save_figure_to_many(fig, [out_suite, out_local])
+    plt.close(fig)
+    return {"synthetic_msc_by_scale": str(out_suite), "synthetic_msc_by_scale_local": str(out_local)}, []
 
 
 def _heatmap_tick_positions(n: int, *, max_ticks: int = 7) -> np.ndarray:
@@ -1285,6 +1511,7 @@ def visualize(config_path: str | Path, *, smoke: bool = False, force: bool = Fal
     vis_cfg = syn.get("visualization", {}) if syn is not None else {}
     heatmaps_enabled = _cfg_bool(vis_cfg, "heatmaps_enabled", True)
     heatmap_max_runs = _cfg_optional_int(vis_cfg, "heatmap_max_runs")
+    msc_r_tau_steps = _cfg_optional_int(vis_cfg, "msc_r_tau_steps")
     heatmap_cmap = str(vis_cfg.get("heatmap_cmap", "coolwarm") if vis_cfg is not None else "coolwarm")
     paths: dict[str, str] = {}
     rows: list[dict[str, Any]] = []
@@ -1303,6 +1530,20 @@ def visualize(config_path: str | Path, *, smoke: bool = False, force: bool = Fal
     log_event(
         f"synthetic visualization grid done status={'written_or_exists' if grid_paths else 'skipped'} "
         f"time={_format_duration(time.perf_counter() - grid_start)}",
+        component="synthetic",
+    )
+    msc_start = time.perf_counter()
+    msc_paths, msc_skips = _plot_synthetic_msc_by_scale_from_table(
+        dirs=dirs,
+        suite_figures=suite_figures,
+        tau_steps=msc_r_tau_steps,
+        force=force,
+    )
+    paths.update(msc_paths)
+    skip_rows.extend(msc_skips)
+    log_event(
+        f"synthetic visualization msc-by-scale done status={'written_or_exists' if msc_paths else 'skipped'} "
+        f"time={_format_duration(time.perf_counter() - msc_start)}",
         component="synthetic",
     )
 
@@ -1498,7 +1739,7 @@ def visualize(config_path: str | Path, *, smoke: bool = False, force: bool = Fal
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Mandatory synthetic MSPD calibration S0-S7.")
+    parser = argparse.ArgumentParser(description="Mandatory synthetic MSPD calibration S0-S8.")
     parser.add_argument("config", help="experiments/paper_suite/config.yaml")
     parser.add_argument("--layer", choices=["simulation", "metrics", "visualization", "all"], default="all")
     parser.add_argument("--smoke", action="store_true")
