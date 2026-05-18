@@ -26,7 +26,13 @@ datasets:
   flow_lenia:
     enabled: true
     required: true
-    frustration_root: experiments/paper_check_flow_lenia/checkpoints/frustration_simulation
+    # Real legacy Flow-Lenia paper-check artifacts are split across these three
+    # valid roots. Do not include experiments/paper_check/checkpoints3 or
+    # experiments/paper_check/checkpoints4; those runs are known-bad.
+    frustration_roots:
+      - experiments/paper_check/checkpoints/frustration_simulation
+      - experiments/paper_check/checkpoints_0/frustration_simulation
+      - experiments/paper_check/checkpoints_reference/frustration_simulation
     c1:
       metric:
         metric_tau_mode: max_grid
@@ -134,8 +140,25 @@ datasets:
         metric_particle_samples: 64
 
 c2:
-  required: false
-  minibang_root: experiments/flow_lenia_mspd/checkpoints/test_run_longrun_check/minibang_golden_set
+  required: true
+  # Primary C2 source. The old minibang golden set is intentionally not used
+  # as primary evidence because its 128x128 substrate is too noisy for the
+  # transition-sensitivity claim.
+  trajectory_root: experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts
+  legacy_minibang_root: experiments/flow_lenia_mspd/checkpoints/minibang_golden_set/run_longrun_check_v2
+  flow_lenia_highres:
+    enabled: true
+    required: true
+    rollout_config: experiments/paper_suite/c2_flowlenia_highres_rollout.yaml
+    output_root: experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts
+    # Valid paper-check Flow-Lenia optimized roots. checkpoints3/checkpoints4
+    # are intentionally excluded.
+    optimized_checkpoint_roots:
+      - experiments/paper_check/checkpoints/optimization
+      - experiments/paper_check/checkpoints_0/optimization
+      - experiments/paper_check/checkpoints_reference/optimization
+    dedupe_by_run_idx: true
+    max_checkpoints: 5
   branching:
     enabled: true
     required: false
@@ -165,10 +188,16 @@ simulation:
       heavy: true
       command: ["{python}", "scripts/run_paper_check_frustration.py", "experiments/paper_check_flow_lenia/config.yaml"]
       expected_paths:
-        - experiments/paper_check_flow_lenia/checkpoints/frustration_simulation/trial_results.csv
+        - experiments/paper_check/checkpoints/frustration_simulation/trial_results.csv
+        - experiments/paper_check/checkpoints_0/frustration_simulation/trial_results.csv
+        - experiments/paper_check/checkpoints_reference/frustration_simulation/trial_results.csv
       expected_globs:
-        - experiments/paper_check_flow_lenia/checkpoints/frustration_simulation/trial_data/trial_*_lagrangian.npz
-        - experiments/paper_check_flow_lenia/checkpoints/frustration_simulation/trial_data/trial_*_embeddings.npz
+        - experiments/paper_check/checkpoints/frustration_simulation/trial_data/trial_*_lagrangian.npz
+        - experiments/paper_check/checkpoints/frustration_simulation/trial_data/trial_*_embeddings.npz
+        - experiments/paper_check/checkpoints_0/frustration_simulation/trial_data/trial_*_lagrangian.npz
+        - experiments/paper_check/checkpoints_0/frustration_simulation/trial_data/trial_*_embeddings.npz
+        - experiments/paper_check/checkpoints_reference/frustration_simulation/trial_data/trial_*_lagrangian.npz
+        - experiments/paper_check/checkpoints_reference/frustration_simulation/trial_data/trial_*_embeddings.npz
 
     - name: plife_plus_paper_check_frustration
       task: paper_check
@@ -194,27 +223,27 @@ simulation:
         - experiments/paper_check_boids/checkpoints/frustration_simulation/trial_data/trial_*_lagrangian.npz
         - experiments/paper_check_boids/checkpoints/frustration_simulation/trial_data/trial_*_embeddings.npz
 
-    - name: flow_lenia_minibang_apf_trajectory_logging
-      task: apf
+    - name: flow_lenia_c2_highres_rollouts
+      task: c2
       enabled: true
-      required: false
+      required: true
       heavy: true
-      command: ["{python}", "scripts/flowlenia_minibang_simulate.py", "experiments/flow_lenia_mspd/minibang_golden_set/config.yaml"]
+      command: ["{python}", "scripts/paper_suite_c2_flowlenia_highres.py", "{config}"]
       expected_paths:
-        - experiments/flow_lenia_mspd/checkpoints/test_run_longrun_check/minibang_golden_set/manifest.json
+        - experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts/manifest.json
       expected_globs:
-        - experiments/flow_lenia_mspd/checkpoints/test_run_longrun_check/minibang_golden_set/traj_*/apf_logs/P_steps_*.npz
+        - experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts/flow_opt_run_*/traj_*/apf_logs/P_steps_*.npz
       expected_npz_keys: [A, P, F, lagrangian_xy, lagrangian_c, resume_batch_rng_key, state_t, state_mass_cycle_start]
       npz_key_check_limit: 3
 
-    - name: flow_lenia_minibang_event_detection
+    - name: flow_lenia_minibang_event_detection_legacy
       task: c2
-      enabled: true
+      enabled: false
       required: false
       heavy: false
-      command: ["{python}", "scripts/flowlenia_minibang_detect.py", "experiments/flow_lenia_mspd/checkpoints/test_run_longrun_check/minibang_golden_set"]
+      command: ["{python}", "scripts/flowlenia_minibang_detect.py", "experiments/flow_lenia_mspd/checkpoints/minibang_golden_set/run_longrun_check_v2"]
       expected_paths:
-        - experiments/flow_lenia_mspd/checkpoints/test_run_longrun_check/minibang_golden_set/detections/minibang_candidates.csv
+        - experiments/flow_lenia_mspd/checkpoints/minibang_golden_set/run_longrun_check_v2/detections/minibang_candidates.csv
 
 smoke:
   meta:

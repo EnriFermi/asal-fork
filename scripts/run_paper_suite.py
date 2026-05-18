@@ -48,11 +48,37 @@ def _metrics(config: str, task: str, *, smoke: bool, force: bool) -> None:
         args = []
         if smoke:
             args.append("--smoke")
+        if force:
+            args.append("--force")
+        _call("paper_suite_c2_flowlenia_metrics.py", config, *args)
+        args = []
+        if smoke:
+            args.append("--smoke")
         _call("paper_suite_c2_events.py", config, *args)
         args = ["--layer", "metrics"]
         if smoke:
             args.append("--smoke")
         _call("paper_suite_c2_branching.py", config, *args)
+
+
+def _c2_branching_simulation(config: str, *, smoke: bool, force: bool, allow_heavy: bool, dry_run: bool) -> None:
+    args = ["--layer", "simulation"]
+    if smoke:
+        args.append("--smoke")
+    if force:
+        args.append("--force")
+    if allow_heavy:
+        args.append("--allow-heavy")
+    if dry_run:
+        args.append("--dry-run")
+    _call("paper_suite_c2_branching.py", config, *args)
+
+
+def _c2_branching_metrics(config: str, *, smoke: bool) -> None:
+    args = ["--layer", "metrics"]
+    if smoke:
+        args.append("--smoke")
+    _call("paper_suite_c2_branching.py", config, *args)
 
 
 def _visualization(config: str, task: str, *, smoke: bool) -> None:
@@ -88,6 +114,15 @@ def main(argv: list[str] | None = None) -> int:
         _simulation(args.config, args.task, smoke=args.smoke, force=args.force, allow_heavy=args.allow_heavy, dry_run=args.dry_run)
     if args.layer in {"metrics", "all"}:
         _metrics(args.config, args.task, smoke=args.smoke, force=args.force)
+    if args.layer == "all" and args.task in {"all", "c2"}:
+        _c2_branching_simulation(
+            args.config,
+            smoke=args.smoke,
+            force=args.force,
+            allow_heavy=args.allow_heavy,
+            dry_run=args.dry_run,
+        )
+        _c2_branching_metrics(args.config, smoke=args.smoke)
     if args.layer in {"visualization", "all"}:
         _visualization(args.config, args.task, smoke=args.smoke)
     return 0

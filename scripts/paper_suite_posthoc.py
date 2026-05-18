@@ -29,6 +29,7 @@ from analysis.history_dependence.paper_check_metric_stats import (
 from clip_deltah_msc_metric import make_metric_loss_fn, resolve_metric_config
 from paper_suite_common import (
     REPO_ROOT,
+    as_list,
     cfg_get,
     dataset_items,
     ensure_dir,
@@ -69,6 +70,7 @@ def _load_trial_rows(root: Path) -> pd.DataFrame:
     df = df.copy()
     df["frustration_root"] = str(fs_root)
     df["source_root"] = str(root)
+    df["source_root_name"] = Path(root).name
     for col in df.columns:
         if df[col].dtype == object:
             try:
@@ -82,6 +84,48 @@ def _load_trial_rows(root: Path) -> pd.DataFrame:
         for kind, label in zip(df.get("candidate_kind", ""), df.get("candidate_label", ""))
     ]
     return df.sort_values(["optimized_run_idx", "candidate_kind_canon", "candidate_idx"], na_position="last").reset_index(drop=True)
+
+
+def _dedupe_trial_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    if rows.empty:
+        return rows
+    out = rows.copy()
+    if "candidate_idx" not in out.columns:
+        out["candidate_idx"] = 0
+    if "optimized_run_idx" not in out.columns:
+        out["optimized_run_idx"] = out.get("trial_idx", np.arange(out.shape[0]))
+    key_cols = ["optimized_run_idx", "candidate_kind_canon", "candidate_idx"]
+    for col in key_cols:
+        if col not in out.columns:
+            return out
+    out["_dedupe_key"] = [tuple(row[col] for col in key_cols) for _, row in out.iterrows()]
+    out = out.drop_duplicates("_dedupe_key", keep="first").drop(columns=["_dedupe_key"])
+    return out.reset_index(drop=True)
+
+
+def _load_trial_rows_many(roots: list[Path]) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    errors: list[str] = []
+    for rank, root in enumerate(roots):
+        try:
+            frame = _load_trial_rows(root)
+        except Exception as exc:
+            errors.append(f"{root}: {exc}")
+            continue
+        frame["source_root_rank"] = int(rank)
+        frames.append(frame)
+    if not frames:
+        raise FileNotFoundError("No usable paper-check roots found. Errors: " + "; ".join(errors))
+    merged = pd.concat(frames, ignore_index=True, sort=False)
+    merged = merged.sort_values(["source_root_rank", "optimized_run_idx", "candidate_kind_canon", "candidate_idx"], na_position="last")
+    merged = _dedupe_trial_rows(merged)
+    merged["trial_uid"] = [
+        f"{Path(str(row['source_root'])).name}_trial_{int(row['trial_idx']):05d}"
+        if "trial_idx" in row and not pd.isna(row["trial_idx"])
+        else f"{Path(str(row['source_root'])).name}_{idx:05d}"
+        for idx, row in merged.iterrows()
+    ]
+    return merged.reset_index(drop=True)
 
 
 def _canonicalize_kind(kind: Any, label: Any = None) -> str:
@@ -186,7 +230,8 @@ def _compute_c1(dataset_name: str, rows: pd.DataFrame, ds_cfg: Any, output_dir: 
         tau_steps = np.asarray(sel_info["tau_steps"], dtype=np.int32)
         eval_values = eval_map[selected_idx, eval_cols]
         eval_score = float(np.nanmedian(eval_values))
-        maps_path = maps_dir / f"trial_{int(row['trial_idx']):05d}_c1_maps.npz"
+        trial_uid = str(row.get("trial_uid", f"trial_{int(row['trial_idx']):05d}"))
+        maps_path = maps_dir / f"{trial_uid}_c1_maps.npz"
         np.savez_compressed(
             maps_path,
             delta_h_selection=sel_map,
@@ -200,6 +245,8 @@ def _compute_c1(dataset_name: str, rows: pd.DataFrame, ds_cfg: Any, output_dir: 
             {
                 "dataset": dataset_name,
                 "trial_idx": int(row["trial_idx"]),
+                "trial_uid": trial_uid,
+                "source_root": str(row.get("source_root", "")),
                 "optimized_run_idx": int(row["optimized_run_idx"]),
                 "candidate_kind": row["candidate_kind_canon"],
                 "candidate_idx": int(row.get("candidate_idx", 0)),
@@ -471,23 +518,24 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
     overview: dict[str, Any] = {}
     for dataset_name, ds in datasets:
         ds_out = ensure_dir(output_root / dataset_name)
-        root_raw = cfg_get(ds, "frustration_root", None) or cfg_get(ds, "paper_check_root", None)
-        if root_raw is None:
-            root_raw = cfg_get(ds, "checkpoint_root", None)
-        if root_raw is None:
+        roots_raw = cfg_get(ds, "frustration_roots", None)
+        if roots_raw is not None:
+            fs_roots = [resolve_path(x) for x in as_list(roots_raw)]
+            fs_roots = [Path(x) for x in fs_roots if x is not None and Path(x).exists()]
+        else:
+            root_raw = cfg_get(ds, "frustration_root", None) or cfg_get(ds, "paper_check_root", None)
+            if root_raw is None:
+                root_raw = cfg_get(ds, "checkpoint_root", None)
+            fs_root = resolve_path(root_raw) if root_raw is not None else None
+            fs_roots = [Path(fs_root)] if fs_root is not None and Path(fs_root).exists() else []
+        if not fs_roots:
             if bool(cfg_get(ds, "required", False)):
-                raise ValueError(f"{dataset_name}: set frustration_root/paper_check_root/checkpoint_root.")
+                raise ValueError(f"{dataset_name}: no existing frustration_root/frustration_roots configured.")
             overview[dataset_name] = {"status": "skipped", "reason": "no root configured"}
             continue
-        fs_root = resolve_path(root_raw)
-        if fs_root is None or not fs_root.exists():
-            if bool(cfg_get(ds, "required", False)):
-                raise FileNotFoundError(f"{dataset_name}: configured root does not exist: {fs_root}")
-            overview[dataset_name] = {"status": "skipped", "reason": f"missing root {fs_root}"}
-            continue
         try:
-            rows = _load_trial_rows(fs_root)
-            status = {"status": "ok", "n_trials": int(rows.shape[0])}
+            rows = _load_trial_rows_many(fs_roots)
+            status = {"status": "ok", "n_trials": int(rows.shape[0]), "frustration_roots": [str(x) for x in fs_roots]}
             if task in {"all", "c1", "c6"}:
                 _scores, contrasts, c1_summary = _compute_c1(dataset_name, rows, ds, ds_out)
                 status["c1"] = c1_summary

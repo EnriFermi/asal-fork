@@ -96,7 +96,7 @@ conda run -n onerec python scripts/run_paper_suite.py experiments/paper_suite/co
 Перед реальным heavy запуском на A100 сначала сделать dry-run:
 
 ```bash
-conda run -n onerec python scripts/run_paper_suite.py experiments/paper_suite/config.yaml --layer simulation --task c2 --dry-run
+conda run -n onerec python scripts/run_paper_suite.py experiments/paper_suite/config.yaml --layer simulation --task c2 --allow-heavy --dry-run
 ```
 
 ## Запуск отдельных задач
@@ -116,7 +116,7 @@ conda run -n onerec python scripts/run_paper_suite.py experiments/paper_suite/co
 C2:
 
 ```bash
-conda run -n onerec python scripts/run_paper_suite.py experiments/paper_suite/config.yaml --layer all --task c2
+conda run -n onerec python scripts/run_paper_suite.py experiments/paper_suite/config.yaml --layer all --task c2 --allow-heavy
 ```
 
 C5:
@@ -220,7 +220,61 @@ Datasets:
 scripts/paper_suite_c2_events.py
 ```
 
-Код читает minibang/APF `metrics.npz` и извлекает:
+Primary C2 source is no longer the old minibang golden set. The suite first
+creates/reuses high-resolution Flow-Lenia rollouts from paper-check optimized
+checkpoints:
+
+```text
+experiments/paper_check/checkpoints/optimization
+experiments/paper_check/checkpoints_0/optimization
+experiments/paper_check/checkpoints_reference/optimization
+```
+
+The dedicated rollout config is:
+
+```text
+experiments/paper_suite/c2_flowlenia_highres_rollout.yaml
+```
+
+It uses the paper-check Flow-Lenia optimization config with:
+
+```yaml
+grid_size: 384
+rollout_steps: 500000
+max_steps: 500000
+```
+
+The output trajectory root is:
+
+```text
+experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts
+```
+
+The simulation layer writes reusable APF chunks first:
+
+```text
+experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts/flow_opt_run_*/traj_*/apf_logs/P_steps_*.npz
+```
+
+Those chunks are the durable source for C2 posthoc work. A rollout is treated
+as simulation-ready when APF chunks, `config.yaml`, and `params.npy` exist;
+`metrics.npz` is produced by the metrics layer and can be deleted/recomputed
+without rerunning Flow-Lenia.
+
+The posthoc metrics script is:
+
+```bash
+scripts/paper_suite_c2_flowlenia_metrics.py
+```
+
+It reads APF chunks and writes:
+
+```text
+experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts/flow_opt_run_*/traj_*/metrics.npz
+analysis/results/paper_suite/c2_highres_metrics/c2_highres_metrics_manifest.csv
+```
+
+Event summary then reads high-res C2 `metrics.npz` and extracts:
 
 - selected tau.
 - Delta-H peak time.
@@ -247,7 +301,7 @@ scripts/paper_suite_c2_branching.py
 
 Simulation layer:
 
-- читает minibang `metrics.npz`;
+- читает high-res C2 `metrics.npz`;
 - выбирает high Delta-H локальные времена;
 - подбирает matched low/mid Delta-H времена;
 - пишет `branch_plan.csv`;
@@ -365,9 +419,17 @@ analysis/results/paper_suite/figures/c6_cross_substrate_effects.png
 Paper-check artifacts:
 
 ```text
-experiments/paper_check_flow_lenia/checkpoints/frustration_simulation/trial_results.csv
-experiments/paper_check_flow_lenia/checkpoints/frustration_simulation/trial_data/trial_*_lagrangian.npz
-experiments/paper_check_flow_lenia/checkpoints/frustration_simulation/trial_data/trial_*_embeddings.npz
+experiments/paper_check/checkpoints/frustration_simulation/trial_results.csv
+experiments/paper_check/checkpoints/frustration_simulation/trial_data/trial_*_lagrangian.npz
+experiments/paper_check/checkpoints/frustration_simulation/trial_data/trial_*_embeddings.npz
+
+experiments/paper_check/checkpoints_0/frustration_simulation/trial_results.csv
+experiments/paper_check/checkpoints_0/frustration_simulation/trial_data/trial_*_lagrangian.npz
+experiments/paper_check/checkpoints_0/frustration_simulation/trial_data/trial_*_embeddings.npz
+
+experiments/paper_check/checkpoints_reference/frustration_simulation/trial_results.csv
+experiments/paper_check/checkpoints_reference/frustration_simulation/trial_data/trial_*_lagrangian.npz
+experiments/paper_check/checkpoints_reference/frustration_simulation/trial_data/trial_*_embeddings.npz
 
 experiments/paper_check_plife_plus/checkpoints/frustration_simulation/trial_results.csv
 experiments/paper_check_plife_plus/checkpoints/frustration_simulation/trial_data/trial_*_lagrangian.npz
@@ -378,14 +440,21 @@ experiments/paper_check_boids/checkpoints/frustration_simulation/trial_data/tria
 experiments/paper_check_boids/checkpoints/frustration_simulation/trial_data/trial_*_embeddings.npz
 ```
 
-Minibang/APF artifacts:
+C2 high-res APF artifacts:
 
 ```text
-experiments/flow_lenia_mspd/checkpoints/test_run_longrun_check/minibang_golden_set/manifest.json
-experiments/flow_lenia_mspd/checkpoints/test_run_longrun_check/minibang_golden_set/traj_*/metrics.npz
-experiments/flow_lenia_mspd/checkpoints/test_run_longrun_check/minibang_golden_set/traj_*/config.yaml
-experiments/flow_lenia_mspd/checkpoints/test_run_longrun_check/minibang_golden_set/traj_*/params.npy
-experiments/flow_lenia_mspd/checkpoints/test_run_longrun_check/minibang_golden_set/traj_*/apf_logs/P_steps_*.npz
+experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts/manifest.json
+experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts/flow_opt_run_*/traj_*/config.yaml
+experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts/flow_opt_run_*/traj_*/params.npy
+experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts/flow_opt_run_*/traj_*/apf_logs/P_steps_*.npz
+```
+
+C2 high-res posthoc metric artifacts:
+
+```text
+experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts/flow_opt_run_*/traj_*/metrics.npz
+experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts/flow_opt_run_*/traj_*/metrics_summary.json
+analysis/results/paper_suite/c2_highres_metrics/c2_highres_metrics_manifest.csv
 ```
 
 APF chunks should contain resume-capable keys where possible:
@@ -421,13 +490,20 @@ conda run -n onerec python scripts/run_paper_suite.py experiments/paper_suite/co
 conda run -n onerec python scripts/run_paper_suite.py experiments/paper_suite/config.yaml --layer metrics
 ```
 
-4. Build figures:
+4. After C2 high-res `metrics.npz` exists, run C2 branch continuations if needed:
+
+```bash
+conda run -n onerec python scripts/paper_suite_c2_branching.py experiments/paper_suite/config.yaml --layer simulation --allow-heavy
+conda run -n onerec python scripts/paper_suite_c2_branching.py experiments/paper_suite/config.yaml --layer metrics
+```
+
+5. Build figures:
 
 ```bash
 conda run -n onerec python scripts/run_paper_suite.py experiments/paper_suite/config.yaml --layer visualization
 ```
 
-5. Full one-command paper suite after artifacts are ready:
+6. Full one-command paper suite after artifacts are ready:
 
 ```bash
 conda run -n onerec python scripts/run_paper_suite.py experiments/paper_suite/config.yaml --layer all

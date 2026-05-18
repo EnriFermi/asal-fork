@@ -29,9 +29,16 @@ from paper_suite_synthetic import simulate as simulate_synthetic
 from paper_suite_c2_branching import simulation as simulate_c2_branching
 
 
-def _command_from_cfg(raw: Any) -> list[str]:
+def _command_from_cfg(raw: Any, config_path: str | Path) -> list[str]:
     cmd = [str(x) for x in as_list(raw)]
-    return [current_python() if x == "{python}" else x for x in cmd]
+    return [
+        current_python()
+        if x == "{python}"
+        else str(config_path)
+        if x == "{config}"
+        else x
+        for x in cmd
+    ]
 
 
 def _glob_paths(pattern: str) -> list[Path]:
@@ -117,7 +124,7 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
             if pre_status == "ok" and not force:
                 rows.append({"name": name, "layer": "simulation", "status": "exists", "message": "expected outputs already present", "command": ""})
                 continue
-            cmd = _command_from_cfg(entry.get("command", []))
+            cmd = _command_from_cfg(entry.get("command", []), config_path)
             if not cmd:
                 rows.append({"name": name, "layer": "simulation", "status": pre_status, "message": pre_msg or "no command configured", "command": ""})
                 continue
@@ -125,6 +132,9 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
                 rows.append({"name": name, "layer": "simulation", "status": "skipped_heavy", "message": pre_msg, "command": command_to_str(cmd)})
                 continue
             run_subprocess(cmd, dry_run=dry_run)
+            if dry_run:
+                rows.append({"name": name, "layer": "simulation", "status": "dry_run", "message": pre_msg, "command": command_to_str(cmd)})
+                continue
             post_status, post_msg = _validate_expected(entry)
             if post_status != "ok" and bool(entry.get("required", False)):
                 raise RuntimeError(f"Simulation command {name} finished but outputs are invalid: {post_msg}")
