@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import csv
+import datetime as _dt
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +15,7 @@ from omegaconf import DictConfig, OmegaConf
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+_SUBPROCESS_COUNTER = 0
 
 
 def ensure_env_resolver() -> None:
@@ -137,11 +140,110 @@ def command_to_str(cmd: list[str]) -> str:
     return " ".join(str(x) for x in cmd)
 
 
+def _timestamp() -> str:
+    return _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _run_stamp() -> str:
+    return _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _safe_name(value: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
+    return value[:96] or "command"
+
+
+def _default_log_dir() -> Path:
+    raw = os.environ.get("PAPER_SUITE_LOG_DIR")
+    if raw:
+        path = Path(raw)
+        if not path.is_absolute():
+            path = REPO_ROOT / path
+        return ensure_dir(path)
+    return ensure_dir(REPO_ROOT / "analysis" / "results" / "paper_suite" / "logs")
+
+
+def log_event(message: str, *, component: str = "paper-suite") -> None:
+    line = f"{_timestamp()} [{component}] {message}"
+    print(line, flush=True)
+    master = os.environ.get("PAPER_SUITE_MASTER_LOG")
+    if not master:
+        return
+    try:
+        path = Path(master)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def init_suite_logging(config_path: str | Path, *, smoke: bool = False, layer: str = "all", task: str = "all") -> Path:
+    cfg, _ = load_config(config_path, smoke=smoke)
+    output_root = resolve_path(cfg.get("meta", {}).get("output_root", "analysis/results/paper_suite")) or (
+        REPO_ROOT / "analysis" / "results" / "paper_suite"
+    )
+    log_dir = ensure_dir(output_root / "logs")
+    run_id = os.environ.get("PAPER_SUITE_RUN_ID") or _run_stamp()
+    master_log = log_dir / f"{run_id}_master.log"
+    os.environ["PAPER_SUITE_RUN_ID"] = run_id
+    os.environ["PAPER_SUITE_LOG_DIR"] = str(log_dir)
+    os.environ["PAPER_SUITE_MASTER_LOG"] = str(master_log)
+    os.environ.setdefault("PAPER_SUITE_LOG_PROGRESS", "plain")
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    log_event(
+        f"logging initialized run_id={run_id} layer={layer} task={task} log_dir={log_dir}",
+        component="runner",
+    )
+    return master_log
+
+
+def _command_log_path(cmd: list[str]) -> Path:
+    global _SUBPROCESS_COUNTER
+    _SUBPROCESS_COUNTER += 1
+    run_id = os.environ.get("PAPER_SUITE_RUN_ID") or _run_stamp()
+    script = next((Path(str(part)).name for part in cmd if str(part).endswith(".py")), Path(str(cmd[0])).name if cmd else "command")
+    name = _safe_name(script.replace(".py", ""))
+    return _default_log_dir() / f"{run_id}_{os.getpid()}_{_SUBPROCESS_COUNTER:03d}_{name}.log"
+
+
 def run_subprocess(cmd: list[str], *, dry_run: bool = False) -> int:
-    print(f"[paper-suite] command: {command_to_str(cmd)}")
+    log_path = _command_log_path(cmd)
+    log_event(f"command start log={log_path} cmd={command_to_str(cmd)}")
     if dry_run:
+        log_path.write_text(f"{_timestamp()} [dry-run] {command_to_str(cmd)}\n")
+        log_event(f"command dry-run log={log_path}")
         return 0
-    subprocess.run(cmd, cwd=str(REPO_ROOT), check=True)
+    env = os.environ.copy()
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    with log_path.open("ab") as log_f:
+        log_f.write(f"{_timestamp()} [command] {command_to_str(cmd)}\n".encode("utf-8"))
+        log_f.flush()
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(REPO_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=False,
+            bufsize=0,
+            env=env,
+        )
+        assert proc.stdout is not None
+        while True:
+            chunk = proc.stdout.read(4096)
+            if not chunk:
+                break
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+            log_f.write(chunk)
+            log_f.flush()
+        returncode = proc.wait()
+        log_f.write(f"{_timestamp()} [exit] returncode={returncode}\n".encode("utf-8"))
+        log_f.flush()
+    if returncode != 0:
+        log_event(f"command failed returncode={returncode} log={log_path}")
+        raise subprocess.CalledProcessError(returncode, cmd)
+    log_event(f"command done log={log_path}")
     return 0
 
 
@@ -201,4 +303,3 @@ def _binom_pmf(n: int, k: int) -> float:
     import math
 
     return math.comb(n, k) * (0.5 ** n)
-

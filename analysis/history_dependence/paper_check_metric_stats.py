@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -91,6 +92,12 @@ def _resolve_artifact_path(row: dict[str, Any], field: str) -> Path | None:
 def _progress(iterable, *, total: int, enabled: bool, desc: str):
     if not enabled:
         for item in iterable:
+            yield item
+        return
+    if os.environ.get("PAPER_SUITE_LOG_PROGRESS") == "plain":
+        for idx, item in enumerate(iterable, start=1):
+            if idx == 1 or idx == total or idx % 5 == 0:
+                print(f"[{desc}] {idx}/{total}", flush=True)
             yield item
         return
     try:

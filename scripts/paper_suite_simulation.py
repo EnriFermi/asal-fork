@@ -20,6 +20,7 @@ from paper_suite_common import (
     current_python,
     ensure_dir,
     load_config,
+    log_event,
     resolve_path,
     run_subprocess,
     write_csv,
@@ -100,10 +101,16 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
     cfg, _ = load_config(config_path, smoke=smoke)
     output_root = ensure_dir(resolve_path(cfg.get("meta", {}).get("output_root", "analysis/results/paper_suite")) or Path("analysis/results/paper_suite"))
     rows: list[dict[str, Any]] = []
+    log_event(
+        f"simulation layer start task={task} smoke={smoke} force={force} allow_heavy={allow_heavy} dry_run={dry_run}",
+        component="simulation",
+    )
 
     if task in {"all", "synthetic"}:
+        log_event("simulation synthetic start", component="simulation")
         result = simulate_synthetic(config_path, smoke=smoke, force=force)
         rows.append({"name": "synthetic_calibration", "layer": "simulation", "status": "ok", "message": str(result), "command": ""})
+        log_event(f"simulation synthetic done result={result}", component="simulation")
 
     if task in {"all", "paper_check", "apf", "c2"}:
         sim_cfg = cfg.get("simulation", {})
@@ -113,41 +120,54 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
             entry_task = str(entry.get("task", "paper_check"))
             if not _task_matches(task, entry_task):
                 continue
+            log_event(f"simulation command check name={name} task={entry_task}", component="simulation")
             if smoke:
                 rows.append({"name": name, "layer": "simulation", "status": "smoke_skipped", "message": "real simulation command skipped in smoke mode", "command": ""})
+                log_event(f"simulation {name} smoke skipped", component="simulation")
                 continue
             if not bool(entry.get("enabled", True)):
                 rows.append({"name": name, "layer": "simulation", "status": "disabled", "message": "", "command": ""})
+                log_event(f"simulation {name} disabled", component="simulation")
                 continue
             heavy = bool(entry.get("heavy", True))
             pre_status, pre_msg = _validate_expected(entry)
             if pre_status == "ok" and not force:
                 rows.append({"name": name, "layer": "simulation", "status": "exists", "message": "expected outputs already present", "command": ""})
+                log_event(f"simulation {name} exists", component="simulation")
                 continue
             cmd = _command_from_cfg(entry.get("command", []), config_path)
             if not cmd:
                 rows.append({"name": name, "layer": "simulation", "status": pre_status, "message": pre_msg or "no command configured", "command": ""})
+                log_event(f"simulation {name} no command status={pre_status} message={pre_msg}", component="simulation")
                 continue
             if heavy and not allow_heavy:
                 rows.append({"name": name, "layer": "simulation", "status": "skipped_heavy", "message": pre_msg, "command": command_to_str(cmd)})
+                log_event(f"simulation {name} skipped heavy message={pre_msg}", component="simulation")
                 continue
+            log_event(f"simulation {name} running command", component="simulation")
             run_subprocess(cmd, dry_run=dry_run)
             if dry_run:
                 rows.append({"name": name, "layer": "simulation", "status": "dry_run", "message": pre_msg, "command": command_to_str(cmd)})
+                log_event(f"simulation {name} dry run recorded", component="simulation")
                 continue
             post_status, post_msg = _validate_expected(entry)
             if post_status != "ok" and bool(entry.get("required", False)):
+                log_event(f"simulation {name} invalid required outputs message={post_msg}", component="simulation")
                 raise RuntimeError(f"Simulation command {name} finished but outputs are invalid: {post_msg}")
             rows.append({"name": name, "layer": "simulation", "status": post_status, "message": post_msg, "command": command_to_str(cmd)})
+            log_event(f"simulation {name} done status={post_status} message={post_msg}", component="simulation")
 
     if task in {"all", "c2"}:
+        log_event("simulation C2 branching pre-metrics check start", component="simulation")
         result = simulate_c2_branching(config_path, smoke=smoke, force=force, allow_heavy=allow_heavy, dry_run=dry_run)
         rows.append({"name": "c2_branching", "layer": "simulation", "status": str(result.get("status", "ok")), "message": str(result), "command": ""})
+        log_event(f"simulation C2 branching pre-metrics check done result={result}", component="simulation")
 
     manifest = output_root / "simulation_layer_manifest.csv"
     write_csv(manifest, rows, fieldnames=["name", "layer", "status", "message", "command"])
     summary = {"n_entries": len(rows), "allow_heavy": bool(allow_heavy), "manifest": str(manifest)}
     write_json(output_root / "simulation_layer_summary.json", summary)
+    log_event(f"simulation layer done manifest={manifest}", component="simulation")
     return summary
 
 

@@ -14,7 +14,7 @@ for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "scripts")):
 import numpy as np
 import pandas as pd
 
-from paper_suite_common import dataset_items, ensure_dir, load_config, resolve_path, write_json
+from paper_suite_common import dataset_items, ensure_dir, load_config, log_event, resolve_path, write_json
 
 
 def _ensure_matplotlib():
@@ -191,6 +191,7 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False) -> d
     output_root = _output_root(cfg)
     figures = ensure_dir(output_root / "figures")
     paths: dict[str, str] = {}
+    log_event(f"visualization start task={task} smoke={smoke} figures={figures}", component="visualization")
     if task in {"all", "synthetic"}:
         paths.update(_plot_synthetic(output_root, figures))
     if task in {"all", "c2"}:
@@ -204,6 +205,7 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False) -> d
                 paths.update(_plot_c5(dataset, ds_dir, figures))
         paths.update(_plot_cross(output_root, figures))
     write_json(output_root / "visualization_summary.json", {"figure_paths": paths})
+    log_event(f"visualization done n_figures={len(paths)} summary={output_root / 'visualization_summary.json'}", component="visualization")
     return {"n_figures": len(paths), "figure_paths": paths}
 
 

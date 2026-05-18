@@ -22,6 +22,7 @@ from paper_suite_common import (
     current_python,
     ensure_dir,
     load_config,
+    log_event,
     read_csv,
     resolve_path,
     run_subprocess,
@@ -259,8 +260,13 @@ def simulation(
     out_dir = ensure_dir(output_root / "c2_branching")
     bcfg = _branch_cfg(cfg)
     branch_root = _branch_root(cfg, output_root)
+    log_event(
+        f"C2 branching simulation start smoke={smoke} force={force} allow_heavy={allow_heavy} dry_run={dry_run} branch_root={branch_root}",
+        component="c2-branch",
+    )
     if smoke:
         plan = _write_smoke_fixture(output_root, branch_root)
+        log_event(f"C2 branching simulation smoke fixture plan={plan}", component="c2-branch")
         return {"status": "ok", "n_branches": len(read_csv(plan)), "plan": str(plan)}
 
     c2_cfg = cfg.get("c2", {})
@@ -268,6 +274,7 @@ def simulation(
     if trajectory_root is None or not trajectory_root.exists():
         summary = {"status": "skipped", "reason": f"missing trajectory root {trajectory_root}"}
         write_json(output_root / "c2_branching_simulation_summary.json", summary)
+        log_event(f"C2 branching simulation skipped missing trajectory_root={trajectory_root}", component="c2-branch")
         return summary
 
     metric_items = _iter_metric_items(trajectory_root)
@@ -277,6 +284,7 @@ def simulation(
             "reason": f"no metrics.npz found under {trajectory_root}; run the C2 metrics layer after APF simulation first",
         }
         write_json(output_root / "c2_branching_simulation_summary.json", summary)
+        log_event(f"C2 branching simulation skipped no metrics trajectory_root={trajectory_root}", component="c2-branch")
         return summary
 
     max_trajectories = int(_get(bcfg, "max_trajectories", 2))
@@ -297,6 +305,10 @@ def simulation(
         centers, dh = _load_delta_h(path)
         ranked.append((float(np.nanmax(dh)), item, centers, dh))
     ranked.sort(key=lambda x: -x[0])
+    log_event(
+        f"C2 branching simulation ranked n_metric_items={len(ranked)} max_trajectories={max_trajectories} m_pairs={m_pairs} branches_per_time={branches_per_time}",
+        component="c2-branch",
+    )
 
     rows: list[dict[str, Any]] = []
     for _peak, item, centers, dh in ranked[:max_trajectories]:
@@ -310,6 +322,10 @@ def simulation(
             refractory_steps=refractory_steps,
             high_quantile=high_quantile,
             low_quantile=low_quantile,
+        )
+        log_event(
+            f"C2 branching simulation traj={traj_id} selected_pairs={len(pairs)} source={metrics_path}",
+            component="c2-branch",
         )
         for pair in pairs:
             for condition in ("high", "low"):
@@ -334,6 +350,10 @@ def simulation(
                     elif not allow_heavy:
                         status = "skipped_heavy"
                     else:
+                        log_event(
+                            f"C2 branching simulation running traj={traj_id} pair={pair['pair_id']} condition={condition} branch={branch_id} step={step}",
+                            component="c2-branch",
+                        )
                         run_subprocess(cmd, dry_run=dry_run)
                         status = "dry_run" if dry_run else ("exists" if _branch_output_ok(branch_dir) else "missing")
                     rows.append(
@@ -362,6 +382,10 @@ def simulation(
         "plan": str(plan_path),
     }
     write_json(output_root / "c2_branching_simulation_summary.json", summary)
+    log_event(
+        f"C2 branching simulation done n_branches={len(rows)} n_ready={summary['n_ready']} plan={plan_path}",
+        component="c2-branch",
+    )
     return summary
 
 
@@ -444,11 +468,13 @@ def metrics(config_path: str | Path, *, smoke: bool = False) -> dict[str, Any]:
     branch_root = _branch_root(cfg, output_root)
     out_dir = ensure_dir(output_root / "c2_branching")
     plan_path = out_dir / "branch_plan.csv"
+    log_event(f"C2 branching metrics start smoke={smoke} plan={plan_path}", component="c2-branch")
     if smoke and not plan_path.exists():
         _write_smoke_fixture(output_root, branch_root)
     if not plan_path.exists():
         summary = {"status": "skipped", "reason": f"missing branch plan {plan_path}"}
         write_json(output_root / "c2_branching_metrics_summary.json", summary)
+        log_event(f"C2 branching metrics skipped missing plan={plan_path}", component="c2-branch")
         return summary
 
     max_chunks = int(_get(bcfg, "feature_max_apf_chunks", 4))
@@ -458,9 +484,16 @@ def metrics(config_path: str | Path, *, smoke: bool = False) -> dict[str, Any]:
     for row in plan_rows:
         key = (str(row["traj_id"]), str(row["pair_id"]), str(row["condition"]))
         groups.setdefault(key, []).append(row)
+    log_event(f"C2 branching metrics loaded n_plan_rows={len(plan_rows)} n_groups={len(groups)}", component="c2-branch")
 
     score_rows: list[dict[str, Any]] = []
-    for (traj_id, pair_id, condition), rows in sorted(groups.items()):
+    group_items = sorted(groups.items())
+    for group_idx, ((traj_id, pair_id, condition), rows) in enumerate(group_items, start=1):
+        if group_idx == 1 or group_idx == len(group_items) or group_idx % 5 == 0:
+            log_event(
+                f"C2 branching metrics group {group_idx}/{len(group_items)} traj={traj_id} pair={pair_id} condition={condition}",
+                component="c2-branch",
+            )
         features = []
         used = []
         for row in rows:
@@ -523,6 +556,10 @@ def metrics(config_path: str | Path, *, smoke: bool = False) -> dict[str, Any]:
         "contrasts": str(contrasts_path),
     }
     write_json(output_root / "c2_branching_metrics_summary.json", summary)
+    log_event(
+        f"C2 branching metrics done n_scores={len(score_rows)} n_pairs={len(contrast_rows)} scores={scores_path}",
+        component="c2-branch",
+    )
     return summary
 
 

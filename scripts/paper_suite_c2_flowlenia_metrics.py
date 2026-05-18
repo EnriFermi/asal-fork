@@ -19,6 +19,7 @@ from flowlenia_minibang_common import load_config as load_rollout_config
 from flowlenia_minibang_simulate import compute_metrics_for_run
 from paper_suite_common import ensure_dir
 from paper_suite_common import load_config as load_suite_config
+from paper_suite_common import log_event
 from paper_suite_common import resolve_path, write_csv, write_json
 
 
@@ -179,9 +180,11 @@ def run(config_path: str | Path, *, smoke: bool = False, force: bool = False) ->
     cfg, _ = load_suite_config(config_path, smoke=smoke)
     output_root = ensure_dir(resolve_path(cfg.get("meta", {}).get("output_root", "analysis/results/paper_suite")) or Path("analysis/results/paper_suite"))
     out_dir = ensure_dir(output_root / "c2_highres_metrics")
+    log_event(f"C2 highres metrics start smoke={smoke} force={force} output={out_dir}", component="c2-metrics")
     if smoke:
         summary = {"status": "smoke_skipped", "reason": "smoke C2 metrics use generated tiny metrics fixtures"}
         write_json(out_dir / "c2_highres_metrics_summary.json", summary)
+        log_event("C2 highres metrics smoke skipped", component="c2-metrics")
         return summary
 
     c2_cfg = cfg.get("c2", {})
@@ -192,6 +195,7 @@ def run(config_path: str | Path, *, smoke: bool = False, force: bool = False) ->
             raise FileNotFoundError(f"C2 trajectory root not found: {root}")
         summary = {"status": "skipped", "reason": f"missing trajectory root {root}"}
         write_json(out_dir / "c2_highres_metrics_summary.json", summary)
+        log_event(f"C2 highres metrics skipped missing root={root}", component="c2-metrics")
         return summary
 
     items = _iter_trajectories(root)
@@ -200,23 +204,37 @@ def run(config_path: str | Path, *, smoke: bool = False, force: bool = False) ->
             raise FileNotFoundError(f"No C2 trajectories found under {root}")
         summary = {"status": "skipped", "reason": f"no trajectories under {root}"}
         write_json(out_dir / "c2_highres_metrics_summary.json", summary)
+        log_event(f"C2 highres metrics skipped no trajectories root={root}", component="c2-metrics")
         return summary
 
     rollout_config = _rollout_config(c2_cfg)
     flat_args = _flat_metric_args(rollout_config)
     rows: list[dict[str, Any]] = []
-    for item in items:
+    log_event(f"C2 highres metrics found n_trajectories={len(items)} root={root}", component="c2-metrics")
+    for idx, item in enumerate(items, start=1):
         metrics_path = Path(item["metrics_path"])
         apf_ready, apf_message, n_chunks = _apf_status(Path(item["apf_dir"]))
         if not apf_ready:
             status = "missing_apf"
             message = apf_message
+            log_event(
+                f"C2 highres metrics {idx}/{len(items)} traj={item['traj_id']} missing_apf message={message}",
+                component="c2-metrics",
+            )
             if required:
                 raise FileNotFoundError(f"Cannot compute C2 metrics for {item['traj_id']}: {message}")
         elif metrics_path.exists() and not force:
             status = "exists"
             message = ""
+            log_event(
+                f"C2 highres metrics {idx}/{len(items)} traj={item['traj_id']} exists metrics={metrics_path}",
+                component="c2-metrics",
+            )
         else:
+            log_event(
+                f"C2 highres metrics {idx}/{len(items)} traj={item['traj_id']} computing from apf_chunks={n_chunks}",
+                component="c2-metrics",
+            )
             run_row = {
                 "traj_id": str(item["traj_id"]),
                 "traj_dir": Path(item["traj_dir"]),
@@ -230,6 +248,10 @@ def run(config_path: str | Path, *, smoke: bool = False, force: bool = False) ->
             compute_metrics_for_run(run_row, flat_args)
             status = "computed"
             message = ""
+            log_event(
+                f"C2 highres metrics {idx}/{len(items)} traj={item['traj_id']} computed metrics={metrics_path}",
+                component="c2-metrics",
+            )
         rows.append(
             {
                 "traj_id": str(item["traj_id"]),
@@ -261,6 +283,10 @@ def run(config_path: str | Path, *, smoke: bool = False, force: bool = False) ->
         "table": str(table),
     }
     write_json(out_dir / "c2_highres_metrics_summary.json", summary)
+    log_event(
+        f"C2 highres metrics done status={summary['status']} n_metrics_ready={n_metrics_ready}/{len(rows)} table={table}",
+        component="c2-metrics",
+    )
     return summary
 
 
