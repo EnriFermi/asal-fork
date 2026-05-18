@@ -551,12 +551,23 @@ def _derive_anchor_columns(rows: pd.DataFrame, base_names: list[str]) -> pd.Data
     out = rows.copy()
     if "anchor_effect_minus_baseline" not in out.columns and {"walls_effect_distance_ctrl_a", "baseline_distance"}.issubset(out.columns):
         out["anchor_effect_minus_baseline"] = out["walls_effect_distance_ctrl_a"] - out["baseline_distance"]
+    if "anchor_effect_over_baseline_ratio" not in out.columns and {"walls_effect_distance_ctrl_a", "baseline_distance"}.issubset(out.columns):
+        out["anchor_effect_over_baseline_ratio"] = out["walls_effect_distance_ctrl_a"] / (
+            out["baseline_distance"] + 1e-12
+        )
+    if "clip_oe_loss_walls_minus_control_a" not in out.columns and {"clip_oe_loss_walls", "clip_oe_loss_control_a"}.issubset(out.columns):
+        out["clip_oe_loss_walls_minus_control_a"] = out["clip_oe_loss_walls"] - out["clip_oe_loss_control_a"]
+    if "msc_score_walls_minus_control_a" not in out.columns and {"msc_score_walls", "msc_score_control_a"}.issubset(out.columns):
+        out["msc_score_walls_minus_control_a"] = out["msc_score_walls"] - out["msc_score_control_a"]
     for base in base_names:
         ctrl = f"{base}__walls_effect_distance_ctrl_a"
         baseline = f"{base}__baseline_distance"
         anchor = f"{base}__anchor_effect_minus_baseline"
         if anchor not in out.columns and {ctrl, baseline}.issubset(out.columns):
             out[anchor] = out[ctrl] - out[baseline]
+        anchor_ratio = f"{base}__anchor_effect_over_baseline_ratio"
+        if anchor_ratio not in out.columns and {ctrl, baseline}.issubset(out.columns):
+            out[anchor_ratio] = out[ctrl] / (out[baseline] + 1e-12)
     return out
 
 
@@ -577,7 +588,12 @@ def _compute_c5(dataset_name: str, rows: pd.DataFrame, ds_cfg: Any, output_dir: 
 
     preferred = [
         "anchor_effect_minus_baseline",
+        "anchor_effect_over_baseline_ratio",
+        "walls_effect_distance_ctrl_a",
+        "clip_oe_loss_walls_minus_control_a",
+        "msc_score_walls_minus_control_a",
         "embedding_cloud_chamfer_cosine__anchor_effect_minus_baseline",
+        "embedding_cloud_chamfer_cosine__anchor_effect_over_baseline_ratio",
         "embedding_synced_cosine__anchor_effect_minus_baseline",
         "delta_h_l2__anchor_effect_minus_baseline",
         "delta_h_mean_abs__anchor_effect_minus_baseline",

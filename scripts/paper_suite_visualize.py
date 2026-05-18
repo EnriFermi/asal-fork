@@ -49,7 +49,7 @@ def _plot_synthetic(output_root: Path, figures: Path) -> dict[str, str]:
     scores = pd.read_csv(score_path)
     role = pd.read_csv(role_path) if role_path.exists() and role_path.stat().st_size > 1 else pd.DataFrame()
     event = pd.read_csv(event_path) if event_path.exists() and event_path.stat().st_size > 1 else pd.DataFrame()
-    families = [f for f in ["S0", "S1", "S3", "S4", "S5", "S6", "S7"] if f in set(tau["family"])]
+    families = [f for f in ["S0", "S1", "S3", "S4", "S5", "S6", "S7", "S8"] if f in set(tau["family"])]
     if not families:
         return {}
     fig, axes = plt.subplots(len(families), 2, figsize=(9, max(2.2, 2.0 * len(families))), squeeze=False)
@@ -208,7 +208,194 @@ def _plot_c1_heatmaps(dataset: str, ds_dir: Path, figures: Path) -> dict[str, st
     out = figures / f"c1_{dataset}_delta_h_heatmaps.png"
     fig.savefig(out, dpi=180)
     plt.close(fig)
-    return {f"c1_{dataset}_delta_h_heatmaps": str(out)}
+    paths = {f"c1_{dataset}_delta_h_heatmaps": str(out)}
+    paths.update(_plot_c1_optimized_vs_random_delta_h_heatmaps(dataset, scores, figures))
+    return paths
+
+
+def _load_c1_eval_map(row: pd.Series) -> dict[str, Any] | None:
+    path = Path(str(row.get("maps_path", "")))
+    if not path.exists():
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            if "delta_h_eval" not in data.files:
+                return None
+            delta_h_eval = np.asarray(data["delta_h_eval"], dtype=np.float64)
+            tau_steps = (
+                np.asarray(data["tau_steps"], dtype=np.int64)
+                if "tau_steps" in data.files
+                else np.arange(delta_h_eval.shape[0], dtype=np.int64)
+            )
+            selected_tau_idx = (
+                int(np.asarray(data["selected_tau_idx"]).reshape(-1)[0])
+                if "selected_tau_idx" in data.files
+                else 0
+            )
+            out = {
+                "delta_h_eval": delta_h_eval,
+                "tau_steps": tau_steps,
+                "selected_tau_idx": selected_tau_idx,
+            }
+    except Exception:
+        return None
+    return out
+
+
+def _symmetric_heatmap_limit(arrays: list[np.ndarray], *, percentile: float = 98.0) -> float:
+    vals = []
+    for arr in arrays:
+        a = np.asarray(arr, dtype=np.float64)
+        finite = a[np.isfinite(a)]
+        if finite.size:
+            vals.append(np.abs(finite))
+    if not vals:
+        return 1.0
+    lim = float(np.nanpercentile(np.concatenate(vals), percentile))
+    return max(lim, 1e-12)
+
+
+def _format_tau_ticks(ax: Any, tau_steps: np.ndarray) -> None:
+    tau = np.asarray(tau_steps, dtype=np.int64).reshape(-1)
+    if tau.size <= 8:
+        ax.set_yticks(np.arange(tau.size), [str(int(x)) for x in tau])
+    else:
+        idx = np.unique(np.linspace(0, tau.size - 1, num=6, dtype=int))
+        ax.set_yticks(idx, [str(int(tau[i])) for i in idx])
+
+
+def _plot_c1_optimized_vs_random_delta_h_heatmaps(
+    dataset: str,
+    scores: pd.DataFrame,
+    figures: Path,
+    *,
+    max_groups: int = 8,
+) -> dict[str, str]:
+    required = {"optimized_run_idx", "candidate_kind", "maps_path"}
+    if scores.empty or not required.issubset(scores.columns):
+        return {}
+
+    pair_records: list[dict[str, Any]] = []
+    opt_maps: list[np.ndarray] = []
+    random_maps: list[np.ndarray] = []
+    reference_shape: tuple[int, ...] | None = None
+
+    for group_idx, group in scores.groupby("optimized_run_idx"):
+        opt = group[group["candidate_kind"] == "optimized"]
+        randoms = group[group["candidate_kind"] == "random"]
+        if opt.empty or randoms.empty:
+            continue
+        opt_row = opt.iloc[0]
+        opt_loaded = _load_c1_eval_map(opt_row)
+        if opt_loaded is None:
+            continue
+
+        if "eval_score_mspd" in randoms.columns:
+            rand_scores = pd.to_numeric(randoms["eval_score_mspd"], errors="coerce")
+            med = float(np.nanmedian(rand_scores.to_numpy(dtype=np.float64)))
+            if np.isfinite(med):
+                pick_idx = (rand_scores - med).abs().sort_values().index[0]
+                rand_row = randoms.loc[pick_idx]
+            else:
+                rand_row = randoms.iloc[0]
+        else:
+            rand_row = randoms.iloc[0]
+        rand_loaded = _load_c1_eval_map(rand_row)
+        if rand_loaded is None:
+            continue
+
+        opt_map = np.asarray(opt_loaded["delta_h_eval"], dtype=np.float64)
+        rand_map = np.asarray(rand_loaded["delta_h_eval"], dtype=np.float64)
+        if opt_map.shape != rand_map.shape:
+            continue
+        if reference_shape is None:
+            reference_shape = opt_map.shape
+        if opt_map.shape == reference_shape:
+            opt_maps.append(opt_map)
+            random_maps.append(rand_map)
+
+        pair_records.append(
+            {
+                "group_idx": int(group_idx),
+                "opt_row": opt_row,
+                "rand_row": rand_row,
+                "opt": opt_loaded,
+                "random": rand_loaded,
+            }
+        )
+
+    paths: dict[str, str] = {}
+    if not pair_records:
+        return paths
+
+    plt = _ensure_matplotlib()
+
+    if opt_maps and random_maps:
+        opt_med = np.nanmedian(np.stack(opt_maps, axis=0), axis=0)
+        rand_med = np.nanmedian(np.stack(random_maps, axis=0), axis=0)
+        diff = opt_med - rand_med
+        lim = _symmetric_heatmap_limit([opt_med, rand_med])
+        diff_lim = _symmetric_heatmap_limit([diff])
+        fig, axes = plt.subplots(1, 3, figsize=(11.5, 3.4), squeeze=False)
+        panels = [
+            (opt_med, "optimized median eval Delta-H", "coolwarm", -lim, lim),
+            (rand_med, "random median eval Delta-H", "coolwarm", -lim, lim),
+            (diff, "optimized - random median", "coolwarm", -diff_lim, diff_lim),
+        ]
+        for ax, (arr, title, cmap, vmin, vmax) in zip(axes[0], panels):
+            im = ax.imshow(arr, aspect="auto", interpolation="nearest", cmap=cmap, vmin=vmin, vmax=vmax)
+            ax.set_title(title)
+            ax.set_xlabel("window")
+            ax.set_ylabel("tau index")
+            fig.colorbar(im, ax=ax, fraction=0.04, pad=0.02)
+        fig.tight_layout()
+        out = figures / f"c1_{dataset}_delta_h_eval_optimized_vs_random_median.png"
+        fig.savefig(out, dpi=180)
+        plt.close(fig)
+        paths[f"c1_{dataset}_delta_h_eval_optimized_vs_random_median"] = str(out)
+
+    selected_pairs = pair_records[: max(1, int(max_groups))]
+    arrays = []
+    for rec in selected_pairs:
+        arrays.append(np.asarray(rec["opt"]["delta_h_eval"], dtype=np.float64))
+        arrays.append(np.asarray(rec["random"]["delta_h_eval"], dtype=np.float64))
+    lim = _symmetric_heatmap_limit(arrays)
+    fig, axes = plt.subplots(
+        len(selected_pairs),
+        2,
+        figsize=(9.2, max(2.8, 2.35 * len(selected_pairs))),
+        squeeze=False,
+    )
+    last_im = None
+    for row_idx, rec in enumerate(selected_pairs):
+        for col_idx, (label, loaded, row) in enumerate(
+            (
+                ("optimized", rec["opt"], rec["opt_row"]),
+                ("random / non-optimized", rec["random"], rec["rand_row"]),
+            )
+        ):
+            arr = np.asarray(loaded["delta_h_eval"], dtype=np.float64)
+            ax = axes[row_idx, col_idx]
+            last_im = ax.imshow(arr, aspect="auto", interpolation="nearest", cmap="coolwarm", vmin=-lim, vmax=lim)
+            sel_idx = int(loaded.get("selected_tau_idx", 0))
+            if 0 <= sel_idx < arr.shape[0]:
+                ax.axhline(sel_idx, color="#111111", linewidth=0.9, linestyle="--")
+            score = row.get("eval_score_mspd", np.nan)
+            tau_steps = np.asarray(loaded.get("tau_steps", []), dtype=np.int64)
+            selected_tau = int(tau_steps[sel_idx]) if tau_steps.size and 0 <= sel_idx < tau_steps.size else -1
+            ax.set_title(f"{label}; score={float(score):.3g}; tau={selected_tau}")
+            ax.set_xlabel("window")
+            ax.set_ylabel(f"group {int(rec['group_idx'])}\ntau")
+            _format_tau_ticks(ax, tau_steps)
+    if last_im is not None:
+        fig.colorbar(last_im, ax=axes.ravel().tolist(), fraction=0.018, pad=0.015)
+    fig.suptitle(f"C1 eval Delta-H heatmaps: optimized vs matched random ({dataset})", y=0.995)
+    fig.tight_layout(rect=(0, 0, 0.98, 0.97))
+    out = figures / f"c1_{dataset}_delta_h_eval_optimized_vs_random_grid.png"
+    fig.savefig(out, dpi=180)
+    plt.close(fig)
+    paths[f"c1_{dataset}_delta_h_eval_optimized_vs_random_grid"] = str(out)
+    return paths
 
 
 def _plot_c1(dataset: str, ds_dir: Path, figures: Path) -> dict[str, str]:
