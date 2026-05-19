@@ -19,7 +19,7 @@ rollout:
     video_fps: 30
     codec: libx264
     macro_block_size: 1
-    jit_microbatch: 64
+    jit_microbatch: 512
 
   logging:
     snapshot_interval: 1000
