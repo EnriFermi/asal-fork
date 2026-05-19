@@ -389,6 +389,7 @@ def _iter_apf_metric_items(root: Path) -> list[dict[str, Any]]:
             traj_id = str(row.get("traj_id", f"flow_opt_{idx:03d}"))
             traj_dir = _manifest_path(root, row.get("traj_dir"), default=root / traj_id)
             metrics_path = _manifest_path(root, row.get("metrics_path"), default=traj_dir / "metrics.npz")
+            candidate_kind = _canonicalize_kind(row.get("candidate_kind", row.get("candidate_label", "optimized")), row.get("candidate_label", None))
             items.append(
                 {
                     "traj_id": traj_id,
@@ -398,6 +399,9 @@ def _iter_apf_metric_items(root: Path) -> list[dict[str, Any]]:
                     "source_root": str(row.get("source_root", "")),
                     "source_root_name": str(row.get("source_root_name", "")),
                     "run_seed": int(row.get("run_seed", -1)),
+                    "candidate_kind": candidate_kind,
+                    "candidate_idx": int(row.get("candidate_idx", 0)),
+                    "candidate_label": str(row.get("candidate_label", candidate_kind)),
                     "traj_dir": traj_dir,
                     "metrics_path": metrics_path,
                 }
@@ -417,6 +421,9 @@ def _iter_apf_metric_items(root: Path) -> list[dict[str, Any]]:
                 "source_root": "",
                 "source_root_name": "",
                 "run_seed": -1,
+                "candidate_kind": _canonicalize_kind(traj_dir.name, traj_dir.name),
+                "candidate_idx": 0,
+                "candidate_label": traj_dir.name,
                 "traj_dir": traj_dir,
                 "metrics_path": metrics_path,
             }
@@ -438,6 +445,7 @@ def _compute_c1_from_apf_metrics(
     items = _iter_apf_metric_items(root)
     if not items:
         raise FileNotFoundError(f"{dataset_name}: no APF metric items found under {root}")
+    require_random = bool(cfg_get(c1_cfg, "require_random", True))
 
     expected_start_raw = cfg_get(c1_cfg, "expected_window_start_steps", None)
     expected_end_raw = cfg_get(c1_cfg, "expected_window_end_steps", None)
@@ -526,8 +534,9 @@ def _compute_c1_from_apf_metrics(
                 "source_root_name": str(item.get("source_root_name", "arun_lagrangian_apf_500k")),
                 "source_optimized_run_idx": int(item.get("source_optimized_run_idx", idx - 1)),
                 "optimized_run_idx": int(item.get("optimized_run_idx", idx - 1)),
-                "candidate_kind": "optimized",
-                "candidate_idx": 0,
+                "candidate_kind": str(item.get("candidate_kind", "optimized")),
+                "candidate_idx": int(item.get("candidate_idx", 0)),
+                "candidate_label": str(item.get("candidate_label", item.get("candidate_kind", "optimized"))),
                 "selected_tau_idx": selected_idx,
                 "selected_tau_steps": int(tau_steps[selected_idx]),
                 "selection_score_mspd": float(score_by_tau[selected_idx]),
@@ -550,8 +559,25 @@ def _compute_c1_from_apf_metrics(
 
     score_df = pd.DataFrame(score_rows)
     contrast_df = _group_contrasts(score_df, "eval_score_mspd")
+    n_random_rows = int((score_df["candidate_kind"] == "random").sum()) if "candidate_kind" in score_df.columns else 0
+    if require_random and n_random_rows == 0:
+        for stale in (
+            output_dir / "group_contrasts.csv",
+            output_dir / "checkpoint_scores.csv",
+        ):
+            if stale.exists():
+                stale.unlink()
+        raise ValueError(
+            f"{dataset_name}: C1 APF source {root} has no candidate_kind=random metrics. "
+            "Refusing to fabricate random=0 baselines. Generate/add random APF metrics "
+            "under the same manifest, or set c1.require_random=false only for optimized-only diagnostics."
+        )
+    if require_random and contrast_df.empty:
+        raise ValueError(f"{dataset_name}: C1 APF source {root} has random rows but no matched optimized-vs-random groups.")
     if contrast_df.empty:
-        contrast_df = pd.DataFrame(columns=["optimized_run_idx", "eval_score_mspd__optimized", "eval_score_mspd__random_median", "n_random", "delta_vs_random_median"])
+        contrast_df = pd.DataFrame(
+            columns=["optimized_run_idx", "eval_score_mspd__optimized", "eval_score_mspd__random_median", "n_random", "delta_vs_random_median"]
+        )
     score_df.to_csv(output_dir / "checkpoint_scores.csv", index=False)
     contrast_df.to_csv(output_dir / "group_contrasts.csv", index=False)
     summary = sign_test_greater(contrast_df["delta_vs_random_median"].tolist() if "delta_vs_random_median" in contrast_df.columns else [])
@@ -561,7 +587,11 @@ def _compute_c1_from_apf_metrics(
             "apf_root": str(root),
             "n_scores": int(len(score_df)),
             "n_contrasts": int(len(contrast_df)),
-            "comparison_note": "Flow-Lenia C1 reads optimized A-run APF metrics; matched random contrasts are unavailable in this source.",
+            "comparison_note": (
+                "Flow-Lenia C1 reads matched optimized/random APF metrics."
+                if len(contrast_df)
+                else "Flow-Lenia C1 reads optimized A-run APF metrics; matched random contrasts are unavailable in this source."
+            ),
         }
     )
     log_event(

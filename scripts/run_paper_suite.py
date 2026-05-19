@@ -30,6 +30,13 @@ def _simulation(config: str, task: str, *, smoke: bool, force: bool, allow_heavy
 
 
 def _metrics(config: str, task: str, *, smoke: bool, force: bool) -> None:
+    if task in {"all", "c1", "c2"}:
+        args = []
+        if smoke:
+            args.append("--smoke")
+        if force:
+            args.append("--force")
+        _call("paper_suite_c2_flowlenia_metrics.py", config, *args)
     if task in {"all", "synthetic"}:
         args = ["--layer", "metrics"]
         if smoke:
@@ -45,12 +52,6 @@ def _metrics(config: str, task: str, *, smoke: bool, force: bool) -> None:
             args.append("--force")
         _call("paper_suite_posthoc.py", config, *args)
     if task in {"all", "c2"}:
-        args = []
-        if smoke:
-            args.append("--smoke")
-        if force:
-            args.append("--force")
-        _call("paper_suite_c2_flowlenia_metrics.py", config, *args)
         args = []
         if smoke:
             args.append("--smoke")

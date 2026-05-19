@@ -71,7 +71,7 @@ minibang:
   checkpoint_dir: null
   output_root: null
   n_trajectories: 1
-  batch_size: 4
+  batch_size: 9
 
   selection_mode: loss
   include_population: false

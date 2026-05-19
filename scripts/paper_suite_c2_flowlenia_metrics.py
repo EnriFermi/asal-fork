@@ -87,7 +87,10 @@ def _iter_trajectories(root: Path) -> list[dict[str, Any]]:
                 {
                     "traj_id": traj_id,
                     "selection_idx": int(row.get("selection_idx", idx)),
-                    "run_idx": int(row.get("run_idx", -1)),
+                    "run_idx": int(row.get("suite_run_idx", row.get("run_idx", -1))),
+                    "candidate_kind": str(row.get("candidate_kind", "optimized")),
+                    "candidate_idx": int(row.get("candidate_idx", 0)),
+                    "candidate_label": str(row.get("candidate_label", row.get("candidate_kind", "optimized"))),
                     "traj_dir": traj_dir,
                     "apf_dir": apf_dir,
                     "metrics_path": metrics_path,
@@ -105,6 +108,9 @@ def _iter_trajectories(root: Path) -> list[dict[str, Any]]:
                 "traj_id": traj_dir.name,
                 "selection_idx": idx,
                 "run_idx": -1,
+                "candidate_kind": "optimized",
+                "candidate_idx": 0,
+                "candidate_label": "optimized",
                 "traj_dir": traj_dir,
                 "apf_dir": traj_dir / "apf_logs",
                 "metrics_path": traj_dir / "metrics.npz",
@@ -122,6 +128,9 @@ def _iter_trajectories(root: Path) -> list[dict[str, Any]]:
                 "traj_id": traj_dir.parent.name,
                 "selection_idx": idx,
                 "run_idx": -1,
+                "candidate_kind": "optimized",
+                "candidate_idx": 0,
+                "candidate_label": "optimized",
                 "traj_dir": traj_dir,
                 "apf_dir": traj_dir / "apf_logs",
                 "metrics_path": traj_dir / "metrics.npz",
@@ -139,6 +148,9 @@ def _iter_trajectories(root: Path) -> list[dict[str, Any]]:
                 "traj_id": traj_dir.name,
                 "selection_idx": idx,
                 "run_idx": -1,
+                "candidate_kind": "optimized",
+                "candidate_idx": 0,
+                "candidate_label": "optimized",
                 "traj_dir": traj_dir,
                 "apf_dir": traj_dir / "apf_logs",
                 "metrics_path": traj_dir / "metrics.npz",
@@ -274,6 +286,9 @@ def run(config_path: str | Path, *, smoke: bool = False, force: bool = False) ->
                 "traj_id": str(item["traj_id"]),
                 "selection_idx": int(item["selection_idx"]),
                 "run_idx": int(item.get("run_idx", -1)),
+                "candidate_kind": str(item.get("candidate_kind", "optimized")),
+                "candidate_idx": int(item.get("candidate_idx", 0)),
+                "candidate_label": str(item.get("candidate_label", item.get("candidate_kind", "optimized"))),
                 "traj_dir": str(item["traj_dir"]),
                 "apf_dir": str(item["apf_dir"]),
                 "metrics_path": str(metrics_path),
@@ -290,11 +305,15 @@ def run(config_path: str | Path, *, smoke: bool = False, force: bool = False) ->
     write_csv(table, rows)
     n_apf_ready = sum(1 for row in rows if row["apf_ready"])
     n_metrics_ready = sum(1 for row in rows if row["metrics_ready"])
+    n_optimized = sum(1 for row in rows if str(row.get("candidate_kind", "optimized")) == "optimized")
+    n_random = sum(1 for row in rows if str(row.get("candidate_kind", "optimized")) == "random")
     summary = {
         "status": "ok" if n_apf_ready == len(rows) and n_metrics_ready == len(rows) else "incomplete",
         "trajectory_root": str(root),
         "rollout_config": str(rollout_config),
         "n_trajectories": len(rows),
+        "n_optimized": int(n_optimized),
+        "n_random": int(n_random),
         "n_apf_ready": int(n_apf_ready),
         "n_metrics_ready": int(n_metrics_ready),
         "table": str(table),
