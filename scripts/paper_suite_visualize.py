@@ -271,8 +271,15 @@ def _plot_c1_optimized_vs_random_delta_h_heatmaps(
     *,
     max_groups: int = 8,
 ) -> dict[str, str]:
+    stale_outputs = [
+        figures / f"c1_{dataset}_delta_h_eval_optimized_vs_random_median.png",
+        figures / f"c1_{dataset}_delta_h_eval_optimized_vs_random_grid.png",
+    ]
     required = {"optimized_run_idx", "candidate_kind", "maps_path"}
     if scores.empty or not required.issubset(scores.columns):
+        for stale in stale_outputs:
+            if stale.exists():
+                stale.unlink()
         return {}
 
     pair_records: list[dict[str, Any]] = []
@@ -326,6 +333,9 @@ def _plot_c1_optimized_vs_random_delta_h_heatmaps(
 
     paths: dict[str, str] = {}
     if not pair_records:
+        for stale in stale_outputs:
+            if stale.exists():
+                stale.unlink()
         return paths
 
     plt = _ensure_matplotlib()
@@ -399,28 +409,31 @@ def _plot_c1_optimized_vs_random_delta_h_heatmaps(
 
 
 def _plot_c1(dataset: str, ds_dir: Path, figures: Path) -> dict[str, str]:
+    paths: dict[str, str] = {}
     path = ds_dir / "group_contrasts.csv"
-    if not path.exists():
-        return {}
-    df = pd.read_csv(path)
-    if df.empty or "delta_vs_random_median" not in df.columns:
-        return {}
-    plt = _ensure_matplotlib()
-    fig, ax = plt.subplots(figsize=(6, 3.4))
-    x = np.arange(df.shape[0])
-    y = df["delta_vs_random_median"].astype(float).to_numpy()
-    ax.axhline(0.0, color="#777777", linewidth=1)
-    ax.scatter(x, y, color=np.where(y >= 0, "#2ca02c", "#d62728"), s=42)
-    if y.size:
-        ax.axhline(float(np.median(y)), color="#111111", linestyle="--", linewidth=1)
-    ax.set_xlabel("matched group")
-    ax.set_ylabel("optimized - random median")
-    ax.set_title(f"C1 selection-adjusted contrast: {dataset}")
-    fig.tight_layout()
-    out = figures / f"c1_{dataset}_paired_contrast.png"
-    fig.savefig(out, dpi=180)
-    plt.close(fig)
-    paths = {f"c1_{dataset}_paired_contrast": str(out)}
+    paired_out = figures / f"c1_{dataset}_paired_contrast.png"
+    if path.exists():
+        df = pd.read_csv(path)
+        if not df.empty and "delta_vs_random_median" in df.columns:
+            plt = _ensure_matplotlib()
+            fig, ax = plt.subplots(figsize=(6, 3.4))
+            x = np.arange(df.shape[0])
+            y = df["delta_vs_random_median"].astype(float).to_numpy()
+            ax.axhline(0.0, color="#777777", linewidth=1)
+            ax.scatter(x, y, color=np.where(y >= 0, "#2ca02c", "#d62728"), s=42)
+            if y.size:
+                ax.axhline(float(np.median(y)), color="#111111", linestyle="--", linewidth=1)
+            ax.set_xlabel("matched group")
+            ax.set_ylabel("optimized - random median")
+            ax.set_title(f"C1 selection-adjusted contrast: {dataset}")
+            fig.tight_layout()
+            fig.savefig(paired_out, dpi=180)
+            plt.close(fig)
+            paths[f"c1_{dataset}_paired_contrast"] = str(paired_out)
+        elif paired_out.exists():
+            paired_out.unlink()
+    elif paired_out.exists():
+        paired_out.unlink()
     paths.update(_plot_c1_tau_profiles(dataset, ds_dir, figures))
     paths.update(_plot_c1_heatmaps(dataset, ds_dir, figures))
     return paths
