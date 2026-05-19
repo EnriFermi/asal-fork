@@ -65,10 +65,10 @@ datasets:
       apf_root: experiments/paper_check_flow_lenia/checkpoints/arun_lagrangian_apf_500k
       require_random: true
       expected_window_start_steps: 100000
-      expected_window_end_steps: 300000
+      expected_window_end_steps: 500000
       metric:
         metric_tau_mode: max_grid
-        metric_tau_grid_steps: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000]
+        metric_tau_grid_steps: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 11000, 12000, 13000, 14000, 15000, 16000, 17000, 18000, 19000]
         metric_tau_steps: 3000
         metric_window_size_steps: 20000
         metric_window_step_steps: 5000
