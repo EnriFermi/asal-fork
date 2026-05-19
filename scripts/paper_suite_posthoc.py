@@ -368,6 +368,209 @@ def _load_npz_arrays(path: Path, keys: list[str], *, context: str) -> dict[str, 
         raise ValueError(f"{context}: invalid npz artifact path={path} {_file_probe(path)} error={type(exc).__name__}: {exc}") from exc
 
 
+def _c1_source_mode(ds_cfg: Any) -> str:
+    c1_cfg = cfg_get(ds_cfg, "c1", {})
+    return str(cfg_get(c1_cfg, "source", "frustration_lagrangian")).strip().lower()
+
+
+def _manifest_path(root: Path, raw: Any, *, default: Path) -> Path:
+    if raw is None or str(raw) == "":
+        return default
+    path = Path(str(raw))
+    return path if path.is_absolute() else root / path
+
+
+def _iter_apf_metric_items(root: Path) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    manifest = root / "manifest.json"
+    if manifest.exists():
+        payload = json.loads(manifest.read_text())
+        for idx, row in enumerate(payload.get("trajectories", [])):
+            traj_id = str(row.get("traj_id", f"flow_opt_{idx:03d}"))
+            traj_dir = _manifest_path(root, row.get("traj_dir"), default=root / traj_id)
+            metrics_path = _manifest_path(root, row.get("metrics_path"), default=traj_dir / "metrics.npz")
+            items.append(
+                {
+                    "traj_id": traj_id,
+                    "optimized_run_idx": int(row.get("suite_run_idx", row.get("selection_idx", idx))),
+                    "source_optimized_run_idx": int(row.get("source_run_idx", row.get("suite_run_idx", idx))),
+                    "source_root_rank": int(row.get("source_root_rank", -1)),
+                    "source_root": str(row.get("source_root", "")),
+                    "source_root_name": str(row.get("source_root_name", "")),
+                    "run_seed": int(row.get("run_seed", -1)),
+                    "traj_dir": traj_dir,
+                    "metrics_path": metrics_path,
+                }
+            )
+    if items:
+        return items
+    for idx, traj_dir in enumerate(sorted(root.glob("flow_opt_*"))):
+        if not traj_dir.is_dir():
+            continue
+        metrics_path = traj_dir / "metrics.npz"
+        items.append(
+            {
+                "traj_id": traj_dir.name,
+                "optimized_run_idx": idx,
+                "source_optimized_run_idx": idx,
+                "source_root_rank": -1,
+                "source_root": "",
+                "source_root_name": "",
+                "run_seed": -1,
+                "traj_dir": traj_dir,
+                "metrics_path": metrics_path,
+            }
+        )
+    return items
+
+
+def _compute_c1_from_apf_metrics(
+    dataset_name: str,
+    ds_cfg: Any,
+    output_dir: Path,
+    *,
+    force: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    c1_cfg = cfg_get(ds_cfg, "c1", {})
+    root = resolve_path(cfg_get(c1_cfg, "apf_root", None))
+    if root is None or not root.exists():
+        raise FileNotFoundError(f"{dataset_name}: C1 apf_root not found: {root}")
+    items = _iter_apf_metric_items(root)
+    if not items:
+        raise FileNotFoundError(f"{dataset_name}: no APF metric items found under {root}")
+
+    expected_start_raw = cfg_get(c1_cfg, "expected_window_start_steps", None)
+    expected_end_raw = cfg_get(c1_cfg, "expected_window_end_steps", None)
+    expected_start = None if expected_start_raw is None else int(expected_start_raw)
+    expected_end = None if expected_end_raw is None else int(expected_end_raw)
+
+    maps_dir = ensure_dir(output_dir / "c1_delta_h_maps")
+    if force:
+        for stale in maps_dir.glob("*_c1_maps.npz"):
+            stale.unlink()
+
+    score_rows: list[dict[str, Any]] = []
+    log_event(f"{dataset_name}: C1 APF metrics start n_items={len(items)} root={root}", component="posthoc")
+    for idx, item in enumerate(items, start=1):
+        metrics_path = Path(item["metrics_path"])
+        if idx == 1 or idx == len(items) or idx % 5 == 0:
+            log_event(
+                f"{dataset_name}: C1 APF scoring {idx}/{len(items)} traj={item['traj_id']} metrics={metrics_path}",
+                component="posthoc",
+            )
+        try:
+            with np.load(metrics_path, allow_pickle=False) as data:
+                required = [
+                    "delta_h_map",
+                    "delta_h_score_by_tau",
+                    "delta_h_amp_by_tau",
+                    "delta_h_msc_by_tau",
+                    "delta_h_tau_steps",
+                    "delta_h_selected_tau_idx",
+                    "delta_h_window_start_steps",
+                    "delta_h_window_end_steps",
+                ]
+                missing = [key for key in required if key not in data.files]
+                if missing:
+                    raise KeyError(f"missing keys {missing}; available keys={list(data.files)}")
+                delta_h_map = np.asarray(data["delta_h_map"], dtype=np.float64)
+                score_by_tau = np.asarray(data["delta_h_score_by_tau"], dtype=np.float64).reshape(-1)
+                amp_by_tau = np.asarray(data["delta_h_amp_by_tau"], dtype=np.float64).reshape(-1)
+                msc_by_tau = np.asarray(data["delta_h_msc_by_tau"], dtype=np.float64).reshape(-1)
+                tau_steps = np.asarray(data["delta_h_tau_steps"], dtype=np.int32).reshape(-1)
+                selected_idx = int(np.asarray(data["delta_h_selected_tau_idx"]).reshape(-1)[0])
+                window_start_steps = np.asarray(data["delta_h_window_start_steps"], dtype=np.int64).reshape(-1)
+                window_end_steps = np.asarray(data["delta_h_window_end_steps"], dtype=np.int64).reshape(-1)
+        except Exception as exc:
+            raise ValueError(f"{dataset_name}: invalid C1 APF metrics path={metrics_path} {_file_probe(metrics_path)} error={type(exc).__name__}: {exc}") from exc
+
+        if selected_idx < 0 or selected_idx >= int(score_by_tau.shape[0]):
+            selected_idx = int(np.nanargmax(score_by_tau))
+        if expected_start is not None and int(np.nanmin(window_start_steps)) != expected_start:
+            raise ValueError(
+                f"{dataset_name}: C1 APF metrics range mismatch for {metrics_path}: "
+                f"first_start={int(np.nanmin(window_start_steps))}, expected {expected_start}."
+            )
+        if expected_end is not None and int(np.nanmax(window_end_steps)) != expected_end:
+            raise ValueError(
+                f"{dataset_name}: C1 APF metrics range mismatch for {metrics_path}: "
+                f"last_end={int(np.nanmax(window_end_steps))}, expected {expected_end}."
+            )
+
+        trial_uid = str(item["traj_id"])
+        maps_path = maps_dir / f"{trial_uid}_c1_maps.npz"
+        np.savez_compressed(
+            maps_path,
+            delta_h_selection=delta_h_map,
+            delta_h_eval=delta_h_map,
+            tau_steps=tau_steps,
+            window_start_steps=window_start_steps.astype(np.int64),
+            window_end_steps=window_end_steps.astype(np.int64),
+            selection_score_by_tau=score_by_tau,
+            eval_score_by_tau=score_by_tau,
+            selection_amp_by_tau=amp_by_tau,
+            eval_amp_by_tau=amp_by_tau,
+            selection_msc_by_tau=msc_by_tau,
+            eval_msc_by_tau=msc_by_tau,
+            selected_tau_idx=np.asarray(selected_idx, dtype=np.int32),
+            source_metrics_path=str(metrics_path),
+        )
+        eval_values = delta_h_map[selected_idx]
+        score_rows.append(
+            {
+                "dataset": dataset_name,
+                "trial_idx": idx - 1,
+                "trial_uid": trial_uid,
+                "source_root": str(item.get("source_root", root)),
+                "source_root_rank": int(item.get("source_root_rank", -1)),
+                "source_root_name": str(item.get("source_root_name", "arun_lagrangian_apf_500k")),
+                "source_optimized_run_idx": int(item.get("source_optimized_run_idx", idx - 1)),
+                "optimized_run_idx": int(item.get("optimized_run_idx", idx - 1)),
+                "candidate_kind": "optimized",
+                "candidate_idx": 0,
+                "selected_tau_idx": selected_idx,
+                "selected_tau_steps": int(tau_steps[selected_idx]),
+                "selection_score_mspd": float(score_by_tau[selected_idx]),
+                "selection_amp": float(amp_by_tau[selected_idx]),
+                "selection_msc": float(msc_by_tau[selected_idx]),
+                "eval_score_mspd": float(score_by_tau[selected_idx]),
+                "eval_amp": float(amp_by_tau[selected_idx]),
+                "eval_msc": float(msc_by_tau[selected_idx]),
+                "eval_delta_h_mean": float(np.nanmean(eval_values)),
+                "eval_delta_h_median": float(np.nanmedian(eval_values)),
+                "eval_delta_h_std": float(np.nanstd(eval_values)),
+                "window_start_min_steps": int(np.nanmin(window_start_steps)),
+                "window_end_max_steps": int(np.nanmax(window_end_steps)),
+                "metrics_path": str(metrics_path),
+                "maps_path": str(maps_path),
+                "c1_source": "apf_metrics",
+                "c1_eval_mode": "single_arun_trajectory",
+            }
+        )
+
+    score_df = pd.DataFrame(score_rows)
+    contrast_df = _group_contrasts(score_df, "eval_score_mspd")
+    if contrast_df.empty:
+        contrast_df = pd.DataFrame(columns=["optimized_run_idx", "eval_score_mspd__optimized", "eval_score_mspd__random_median", "n_random", "delta_vs_random_median"])
+    score_df.to_csv(output_dir / "checkpoint_scores.csv", index=False)
+    contrast_df.to_csv(output_dir / "group_contrasts.csv", index=False)
+    summary = sign_test_greater(contrast_df["delta_vs_random_median"].tolist() if "delta_vs_random_median" in contrast_df.columns else [])
+    summary.update(
+        {
+            "source": "apf_metrics",
+            "apf_root": str(root),
+            "n_scores": int(len(score_df)),
+            "n_contrasts": int(len(contrast_df)),
+            "comparison_note": "Flow-Lenia C1 reads optimized A-run APF metrics; matched random contrasts are unavailable in this source.",
+        }
+    )
+    log_event(
+        f"{dataset_name}: C1 APF metrics done n_scores={len(score_df)} n_contrasts={len(contrast_df)} output={output_dir}",
+        component="posthoc",
+    )
+    return score_df, contrast_df, summary
+
+
 def _compute_c1(
     dataset_name: str,
     rows: pd.DataFrame,
@@ -764,29 +967,39 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
     for dataset_name, ds in datasets:
         ds_out = ensure_dir(output_root / dataset_name)
         log_event(f"{dataset_name}: dataset start output={ds_out}", component="posthoc")
-        roots_raw = cfg_get(ds, "frustration_roots", None)
-        if roots_raw is not None:
-            fs_roots = [resolve_path(x) for x in as_list(roots_raw)]
-            fs_roots = [Path(x) for x in fs_roots if x is not None and Path(x).exists()]
-        else:
-            root_raw = cfg_get(ds, "frustration_root", None) or cfg_get(ds, "paper_check_root", None)
-            if root_raw is None:
-                root_raw = cfg_get(ds, "checkpoint_root", None)
-            fs_root = resolve_path(root_raw) if root_raw is not None else None
-            fs_roots = [Path(fs_root)] if fs_root is not None and Path(fs_root).exists() else []
-        if not fs_roots:
-            if bool(cfg_get(ds, "required", False)):
-                raise ValueError(f"{dataset_name}: no existing frustration_root/frustration_roots configured.")
-            overview[dataset_name] = {"status": "skipped", "reason": "no root configured"}
-            log_event(f"{dataset_name}: skipped no root configured", component="posthoc")
-            continue
+        c1_apf_source = _c1_source_mode(ds) in {"apf", "apf_metrics", "arun", "arun_lagrangian_apf"}
+        needs_frustration_rows = task in {"all", "c5", "c6"} or (task in {"c1"} and not c1_apf_source)
+        fs_roots: list[Path] = []
+        if needs_frustration_rows:
+            roots_raw = cfg_get(ds, "frustration_roots", None)
+            if roots_raw is not None:
+                fs_roots = [resolve_path(x) for x in as_list(roots_raw)]
+                fs_roots = [Path(x) for x in fs_roots if x is not None and Path(x).exists()]
+            else:
+                root_raw = cfg_get(ds, "frustration_root", None) or cfg_get(ds, "paper_check_root", None)
+                if root_raw is None:
+                    root_raw = cfg_get(ds, "checkpoint_root", None)
+                fs_root = resolve_path(root_raw) if root_raw is not None else None
+                fs_roots = [Path(fs_root)] if fs_root is not None and Path(fs_root).exists() else []
+            if not fs_roots:
+                if bool(cfg_get(ds, "required", False)):
+                    raise ValueError(f"{dataset_name}: no existing frustration_root/frustration_roots configured.")
+                overview[dataset_name] = {"status": "skipped", "reason": "no root configured"}
+                log_event(f"{dataset_name}: skipped no root configured", component="posthoc")
+                continue
         try:
-            log_event(f"{dataset_name}: loading roots {[str(x) for x in fs_roots]}", component="posthoc")
-            rows = _load_trial_rows_many(fs_roots)
-            log_event(f"{dataset_name}: loaded n_trials={rows.shape[0]}", component="posthoc")
+            if fs_roots:
+                log_event(f"{dataset_name}: loading roots {[str(x) for x in fs_roots]}", component="posthoc")
+                rows = _load_trial_rows_many(fs_roots)
+                log_event(f"{dataset_name}: loaded n_trials={rows.shape[0]}", component="posthoc")
+            else:
+                rows = pd.DataFrame()
             status = {"status": "ok", "n_trials": int(rows.shape[0]), "frustration_roots": [str(x) for x in fs_roots]}
             if task in {"all", "c1", "c6"}:
-                _scores, contrasts, c1_summary = _compute_c1(dataset_name, rows, ds, ds_out, force=force)
+                if c1_apf_source:
+                    _scores, contrasts, c1_summary = _compute_c1_from_apf_metrics(dataset_name, ds, ds_out, force=force)
+                else:
+                    _scores, contrasts, c1_summary = _compute_c1(dataset_name, rows, ds, ds_out, force=force)
                 status["c1"] = c1_summary
                 cross_rows.append({"dataset": dataset_name, "claim": "C1/C6", "metric": "eval_score_mspd", **c1_summary})
             if task in {"all", "c5", "c6"}:
