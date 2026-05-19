@@ -12,11 +12,12 @@ for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "scripts")):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
+from flowlenia_minibang_common import list_apf_chunks
 from flowlenia_minibang_common import load_config as load_rollout_config
 from flowlenia_minibang_simulate import select_params, simulate_batch
 from paper_suite_c2_flowlenia_highres import (
     REQUIRED_APF_KEYS,
-    _apf_status,
+    _apf_status as _base_apf_status,
     _discover_checkpoints,
     _traj_id,
 )
@@ -55,6 +56,22 @@ def _output_paths(output_root: Path, traj_id: str) -> dict[str, Path]:
         "video_path": traj_dir / "video.mp4",
         "frame_times_path": traj_dir / "frame_times.csv",
     }
+
+
+def _apf_status(paths: dict[str, Path], *, expected_steps: int | None = None) -> tuple[bool, str]:
+    ready, message = _base_apf_status(paths)
+    if not ready or expected_steps is None:
+        return ready, message
+    chunks = list_apf_chunks(paths["apf_dir"])
+    if not chunks:
+        return False, f"missing APF chunks in {paths['apf_dir']}"
+    first_start = min(start for _path, start, _end, _idx in chunks)
+    last_end = max(end for _path, _start, end, _idx in chunks)
+    if first_start > 0:
+        return False, f"APF coverage starts at {first_start}, expected 0"
+    if last_end < int(expected_steps):
+        return False, f"APF coverage ends at {last_end}, expected >= {int(expected_steps)}"
+    return True, ""
 
 
 def _validate_rollout_profile(flat: Any, *, expected_steps: int) -> None:
@@ -145,12 +162,13 @@ def _write_manifest(
     rollout_config: Path,
     selected: list[dict[str, Any]],
     command_rows: list[dict[str, Any]],
+    expected_steps: int | None = None,
 ) -> None:
     trajectories: list[dict[str, Any]] = []
     for row in selected:
         traj_id = str(row["traj_id"])
         paths = _output_paths(output_root, traj_id)
-        apf_ready, apf_message = _apf_status(paths)
+        apf_ready, apf_message = _apf_status(paths, expected_steps=expected_steps)
         trajectories.append(
             {
                 "traj_id": traj_id,
@@ -278,7 +296,7 @@ def run(
 
     ready_by_traj: dict[str, tuple[bool, str]] = {}
     for row in selected:
-        ready, message = _apf_status(_output_paths(output_root, str(row["traj_id"])))
+        ready, message = _apf_status(_output_paths(output_root, str(row["traj_id"])), expected_steps=expected_steps)
         ready_by_traj[str(row["traj_id"])] = (ready, message)
     pending = [
         row
@@ -319,6 +337,7 @@ def run(
         rollout_config=rollout_config,
         selected=selected,
         command_rows=command_rows,
+        expected_steps=expected_steps,
     )
 
     if dry_run:
@@ -330,6 +349,7 @@ def run(
             rollout_config=rollout_config,
             selected=selected,
             command_rows=command_rows,
+            expected_steps=expected_steps,
         )
         summary = {
             "status": "dry_run",
@@ -354,14 +374,23 @@ def run(
         # Every selected row carries an explicit run_seed, so missing random
         # candidates can be filled without re-running already ready optimized
         # trajectories.
-        existing_run_roots = [str(_output_paths(output_root, traj_id)["run_root"]) for traj_id in batch_ids if _output_paths(output_root, traj_id)["run_root"].exists()]
-        if existing_run_roots and not force:
+        existing = [
+            (row, _output_paths(output_root, str(row["traj_id"]))["run_root"])
+            for row in batch
+            if _output_paths(output_root, str(row["traj_id"]))["run_root"].exists()
+        ]
+        protected = [
+            str(path)
+            for row, path in existing
+            if str(row.get("candidate_kind", "optimized")) == "optimized"
+        ]
+        if protected and not force:
             raise RuntimeError(
-                "Refusing to overwrite existing Flow-Lenia A-run APF trajectory directories without --force. "
-                "These outputs are present but do not match the requested APF profile; inspect or move them first: "
-                + ", ".join(existing_run_roots[:10])
+                "Refusing to overwrite incomplete optimized Flow-Lenia A-run APF trajectory directories without --force. "
+                "Inspect or move them first: "
+                + ", ".join(protected[:10])
             )
-        overwrite = bool(force)
+        overwrite = bool(force or existing)
         log_event(
             f"Flow-Lenia A-run APF running batch {batch_idx}/{len(batches_to_run)} "
             f"batch_size={len(batch)} overwrite={overwrite} traj_ids={batch_ids}",
@@ -377,7 +406,7 @@ def run(
         for row in command_rows:
             if row["traj_id"] in batch_ids:
                 paths = _output_paths(output_root, str(row["traj_id"]))
-                ready, message = _apf_status(paths)
+                ready, message = _apf_status(paths, expected_steps=expected_steps)
                 row["status"] = "exists" if ready else "missing_apf"
                 row["message"] = message
         _write_manifest(
@@ -385,11 +414,12 @@ def run(
             rollout_config=rollout_config,
             selected=selected,
             command_rows=command_rows,
+            expected_steps=expected_steps,
         )
 
     n_ready = 0
     for row in selected:
-        ready, _message = _apf_status(_output_paths(output_root, str(row["traj_id"])))
+        ready, _message = _apf_status(_output_paths(output_root, str(row["traj_id"])), expected_steps=expected_steps)
         n_ready += int(ready)
     status = "ok" if n_ready == len(selected) else "incomplete"
     summary = {
@@ -408,6 +438,7 @@ def run(
         rollout_config=rollout_config,
         selected=selected,
         command_rows=command_rows,
+        expected_steps=expected_steps,
     )
     if status != "ok" and bool(_get(section, "required", True)):
         raise RuntimeError(f"Flow-Lenia A-run APF generation incomplete: {n_ready}/{len(selected)} ready.")
