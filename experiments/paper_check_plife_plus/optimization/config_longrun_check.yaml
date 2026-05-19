@@ -5,23 +5,26 @@ meta:
 
 substrate:
   substrate: plife_plus
-  rollout_steps: 200000
-  n_particles: 1000
+  rollout_steps: 6000
+  n_particles: 600
   n_colors: 6
-  dt: 0.02
+  n_dims: 2
+  x_dist_bins: 7
   beta: 0.3
   mass: 0.1
+  dt: 0.02
   half_life: 0.04
   rmax: 0.1
   render_radius: 0.04
   sharpness: 30.0
   update_colors: true
   world_size: 1.0
-  border: wall
+  border: torus
+  neighbor_mode: dense
   background_color: black
 
 evaluation:
-  sample_every_steps: 50
+  sample_every_steps: 1
   log_clip_evolution: false
 
 optimization:
@@ -29,7 +32,7 @@ optimization:
   bs: 1
   pop_batch: 8
   pop_size: 8
-  n_iters: 100
+  n_iters: 500
   sigma: 0.2
 
 logging:
@@ -42,12 +45,12 @@ metric:
   metric_trajectory_source: state_x
   metric_unwrap_state_x: true
   metric_tau_mode: trainable_grid
-  metric_tau_grid_steps: [100, 200, 400, 800, 1200, 1600, 2000, 3000, 4000]
-  metric_window_size_steps: 20000
-  metric_window_step_steps: 5000
-  metric_tau_steps: 800
-  metric_range_start_steps: 50000
-  metric_range_end_steps: 200000
+  metric_tau_grid_steps: [5, 10, 15, 20, 25, 30, 35]
+  metric_window_size_steps: 100
+  metric_window_step_steps: 50
+  metric_tau_steps: 20
+  metric_range_start_steps: 0
+  metric_range_end_steps: 1000
   metric_window_size_frames: null
   metric_window_step_frames: null
   metric_tau_frames: null
@@ -67,6 +70,6 @@ metric:
   metric_scales: null
   metric_scale_weights: null
 
-  metric_alpha: 0.0
+  metric_alpha: 1.0
   metric_beta: 1.0
-  metric_eps: 1.0e-12
+  metric_eps: 1.0e-3
