@@ -26,8 +26,7 @@ synthetic:
   # Synthetic MSC denominator floor in mean(g^2) + metric_msc_floor^2 + eps.
   metric_msc_floor: 0.01
   metric_eps: 1.0e-12
-  # Synthetic-only MSC scoring. Real C1/C5/C2 posthoc keeps the legacy overlap
-  # score unless explicitly configured otherwise in its own metric block.
+  # Paper-suite MSC scoring: averaged floor-aware reconstruction error.
   metric_msc_term: floor_reconstruction_error
   metric_msc_normalize_by_weight_sum: true
   render:
@@ -62,14 +61,14 @@ datasets:
     c1:
       # Flow-Lenia C1 is read from the reusable A-run APF/lagrangian posthoc
       # metrics, not from the legacy late-window frustration artifacts.
-      source: apf_metrics
+      source: apf_lagrangian_split
       apf_root: experiments/paper_check_flow_lenia/checkpoints/arun_lagrangian_apf_500k
       require_random: true
       expected_window_start_steps: 100000
-      expected_window_end_steps: 300000
+      expected_window_end_steps: 500000
       metric:
         metric_tau_mode: max_grid
-        metric_tau_grid_steps: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000]
+        metric_tau_grid_steps: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 11000, 12000, 13000, 14000, 15000, 16000, 17000, 18000, 19000]
         metric_tau_steps: 3000
         metric_window_size_steps: 20000
         metric_window_step_steps: 5000
@@ -82,6 +81,10 @@ datasets:
         metric_periodic: false
         metric_domain_y: 384.0
         metric_domain_x: 384.0
+        metric_delta_h_floor: 0.0
+        metric_msc_floor: 0.01
+        metric_msc_term: floor_reconstruction_error
+        metric_msc_normalize_by_weight_sum: true
     c5:
       metric:
         metric_tau_mode: max_grid
@@ -99,6 +102,10 @@ datasets:
         metric_periodic: false
         metric_domain_y: 384.0
         metric_domain_x: 384.0
+        metric_delta_h_floor: 0.0
+        metric_msc_floor: 0.01
+        metric_msc_term: floor_reconstruction_error
+        metric_msc_normalize_by_weight_sum: true
 
   plife_plus:
     enabled: true
@@ -106,35 +113,65 @@ datasets:
     frustration_root: experiments/paper_check_plife_plus/checkpoints/frustration_simulation
     analysis_config: experiments/paper_check_plife_plus/frustration_simulation/analysis_config.yaml
     c1:
+      # C6 uses the same optimized-vs-random C1-style check on PLife++, but
+      # from a reusable single-trajectory source separate from C5/C6.5.
+      source: lagrangian_root
+      lagrangian_root: experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k
+      require_random: true
+      expected_trajectory_start_steps: 20000
+      expected_trajectory_end_steps: 24000
       metric:
-        metric_tau_mode: max_grid
-        metric_tau_grid_steps: [100, 200, 400, 800, 1200, 1600, 2000, 3000, 4000]
-        metric_tau_steps: 800
-        metric_window_size_steps: 20000
-        metric_window_step_steps: 5000
+        metric_tau_mode: fixed
+        metric_tau_grid_steps: null
+        metric_tau_steps: 25
+        metric_window_size_steps: 100
+        metric_window_step_steps: 50
         metric_range_start_steps: 0
+        metric_range_end_steps: null
         metric_m_samples: 48
         metric_m_min: 4
         metric_n_proj: 16
         metric_null_reps: 6
         metric_particle_samples: 64
-        metric_periodic: false
+        metric_dirs_seed: 123
+        metric_periodic: true
         metric_domain_y: 1.0
         metric_domain_x: 1.0
+        metric_preprocess_mode: clip
+        metric_delta_h_floor: 0.0
+        metric_msc_floor: 0.01
+        metric_msc_term: floor_reconstruction_error
+        metric_msc_normalize_by_weight_sum: true
+        metric_alpha: 0.0
+        metric_beta: 1.0
+        metric_eps: 1.0e-12
     c5:
       metric:
-        metric_tau_mode: max_grid
-        metric_tau_grid_steps: [100, 200, 400, 800, 1200, 1600, 2000, 3000, 4000]
-        metric_tau_steps: 800
-        fixed_tau_distribution_steps: 800
-        metric_window_size_steps: 20000
-        metric_window_step_steps: 5000
+        metric_tau_mode: fixed
+        metric_tau_grid_steps: null
+        metric_tau_steps: 25
+        fixed_tau_distribution_steps: 25
+        metric_window_size_steps: 100
+        metric_window_step_steps: 50
         metric_range_start_steps: 0
+        metric_range_end_steps: null
         metric_m_samples: 48
         metric_m_min: 4
         metric_n_proj: 16
         metric_null_reps: 6
         metric_particle_samples: 64
+        metric_dirs_seed: 123
+        metric_periodic: true
+        metric_domain_y: 1.0
+        metric_domain_x: 1.0
+        metric_preprocess_mode: clip
+        metric_delta_h_floor: 0.0
+        metric_msc_floor: 0.01
+        metric_msc_term: floor_reconstruction_error
+        metric_msc_normalize_by_weight_sum: true
+        metric_alpha: 0.0
+        metric_beta: 1.0
+        metric_eps: 1.0e-12
 
   boids:
     enabled: false
@@ -157,6 +194,10 @@ datasets:
         metric_periodic: false
         metric_domain_y: 1.0
         metric_domain_x: 1.0
+        metric_delta_h_floor: 0.0
+        metric_msc_floor: 0.01
+        metric_msc_term: floor_reconstruction_error
+        metric_msc_normalize_by_weight_sum: true
     c5:
       metric:
         metric_tau_mode: max_grid
@@ -171,6 +212,10 @@ datasets:
         metric_n_proj: 16
         metric_null_reps: 6
         metric_particle_samples: 64
+        metric_delta_h_floor: 0.0
+        metric_msc_floor: 0.01
+        metric_msc_term: floor_reconstruction_error
+        metric_msc_normalize_by_weight_sum: true
 
 c2:
   required: true
@@ -243,6 +288,31 @@ simulation:
       - experiments/paper_check/checkpoints_reference/optimization
     dedupe_by_run_idx: false
     max_checkpoints: null
+
+  plife_plus_c1_lagrangian:
+    enabled: true
+    required: true
+    base_config: experiments/paper_check_plife_plus/frustration_simulation/config.yaml
+    output_root: experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k
+    smoke_output_root: analysis/results/paper_suite_smoke/plife_plus_c1_lagrangian
+    include_random_baselines: true
+    num_random_baselines: 3
+    expected_optimized_groups: 7
+    n_trajectories_per_checkpoint: 1
+    include_population: false
+    include_best_traj: false
+    include_final_best: true
+    run_seed_base: 400000
+    run_seed_mode: source_run_idx
+    metric_seed_base: 800000
+    selection_mode: loss
+    batch_size: 9
+    jit_microbatch: 256
+    optimized_checkpoint_roots:
+      - experiments/paper_check_plife_plus/checkpoints/optimization_main
+    dedupe_by_run_idx: false
+    max_checkpoints: null
+
   commands:
     - name: flow_lenia_paper_check_frustration
       task: paper_check
@@ -292,6 +362,21 @@ simulation:
         - experiments/paper_check_plife_plus/checkpoints/frustration_simulation/trial_data/trial_*_lagrangian.npz
         - experiments/paper_check_plife_plus/checkpoints/frustration_simulation/trial_data/trial_*_embeddings.npz
 
+    - name: plife_plus_c1_lagrangian_24k
+      task: paper_check_c1
+      enabled: true
+      required: true
+      heavy: true
+      always_run: true
+      command: ["{python}", "scripts/paper_suite_plife_c1_lagrangian.py", "{config}"]
+      expected_paths:
+        - experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k/manifest.json
+        - experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k/trial_results.csv
+      expected_globs:
+        - experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k/trial_data/trial_*_lagrangian.npz
+      expected_npz_keys: [xy_control_a, sample_offsets_steps, xy_late_sample_steps, trajectory_start_steps, trajectory_end_steps]
+      npz_key_check_limit: 3
+
     - name: boids_paper_check_frustration
       task: paper_check
       enabled: false
@@ -334,15 +419,15 @@ smoke:
   meta:
     output_root: analysis/results/paper_suite_smoke
   synthetic:
-    seeds: 20
-    n_particles: 256
-    time_steps: 512
-    tau_grid_steps: [8, 16, 32, 64, 128]
-    metric_window_size_steps: 32
-    metric_window_step_steps: 8
-    metric_m_samples: 12
-    metric_n_proj: 8
-    metric_null_reps: 2
+    seeds: 1
+    n_particles: 32
+    time_steps: 96
+    tau_grid_steps: [1, 2, 4, 8, 12, 16]
+    metric_window_size_steps: 24
+    metric_window_step_steps: 12
+    metric_m_samples: 8
+    metric_n_proj: 4
+    metric_null_reps: 1
     metric_particle_samples: 32
     metric_delta_h_floor: 0.01
     metric_msc_floor: 0.01
@@ -351,11 +436,11 @@ smoke:
     metric_msc_normalize_by_weight_sum: true
     render:
       enabled: true
-      size_px: 384
+      size_px: 256
       fps: 12
-      max_frames: 512
+      max_frames: 96
       trail_steps: 8
-      particle_radius_px: 8
+      particle_radius_px: 4
     visualization:
       heatmap_max_runs: null
       msc_r_tau_steps: null

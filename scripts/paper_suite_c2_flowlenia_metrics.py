@@ -16,11 +16,12 @@ from omegaconf import OmegaConf
 
 from flowlenia_minibang_common import list_apf_chunks
 from flowlenia_minibang_common import load_config as load_rollout_config
-from flowlenia_minibang_simulate import compute_metrics_for_run
+from flowlenia_minibang_simulate import compute_metrics_for_run, expected_delta_h_metric_metadata
 from paper_suite_common import ensure_dir
 from paper_suite_common import load_config as load_suite_config
 from paper_suite_common import log_event
 from paper_suite_common import resolve_path, write_csv, write_json
+from paper_suite_metric_cache import compare_metrics_npz_metadata
 
 
 REQUIRED_APF_KEYS = (
@@ -253,10 +254,17 @@ def run(config_path: str | Path, *, smoke: bool = False, force: bool = False) ->
             if required:
                 raise FileNotFoundError(f"Cannot compute C2 metrics for {item['traj_id']}: {message}")
         elif metrics_path.exists() and not force:
+            metric_cfg, input_identity, _metadata = expected_delta_h_metric_metadata(Path(item["apf_dir"]), flat_args)
+            fresh, reason, _expected = compare_metrics_npz_metadata(metrics_path, metric_cfg, input_identity)
+            if not fresh:
+                raise ValueError(
+                    f"C2 highres metrics stale cache for {item['traj_id']} at {metrics_path}: {reason}. "
+                    "Run the metrics layer with --force to recompute from existing APF logs."
+                )
             status = "exists"
-            message = ""
+            message = "fresh"
             log_event(
-                f"C2 highres metrics {idx}/{len(items)} traj={item['traj_id']} exists metrics={metrics_path}",
+                f"C2 highres metrics {idx}/{len(items)} traj={item['traj_id']} exists fresh metrics={metrics_path}",
                 component="c2-metrics",
             )
         else:
@@ -275,6 +283,10 @@ def run(config_path: str | Path, *, smoke: bool = False, force: bool = False) ->
                 },
             }
             compute_metrics_for_run(run_row, flat_args)
+            metric_cfg, input_identity, _metadata = expected_delta_h_metric_metadata(Path(item["apf_dir"]), flat_args)
+            fresh, reason, _expected = compare_metrics_npz_metadata(metrics_path, metric_cfg, input_identity)
+            if not fresh:
+                raise ValueError(f"C2 highres metrics wrote invalid cache for {item['traj_id']} at {metrics_path}: {reason}")
             status = "computed"
             message = ""
             log_event(

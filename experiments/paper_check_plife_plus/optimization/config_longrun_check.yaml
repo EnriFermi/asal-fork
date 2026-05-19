@@ -69,6 +69,10 @@ metric:
   metric_preprocess_mode: clip
   metric_scales: null
   metric_scale_weights: null
+  metric_delta_h_floor: 0.0
+  metric_msc_floor: 0.01
+  metric_msc_term: floor_reconstruction_error
+  metric_msc_normalize_by_weight_sum: true
 
   metric_alpha: 1.0
   metric_beta: 1.0

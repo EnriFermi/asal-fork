@@ -27,6 +27,7 @@ from analysis.history_dependence.paper_check_metric_stats import (
     history_distance_base_names,
 )
 from clip_deltah_msc_metric import make_metric_loss_fn, resolve_metric_config
+from flowlenia_minibang_simulate import _load_lagrangian_series
 from paper_suite_common import (
     REPO_ROOT,
     as_list,
@@ -197,6 +198,18 @@ def _resolve_artifact(row: pd.Series | dict[str, Any], field: str) -> Path | Non
     return root / path
 
 
+def _primary_lagrangian_xy_key(data: np.lib.npyio.NpzFile, preferred: Any = None) -> str:
+    if preferred is not None and str(preferred).strip():
+        key = str(preferred)
+        if key not in data.files:
+            raise KeyError(f"missing configured trajectory key {key!r}; available keys={list(data.files)}")
+        return key
+    for key in ("xy_trajectory", "xy", "xy_control_a"):
+        if key in data.files:
+            return key
+    raise KeyError(f"missing primary trajectory key; expected one of xy_trajectory, xy, xy_control_a; available keys={list(data.files)}")
+
+
 def _cfg_list(value: Any) -> list[Any] | None:
     if value is None:
         return None
@@ -297,12 +310,15 @@ def _safe_metric_timing(metric_cfg_raw: Any, *, rollout_steps: int, sample_every
 def _metric_config_from_lagrangian(path: Path, metric_cfg_raw: Any) -> dict[str, Any]:
     try:
         with np.load(path, allow_pickle=False) as data:
-            if "xy_control_a" not in data.files:
-                raise KeyError(f"missing xy_control_a; available keys={list(data.files)}")
-            xy = np.asarray(data["xy_control_a"], dtype=np.float32)
+            xy_key = _primary_lagrangian_xy_key(data)
+            xy = np.asarray(data[xy_key], dtype=np.float32)
             sample_every, rollout_steps = _infer_lagrangian_timing(data, xy)
     except Exception as exc:
         raise ValueError(f"invalid lagrangian npz used for metric config path={path} {_file_probe(path)} error={type(exc).__name__}: {exc}") from exc
+    return _metric_config_from_timing(metric_cfg_raw, rollout_steps=rollout_steps, sample_every=sample_every)
+
+
+def _metric_config_from_timing(metric_cfg_raw: Any, *, rollout_steps: int, sample_every: int) -> dict[str, Any]:
     timing = _safe_metric_timing(metric_cfg_raw, rollout_steps=rollout_steps, sample_every=sample_every)
     args = SimpleNamespace(
         rollout_steps=rollout_steps,
@@ -331,6 +347,10 @@ def _metric_config_from_lagrangian(path: Path, metric_cfg_raw: Any) -> dict[str,
         metric_preprocess_mode=str(cfg_get(metric_cfg_raw, "metric_preprocess_mode", "clip")),
         metric_scales=cfg_get(metric_cfg_raw, "metric_scales", None),
         metric_scale_weights=cfg_get(metric_cfg_raw, "metric_scale_weights", None),
+        metric_delta_h_floor=float(cfg_get(metric_cfg_raw, "metric_delta_h_floor", 0.0)),
+        metric_msc_floor=cfg_get(metric_cfg_raw, "metric_msc_floor", 0.01),
+        metric_msc_term=str(cfg_get(metric_cfg_raw, "metric_msc_term", "floor_reconstruction_error")),
+        metric_msc_normalize_by_weight_sum=bool(cfg_get(metric_cfg_raw, "metric_msc_normalize_by_weight_sum", True)),
         metric_alpha=float(cfg_get(metric_cfg_raw, "metric_alpha", 0.0)),
         metric_beta=float(cfg_get(metric_cfg_raw, "metric_beta", 1.0)),
         metric_eps=float(cfg_get(metric_cfg_raw, "metric_eps", 1e-12)),
@@ -373,6 +393,39 @@ def _c1_source_mode(ds_cfg: Any) -> str:
     return str(cfg_get(c1_cfg, "source", "frustration_lagrangian")).strip().lower()
 
 
+def _c1_uses_apf(ds_cfg: Any) -> bool:
+    return _c1_source_mode(ds_cfg) in {
+        "apf",
+        "apf_metrics",
+        "arun",
+        "arun_lagrangian_apf",
+        "apf_lagrangian_split",
+        "apf_temporal_holdout",
+    }
+
+
+def _c1_uses_apf_lagrangian_split(ds_cfg: Any) -> bool:
+    return _c1_source_mode(ds_cfg) in {"apf_lagrangian_split", "apf_temporal_holdout"}
+
+
+def _c1_uses_lagrangian_root(ds_cfg: Any) -> bool:
+    return _c1_source_mode(ds_cfg) in {"lagrangian_root", "c1_lagrangian", "trajectory_root", "trajectories"}
+
+
+def _c1_lagrangian_roots(ds_cfg: Any) -> list[Path]:
+    c1_cfg = cfg_get(ds_cfg, "c1", {})
+    roots_raw = cfg_get(c1_cfg, "lagrangian_roots", None)
+    if roots_raw is None:
+        root_raw = cfg_get(c1_cfg, "lagrangian_root", None) or cfg_get(c1_cfg, "trajectory_root", None)
+        roots_raw = [] if root_raw is None else [root_raw]
+    roots = []
+    for raw in as_list(roots_raw):
+        path = resolve_path(raw)
+        if path is not None and Path(path).exists():
+            roots.append(Path(path))
+    return roots
+
+
 def _manifest_path(root: Path, raw: Any, *, default: Path) -> Path:
     if raw is None or str(raw) == "":
         return default
@@ -388,11 +441,13 @@ def _iter_apf_metric_items(root: Path) -> list[dict[str, Any]]:
         for idx, row in enumerate(payload.get("trajectories", [])):
             traj_id = str(row.get("traj_id", f"flow_opt_{idx:03d}"))
             traj_dir = _manifest_path(root, row.get("traj_dir"), default=root / traj_id)
+            apf_dir = _manifest_path(root, row.get("apf_dir"), default=traj_dir / "apf_logs")
             metrics_path = _manifest_path(root, row.get("metrics_path"), default=traj_dir / "metrics.npz")
             candidate_kind = _canonicalize_kind(row.get("candidate_kind", row.get("candidate_label", "optimized")), row.get("candidate_label", None))
             items.append(
                 {
                     "traj_id": traj_id,
+                    "selection_idx": int(row.get("selection_idx", idx)),
                     "optimized_run_idx": int(row.get("suite_run_idx", row.get("selection_idx", idx))),
                     "source_optimized_run_idx": int(row.get("source_run_idx", row.get("suite_run_idx", idx))),
                     "source_root_rank": int(row.get("source_root_rank", -1)),
@@ -403,6 +458,7 @@ def _iter_apf_metric_items(root: Path) -> list[dict[str, Any]]:
                     "candidate_idx": int(row.get("candidate_idx", 0)),
                     "candidate_label": str(row.get("candidate_label", candidate_kind)),
                     "traj_dir": traj_dir,
+                    "apf_dir": apf_dir,
                     "metrics_path": metrics_path,
                 }
             )
@@ -415,6 +471,7 @@ def _iter_apf_metric_items(root: Path) -> list[dict[str, Any]]:
         items.append(
             {
                 "traj_id": traj_dir.name,
+                "selection_idx": idx,
                 "optimized_run_idx": idx,
                 "source_optimized_run_idx": idx,
                 "source_root_rank": -1,
@@ -425,10 +482,348 @@ def _iter_apf_metric_items(root: Path) -> list[dict[str, Any]]:
                 "candidate_idx": 0,
                 "candidate_label": traj_dir.name,
                 "traj_dir": traj_dir,
+                "apf_dir": traj_dir / "apf_logs",
                 "metrics_path": metrics_path,
             }
         )
     return items
+
+
+def _apf_sample_every(steps: np.ndarray) -> int:
+    diffs = np.diff(np.asarray(steps, dtype=np.int64).reshape(-1))
+    positive = diffs[diffs > 0]
+    if positive.size == 0:
+        raise ValueError("Cannot infer APF lagrangian sample interval from fewer than two increasing steps.")
+    return int(round(float(np.median(positive))))
+
+
+def _slice_apf_lagrangian(
+    steps: np.ndarray,
+    lagrangian_xy: np.ndarray,
+    *,
+    start_steps: int,
+    end_steps: int,
+    sample_every: int,
+    context: str,
+) -> np.ndarray:
+    steps = np.asarray(steps, dtype=np.int64).reshape(-1)
+    xy = np.asarray(lagrangian_xy, dtype=np.float32)
+    if steps.shape[0] != xy.shape[0]:
+        raise ValueError(f"{context}: steps/lagrangian length mismatch: steps={steps.shape[0]}, xy={xy.shape[0]}.")
+    start_steps = int(start_steps)
+    end_steps = int(end_steps)
+    if end_steps <= start_steps:
+        raise ValueError(f"{context}: invalid APF holdout range {start_steps}..{end_steps}.")
+    if (end_steps - start_steps) % int(sample_every) != 0:
+        raise ValueError(
+            f"{context}: APF holdout range {start_steps}..{end_steps} is not divisible by sample_every={sample_every}."
+        )
+    mask = (steps > start_steps) & (steps <= end_steps)
+    out = xy[mask]
+    expected = int((end_steps - start_steps) // int(sample_every))
+    if int(out.shape[0]) != expected:
+        available_min = int(np.nanmin(steps)) if steps.size else None
+        available_max = int(np.nanmax(steps)) if steps.size else None
+        raise ValueError(
+            f"{context}: APF holdout range {start_steps}..{end_steps} has {out.shape[0]} samples, expected {expected}; "
+            f"available step span is {available_min}..{available_max}."
+        )
+    return out
+
+
+def _absolute_window_steps(info: dict[str, np.ndarray], *, range_start_steps: int, window_size_steps: int) -> tuple[np.ndarray, np.ndarray]:
+    starts = np.asarray(info["window_start_steps"], dtype=np.int64).reshape(-1) + int(range_start_steps)
+    ends = starts + int(window_size_steps)
+    return starts, ends
+
+
+def _interleaved_window_masks(n_windows: int) -> tuple[np.ndarray, np.ndarray]:
+    idx = np.arange(int(n_windows), dtype=np.int64)
+    selection = (idx % 2) == 0
+    evaluation = ~selection
+    if not np.any(selection) or not np.any(evaluation):
+        raise ValueError(f"Need at least one selection and one eval window for interleaved C1 split, got W={n_windows}.")
+    return selection, evaluation
+
+
+def _preprocess_delta_h_for_score(metric_cfg: dict[str, Any], h: np.ndarray) -> np.ndarray:
+    mode = str(metric_cfg.get("preprocess_mode", "clip"))
+    out = np.asarray(h, dtype=np.float64)
+    if mode == "clip":
+        out = np.maximum(out, 0.0)
+    elif mode == "shift":
+        out = out - np.nanmin(out)
+    elif mode != "none":
+        raise ValueError(f"Unknown metric preprocess mode: {mode!r}")
+    floor = float(metric_cfg.get("delta_h_floor", 0.0) or 0.0)
+    if floor > 0.0:
+        out = np.where(out >= floor, out, 0.0)
+    return out
+
+
+def _score_processed_h(metric_cfg: dict[str, Any], h_pos: np.ndarray) -> tuple[float, float, float]:
+    h_pos = np.asarray(h_pos, dtype=np.float64).reshape(-1)
+    if h_pos.size == 0:
+        raise ValueError("Cannot score empty Delta-H window subset.")
+    amp = float(np.nanmean(h_pos))
+    eps = float(metric_cfg.get("eps", 1e-12))
+    msc_floor = float(metric_cfg.get("msc_floor", metric_cfg.get("delta_h_floor", 0.0)) or 0.0)
+    msc_term = str(metric_cfg.get("msc_term", "overlap"))
+    valid_pairs = []
+    for r_raw, w_raw in metric_cfg.get("scale_pairs", []):
+        r = int(r_raw)
+        if r <= 0 or h_pos.size // (2 * r) < 1:
+            continue
+        valid_pairs.append((r, float(w_raw)))
+    if str(metric_cfg.get("scale_normalization", "none")) == "sum_weight_r":
+        weight_denom = float(sum(w for _r, w in valid_pairs)) + eps
+    else:
+        weight_denom = 1.0
+    msc = 0.0
+    for r, wr in valid_pairs:
+        U_r = h_pos.size // r
+        U_2r = h_pos.size // (2 * r)
+        if U_r < 1 or U_2r < 1:
+            continue
+        g_r = np.mean(h_pos[: U_r * r].reshape(U_r, r), axis=1)
+        g_2r = np.mean(h_pos[: U_2r * (2 * r)].reshape(U_2r, 2 * r), axis=1)
+        U_cmp = min(g_r.shape[0], 2 * g_2r.shape[0])
+        if U_cmp < 1:
+            continue
+        g_r_cmp = g_r[:U_cmp]
+        up = np.repeat(g_2r, 2)[:U_cmp]
+        if msc_term == "floor_reconstruction_error":
+            numerator = float(np.nanmean((g_r_cmp - up) ** 2))
+            denominator = float(np.nanmean(g_r_cmp * g_r_cmp)) + msc_floor * msc_floor + eps
+            d_r = numerator / denominator
+        else:
+            overlap = float(np.nansum(g_r_cmp * up))
+            power = float(np.nansum(g_r_cmp * g_r_cmp))
+            d_r = 1.0 - overlap / (power + eps) if power > eps else 0.0
+        msc += (wr * d_r) / weight_denom
+    score = float(metric_cfg.get("alpha", 0.0)) * amp + float(metric_cfg.get("beta", 1.0)) * float(msc)
+    return float(score), float(amp), float(msc)
+
+
+def _score_delta_h_map_subset(
+    metric_cfg: dict[str, Any],
+    delta_h_map: np.ndarray,
+    mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    full = np.asarray(delta_h_map, dtype=np.float64)
+    if full.ndim != 2:
+        raise ValueError(f"Expected delta_h_map with shape (n_tau, n_windows), got {full.shape}.")
+    mask = np.asarray(mask, dtype=bool).reshape(-1)
+    if mask.size != full.shape[1]:
+        raise ValueError(f"Window mask length {mask.size} does not match delta_h_map W={full.shape[1]}.")
+    subset_raw = full[:, mask]
+    scores, amps, mscs = [], [], []
+    for row in subset_raw:
+        h_pos = _preprocess_delta_h_for_score(metric_cfg, row)
+        score, amp, msc = _score_processed_h(metric_cfg, h_pos)
+        scores.append(score)
+        amps.append(amp)
+        mscs.append(msc)
+    return (
+        np.asarray(scores, dtype=np.float64),
+        np.asarray(amps, dtype=np.float64),
+        np.asarray(mscs, dtype=np.float64),
+        subset_raw,
+    )
+
+
+def _compute_c1_from_apf_lagrangian_split(
+    dataset_name: str,
+    ds_cfg: Any,
+    output_dir: Path,
+    *,
+    force: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    c1_cfg = cfg_get(ds_cfg, "c1", {})
+    metric_cfg_raw = cfg_get(c1_cfg, "metric", {})
+    root = resolve_path(cfg_get(c1_cfg, "apf_root", None))
+    if root is None or not root.exists():
+        raise FileNotFoundError(f"{dataset_name}: C1 apf_root not found: {root}")
+    items = _iter_apf_metric_items(root)
+    if not items:
+        raise FileNotFoundError(f"{dataset_name}: no APF trajectory items found under {root}")
+
+    range_start_raw = cfg_get(c1_cfg, "expected_window_start_steps", None)
+    range_end_raw = cfg_get(c1_cfg, "expected_window_end_steps", None)
+    if range_start_raw is None or range_end_raw is None:
+        raise ValueError(
+            f"{dataset_name}: apf_lagrangian_split requires c1.expected_window_start_steps and c1.expected_window_end_steps."
+        )
+    range_start = int(range_start_raw)
+    range_end = int(range_end_raw)
+    if range_end <= range_start:
+        raise ValueError(f"{dataset_name}: invalid C1 APF range {range_start}..{range_end}.")
+    require_random = bool(cfg_get(c1_cfg, "require_random", True))
+
+    maps_dir = ensure_dir(output_dir / "c1_delta_h_maps")
+    if force:
+        for stale in maps_dir.glob("*_c1_maps.npz"):
+            stale.unlink()
+
+    first_steps, first_lag = _load_lagrangian_series(Path(items[0]["apf_dir"]))
+    sample_every = _apf_sample_every(first_steps)
+    full_len = range_end - range_start
+    metric_cfg = _metric_config_from_timing(metric_cfg_raw, rollout_steps=full_len, sample_every=sample_every)
+    metric_eval = jax.jit(make_metric_loss_fn(metric_cfg, include_maps=True))
+    window_size_steps = int(metric_cfg["window_size_frames"]) * int(metric_cfg["sample_every_steps"])
+
+    score_rows: list[dict[str, Any]] = []
+    log_event(
+        f"{dataset_name}: C1 APF interleaved holdout start n_items={len(items)} root={root} "
+        f"range={range_start}..{range_end} selection_windows=2k eval_windows=2k+1",
+        component="posthoc",
+    )
+    for idx, item in enumerate(items, start=1):
+        apf_dir = Path(item["apf_dir"])
+        if idx == 1 or idx == len(items) or idx % 5 == 0:
+            log_event(
+                f"{dataset_name}: C1 APF interleaved scoring {idx}/{len(items)} traj={item['traj_id']} apf={apf_dir}",
+                component="posthoc",
+            )
+        try:
+            steps, lag = (first_steps, first_lag) if idx == 1 else _load_lagrangian_series(apf_dir)
+            sample_every_i = _apf_sample_every(steps)
+            if sample_every_i != sample_every:
+                raise ValueError(f"sample_every mismatch: got {sample_every_i}, expected {sample_every}")
+            xy_full = _slice_apf_lagrangian(
+                steps,
+                lag,
+                start_steps=range_start,
+                end_steps=range_end,
+                sample_every=sample_every,
+                context=f"{dataset_name}: {item['traj_id']} full_range",
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"{dataset_name}: invalid C1 APF lagrangian path={apf_dir} error={type(exc).__name__}: {exc}"
+            ) from exc
+
+        metric_seed = 10_000_000 + int(item.get("selection_idx", idx - 1))
+        info = _score_maps(metric_eval, metric_seed, xy_full)
+        full_map = np.asarray(info["delta_h_map"], dtype=np.float64)
+        selection_mask, eval_mask = _interleaved_window_masks(full_map.shape[1])
+        sel_score_by_tau, sel_amp_by_tau, sel_msc_by_tau, sel_map = _score_delta_h_map_subset(
+            metric_cfg,
+            full_map,
+            selection_mask,
+        )
+        eval_score_by_tau, eval_amp_by_tau, eval_msc_by_tau, eval_map = _score_delta_h_map_subset(
+            metric_cfg,
+            full_map,
+            eval_mask,
+        )
+        tau_steps = np.asarray(info["tau_steps"], dtype=np.int32)
+        selected_idx = int(np.nanargmax(sel_score_by_tau))
+        eval_values = eval_map[selected_idx]
+        full_window_start, full_window_end = _absolute_window_steps(
+            info,
+            range_start_steps=range_start,
+            window_size_steps=window_size_steps,
+        )
+        sel_window_start = full_window_start[selection_mask]
+        sel_window_end = full_window_end[selection_mask]
+        eval_window_start = full_window_start[eval_mask]
+        eval_window_end = full_window_end[eval_mask]
+
+        trial_uid = str(item["traj_id"])
+        maps_path = maps_dir / f"{trial_uid}_c1_maps.npz"
+        np.savez_compressed(
+            maps_path,
+            delta_h_selection=sel_map,
+            delta_h_eval=eval_map,
+            tau_steps=tau_steps,
+            window_start_steps=eval_window_start.astype(np.int64),
+            window_end_steps=eval_window_end.astype(np.int64),
+            selection_window_start_steps=sel_window_start.astype(np.int64),
+            selection_window_end_steps=sel_window_end.astype(np.int64),
+            eval_window_start_steps=eval_window_start.astype(np.int64),
+            eval_window_end_steps=eval_window_end.astype(np.int64),
+            selection_score_by_tau=sel_score_by_tau,
+            eval_score_by_tau=eval_score_by_tau,
+            selection_amp_by_tau=sel_amp_by_tau,
+            eval_amp_by_tau=eval_amp_by_tau,
+            selection_msc_by_tau=sel_msc_by_tau,
+            eval_msc_by_tau=eval_msc_by_tau,
+            selected_tau_idx=np.asarray(selected_idx, dtype=np.int32),
+            apf_dir=str(apf_dir),
+        )
+        score_rows.append(
+            {
+                "dataset": dataset_name,
+                "trial_idx": idx - 1,
+                "trial_uid": trial_uid,
+                "source_root": str(item.get("source_root", root)),
+                "source_root_rank": int(item.get("source_root_rank", -1)),
+                "source_root_name": str(item.get("source_root_name", "arun_lagrangian_apf_500k")),
+                "source_optimized_run_idx": int(item.get("source_optimized_run_idx", idx - 1)),
+                "optimized_run_idx": int(item.get("optimized_run_idx", idx - 1)),
+                "candidate_kind": str(item.get("candidate_kind", "optimized")),
+                "candidate_idx": int(item.get("candidate_idx", 0)),
+                "candidate_label": str(item.get("candidate_label", item.get("candidate_kind", "optimized"))),
+                "selected_tau_idx": selected_idx,
+                "selected_tau_steps": int(tau_steps[selected_idx]),
+                "selection_score_mspd": float(sel_score_by_tau[selected_idx]),
+                "selection_amp": float(sel_amp_by_tau[selected_idx]),
+                "selection_msc": float(sel_msc_by_tau[selected_idx]),
+                "eval_score_mspd": float(eval_score_by_tau[selected_idx]),
+                "eval_amp": float(eval_amp_by_tau[selected_idx]),
+                "eval_msc": float(eval_msc_by_tau[selected_idx]),
+                "selection_delta_h_mean": float(np.nanmean(sel_map[selected_idx])),
+                "selection_delta_h_median": float(np.nanmedian(sel_map[selected_idx])),
+                "selection_delta_h_std": float(np.nanstd(sel_map[selected_idx])),
+                "eval_delta_h_mean": float(np.nanmean(eval_values)),
+                "eval_delta_h_median": float(np.nanmedian(eval_values)),
+                "eval_delta_h_std": float(np.nanstd(eval_values)),
+                "window_start_min_steps": int(np.nanmin(eval_window_start)),
+                "window_end_max_steps": int(np.nanmax(eval_window_end)),
+                "selection_window_start_min_steps": int(np.nanmin(sel_window_start)),
+                "selection_window_end_max_steps": int(np.nanmax(sel_window_end)),
+                "eval_window_start_min_steps": int(np.nanmin(eval_window_start)),
+                "eval_window_end_max_steps": int(np.nanmax(eval_window_end)),
+                "apf_dir": str(apf_dir),
+                "maps_path": str(maps_path),
+                "c1_source": "apf_lagrangian_split",
+                "c1_eval_mode": "interleaved_windows_2k_vs_2k_plus_1",
+            }
+        )
+
+    score_df = pd.DataFrame(score_rows)
+    contrast_df = _group_contrasts(score_df, "eval_score_mspd")
+    n_random_rows = int((score_df["candidate_kind"] == "random").sum()) if "candidate_kind" in score_df.columns else 0
+    if require_random and n_random_rows == 0:
+        for stale in (output_dir / "group_contrasts.csv", output_dir / "checkpoint_scores.csv"):
+            if stale.exists():
+                stale.unlink()
+        raise ValueError(
+            f"{dataset_name}: C1 APF interleaved holdout source {root} has no candidate_kind=random rows. "
+            "Refusing to report optimized-only C1 as a matched contrast."
+        )
+    if require_random and contrast_df.empty:
+        raise ValueError(f"{dataset_name}: C1 APF interleaved holdout source {root} has random rows but no matched groups.")
+    score_df.to_csv(output_dir / "checkpoint_scores.csv", index=False)
+    contrast_df.to_csv(output_dir / "group_contrasts.csv", index=False)
+    summary = sign_test_greater(contrast_df["delta_vs_random_median"].tolist())
+    summary.update(
+        {
+            "source": "apf_lagrangian_split",
+            "apf_root": str(root),
+            "range_steps": [int(range_start), int(range_end)],
+            "holdout_split": "interleaved_windows_2k_vs_2k_plus_1",
+            "n_scores": int(len(score_df)),
+            "n_contrasts": int(len(contrast_df)),
+            "n_random_rows": int(n_random_rows),
+        }
+    )
+    log_event(
+        f"{dataset_name}: C1 APF interleaved holdout done n_scores={len(score_df)} n_contrasts={len(contrast_df)} output={output_dir}",
+        component="posthoc",
+    )
+    return score_df, contrast_df, summary
 
 
 def _compute_c1_from_apf_metrics(
@@ -439,6 +834,7 @@ def _compute_c1_from_apf_metrics(
     force: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     c1_cfg = cfg_get(ds_cfg, "c1", {})
+    metric_cfg_raw = cfg_get(c1_cfg, "metric", {})
     root = resolve_path(cfg_get(c1_cfg, "apf_root", None))
     if root is None or not root.exists():
         raise FileNotFoundError(f"{dataset_name}: C1 apf_root not found: {root}")
@@ -489,11 +885,15 @@ def _compute_c1_from_apf_metrics(
                 selected_idx = int(np.asarray(data["delta_h_selected_tau_idx"]).reshape(-1)[0])
                 window_start_steps = np.asarray(data["delta_h_window_start_steps"], dtype=np.int64).reshape(-1)
                 window_end_steps = np.asarray(data["delta_h_window_end_steps"], dtype=np.int64).reshape(-1)
+                if "delta_h_sample_every_steps" in data.files:
+                    sample_every_steps = int(np.asarray(data["delta_h_sample_every_steps"]).reshape(-1)[0])
+                else:
+                    diffs = np.diff(window_start_steps)
+                    positive = diffs[diffs > 0]
+                    sample_every_steps = int(np.gcd.reduce(positive.astype(np.int64))) if positive.size else 1
         except Exception as exc:
             raise ValueError(f"{dataset_name}: invalid C1 APF metrics path={metrics_path} {_file_probe(metrics_path)} error={type(exc).__name__}: {exc}") from exc
 
-        if selected_idx < 0 or selected_idx >= int(score_by_tau.shape[0]):
-            selected_idx = int(np.nanargmax(score_by_tau))
         if expected_start is not None and int(np.nanmin(window_start_steps)) != expected_start:
             raise ValueError(
                 f"{dataset_name}: C1 APF metrics range mismatch for {metrics_path}: "
@@ -505,25 +905,39 @@ def _compute_c1_from_apf_metrics(
                 f"last_end={int(np.nanmax(window_end_steps))}, expected {expected_end}."
             )
 
+        rollout_steps = int(np.nanmax(window_end_steps) - np.nanmin(window_start_steps))
+        metric_cfg = _metric_config_from_timing(metric_cfg_raw, rollout_steps=rollout_steps, sample_every=max(1, sample_every_steps))
+        selection_mask, eval_mask = _interleaved_window_masks(delta_h_map.shape[1])
+        sel_score_by_tau, sel_amp_by_tau, sel_msc_by_tau, sel_map = _score_delta_h_map_subset(metric_cfg, delta_h_map, selection_mask)
+        eval_score_by_tau, eval_amp_by_tau, eval_msc_by_tau, eval_map = _score_delta_h_map_subset(metric_cfg, delta_h_map, eval_mask)
+        selected_idx = int(np.nanargmax(sel_score_by_tau))
+        sel_window_start = window_start_steps[selection_mask]
+        sel_window_end = window_end_steps[selection_mask]
+        eval_window_start = window_start_steps[eval_mask]
+        eval_window_end = window_end_steps[eval_mask]
         trial_uid = str(item["traj_id"])
         maps_path = maps_dir / f"{trial_uid}_c1_maps.npz"
         np.savez_compressed(
             maps_path,
-            delta_h_selection=delta_h_map,
-            delta_h_eval=delta_h_map,
+            delta_h_selection=sel_map,
+            delta_h_eval=eval_map,
             tau_steps=tau_steps,
-            window_start_steps=window_start_steps.astype(np.int64),
-            window_end_steps=window_end_steps.astype(np.int64),
-            selection_score_by_tau=score_by_tau,
-            eval_score_by_tau=score_by_tau,
-            selection_amp_by_tau=amp_by_tau,
-            eval_amp_by_tau=amp_by_tau,
-            selection_msc_by_tau=msc_by_tau,
-            eval_msc_by_tau=msc_by_tau,
+            window_start_steps=eval_window_start.astype(np.int64),
+            window_end_steps=eval_window_end.astype(np.int64),
+            selection_window_start_steps=sel_window_start.astype(np.int64),
+            selection_window_end_steps=sel_window_end.astype(np.int64),
+            eval_window_start_steps=eval_window_start.astype(np.int64),
+            eval_window_end_steps=eval_window_end.astype(np.int64),
+            selection_score_by_tau=sel_score_by_tau,
+            eval_score_by_tau=eval_score_by_tau,
+            selection_amp_by_tau=sel_amp_by_tau,
+            eval_amp_by_tau=eval_amp_by_tau,
+            selection_msc_by_tau=sel_msc_by_tau,
+            eval_msc_by_tau=eval_msc_by_tau,
             selected_tau_idx=np.asarray(selected_idx, dtype=np.int32),
             source_metrics_path=str(metrics_path),
         )
-        eval_values = delta_h_map[selected_idx]
+        eval_values = eval_map[selected_idx]
         score_rows.append(
             {
                 "dataset": dataset_name,
@@ -539,21 +953,25 @@ def _compute_c1_from_apf_metrics(
                 "candidate_label": str(item.get("candidate_label", item.get("candidate_kind", "optimized"))),
                 "selected_tau_idx": selected_idx,
                 "selected_tau_steps": int(tau_steps[selected_idx]),
-                "selection_score_mspd": float(score_by_tau[selected_idx]),
-                "selection_amp": float(amp_by_tau[selected_idx]),
-                "selection_msc": float(msc_by_tau[selected_idx]),
-                "eval_score_mspd": float(score_by_tau[selected_idx]),
-                "eval_amp": float(amp_by_tau[selected_idx]),
-                "eval_msc": float(msc_by_tau[selected_idx]),
+                "selection_score_mspd": float(sel_score_by_tau[selected_idx]),
+                "selection_amp": float(sel_amp_by_tau[selected_idx]),
+                "selection_msc": float(sel_msc_by_tau[selected_idx]),
+                "eval_score_mspd": float(eval_score_by_tau[selected_idx]),
+                "eval_amp": float(eval_amp_by_tau[selected_idx]),
+                "eval_msc": float(eval_msc_by_tau[selected_idx]),
                 "eval_delta_h_mean": float(np.nanmean(eval_values)),
                 "eval_delta_h_median": float(np.nanmedian(eval_values)),
                 "eval_delta_h_std": float(np.nanstd(eval_values)),
-                "window_start_min_steps": int(np.nanmin(window_start_steps)),
-                "window_end_max_steps": int(np.nanmax(window_end_steps)),
+                "window_start_min_steps": int(np.nanmin(eval_window_start)),
+                "window_end_max_steps": int(np.nanmax(eval_window_end)),
+                "selection_window_start_min_steps": int(np.nanmin(sel_window_start)),
+                "selection_window_end_max_steps": int(np.nanmax(sel_window_end)),
+                "eval_window_start_min_steps": int(np.nanmin(eval_window_start)),
+                "eval_window_end_max_steps": int(np.nanmax(eval_window_end)),
                 "metrics_path": str(metrics_path),
                 "maps_path": str(maps_path),
                 "c1_source": "apf_metrics",
-                "c1_eval_mode": "single_arun_trajectory",
+                "c1_eval_mode": "interleaved_windows_2k_vs_2k_plus_1_from_cached_apf_metrics",
             }
         )
 
@@ -609,7 +1027,13 @@ def _compute_c1(
     *,
     force: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    metric_cfg_raw = cfg_get(cfg_get(ds_cfg, "c1", {}), "metric", {})
+    c1_cfg = cfg_get(ds_cfg, "c1", {})
+    metric_cfg_raw = cfg_get(c1_cfg, "metric", {})
+    expected_start_raw = cfg_get(c1_cfg, "expected_trajectory_start_steps", None)
+    expected_end_raw = cfg_get(c1_cfg, "expected_trajectory_end_steps", None)
+    expected_start = None if expected_start_raw is None else int(expected_start_raw)
+    expected_end = None if expected_end_raw is None else int(expected_end_raw)
+    require_random = bool(cfg_get(c1_cfg, "require_random", False))
     available = rows.copy()
     available["lagrangian_abs_path"] = [_resolve_artifact(row, "lagrangian_path") for _, row in available.iterrows()]
     available = available[[path is not None and Path(path).exists() for path in available["lagrangian_abs_path"]]].reset_index(drop=True)
@@ -632,28 +1056,55 @@ def _compute_c1(
                 f"{dataset_name}: C1 scoring {idx}/{total} trial_idx={row.get('trial_idx', 'na')} path={lag_path}",
                 component="posthoc",
             )
-        arrays = _load_npz_arrays(
-            lag_path,
-            ["xy_control_a", "xy_control_b"],
-            context=f"{dataset_name}: C1 trial_idx={row.get('trial_idx', 'na')} row={idx}/{total}",
-        )
-        xy_sel = np.asarray(arrays["xy_control_a"], dtype=np.float32)
-        xy_eval = np.asarray(arrays["xy_control_b"], dtype=np.float32)
+        trajectory_key_cfg = cfg_get(c1_cfg, "trajectory_key", None)
+        try:
+            with np.load(lag_path, allow_pickle=False) as data:
+                trajectory_key = _primary_lagrangian_xy_key(data, trajectory_key_cfg)
+                xy_primary = np.asarray(data[trajectory_key], dtype=np.float32)
+                if expected_start is not None:
+                    if "trajectory_start_steps" not in data.files:
+                        raise ValueError(f"{dataset_name}: C1 {lag_path} missing trajectory_start_steps.")
+                    actual_start = int(np.asarray(data["trajectory_start_steps"]).item())
+                    if actual_start != expected_start:
+                        raise ValueError(
+                            f"{dataset_name}: C1 trajectory range mismatch for {lag_path}: "
+                            f"start={actual_start}, expected {expected_start}."
+                        )
+                if expected_end is not None:
+                    if "trajectory_end_steps" not in data.files:
+                        raise ValueError(f"{dataset_name}: C1 {lag_path} missing trajectory_end_steps.")
+                    actual_end = int(np.asarray(data["trajectory_end_steps"]).item())
+                    if actual_end != expected_end:
+                        raise ValueError(
+                            f"{dataset_name}: C1 trajectory range mismatch for {lag_path}: "
+                            f"end={actual_end}, expected {expected_end}."
+                        )
+        except Exception as exc:
+            raise ValueError(
+                f"{dataset_name}: invalid C1 lagrangian trajectory path={lag_path} {_file_probe(lag_path)} "
+                f"error={type(exc).__name__}: {exc}"
+            ) from exc
         metric_seed = int(row.get("metric_seed", row.get("seed_x", 0) + 10_000_000))
-        sel_info = _score_maps(metric_eval, metric_seed, xy_sel)
-        eval_info = _score_maps(metric_eval, metric_seed + 1, xy_eval)
-        sel_map = np.asarray(sel_info["delta_h_map"], dtype=np.float64)
-        eval_map = np.asarray(eval_info["delta_h_map"], dtype=np.float64)
-        sel_score_by_tau = np.asarray(sel_info["score_by_tau"], dtype=np.float64).reshape(-1)
-        eval_score_by_tau = np.asarray(eval_info["score_by_tau"], dtype=np.float64).reshape(-1)
-        sel_amp_by_tau = np.asarray(sel_info["amp_by_tau"], dtype=np.float64).reshape(-1)
-        eval_amp_by_tau = np.asarray(eval_info["amp_by_tau"], dtype=np.float64).reshape(-1)
-        sel_msc_by_tau = np.asarray(sel_info["msc_by_tau"], dtype=np.float64).reshape(-1)
-        eval_msc_by_tau = np.asarray(eval_info["msc_by_tau"], dtype=np.float64).reshape(-1)
+        info = _score_maps(metric_eval, metric_seed, xy_primary)
+        full_map = np.asarray(info["delta_h_map"], dtype=np.float64)
+        selection_mask, eval_mask = _interleaved_window_masks(full_map.shape[1])
+        sel_score_by_tau, sel_amp_by_tau, sel_msc_by_tau, sel_map = _score_delta_h_map_subset(
+            metric_cfg,
+            full_map,
+            selection_mask,
+        )
+        eval_score_by_tau, eval_amp_by_tau, eval_msc_by_tau, eval_map = _score_delta_h_map_subset(
+            metric_cfg,
+            full_map,
+            eval_mask,
+        )
         selected_idx = int(np.nanargmax(sel_score_by_tau))
-        tau_steps = np.asarray(sel_info["tau_steps"], dtype=np.int32)
+        tau_steps = np.asarray(info["tau_steps"], dtype=np.int32)
         eval_values = eval_map[selected_idx]
         eval_score_mspd = float(eval_score_by_tau[selected_idx])
+        full_window_start = np.asarray(info["window_start_steps"], dtype=np.int64).reshape(-1)
+        sel_window_start = full_window_start[selection_mask]
+        eval_window_start = full_window_start[eval_mask]
         trial_uid = str(row.get("trial_uid", f"trial_{int(row['trial_idx']):05d}"))
         maps_path = maps_dir / f"{trial_uid}_c1_maps.npz"
         np.savez_compressed(
@@ -661,7 +1112,9 @@ def _compute_c1(
             delta_h_selection=sel_map,
             delta_h_eval=eval_map,
             tau_steps=tau_steps,
-            window_start_steps=np.asarray(sel_info["window_start_steps"], dtype=np.int32),
+            window_start_steps=eval_window_start.astype(np.int64),
+            selection_window_start_steps=sel_window_start.astype(np.int64),
+            eval_window_start_steps=eval_window_start.astype(np.int64),
             selection_score_by_tau=sel_score_by_tau,
             eval_score_by_tau=eval_score_by_tau,
             selection_amp_by_tau=sel_amp_by_tau,
@@ -669,6 +1122,7 @@ def _compute_c1(
             selection_msc_by_tau=sel_msc_by_tau,
             eval_msc_by_tau=eval_msc_by_tau,
             selected_tau_idx=np.asarray(selected_idx, dtype=np.int32),
+            trajectory_key=np.asarray(str(trajectory_key)),
         )
         score_rows.append(
             {
@@ -682,6 +1136,7 @@ def _compute_c1(
                 "optimized_run_idx": int(row["optimized_run_idx"]),
                 "candidate_kind": row["candidate_kind_canon"],
                 "candidate_idx": int(row.get("candidate_idx", 0)),
+                "candidate_label": str(row.get("candidate_label", row["candidate_kind_canon"])),
                 "selected_tau_idx": selected_idx,
                 "selected_tau_steps": int(tau_steps[selected_idx]),
                 "selection_score_mspd": float(sel_score_by_tau[selected_idx]),
@@ -690,21 +1145,54 @@ def _compute_c1(
                 "eval_score_mspd": eval_score_mspd,
                 "eval_amp": float(eval_amp_by_tau[selected_idx]),
                 "eval_msc": float(eval_msc_by_tau[selected_idx]),
+                "selection_delta_h_mean": float(np.nanmean(sel_map[selected_idx])),
+                "selection_delta_h_median": float(np.nanmedian(sel_map[selected_idx])),
+                "selection_delta_h_std": float(np.nanstd(sel_map[selected_idx])),
                 "eval_delta_h_mean": float(np.nanmean(eval_values)),
                 "eval_delta_h_median": float(np.nanmedian(eval_values)),
                 "eval_delta_h_std": float(np.nanstd(eval_values)),
+                "selection_window_start_min_steps": int(np.nanmin(sel_window_start)),
+                "selection_window_start_max_steps": int(np.nanmax(sel_window_start)),
+                "eval_window_start_min_steps": int(np.nanmin(eval_window_start)),
+                "eval_window_start_max_steps": int(np.nanmax(eval_window_start)),
                 "maps_path": str(maps_path),
+                "trajectory_key": str(trajectory_key),
+                "c1_eval_mode": "single_trajectory_interleaved_windows_2k_vs_2k_plus_1",
             }
         )
     score_df = pd.DataFrame(score_rows)
     contrast_df = _group_contrasts(score_df, "eval_score_mspd")
+    n_random_rows = int((score_df["candidate_kind"] == "random").sum()) if "candidate_kind" in score_df.columns else 0
+    if require_random and n_random_rows == 0:
+        for stale in (
+            output_dir / "group_contrasts.csv",
+            output_dir / "checkpoint_scores.csv",
+        ):
+            if stale.exists():
+                stale.unlink()
+        raise ValueError(
+            f"{dataset_name}: C1 lagrangian source has no candidate_kind=random rows. "
+            "Refusing to report optimized-only C1/C6 as a matched contrast."
+        )
+    if require_random and contrast_df.empty:
+        raise ValueError(f"{dataset_name}: C1 lagrangian source has random rows but no matched optimized-vs-random groups.")
     score_df.to_csv(output_dir / "checkpoint_scores.csv", index=False)
     contrast_df.to_csv(output_dir / "group_contrasts.csv", index=False)
     log_event(
         f"{dataset_name}: C1 done n_scores={len(score_df)} n_contrasts={len(contrast_df)} output={output_dir}",
         component="posthoc",
     )
-    return score_df, contrast_df, sign_test_greater(contrast_df["delta_vs_random_median"].tolist())
+    summary = sign_test_greater(contrast_df["delta_vs_random_median"].tolist())
+    summary.update(
+        {
+            "source": _c1_source_mode(ds_cfg),
+            "holdout_split": "interleaved_windows_2k_vs_2k_plus_1",
+            "n_scores": int(len(score_df)),
+            "n_contrasts": int(len(contrast_df)),
+            "n_random_rows": int(n_random_rows),
+        }
+    )
+    return score_df, contrast_df, summary
 
 
 def _group_contrasts(frame: pd.DataFrame, metric: str) -> pd.DataFrame:
@@ -727,6 +1215,14 @@ def _group_contrasts(frame: pd.DataFrame, metric: str) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def _c1_claim_label(dataset_name: str) -> str:
+    return "C6.1" if str(dataset_name) == "plife_plus" else "C1"
+
+
+def _c5_claim_label(dataset_name: str) -> str:
+    return "C6.5" if str(dataset_name) == "plife_plus" else "C5"
 
 
 def _write_analysis_config(output_dir: Path, ds_cfg: Any, frustration_root: Path) -> Path:
@@ -766,8 +1262,15 @@ def _write_analysis_config(output_dir: Path, ds_cfg: Any, frustration_root: Path
             "metric_domain_y": cfg_get(c5_metric, "metric_domain_y", 0.0),
             "metric_domain_x": cfg_get(c5_metric, "metric_domain_x", 0.0),
             "metric_preprocess_mode": cfg_get(c5_metric, "metric_preprocess_mode", "clip"),
-            "metric_alpha": 0.0,
-            "metric_beta": 1.0,
+            "metric_scales": cfg_get(c5_metric, "metric_scales", None),
+            "metric_scale_weights": cfg_get(c5_metric, "metric_scale_weights", None),
+            "metric_delta_h_floor": cfg_get(c5_metric, "metric_delta_h_floor", 0.0),
+            "metric_msc_floor": cfg_get(c5_metric, "metric_msc_floor", 0.01),
+            "metric_msc_term": cfg_get(c5_metric, "metric_msc_term", "floor_reconstruction_error"),
+            "metric_msc_normalize_by_weight_sum": cfg_get(c5_metric, "metric_msc_normalize_by_weight_sum", True),
+            "metric_alpha": cfg_get(c5_metric, "metric_alpha", 0.0),
+            "metric_beta": cfg_get(c5_metric, "metric_beta", 1.0),
+            "metric_eps": cfg_get(c5_metric, "metric_eps", 1e-12),
             "occupancy_bins": 64,
             "pairwise_map_metrics": ["l2", "mean_abs"],
             "fixed_tau_distribution_steps": cfg_get(c5_metric, "fixed_tau_distribution_steps", cfg_get(c5_metric, "metric_tau_steps", 3000)),
@@ -997,8 +1500,11 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
     for dataset_name, ds in datasets:
         ds_out = ensure_dir(output_root / dataset_name)
         log_event(f"{dataset_name}: dataset start output={ds_out}", component="posthoc")
-        c1_apf_source = _c1_source_mode(ds) in {"apf", "apf_metrics", "arun", "arun_lagrangian_apf"}
-        needs_frustration_rows = task in {"all", "c5", "c6"} or (task in {"c1"} and not c1_apf_source)
+        c1_apf_source = _c1_uses_apf(ds)
+        c1_lagrangian_source = _c1_uses_lagrangian_root(ds)
+        needs_frustration_rows = task in {"all", "c5", "c6"} or (
+            task in {"c1"} and not (c1_apf_source or c1_lagrangian_source)
+        )
         fs_roots: list[Path] = []
         if needs_frustration_rows:
             roots_raw = cfg_get(ds, "frustration_roots", None)
@@ -1026,17 +1532,29 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
                 rows = pd.DataFrame()
             status = {"status": "ok", "n_trials": int(rows.shape[0]), "frustration_roots": [str(x) for x in fs_roots]}
             if task in {"all", "c1", "c6"}:
-                if c1_apf_source:
+                if _c1_uses_apf_lagrangian_split(ds):
+                    _scores, contrasts, c1_summary = _compute_c1_from_apf_lagrangian_split(dataset_name, ds, ds_out, force=force)
+                elif c1_apf_source:
                     _scores, contrasts, c1_summary = _compute_c1_from_apf_metrics(dataset_name, ds, ds_out, force=force)
+                elif c1_lagrangian_source:
+                    c1_roots = _c1_lagrangian_roots(ds)
+                    if not c1_roots:
+                        raise ValueError(f"{dataset_name}: C1 lagrangian_root/lagrangian_roots not found.")
+                    log_event(f"{dataset_name}: loading C1 lagrangian roots {[str(x) for x in c1_roots]}", component="posthoc")
+                    c1_rows = _load_trial_rows_many(c1_roots)
+                    log_event(f"{dataset_name}: loaded C1 lagrangian n_trials={c1_rows.shape[0]}", component="posthoc")
+                    status["c1_lagrangian_roots"] = [str(x) for x in c1_roots]
+                    status["c1_lagrangian_trials"] = int(c1_rows.shape[0])
+                    _scores, contrasts, c1_summary = _compute_c1(dataset_name, c1_rows, ds, ds_out, force=force)
                 else:
                     _scores, contrasts, c1_summary = _compute_c1(dataset_name, rows, ds, ds_out, force=force)
                 status["c1"] = c1_summary
-                cross_rows.append({"dataset": dataset_name, "claim": "C1/C6", "metric": "eval_score_mspd", **c1_summary})
+                cross_rows.append({"dataset": dataset_name, "claim": _c1_claim_label(dataset_name), "metric": "eval_score_mspd", **c1_summary})
             if task in {"all", "c5", "c6"}:
                 _run_df, _summary_df, c5_summary = _compute_c5(dataset_name, rows, ds, ds_out)
                 status["c5"] = c5_summary
                 if c5_summary:
-                    cross_rows.append({"dataset": dataset_name, "claim": "C5/C6", "metric": c5_summary.get("metric", "frustration"), **c5_summary})
+                    cross_rows.append({"dataset": dataset_name, "claim": _c5_claim_label(dataset_name), "metric": c5_summary.get("metric", "frustration"), **c5_summary})
             write_json(ds_out / "dataset_summary.json", status)
             overview[dataset_name] = status
             log_event(f"{dataset_name}: dataset done summary={ds_out / 'dataset_summary.json'}", component="posthoc")

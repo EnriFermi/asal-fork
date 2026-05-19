@@ -142,6 +142,8 @@ group.add_argument(
     help="image encoder to use. Supports 'clip', 'siglip2', or a google/siglip2* model id",
 )
 group.add_argument("--time_sampling", type=int, default=32, help="number of images to render during one simulation rollout")
+group.add_argument("--clip_range_start_steps", type=int, default=0, help="first physical step included in CLIP loss samples")
+group.add_argument("--clip_range_end_steps", type=int, default=None, help="last physical step included in CLIP loss samples; defaults to rollout_steps")
 group.add_argument("--prompts", type=str, default="a biological cell;two biological cells", help="prompts to optimize for seperated by ';'")
 group.add_argument("--coef_prompt", type=float, default=0., help="coefficient for ASAL prompt loss")
 group.add_argument("--coef_softmax", type=float, default=0., help="coefficient for softmax loss (only for multiple temporal prompts)")
@@ -661,6 +663,24 @@ def main(args):
         substrate = substrates.FlattenSubstrateParameters(substrate)
         if args.rollout_steps is None:
             args.rollout_steps = substrate.rollout_steps
+        clip_range_start_steps = int(getattr(args, "clip_range_start_steps", 0) or 0)
+        clip_range_end_steps = getattr(args, "clip_range_end_steps", None)
+        clip_range_end_steps = int(args.rollout_steps if clip_range_end_steps is None else clip_range_end_steps)
+        if not (0 <= clip_range_start_steps < clip_range_end_steps <= int(args.rollout_steps)):
+            raise ValueError(
+                "CLIP evaluation window must satisfy "
+                "0 <= clip_range_start_steps < clip_range_end_steps <= rollout_steps, got "
+                f"{clip_range_start_steps}, {clip_range_end_steps}, {int(args.rollout_steps)}."
+            )
+        clip_window_steps = clip_range_end_steps - clip_range_start_steps
+        if clip_window_steps % int(args.time_sampling) != 0:
+            raise ValueError(
+                "CLIP evaluation window length must be divisible by time_sampling, got "
+                f"({clip_range_end_steps} - {clip_range_start_steps}) % {int(args.time_sampling)}."
+            )
+        run.summary["clip_eval/range_start_steps"] = int(clip_range_start_steps)
+        run.summary["clip_eval/range_end_steps"] = int(clip_range_end_steps)
+        run.summary["clip_eval/sample_every_steps"] = int(clip_window_steps // int(args.time_sampling))
         rollout_fn = partial(
             rollout_simulation,
             s0=None,
@@ -670,6 +690,8 @@ def main(args):
             time_sampling=(args.time_sampling, True),
             img_size=rollout_img_size,
             return_state=False,
+            sample_start_steps=clip_range_start_steps,
+            sample_end_steps=clip_range_end_steps,
         )
 
         z_txt = fm.embed_txt(prompts) # P D

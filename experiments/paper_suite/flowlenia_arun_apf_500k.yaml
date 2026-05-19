@@ -41,12 +41,12 @@ rollout:
 
   metric:
     metric_tau_mode: max_grid
-    metric_tau_grid_steps: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000]
+    metric_tau_grid_steps: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 11000, 12000, 13000, 14000, 15000, 16000, 17000, 18000, 19000]
     metric_window_size_steps: 20000
     metric_window_step_steps: 5000
     metric_tau_steps: 3000
     metric_range_start_steps: 100000
-    metric_range_end_steps: 300000
+    metric_range_end_steps: 500000
     metric_window_size_frames: null
     metric_window_step_frames: null
 
@@ -63,6 +63,10 @@ rollout:
     metric_preprocess_mode: clip
     metric_scales: null
     metric_scale_weights: null
+    metric_delta_h_floor: 0.0
+    metric_msc_floor: 0.01
+    metric_msc_term: floor_reconstruction_error
+    metric_msc_normalize_by_weight_sum: true
     metric_alpha: 0.0
     metric_beta: 1.0
     metric_eps: 1.0e-12

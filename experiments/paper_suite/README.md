@@ -145,7 +145,7 @@ C5:
 conda run -n onerec python scripts/run_paper_suite.py experiments/paper_suite/config.yaml --layer metrics --task c5
 ```
 
-C6:
+C6 / C6.1:
 
 ```bash
 conda run -n onerec python scripts/run_paper_suite.py experiments/paper_suite/config.yaml --layer metrics --task c6
@@ -234,11 +234,13 @@ seeds: 1
 scripts/paper_suite_posthoc.py
 ```
 
-Код читает saved `trial_*_lagrangian.npz` из paper-check artifacts и считает selection-adjusted comparison:
+Код читает saved lagrangian artifacts и считает selection-adjusted comparison:
 
 - каждый optimized и random checkpoint выбирает tau по одинаковому rule;
-- selection делается на `control_a`/selection windows;
-- final score считается на held-out `control_b`/evaluation windows;
+- selection делается по четным metric windows `2k`;
+- final score считается на held-out нечетных windows `2k+1`;
+- для Flow-Lenia C1 и PLife++ C6.1 selection/eval maps считаются из одной reusable trajectory per candidate;
+- `control_a/control_b` относятся к C5/C6.5 frustration/history-dependence, не к C6.1;
 - random controls получают такое же право выбрать tau;
 - итоговая статистика считается по matched groups: `optimized - median(random)`.
 
@@ -334,6 +336,12 @@ experiments/paper_check_flow_lenia/checkpoints/arun_lagrangian_apf_500k/flow_opt
 analysis/results/paper_suite/c2_highres_metrics/c2_highres_metrics_manifest.csv
 ```
 
+Every C2 `metrics.npz` stores metric cache metadata: metric config JSON/hash,
+metric code version, tau/window/floor/MSC settings, and an APF chunk input
+identity hash. If those do not match the current config, the metrics layer
+fails loudly unless `--force` is used, in which case metrics are recomputed from
+saved APF chunks without resimulation.
+
 Event summary then reads high-res C2 `metrics.npz` and extracts:
 
 - selected tau.
@@ -363,8 +371,10 @@ Simulation layer:
 
 - читает high-res C2 `metrics.npz`;
 - выбирает high Delta-H локальные времена;
-- подбирает matched low/mid Delta-H времена;
-- пишет `branch_plan.csv`;
+- подбирает matched low/mid Delta-H времена by activity covariates rather than
+  nearest time alone: total mass, active area, mean Lagrangian speed, and field
+  activity when available;
+- пишет `branch_plan.csv` and `branch_plan_meta.json`;
 - при `--allow-heavy` запускает resumed branches через `scripts/flowlenia_minibang_resume.py`;
 - каждый branch получает small perturbation и отдельный `branch_seed`.
 
@@ -390,10 +400,15 @@ Outputs:
 
 ```text
 analysis/results/paper_suite/c2_branching/branch_plan.csv
+analysis/results/paper_suite/c2_branching/branch_plan_meta.json
 analysis/results/paper_suite/c2_branching/branching_scores.csv
 analysis/results/paper_suite/c2_branching/branching_pair_contrasts.csv
 analysis/results/paper_suite/c2_branching_metrics_summary.json
 ```
+
+The branching metrics layer refuses old branch plans without matching metadata
+or with stale upstream `metrics.npz` hashes. Regenerate the branching simulation
+layer after changing C2 metric config.
 
 Default config is deliberately small:
 
@@ -429,7 +444,9 @@ scripts/paper_suite_posthoc.py
 d(control_a, walls) - d(control_a, control_b)
 ```
 
-По embedding axes и Delta-H map axes. Затем агрегирует per matched group:
+По embedding axes и dynamic/MSPD axes. Embedding stays separate; the dynamic
+axis uses the same averaged floor-aware MSC config as C1/C2. Затем агрегирует
+per matched group:
 
 ```text
 optimized - median(random)
@@ -451,7 +468,7 @@ analysis/results/paper_suite/<dataset>/frustration_metric_summary.csv
 scripts/paper_suite_posthoc.py
 ```
 
-Код агрегирует C1/C5 summaries across substrates:
+Код агрегирует C1/C5 summaries across substrates; PLife++ C1-style transfer check is reported as C6.1:
 
 - Flow-Lenia.
 - Particle Life++.

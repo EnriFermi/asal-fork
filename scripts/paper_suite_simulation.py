@@ -90,8 +90,10 @@ def _validate_expected(entry: Any) -> tuple[str, str]:
 def _task_matches(requested: str, entry_task: str) -> bool:
     if requested == "all":
         return True
+    if requested == "paper_check_frustration":
+        return entry_task == "paper_check"
     if requested == "paper_check":
-        return entry_task in {"paper_check", "paper_check_apf"}
+        return entry_task in {"paper_check", "paper_check_apf", "paper_check_c1"}
     if requested == "c2":
         return entry_task in {"c2", "apf", "paper_check_apf"}
     return requested == entry_task
@@ -124,7 +126,7 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
             rows.append({"name": "synthetic_calibration", "layer": "simulation", "status": "ok", "message": str(result), "command": ""})
             log_event(f"simulation synthetic done result={result}", component="simulation")
 
-    if task in {"all", "paper_check", "apf", "c2"}:
+    if task in {"all", "paper_check", "paper_check_frustration", "paper_check_c1", "apf", "c2"}:
         sim_cfg = cfg.get("simulation", {})
         entries = sim_cfg.get("commands", [])
         for entry in entries:
@@ -189,7 +191,11 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Paper-suite simulation layer.")
     parser.add_argument("config")
-    parser.add_argument("--task", choices=["all", "synthetic", "paper_check", "apf", "c2"], default="all")
+    parser.add_argument(
+        "--task",
+        choices=["all", "synthetic", "paper_check", "paper_check_frustration", "paper_check_c1", "apf", "c2"],
+        default="all",
+    )
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--allow-heavy", action="store_true")

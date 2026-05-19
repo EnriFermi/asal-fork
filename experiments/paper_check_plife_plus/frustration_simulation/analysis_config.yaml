@@ -32,9 +32,17 @@ trajectories:
   metric_null_reps: 6
   metric_particle_samples: 64
   metric_dirs_seed: 123
+  metric_periodic: true
+  metric_domain_y: 1.0
+  metric_domain_x: 1.0
   metric_preprocess_mode: clip
+  metric_delta_h_floor: 0.0
+  metric_msc_floor: 0.01
+  metric_msc_term: floor_reconstruction_error
+  metric_msc_normalize_by_weight_sum: true
   metric_alpha: 0.0
   metric_beta: 1.0
+  metric_eps: 1.0e-12
   occupancy_bins: 64
   pairwise_map_metrics:
     - l2
