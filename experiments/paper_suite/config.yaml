@@ -64,6 +64,7 @@ datasets:
       # metrics, not from the legacy late-window frustration artifacts.
       source: apf_metrics
       apf_root: experiments/paper_check_flow_lenia/checkpoints/arun_lagrangian_apf_500k
+      require_random: true
       expected_window_start_steps: 100000
       expected_window_end_steps: 300000
       metric:
@@ -228,12 +229,14 @@ simulation:
     output_root: experiments/paper_check_flow_lenia/checkpoints/arun_lagrangian_apf_500k
     rollout_steps: 500000
     n_trajectories_per_checkpoint: 1
+    include_random_baselines: true
+    num_random_baselines: 3
     # Match paper_check control-A seed_x = pair_seed_base + 2 * group_idx.
     run_seed_base: 400000
     run_seed_mode: source_run_idx
-    # Batched inside one JAX process. Keep this conservative; raise on A100 if
-    # memory telemetry is clean.
-    batch_size: 4
+    # Batched inside one JAX process over the global pending queue. Ready
+    # trajectories are skipped unless --force is passed.
+    batch_size: 9
     optimized_checkpoint_roots:
       - experiments/paper_check/checkpoints/optimization
       - experiments/paper_check/checkpoints_0/optimization

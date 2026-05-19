@@ -4,6 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 from typing import Any
+
 from omegaconf import OmegaConf
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -85,21 +86,46 @@ def _paper_check_control_a_seed(section: Any, row: dict[str, Any], suite_idx: in
     return int(base + 2 * group_idx)
 
 
+def _candidate_traj_id(row: dict[str, Any], *, candidate_kind: str, candidate_idx: int) -> str:
+    base = _traj_id(row)
+    if candidate_kind == "optimized":
+        return base
+    return f"{base}_{candidate_kind}_{candidate_idx:03d}"
+
+
+def _random_checkpoint_dir(row: dict[str, Any], random_idx: int) -> Path:
+    source_root = Path(row["source_root"])
+    source_run_idx = int(row.get("source_run_idx", -1))
+    if source_run_idx < 0:
+        raise ValueError(f"Cannot derive random checkpoint dir without source_run_idx: {row}")
+    return (
+        source_root.parent
+        / "frustration_simulation"
+        / "random_params"
+        / f"group_{source_run_idx:03d}"
+        / f"random_{int(random_idx):03d}"
+    )
+
+
 def _select_one_checkpoint(
     *,
     row: dict[str, Any],
     section: Any,
     rollout_flat: Any,
     suite_idx: int,
+    selection_idx: int,
+    checkpoint_dir: Path,
     traj_id: str,
+    candidate_kind: str,
+    candidate_idx: int,
+    candidate_label: str,
 ) -> dict[str, Any]:
-    checkpoint_dir = Path(row["checkpoint_dir"])
     selected = select_params(checkpoint_dir, rollout_flat)
     if not selected:
         raise FileNotFoundError(f"No selectable params found in {checkpoint_dir}.")
     item = dict(selected[0])
     item["traj_id"] = str(traj_id)
-    item["selection_idx"] = int(suite_idx)
+    item["selection_idx"] = int(selection_idx)
     item["source"] = "paper_check_flow_lenia_control_a"
     item["source_checkpoint_dir"] = str(checkpoint_dir)
     item["source_root"] = str(row["source_root"])
@@ -107,6 +133,9 @@ def _select_one_checkpoint(
     item["source_run_idx"] = int(row.get("source_run_idx", -1))
     item["suite_run_idx"] = int(row.get("run_idx", suite_idx))
     item["run_seed"] = _paper_check_control_a_seed(section, row, suite_idx)
+    item["candidate_kind"] = str(candidate_kind)
+    item["candidate_idx"] = int(candidate_idx)
+    item["candidate_label"] = str(candidate_label)
     return item
 
 
@@ -133,6 +162,9 @@ def _write_manifest(
                 "source_run_idx": int(row.get("source_run_idx", -1)),
                 "suite_run_idx": int(row.get("suite_run_idx", row["selection_idx"])),
                 "run_seed": int(row.get("run_seed", -1)),
+                "candidate_kind": str(row.get("candidate_kind", "optimized")),
+                "candidate_idx": int(row.get("candidate_idx", 0)),
+                "candidate_label": str(row.get("candidate_label", "optimized")),
                 "traj_dir": str(paths["traj_dir"]),
                 "apf_dir": str(paths["apf_dir"]),
                 "metrics_path": str(paths["metrics_path"]),
@@ -204,6 +236,8 @@ def run(
         return summary
 
     selected: list[dict[str, Any]] = []
+    include_random = bool(_get(section, "include_random_baselines", True))
+    n_random = int(_get(section, "num_random_baselines", 3)) if include_random else 0
     for suite_idx, row in enumerate(checkpoints):
         selected.append(
             _select_one_checkpoint(
@@ -211,21 +245,47 @@ def run(
                 section=section,
                 rollout_flat=rollout_flat,
                 suite_idx=suite_idx,
-                traj_id=_traj_id(row),
+                selection_idx=len(selected),
+                checkpoint_dir=Path(row["checkpoint_dir"]),
+                traj_id=_candidate_traj_id(row, candidate_kind="optimized", candidate_idx=0),
+                candidate_kind="optimized",
+                candidate_idx=0,
+                candidate_label="optimized",
             )
         )
+        for random_idx in range(n_random):
+            random_dir = _random_checkpoint_dir(row, random_idx)
+            if not (random_dir / "best.pkl").exists():
+                raise FileNotFoundError(
+                    "Missing random baseline checkpoint for Flow-Lenia A-run APF. "
+                    f"Expected {random_dir / 'best.pkl'} for suite_group={suite_idx}, "
+                    f"source_run_idx={int(row.get('source_run_idx', -1))}, random_idx={random_idx}."
+                )
+            selected.append(
+                _select_one_checkpoint(
+                    row=row,
+                    section=section,
+                    rollout_flat=rollout_flat,
+                    suite_idx=suite_idx,
+                    selection_idx=len(selected),
+                    checkpoint_dir=random_dir,
+                    traj_id=_candidate_traj_id(row, candidate_kind="random", candidate_idx=random_idx),
+                    candidate_kind="random",
+                    candidate_idx=random_idx,
+                    candidate_label=f"random_{random_idx:03d}",
+                )
+            )
 
     ready_by_traj: dict[str, tuple[bool, str]] = {}
-    original_batches = [selected[start : start + batch_size] for start in range(0, len(selected), batch_size)]
-    batches_to_run: list[list[dict[str, Any]]] = []
-    for batch in original_batches:
-        batch_ready = []
-        for row in batch:
-            ready, message = _apf_status(_output_paths(output_root, str(row["traj_id"])))
-            ready_by_traj[str(row["traj_id"])] = (ready, message)
-            batch_ready.append(ready)
-        if force or not all(batch_ready):
-            batches_to_run.append(batch)
+    for row in selected:
+        ready, message = _apf_status(_output_paths(output_root, str(row["traj_id"])))
+        ready_by_traj[str(row["traj_id"])] = (ready, message)
+    pending = [
+        row
+        for row in selected
+        if force or not ready_by_traj[str(row["traj_id"])][0]
+    ]
+    batches_to_run = [pending[start : start + batch_size] for start in range(0, len(pending), batch_size)]
 
     run_traj_ids = {str(row["traj_id"]) for batch in batches_to_run for row in batch}
     command_rows: list[dict[str, Any]] = []
@@ -237,7 +297,7 @@ def run(
             log_event(f"Flow-Lenia A-run APF {idx}/{len(selected)} traj={row['traj_id']} exists", component="arun-apf")
         else:
             status = "queued"
-            reason = "force" if force else ("ready_but_batch_rerun" if ready else message)
+            reason = "force" if force else message
             log_event(
                 f"Flow-Lenia A-run APF {idx}/{len(selected)} traj={row['traj_id']} queued "
                 f"pre_status={reason}",
@@ -254,13 +314,23 @@ def run(
                 "command": "internal simulate_batch",
             }
         )
-    _write_manifest(output_root, rollout_config=rollout_config, selected=selected, command_rows=command_rows)
+    _write_manifest(
+        output_root,
+        rollout_config=rollout_config,
+        selected=selected,
+        command_rows=command_rows,
+    )
 
     if dry_run:
         for row in command_rows:
             if row["status"] == "queued":
                 row["status"] = "dry_run"
-        _write_manifest(output_root, rollout_config=rollout_config, selected=selected, command_rows=command_rows)
+        _write_manifest(
+            output_root,
+            rollout_config=rollout_config,
+            selected=selected,
+            command_rows=command_rows,
+        )
         summary = {
             "status": "dry_run",
             "output_root": str(output_root),
@@ -281,10 +351,17 @@ def run(
     flat_dict = OmegaConf.to_container(rollout_flat, resolve=True)
     for batch_idx, batch in enumerate(batches_to_run, start=1):
         batch_ids = [str(row["traj_id"]) for row in batch]
-        # Re-run the original contiguous batch window as a unit. simulate_batch
-        # seeds from the first selection_idx in the batch, so dropping a ready
-        # member would silently change random keys for later members.
-        overwrite = bool(force) or any(_output_paths(output_root, traj_id)["run_root"].exists() for traj_id in batch_ids)
+        # Every selected row carries an explicit run_seed, so missing random
+        # candidates can be filled without re-running already ready optimized
+        # trajectories.
+        existing_run_roots = [str(_output_paths(output_root, traj_id)["run_root"]) for traj_id in batch_ids if _output_paths(output_root, traj_id)["run_root"].exists()]
+        if existing_run_roots and not force:
+            raise RuntimeError(
+                "Refusing to overwrite existing Flow-Lenia A-run APF trajectory directories without --force. "
+                "These outputs are present but do not match the requested APF profile; inspect or move them first: "
+                + ", ".join(existing_run_roots[:10])
+            )
+        overwrite = bool(force)
         log_event(
             f"Flow-Lenia A-run APF running batch {batch_idx}/{len(batches_to_run)} "
             f"batch_size={len(batch)} overwrite={overwrite} traj_ids={batch_ids}",
@@ -303,7 +380,12 @@ def run(
                 ready, message = _apf_status(paths)
                 row["status"] = "exists" if ready else "missing_apf"
                 row["message"] = message
-        _write_manifest(output_root, rollout_config=rollout_config, selected=selected, command_rows=command_rows)
+        _write_manifest(
+            output_root,
+            rollout_config=rollout_config,
+            selected=selected,
+            command_rows=command_rows,
+        )
 
     n_ready = 0
     for row in selected:
@@ -321,7 +403,12 @@ def run(
         "manifest": str(output_root / "manifest.json"),
     }
     write_json(output_root / "simulation_summary.json", summary)
-    _write_manifest(output_root, rollout_config=rollout_config, selected=selected, command_rows=command_rows)
+    _write_manifest(
+        output_root,
+        rollout_config=rollout_config,
+        selected=selected,
+        command_rows=command_rows,
+    )
     if status != "ok" and bool(_get(section, "required", True)):
         raise RuntimeError(f"Flow-Lenia A-run APF generation incomplete: {n_ready}/{len(selected)} ready.")
     log_event(f"Flow-Lenia A-run APF done status={status} n_ready={n_ready}/{len(selected)}", component="arun-apf")

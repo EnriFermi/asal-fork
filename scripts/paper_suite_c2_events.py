@@ -69,6 +69,8 @@ def _iter_metric_items(root: Path) -> list[dict[str, Any]]:
     if manifest.exists():
         payload = json.loads(manifest.read_text())
         for row in payload.get("trajectories", []):
+            if str(row.get("candidate_kind", "optimized")).strip().lower() != "optimized":
+                continue
             raw = row.get("metrics_path")
             if raw:
                 path = Path(str(raw))
