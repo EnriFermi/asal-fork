@@ -31,6 +31,7 @@ from flowlenia_minibang_common import (
     to_plain,
     write_json,
 )
+from paper_suite_metric_cache import chunks_input_identity, expected_metric_metadata, metadata_npz_payload
 
 
 def _ensure_jax() -> None:
@@ -1057,6 +1058,10 @@ def _prepare_metric_args(flat_args: dict[str, Any], *, rollout_steps: int, sampl
         "metric_null_reps": 6,
         "metric_particle_samples": min(256, int(data.get("lagrangian_n_particles", 256))),
         "metric_preprocess_mode": "clip",
+        "metric_delta_h_floor": 0.0,
+        "metric_msc_floor": 0.01,
+        "metric_msc_term": "floor_reconstruction_error",
+        "metric_msc_normalize_by_weight_sum": True,
         "metric_alpha": 1.0,
         "metric_beta": 1.0,
         "metric_eps": 1e-12,
@@ -1097,7 +1102,7 @@ def _prepare_metric_args(flat_args: dict[str, Any], *, rollout_steps: int, sampl
     return SimpleNamespace(**data)
 
 
-def _compute_delta_h_metrics(apf_dir: Path, flat_args: dict[str, Any], *, seed: int) -> dict[str, np.ndarray]:
+def _delta_h_metric_inputs(apf_dir: Path, flat_args: dict[str, Any]) -> dict[str, Any]:
     _ensure_jax()
     _ensure_metric_modules()
     steps, lag = _load_lagrangian_series(apf_dir)
@@ -1115,6 +1120,47 @@ def _compute_delta_h_metrics(apf_dir: Path, flat_args: dict[str, Any], *, seed: 
     rollout_steps = int(xy.shape[0] * sample_every)
     metric_args = _prepare_metric_args(flat_args, rollout_steps=rollout_steps, sample_every_steps=sample_every)
     metric_cfg = resolve_metric_config(metric_args)
+    chunks = list_apf_chunks(apf_dir)
+    input_identity = chunks_input_identity(apf_dir, chunks)
+    metadata = expected_metric_metadata(
+        metric_cfg,
+        input_identity,
+        extra={
+            "metric_tau_grid_steps": [int(x) for x in metric_cfg.get("tau_steps_list", [])],
+            "metric_window_size_steps": int(metric_cfg["window_size_frames"]) * int(metric_cfg["sample_every_steps"]),
+            "metric_window_step_steps": int(metric_cfg["window_step_frames"]) * int(metric_cfg["sample_every_steps"]),
+            "metric_delta_h_floor": float(metric_cfg.get("delta_h_floor", 0.0)),
+            "metric_msc_floor": float(metric_cfg.get("msc_floor", metric_cfg.get("delta_h_floor", 0.0))),
+            "metric_msc_term": str(metric_cfg.get("msc_term", "overlap")),
+            "metric_msc_normalize_by_weight_sum": str(metric_cfg.get("scale_normalization", "none")) == "sum_weight_r",
+            "metric_range_start_steps": int(metric_cfg.get("range_start_steps", 0)),
+            "metric_range_end_steps": int(metric_cfg.get("range_end_steps", rollout_steps)),
+        },
+    )
+    return {
+        "steps": steps,
+        "lag": lag,
+        "xy": xy,
+        "step_offset": int(step_offset),
+        "sample_every": int(sample_every),
+        "rollout_steps": int(rollout_steps),
+        "metric_cfg": metric_cfg,
+        "input_identity": input_identity,
+        "metadata": metadata,
+    }
+
+
+def expected_delta_h_metric_metadata(apf_dir: Path, flat_args: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    inputs = _delta_h_metric_inputs(apf_dir, flat_args)
+    return inputs["metric_cfg"], inputs["input_identity"], inputs["metadata"]
+
+
+def _compute_delta_h_metrics(apf_dir: Path, flat_args: dict[str, Any], *, seed: int) -> dict[str, np.ndarray]:
+    inputs = _delta_h_metric_inputs(apf_dir, flat_args)
+    xy = inputs["xy"]
+    step_offset = int(inputs["step_offset"])
+    sample_every = int(inputs["sample_every"])
+    metric_cfg = inputs["metric_cfg"]
     metric_eval = make_metric_loss_fn(metric_cfg, include_maps=True)
     _loss, info = metric_eval(jax.random.PRNGKey(seed), jnp.asarray(xy, dtype=jnp.float32))
     info_np = jax.device_get(info)
@@ -1146,6 +1192,7 @@ def _compute_delta_h_metrics(apf_dir: Path, flat_args: dict[str, Any], *, seed: 
         delta_h_score_scalar=np.asarray(info_np["score"], dtype=np.float32),
         delta_h_amp_scalar=np.asarray(info_np["amp"], dtype=np.float32),
         delta_h_msc_scalar=np.asarray(info_np["msc"], dtype=np.float32),
+        **metadata_npz_payload(inputs["metadata"]),
     )
 
 

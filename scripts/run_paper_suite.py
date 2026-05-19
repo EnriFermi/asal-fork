@@ -30,7 +30,7 @@ def _simulation(config: str, task: str, *, smoke: bool, force: bool, allow_heavy
 
 
 def _metrics(config: str, task: str, *, smoke: bool, force: bool) -> None:
-    if task in {"all", "c1", "c2"}:
+    if task in {"all", "c2"}:
         args = []
         if smoke:
             args.append("--smoke")
@@ -97,7 +97,9 @@ def _simulation_task(task: str) -> str:
         return "synthetic"
     if task == "c2":
         return "c2"
-    if task in {"c1", "c5", "c6"}:
+    if task == "c5":
+        return "paper_check_frustration"
+    if task in {"c1", "c6"}:
         return "paper_check"
     return "all"
 

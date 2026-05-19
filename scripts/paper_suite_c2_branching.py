@@ -17,6 +17,7 @@ for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "scripts")):
 import numpy as np
 
 from flowlenia_minibang_common import list_apf_chunks
+from flowlenia_minibang_simulate import expected_delta_h_metric_metadata
 from paper_suite_common import (
     REPO_ROOT,
     command_to_str,
@@ -31,6 +32,12 @@ from paper_suite_common import (
     write_csv,
     write_json,
 )
+from paper_suite_c2_flowlenia_metrics import _flat_metric_args as _c2_flat_metric_args
+from paper_suite_c2_flowlenia_metrics import _rollout_config as _c2_rollout_config
+from paper_suite_metric_cache import compare_metrics_npz_metadata, sha256_text, stable_json
+
+
+BRANCH_PLAN_VERSION = "c2_branch_plan_v2_activity_matched"
 
 
 def _get(cfg: Any, key: str, default: Any = None) -> Any:
@@ -65,6 +72,18 @@ def _trajectory_root(c2_cfg: Any) -> Path | None:
     return resolve_path(raw)
 
 
+def _manifest_path(root: Path, raw: Any, *, default: Path) -> Path:
+    if raw is None or str(raw) == "":
+        return default
+    path = Path(str(raw))
+    if path.is_absolute():
+        return path
+    candidate = root / path
+    if candidate.exists() or len(path.parts) > 1:
+        return candidate
+    return default.parent / path
+
+
 def _iter_metric_items(root: Path) -> list[dict[str, Any]]:
     manifest = root / "manifest.json"
     items: list[dict[str, Any]] = []
@@ -73,24 +92,36 @@ def _iter_metric_items(root: Path) -> list[dict[str, Any]]:
         for row in payload.get("trajectories", []):
             if str(row.get("candidate_kind", "optimized")).strip().lower() != "optimized":
                 continue
-            raw = row.get("metrics_path")
-            if raw:
-                path = Path(str(raw))
-                if not path.is_absolute():
-                    path = root / str(row.get("traj_id", "")) / path.name
-                if path.exists():
-                    traj_dir_raw = row.get("traj_dir", None)
-                    traj_dir = Path(str(traj_dir_raw)) if traj_dir_raw else path.parent
-                    if not traj_dir.is_absolute():
-                        traj_dir = root / traj_dir
-                    items.append({"traj_id": str(row.get("traj_id", path.parent.name)), "metrics_path": path, "traj_dir": traj_dir})
+            traj_id = str(row.get("traj_id", ""))
+            traj_dir = _manifest_path(root, row.get("traj_dir"), default=root / traj_id)
+            apf_dir = _manifest_path(root, row.get("apf_dir"), default=traj_dir / "apf_logs")
+            path = _manifest_path(root, row.get("metrics_path"), default=traj_dir / "metrics.npz")
+            if path.exists():
+                items.append(
+                    {
+                        "traj_id": str(row.get("traj_id", path.parent.name)),
+                        "metrics_path": path,
+                        "traj_dir": traj_dir,
+                        "apf_dir": apf_dir,
+                    }
+                )
             traj_id = row.get("traj_id")
             if traj_id:
                 candidate = root / str(traj_id) / "metrics.npz"
                 if candidate.exists() and all(candidate != item["metrics_path"] for item in items):
-                    items.append({"traj_id": str(traj_id), "metrics_path": candidate, "traj_dir": candidate.parent})
+                    items.append(
+                        {
+                            "traj_id": str(traj_id),
+                            "metrics_path": candidate,
+                            "traj_dir": candidate.parent,
+                            "apf_dir": candidate.parent / "apf_logs",
+                        }
+                    )
     if not items:
-        items = [{"traj_id": path.parent.name, "metrics_path": path, "traj_dir": path.parent} for path in sorted(root.glob("traj_*/metrics.npz"))]
+        items = [
+            {"traj_id": path.parent.name, "metrics_path": path, "traj_dir": path.parent, "apf_dir": path.parent / "apf_logs"}
+            for path in sorted(root.glob("traj_*/metrics.npz"))
+        ]
     return items
 
 
@@ -121,10 +152,112 @@ def _load_delta_h(path: Path) -> tuple[np.ndarray, np.ndarray]:
     return centers[:n], dh[:n]
 
 
+def _validate_metric_item(item: dict[str, Any], flat_args: dict[str, Any]) -> dict[str, Any]:
+    metrics_path = Path(item["metrics_path"])
+    apf_dir = Path(item.get("apf_dir", Path(item["traj_dir"]) / "apf_logs"))
+    metric_cfg, input_identity, _metadata = expected_delta_h_metric_metadata(apf_dir, flat_args)
+    fresh, reason, expected = compare_metrics_npz_metadata(metrics_path, metric_cfg, input_identity)
+    if not fresh:
+        raise ValueError(
+            f"C2 branching refuses stale upstream metrics for {item['traj_id']} at {metrics_path}: {reason}. "
+            "Run the C2 metrics layer with --force before planning branches."
+        )
+    return {
+        "traj_id": str(item["traj_id"]),
+        "metrics_path": str(metrics_path),
+        "apf_dir": str(apf_dir),
+        "metric_config_hash": str(expected["metric_config_hash"]),
+        "metric_input_identity_hash": str(expected["metric_input_identity_hash"]),
+    }
+
+
+def _nearest_indices(steps: np.ndarray, centers: np.ndarray) -> np.ndarray:
+    steps = np.asarray(steps, dtype=np.float64).reshape(-1)
+    centers = np.asarray(centers, dtype=np.float64).reshape(-1)
+    if steps.size == 0:
+        return np.zeros_like(centers, dtype=np.int64)
+    order = np.argsort(steps)
+    sorted_steps = steps[order]
+    pos = np.searchsorted(sorted_steps, centers, side="left")
+    pos = np.clip(pos, 0, sorted_steps.size - 1)
+    prev = np.clip(pos - 1, 0, sorted_steps.size - 1)
+    choose_prev = np.abs(sorted_steps[prev] - centers) <= np.abs(sorted_steps[pos] - centers)
+    nearest = np.where(choose_prev, prev, pos)
+    return order[nearest].astype(np.int64)
+
+
+def _apf_steps_from_chunk(data: np.lib.npyio.NpzFile, *, start: int, end: int, n: int) -> np.ndarray:
+    if "state_t" in data.files:
+        arr = np.asarray(data["state_t"], dtype=np.float64).reshape(-1)
+        if arr.size == n:
+            return arr
+    if n <= 1:
+        return np.asarray([float(start)], dtype=np.float64)
+    return np.linspace(float(start), float(end), int(n), dtype=np.float64)
+
+
+def _activity_covariates(apf_dir: Path, centers: np.ndarray) -> dict[str, np.ndarray]:
+    chunks = list_apf_chunks(apf_dir)
+    if not chunks:
+        raise FileNotFoundError(f"No APF chunks found in {apf_dir}")
+    step_parts: list[np.ndarray] = []
+    mass_parts: list[np.ndarray] = []
+    active_parts: list[np.ndarray] = []
+    field_parts: list[np.ndarray] = []
+    lag_parts: list[np.ndarray] = []
+    for path, start, end, _idx in chunks:
+        with np.load(path, allow_pickle=False) as data:
+            n = 0
+            if "A" in data.files:
+                a = np.asarray(data["A"], dtype=np.float32)
+                n = int(a.shape[0])
+                mass_parts.append(np.sum(a, axis=tuple(range(1, a.ndim)), dtype=np.float64))
+                grid_mass = np.sum(a, axis=-1) if a.ndim >= 4 else a
+                active_parts.append(np.mean(grid_mass > 1e-6, axis=tuple(range(1, grid_mass.ndim)), dtype=np.float64))
+            if "F" in data.files:
+                f = np.asarray(data["F"], dtype=np.float32)
+                if n == 0:
+                    n = int(f.shape[0])
+                field_parts.append(np.mean(np.abs(f), axis=tuple(range(1, f.ndim)), dtype=np.float64))
+            if "lagrangian_xy" in data.files:
+                lag = np.asarray(data["lagrangian_xy"], dtype=np.float32)
+                if n == 0:
+                    n = int(lag.shape[0])
+                lag_parts.append(lag)
+            if n > 0:
+                step_parts.append(_apf_steps_from_chunk(data, start=int(start), end=int(end), n=n))
+    if not step_parts or not mass_parts:
+        raise ValueError(f"No activity covariates could be read from APF chunks in {apf_dir}")
+    steps = np.concatenate(step_parts)
+    order = np.argsort(steps)
+    steps = steps[order]
+    idx = _nearest_indices(steps, centers)
+    out: dict[str, np.ndarray] = {}
+    mass = np.concatenate(mass_parts)[order]
+    out["total_mass"] = mass[idx]
+    if active_parts:
+        active = np.concatenate(active_parts)[order]
+        out["active_fraction"] = active[idx]
+    if field_parts:
+        field = np.concatenate(field_parts)[order]
+        out["field_activity"] = field[idx]
+    if lag_parts:
+        lag = np.concatenate(lag_parts, axis=0)[order]
+        speed = np.full((lag.shape[0],), np.nan, dtype=np.float64)
+        if lag.shape[0] > 1:
+            dxy = np.linalg.norm(np.diff(lag.astype(np.float64), axis=0), axis=-1)
+            dt = np.maximum(np.diff(steps), 1e-12)
+            speed[1:] = np.nanmean(dxy, axis=1) / dt
+            speed[0] = speed[1] if speed.size > 1 else np.nan
+        out["mean_lagrangian_speed"] = speed[idx]
+    return out
+
+
 def _select_events(
     *,
     centers: np.ndarray,
     dh: np.ndarray,
+    covariates: dict[str, np.ndarray] | None = None,
     m_pairs: int,
     refractory_steps: int,
     high_quantile: float,
@@ -135,6 +268,22 @@ def _select_events(
         return []
     c = centers[finite]
     h = dh[finite]
+    cov_full = covariates or {}
+    cov = {
+        key: np.asarray(value, dtype=np.float64).reshape(-1)[finite]
+        for key, value in cov_full.items()
+        if np.asarray(value).reshape(-1).size == finite.size
+    }
+    z_cov: dict[str, np.ndarray] = {}
+    for key, value in cov.items():
+        finite_v = value[np.isfinite(value)]
+        if finite_v.size < 2:
+            continue
+        std = float(np.nanstd(finite_v))
+        if std <= 1e-12:
+            z_cov[key] = np.zeros_like(value, dtype=np.float64)
+        else:
+            z_cov[key] = (value - float(np.nanmean(finite_v))) / std
     high_thr = float(np.nanquantile(h, high_quantile))
     low_thr = float(np.nanquantile(h, low_quantile))
     high_order = np.argsort(-h)
@@ -158,17 +307,38 @@ def _select_events(
         candidates = [i for i in low_pool if i not in used_low]
         if not candidates:
             break
-        lo = min(candidates, key=lambda i: abs(float(c[i]) - float(c[hi])))
+        if z_cov:
+            def _cov_dist(i: int) -> tuple[float, float]:
+                vals = []
+                for key, z in z_cov.items():
+                    a = float(z[hi])
+                    b = float(z[i])
+                    if np.isfinite(a) and np.isfinite(b):
+                        vals.append((a - b) ** 2)
+                dist = math.sqrt(float(np.mean(vals))) if vals else float("inf")
+                return dist, abs(float(c[i]) - float(c[hi]))
+
+            lo = min(candidates, key=_cov_dist)
+            match_dist = float(_cov_dist(lo)[0])
+            match_method = "activity_covariate_nearest_in_low_delta_h_pool"
+        else:
+            lo = min(candidates, key=lambda i: abs(float(c[i]) - float(c[hi])))
+            match_dist = float("nan")
+            match_method = "temporal_fallback_no_activity_covariates"
         used_low.add(lo)
-        pairs.append(
-            {
-                "pair_id": int(pair_id),
-                "high_step": int(round(float(c[hi]))),
-                "high_delta_h": float(h[hi]),
-                "low_step": int(round(float(c[lo]))),
-                "low_delta_h": float(h[lo]),
-            }
-        )
+        row = {
+            "pair_id": int(pair_id),
+            "high_step": int(round(float(c[hi]))),
+            "high_delta_h": float(h[hi]),
+            "low_step": int(round(float(c[lo]))),
+            "low_delta_h": float(h[lo]),
+            "match_method": match_method,
+            "match_covariate_distance": match_dist,
+        }
+        for key, value in cov.items():
+            row[f"high_{key}"] = float(value[hi])
+            row[f"low_{key}"] = float(value[lo])
+        pairs.append(row)
     return pairs
 
 
@@ -273,8 +443,55 @@ def _write_smoke_fixture(output_root: Path, branch_root: Path) -> Path:
                 )
     path = out_dir / "branch_plan.csv"
     write_csv(path, rows)
+    csv_rows = read_csv(path)
+    write_json(
+        out_dir / "branch_plan_meta.json",
+        {
+            "branch_plan_version": BRANCH_PLAN_VERSION,
+            "branch_plan_rows_hash": sha256_text(stable_json(csv_rows)),
+            "smoke": True,
+            "matching": "smoke_fixture",
+        },
+    )
     write_json(output_root / "c2_branching_simulation_summary.json", {"status": "ok", "n_branches": len(rows), "plan": str(path)})
     return path
+
+
+def _validate_branch_plan(plan_path: Path, plan_rows: list[dict[str, str]], flat_args: dict[str, Any]) -> None:
+    meta_path = plan_path.with_name("branch_plan_meta.json")
+    if not meta_path.exists():
+        raise ValueError(f"C2 branching refuses old branch_plan without metadata: {plan_path}. Regenerate the branch simulation layer.")
+    with meta_path.open("r") as f:
+        meta = json.load(f)
+    if str(meta.get("branch_plan_version", "")) != BRANCH_PLAN_VERSION:
+        raise ValueError(
+            f"C2 branching refuses stale branch_plan version {meta.get('branch_plan_version')!r}; "
+            f"expected {BRANCH_PLAN_VERSION}. Regenerate the branch simulation layer."
+        )
+    current_hash = sha256_text(stable_json(plan_rows))
+    if str(meta.get("branch_plan_rows_hash", "")) != current_hash:
+        raise ValueError("C2 branching refuses branch_plan.csv because it no longer matches branch_plan_meta.json.")
+
+    unique: dict[str, dict[str, Any]] = {}
+    for row in plan_rows:
+        metrics_path = str(row.get("source_metrics_path", "")).strip()
+        if not metrics_path:
+            continue
+        traj_dir_raw = str(row.get("source_traj_dir", "")).strip()
+        traj_dir = Path(traj_dir_raw) if traj_dir_raw else Path(metrics_path).parent
+        apf_dir_raw = str(row.get("source_apf_dir", "")).strip()
+        apf_dir = Path(apf_dir_raw) if apf_dir_raw else traj_dir / "apf_logs"
+        unique.setdefault(
+            metrics_path,
+            {
+                "traj_id": str(row.get("traj_id", Path(metrics_path).parent.name)),
+                "metrics_path": Path(metrics_path),
+                "traj_dir": traj_dir,
+                "apf_dir": apf_dir,
+            },
+        )
+    for item in unique.values():
+        _validate_metric_item(item, flat_args)
 
 
 def simulation(
@@ -317,6 +534,8 @@ def simulation(
         log_event(f"C2 branching simulation skipped no metrics trajectory_root={trajectory_root}", component="c2-branch")
         return summary
 
+    rollout_config = _c2_rollout_config(c2_cfg)
+    flat_args = _c2_flat_metric_args(rollout_config)
     max_trajectories = int(_get(bcfg, "max_trajectories", 2))
     m_pairs = int(_get(bcfg, "m_pairs", 2))
     branches_per_time = int(_get(bcfg, "branches_per_time", 3))
@@ -329,11 +548,15 @@ def simulation(
     perturb_p_std = float(_get(perturb, "p_std", 1e-4))
     perturb_lag_xy_std = float(_get(perturb, "lagrangian_xy_std", 0.01))
 
-    ranked: list[tuple[float, dict[str, Any], np.ndarray, np.ndarray]] = []
+    ranked: list[tuple[float, dict[str, Any], np.ndarray, np.ndarray, dict[str, np.ndarray], dict[str, Any]]] = []
+    metric_records: list[dict[str, Any]] = []
     for item in metric_items:
         path = Path(item["metrics_path"])
+        record = _validate_metric_item(item, flat_args)
         centers, dh = _load_delta_h(path)
-        ranked.append((float(np.nanmax(dh)), item, centers, dh))
+        covariates = _activity_covariates(Path(item.get("apf_dir", Path(item["traj_dir"]) / "apf_logs")), centers)
+        metric_records.append(record)
+        ranked.append((float(np.nanmax(dh)), item, centers, dh, covariates, record))
     ranked.sort(key=lambda x: -x[0])
     log_event(
         f"C2 branching simulation ranked n_metric_items={len(ranked)} max_trajectories={max_trajectories} m_pairs={m_pairs} branches_per_time={branches_per_time}",
@@ -341,13 +564,15 @@ def simulation(
     )
 
     rows: list[dict[str, Any]] = []
-    for _peak, item, centers, dh in ranked[:max_trajectories]:
+    for _peak, item, centers, dh, covariates, _record in ranked[:max_trajectories]:
         metrics_path = Path(item["metrics_path"])
         source_traj_dir = Path(item["traj_dir"])
+        source_apf_dir = Path(item.get("apf_dir", source_traj_dir / "apf_logs"))
         traj_id = str(item["traj_id"])
         pairs = _select_events(
             centers=centers,
             dh=dh,
+            covariates=covariates,
             m_pairs=m_pairs,
             refractory_steps=refractory_steps,
             high_quantile=high_quantile,
@@ -404,7 +629,18 @@ def simulation(
                             "branch_id": branch_id,
                             "source_metrics_path": str(metrics_path),
                             "source_traj_dir": str(source_traj_dir),
+                            "source_apf_dir": str(source_apf_dir),
                             "branch_dir": str(branch_dir),
+                            "match_method": str(pair.get("match_method", "")),
+                            "match_covariate_distance": pair.get("match_covariate_distance", ""),
+                            "high_total_mass": pair.get("high_total_mass", ""),
+                            "low_total_mass": pair.get("low_total_mass", ""),
+                            "high_active_fraction": pair.get("high_active_fraction", ""),
+                            "low_active_fraction": pair.get("low_active_fraction", ""),
+                            "high_mean_lagrangian_speed": pair.get("high_mean_lagrangian_speed", ""),
+                            "low_mean_lagrangian_speed": pair.get("low_mean_lagrangian_speed", ""),
+                            "high_field_activity": pair.get("high_field_activity", ""),
+                            "low_field_activity": pair.get("low_field_activity", ""),
                             "status": status,
                             "command": command_to_str(cmd),
                         }
@@ -412,6 +648,24 @@ def simulation(
 
     plan_path = out_dir / "branch_plan.csv"
     write_csv(plan_path, rows)
+    csv_rows = read_csv(plan_path)
+    plan_meta = {
+        "branch_plan_version": BRANCH_PLAN_VERSION,
+        "branch_plan_rows_hash": sha256_text(stable_json(csv_rows)),
+        "matching": "activity_covariate_nearest_in_low_delta_h_pool",
+        "rollout_config": str(rollout_config),
+        "metric_records": metric_records,
+        "branching_config": {
+            "max_trajectories": max_trajectories,
+            "m_pairs": m_pairs,
+            "branches_per_time": branches_per_time,
+            "horizon_steps": horizon_steps,
+            "refractory_steps": refractory_steps,
+            "high_quantile": high_quantile,
+            "low_quantile": low_quantile,
+        },
+    }
+    write_json(out_dir / "branch_plan_meta.json", plan_meta)
     summary = {
         "status": "ok",
         "n_branches": len(rows),
@@ -672,6 +926,11 @@ def metrics(config_path: str | Path, *, smoke: bool = False) -> dict[str, Any]:
     weights = _field_weights(_get(bcfg, "future_field_weights", None))
     allow_feature_fallback = bool(smoke or _get(bcfg, "allow_debug_feature_fallback", False))
     plan_rows = read_csv(plan_path)
+    if not smoke:
+        c2_cfg = cfg.get("c2", {})
+        rollout_config = _c2_rollout_config(c2_cfg)
+        flat_args = _c2_flat_metric_args(rollout_config)
+        _validate_branch_plan(plan_path, plan_rows, flat_args)
     groups: dict[tuple[str, str, str], list[dict[str, str]]] = {}
     for row in plan_rows:
         key = (str(row["traj_id"]), str(row["pair_id"]), str(row["condition"]))

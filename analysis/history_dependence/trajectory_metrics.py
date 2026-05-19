@@ -140,6 +140,13 @@ def derive_metric_config(cfg: dict[str, Any], run_collection) -> dict[str, Any] 
         metric_preprocess_mode=traj_cfg.get("metric_preprocess_mode", source_metric.get("preprocess_mode", "clip")),
         metric_scales=traj_cfg.get("metric_scales", source_metric.get("scales")),
         metric_scale_weights=traj_cfg.get("metric_scale_weights"),
+        metric_delta_h_floor=traj_cfg.get("metric_delta_h_floor", source_metric.get("delta_h_floor", 0.0)),
+        metric_msc_floor=traj_cfg.get("metric_msc_floor", source_metric.get("msc_floor", 0.01)),
+        metric_msc_term=traj_cfg.get("metric_msc_term", source_metric.get("msc_term", "floor_reconstruction_error")),
+        metric_msc_normalize_by_weight_sum=traj_cfg.get(
+            "metric_msc_normalize_by_weight_sum",
+            str(source_metric.get("scale_normalization", "sum_weight_r")) == "sum_weight_r",
+        ),
         metric_alpha=traj_cfg.get("metric_alpha", source_metric.get("alpha", 0.0)),
         metric_beta=traj_cfg.get("metric_beta", source_metric.get("beta", 1.0)),
         metric_eps=traj_cfg.get("metric_eps", 1e-12),
