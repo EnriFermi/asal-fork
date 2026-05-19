@@ -95,6 +95,8 @@ SUBSTRATE_FLAGS = {
 EVALUATION_FLAGS = {
     "foundation_model": "foundation_model",
     "time_sampling": "time_sampling",
+    "clip_range_start_steps": "clip_range_start_steps",
+    "clip_range_end_steps": "clip_range_end_steps",
     "prompts": "prompts",
     "coef_prompt": "coef_prompt",
     "coef_softmax": "coef_softmax",

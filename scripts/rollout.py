@@ -3,7 +3,8 @@ import jax.numpy as jnp
 from jax.random import split
 
 def rollout_simulation(rng, params, s0=None,
-                       substrate=None, fm=None, rollout_steps=256, time_sampling='final', img_size=224, return_state=False, return_mass=False):
+                       substrate=None, fm=None, rollout_steps=256, time_sampling='final', img_size=224, return_state=False, return_mass=False,
+                       sample_start_steps=0, sample_end_steps=None):
     """
     Rollout a simulation described by the specified substrate and parameters.
 
@@ -22,6 +23,9 @@ def rollout_simulation(rng, params, s0=None,
     img_size : image size to render at. Leave at 224 to avoid resizing again for CLIP.
     return_state : return the state data, leave as False, unless you really need it.
     return_mass : when True and time_sampling='video', also return per-frame total mass (sum over grid+channels) and food mass without storing full states.
+    sample_start_steps/sample_end_steps : optional physical-step window for integer/tuple sampled rollouts.
+        The simulation is still advanced from the initial state, but rendered/embedded samples are collected only
+        inside [sample_start_steps, sample_end_steps].
 
     Returns
     ----------
@@ -91,19 +95,34 @@ def rollout_simulation(rng, params, s0=None,
     elif isinstance(time_sampling, int) or isinstance(time_sampling, tuple): # return the rollout at K sampled intervals
         # Memory-efficient: do not store all T states; process in K chunks
         K, chunk_ends = time_sampling if isinstance(time_sampling, tuple) else (time_sampling, False)
-        print('WTF', K, rollout_steps)
-        assert rollout_steps % K == 0, "For memory-efficient sampling, require rollout_steps % K == 0"
-        chunk_steps = rollout_steps // K
+        sample_start_steps = int(sample_start_steps)
+        sample_end_steps = int(rollout_steps if sample_end_steps is None else sample_end_steps)
+        assert 0 <= sample_start_steps < sample_end_steps <= int(rollout_steps), (
+            "Require 0 <= sample_start_steps < sample_end_steps <= rollout_steps, got "
+            f"{sample_start_steps}, {sample_end_steps}, {rollout_steps}."
+        )
+        sample_window_steps = sample_end_steps - sample_start_steps
+        assert sample_window_steps % K == 0, (
+            "For memory-efficient sampling, require sampled window length % K == 0, got "
+            f"({sample_end_steps} - {sample_start_steps}) % {K}."
+        )
+        chunk_steps = sample_window_steps // K
         def step_fn(state, _rng):
             next_state = substrate.step_state(_rng, state, params)
             return next_state, None
+        if sample_start_steps > 0:
+            rng_pre, rng_sample = split(rng)
+            sample_state, _ = jax.lax.scan(step_fn, s0, split(rng_pre, sample_start_steps))
+        else:
+            rng_sample = rng
+            sample_state = s0
         def chunk_fn(state, _rng):
             next_state, _ = jax.lax.scan(step_fn, state, split(_rng, chunk_steps))
             state_to_use = next_state if chunk_ends else state
             img = substrate.render_state(state_to_use, params=params, img_size=img_size)
             z = embed_img_fn(img)
             return next_state, dict(rgb=img, z=z, state=(state_to_use if return_state else None))
-        state_final, data = jax.lax.scan(chunk_fn, s0, split(rng, K))
+        state_final, data = jax.lax.scan(chunk_fn, sample_state, split(rng_sample, K))
         if return_state:
             return dict(**data, state_final=state_final)
         return data
