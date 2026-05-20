@@ -64,11 +64,11 @@ datasets:
       source: apf_lagrangian_split
       apf_root: experiments/paper_check_flow_lenia/checkpoints/arun_lagrangian_apf_500k
       require_random: true
-      expected_window_start_steps: 100000
-      expected_window_end_steps: 500000
+      expected_window_start_steps: 50000
+      expected_window_end_steps: 300000
       metric:
         metric_tau_mode: max_grid
-        metric_tau_grid_steps: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 11000, 12000, 13000, 14000, 15000, 16000, 17000, 18000, 19000]
+        metric_tau_grid_steps: [500, 600, 700, 800, 900, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 11000, 12000, 13000, 14000, 15000]
         metric_tau_steps: 3000
         metric_window_size_steps: 20000
         metric_window_step_steps: 5000
@@ -243,10 +243,10 @@ c2:
     enabled: true
     required: false
     branch_root: analysis/results/paper_suite/c2_branching/branches
-    max_trajectories: 2
-    m_pairs: 2
+    max_trajectories: 5
+    m_pairs: 5
     branches_per_time: 3
-    horizon_steps: 1000
+    horizon_steps: 3000
     refractory_steps: 5000
     high_quantile: 0.85
     low_quantile: 0.35
