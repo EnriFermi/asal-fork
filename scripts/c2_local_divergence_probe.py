@@ -22,6 +22,7 @@ from paper_suite_common import ensure_dir, load_config, resolve_path, write_csv,
 
 
 DEFAULT_FIELD_WEIGHTS = {"A": 1.0, "P": 0.25, "F": 0.25}
+DEFAULT_DIVERGENCE_MODES = ("apf", "clip_chamfer")
 
 
 def _get(cfg: Any, key: str, default: Any = None) -> Any:
@@ -61,6 +62,30 @@ def _parse_field_weights(raw: str | None) -> dict[str, float]:
         if key and weight > 0.0:
             out[key] = float(weight)
     return out or dict(DEFAULT_FIELD_WEIGHTS)
+
+
+def _parse_modes(raw: str | None) -> set[str]:
+    if raw is None or str(raw).strip() == "":
+        return set(DEFAULT_DIVERGENCE_MODES)
+    aliases = {
+        "old": "apf",
+        "field": "apf",
+        "field_l2": "apf",
+        "apf_l2": "apf",
+        "clip": "clip_chamfer",
+        "clip_cloud": "clip_chamfer",
+        "embedding_chamfer": "clip_chamfer",
+    }
+    out: set[str] = set()
+    for part in str(raw).split(","):
+        key = part.strip().lower()
+        if not key:
+            continue
+        key = aliases.get(key, key)
+        if key not in {"apf", "clip_chamfer"}:
+            raise ValueError(f"Unknown divergence mode {part!r}; use apf,clip_chamfer.")
+        out.add(key)
+    return out or set(DEFAULT_DIVERGENCE_MODES)
 
 
 def _trajectory_root(cfg: Any) -> Path:
@@ -349,6 +374,130 @@ def _future_distance(
     return float(sum(weighted) / max(denom, 1e-12))
 
 
+def _future_indices(
+    *,
+    steps: np.ndarray,
+    t0: float,
+    offset_steps: int,
+    horizon_steps: int,
+    max_future_frames: int,
+    max_step_error: float,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    if offset_steps == 0:
+        return None
+    t1 = float(t0) + float(offset_steps)
+    if t0 < steps[0] or t1 < steps[0] or t0 + horizon_steps > steps[-1] or t1 + horizon_steps > steps[-1]:
+        return None
+    n_frames = max(2, int(max_future_frames))
+    rel = np.linspace(0.0, float(horizon_steps), n_frames, dtype=np.float64)
+    idx0, err0 = _nearest_indices(steps, float(t0) + rel)
+    idx1, err1 = _nearest_indices(steps, float(t1) + rel)
+    valid = (err0 <= max_step_error) & (err1 <= max_step_error)
+    if int(np.sum(valid)) < 2:
+        return None
+    return idx0[valid], idx1[valid]
+
+
+def _render_apf_rgb(fields: dict[str, np.ndarray]) -> np.ndarray:
+    if "P" not in fields:
+        raise ValueError("CLIP divergence requires P in APF fields.")
+    p = np.asarray(fields["P"], dtype=np.float32)
+    if p.ndim != 4:
+        raise ValueError(f"P must have shape (T,H,W,C), got {p.shape}.")
+    if p.shape[-1] < 3:
+        reps = int(math.ceil(3 / max(1, int(p.shape[-1]))))
+        p3 = np.tile(p, (1, 1, 1, reps))[..., :3]
+    else:
+        p3 = p[..., :3]
+    if "A" in fields:
+        a = np.asarray(fields["A"], dtype=np.float32)
+        if a.ndim != 4 or a.shape[0] != p.shape[0]:
+            raise ValueError(f"A must have shape (T,H,W,C) with T={p.shape[0]}, got {a.shape}.")
+        intensity = np.sum(a, axis=-1, keepdims=True)
+        return np.clip(intensity * p3, 0.0, 1.0).astype(np.float32)
+    return np.clip(p3, 0.0, 1.0).astype(np.float32)
+
+
+def _normalize_embeddings(z: np.ndarray) -> np.ndarray:
+    arr = np.asarray(z, dtype=np.float64)
+    norms = np.linalg.norm(arr, axis=-1, keepdims=True)
+    return arr / np.clip(norms, 1e-12, None)
+
+
+def _embedding_chamfer_cosine(z_a: np.ndarray, z_b: np.ndarray) -> float:
+    a = _normalize_embeddings(np.asarray(z_a, dtype=np.float64))
+    b = _normalize_embeddings(np.asarray(z_b, dtype=np.float64))
+    if a.ndim != 2 or b.ndim != 2 or a.shape[0] < 1 or b.shape[0] < 1:
+        return float("nan")
+    d = 1.0 - (a @ b.T)
+    return float(0.5 * (np.mean(np.min(d, axis=1)) + np.mean(np.min(d, axis=0))))
+
+
+def _future_clip_chamfer(
+    *,
+    embeddings: np.ndarray,
+    idx0: np.ndarray,
+    idx1: np.ndarray,
+) -> float:
+    if embeddings is None:
+        return float("nan")
+    if idx0.size < 1 or idx1.size < 1:
+        return float("nan")
+    return _embedding_chamfer_cosine(embeddings[idx0], embeddings[idx1])
+
+
+def _load_or_compute_clip_embeddings(
+    *,
+    item: dict[str, Any],
+    steps: np.ndarray,
+    fields: dict[str, np.ndarray],
+    cache_dir: Path,
+    foundation_model: str,
+    spatial_downsample: int,
+    force: bool,
+) -> tuple[np.ndarray, Path]:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    traj_id = str(item["traj_id"]).replace("/", "__")
+    cache_path = cache_dir / f"{traj_id}_{foundation_model.replace('/', '_')}_ds{int(spatial_downsample)}_embeddings.npz"
+    if cache_path.exists() and not force:
+        with np.load(cache_path, allow_pickle=False) as data:
+            z = np.asarray(data["z"], dtype=np.float32)
+            cached_steps = np.asarray(data["steps"], dtype=np.float64).reshape(-1)
+            if "spatial_downsample" in data.files:
+                cached_ds = int(np.asarray(data["spatial_downsample"]).reshape(-1)[0])
+            else:
+                cached_ds = -1
+        if (
+            z.shape[0] == steps.size
+            and cached_steps.shape == steps.shape
+            and np.allclose(cached_steps, steps)
+            and cached_ds == int(spatial_downsample)
+        ):
+            return z, cache_path
+
+    import jax
+    import foundation_models
+
+    frames = _render_apf_rgb(fields)
+    fm = foundation_models.create_foundation_model(str(foundation_model))
+    zs: list[np.ndarray] = []
+    for i, frame in enumerate(frames):
+        if i == 0 or i == frames.shape[0] - 1 or (i + 1) % 50 == 0:
+            print(f"[c2-local-divergence] CLIP embed {traj_id} {i + 1}/{frames.shape[0]}", flush=True)
+        z = jax.device_get(fm.embed_img(frame))
+        zs.append(np.asarray(z, dtype=np.float32).reshape(-1))
+    emb = _normalize_embeddings(np.stack(zs, axis=0)).astype(np.float32)
+    np.savez_compressed(
+        cache_path,
+        z=emb,
+        steps=np.asarray(steps, dtype=np.float64),
+        traj_id=np.asarray(traj_id),
+        foundation_model=np.asarray(str(foundation_model)),
+        spatial_downsample=np.asarray(int(spatial_downsample), dtype=np.int32),
+    )
+    return emb, cache_path
+
+
 def _average_ranks(values: np.ndarray) -> np.ndarray:
     x = np.asarray(values, dtype=np.float64).reshape(-1)
     order = np.argsort(x, kind="mergesort")
@@ -376,9 +525,10 @@ def _corr(x: np.ndarray, y: np.ndarray) -> float:
     return float(np.corrcoef(xx, yy)[0, 1])
 
 
-def _summary(rows: list[dict[str, Any]], *, label: str) -> dict[str, Any]:
-    x = np.asarray([float(row["delta_h"]) for row in rows], dtype=np.float64)
-    y = np.asarray([float(row["local_divergence"]) for row in rows], dtype=np.float64)
+def _summary(rows: list[dict[str, Any]], *, label: str, value_key: str) -> dict[str, Any]:
+    usable = [row for row in rows if value_key in row and str(row.get(value_key, "")).strip() != ""]
+    x = np.asarray([float(row["delta_h"]) for row in usable], dtype=np.float64)
+    y = np.asarray([float(row[value_key]) for row in usable], dtype=np.float64)
     finite = np.isfinite(x) & np.isfinite(y)
     x = x[finite]
     y = y[finite]
@@ -394,7 +544,17 @@ def _summary(rows: list[dict[str, Any]], *, label: str) -> dict[str, Any]:
     }
 
 
-def _write_scatter(rows: list[dict[str, Any]], out_path: Path, title: str) -> str | None:
+def _prefixed_summary(rows: list[dict[str, Any]], *, label: str, value_key: str, prefix: str) -> dict[str, Any]:
+    summary = _summary(rows, label=label, value_key=value_key)
+    out = {"label": label}
+    for key, value in summary.items():
+        if key == "label":
+            continue
+        out[f"{prefix}_{key}"] = value
+    return out
+
+
+def _write_scatter(rows: list[dict[str, Any]], out_path: Path, title: str, *, value_key: str, ylabel: str) -> str | None:
     if not rows:
         return None
     try:
@@ -408,9 +568,12 @@ def _write_scatter(rows: list[dict[str, Any]], out_path: Path, title: str) -> st
     except Exception:
         return None
 
-    x = np.asarray([float(row["delta_h"]) for row in rows], dtype=np.float64)
-    y = np.asarray([float(row["local_divergence"]) for row in rows], dtype=np.float64)
-    labels = [str(row.get("traj_id", "")) for row in rows]
+    usable = [row for row in rows if value_key in row and str(row.get(value_key, "")).strip() != ""]
+    if not usable:
+        return None
+    x = np.asarray([float(row["delta_h"]) for row in usable], dtype=np.float64)
+    y = np.asarray([float(row[value_key]) for row in usable], dtype=np.float64)
+    labels = [str(row.get("traj_id", "")) for row in usable]
     unique = {label: idx for idx, label in enumerate(sorted(set(labels)))}
     colors = np.asarray([unique[label] for label in labels], dtype=np.float64)
     finite = np.isfinite(x) & np.isfinite(y)
@@ -422,7 +585,7 @@ def _write_scatter(rows: list[dict[str, Any]], out_path: Path, title: str) -> st
         ax.plot(xs, coef[0] * xs + coef[1], color="#222222", linewidth=1)
         title = f"{title}; r={np.corrcoef(x[finite], y[finite])[0, 1]:.3g}"
     ax.set_xlabel("Delta-H")
-    ax.set_ylabel("single-trajectory local future divergence")
+    ax.set_ylabel(ylabel)
     ax.set_title(title)
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -434,6 +597,7 @@ def _write_scatter(rows: list[dict[str, Any]], out_path: Path, title: str) -> st
 def _analyze_item(
     item: dict[str, Any],
     *,
+    divergence_modes: set[str],
     field_weights: dict[str, float],
     scales: list[int],
     horizon_steps: int,
@@ -441,6 +605,9 @@ def _analyze_item(
     max_future_frames: int,
     spatial_downsample: int,
     max_step_error: float | None,
+    clip_cache_dir: Path,
+    foundation_model: str,
+    force_clip_cache: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     metrics_path = Path(item["metrics_path"])
     apf_dir = Path(item["apf_dir"])
@@ -449,30 +616,65 @@ def _analyze_item(
     if not apf_dir.exists():
         raise FileNotFoundError(f"Missing APF dir: {apf_dir}")
     centers, delta_h, metric_meta = _load_delta_h(metrics_path)
-    steps, fields = _load_apf_series(apf_dir, field_weights=field_weights, spatial_downsample=spatial_downsample)
+    load_field_weights = dict(field_weights)
+    if "clip_chamfer" in divergence_modes:
+        load_field_weights.setdefault("A", 1.0)
+        load_field_weights.setdefault("P", 1.0)
+    steps, fields = _load_apf_series(apf_dir, field_weights=load_field_weights, spatial_downsample=spatial_downsample)
     if steps.size < 2:
         raise ValueError(f"Too few APF snapshots in {apf_dir}.")
     sample_step = float(np.nanmedian(np.diff(steps)))
     tolerance = float(max_step_error) if max_step_error is not None else max(1.0, 0.55 * sample_step)
+    clip_embeddings = None
+    clip_cache_path = None
+    if "clip_chamfer" in divergence_modes:
+        clip_embeddings, clip_cache_path = _load_or_compute_clip_embeddings(
+            item=item,
+            steps=steps,
+            fields=fields,
+            cache_dir=clip_cache_dir,
+            foundation_model=foundation_model,
+            spatial_downsample=spatial_downsample,
+            force=force_clip_cache,
+        )
 
     rows: list[dict[str, Any]] = []
     for idx, (center, dh) in enumerate(zip(centers, delta_h)):
-        vals = [
-            _future_distance(
+        apf_vals: list[float] = []
+        clip_vals: list[float] = []
+        apf_offsets: list[int] = []
+        clip_offsets: list[int] = []
+        for offset in offset_steps:
+            idx_pair = _future_indices(
                 steps=steps,
-                fields=fields,
                 t0=float(center),
                 offset_steps=int(offset),
                 horizon_steps=int(horizon_steps),
                 max_future_frames=int(max_future_frames),
-                field_weights=field_weights,
-                scales=scales,
                 max_step_error=tolerance,
             )
-            for offset in offset_steps
-        ]
-        finite_vals = [float(v) for v in vals if np.isfinite(v)]
-        if not finite_vals:
+            if idx_pair is None:
+                continue
+            idx0, idx1 = idx_pair
+            if "apf" in divergence_modes:
+                weighted: list[float] = []
+                denom = 0.0
+                for key, weight in field_weights.items():
+                    if key not in fields:
+                        continue
+                    d = _field_l2(fields[key][idx0], fields[key][idx1], scales=scales)
+                    if np.isfinite(d):
+                        weighted.append(float(weight) * d)
+                        denom += float(weight)
+                if weighted and denom > 0.0:
+                    apf_vals.append(float(sum(weighted) / max(denom, 1e-12)))
+                    apf_offsets.append(int(offset))
+            if "clip_chamfer" in divergence_modes and clip_embeddings is not None:
+                d_clip = _future_clip_chamfer(embeddings=clip_embeddings, idx0=idx0, idx1=idx1)
+                if np.isfinite(d_clip):
+                    clip_vals.append(float(d_clip))
+                    clip_offsets.append(int(offset))
+        if not apf_vals and not clip_vals:
             continue
         row = {
             "traj_id": str(item["traj_id"]),
@@ -481,17 +683,50 @@ def _analyze_item(
             "window_idx": int(idx),
             "step": int(round(float(center))),
             "delta_h": float(dh),
-            "local_divergence": float(np.mean(finite_vals)),
-            "local_divergence_median": float(np.median(finite_vals)),
-            "n_offsets_used": int(len(finite_vals)),
-            "offset_steps_used": ",".join(str(offset) for offset, value in zip(offset_steps, vals) if np.isfinite(value)),
             "metrics_path": str(metrics_path),
             "apf_dir": str(apf_dir),
         }
+        if apf_vals:
+            row.update(
+                {
+                    "local_divergence": float(np.mean(apf_vals)),
+                    "local_divergence_apf": float(np.mean(apf_vals)),
+                    "local_divergence_apf_median": float(np.median(apf_vals)),
+                    "n_offsets_used_apf": int(len(apf_vals)),
+                    "offset_steps_used_apf": ",".join(str(offset) for offset in apf_offsets),
+                }
+            )
+        if clip_vals:
+            if "local_divergence" not in row:
+                row["local_divergence"] = float(np.mean(clip_vals))
+            row.update(
+                {
+                    "local_divergence_clip_chamfer": float(np.mean(clip_vals)),
+                    "local_divergence_clip_chamfer_median": float(np.median(clip_vals)),
+                    "n_offsets_used_clip_chamfer": int(len(clip_vals)),
+                    "offset_steps_used_clip_chamfer": ",".join(str(offset) for offset in clip_offsets),
+                    "clip_cache_path": str(clip_cache_path) if clip_cache_path is not None else "",
+                    "foundation_model": str(foundation_model),
+                }
+            )
+        if "local_divergence" in row:
+            row.update(
+                {
+                    "local_divergence_median": row.get("local_divergence_apf_median", row.get("local_divergence_clip_chamfer_median", "")),
+                    "n_offsets_used": row.get("n_offsets_used_apf", row.get("n_offsets_used_clip_chamfer", "")),
+                    "offset_steps_used": row.get("offset_steps_used_apf", row.get("offset_steps_used_clip_chamfer", "")),
+                }
+            )
         for key, value in metric_meta.items():
             row[key] = value
         rows.append(row)
-    summary = _summary(rows, label=str(item["traj_id"]))
+    summary: dict[str, Any] = {"label": str(item["traj_id"])}
+    if "apf" in divergence_modes:
+        summary.update(_prefixed_summary(rows, label=str(item["traj_id"]), value_key="local_divergence_apf", prefix="apf"))
+    if "clip_chamfer" in divergence_modes:
+        summary.update(
+            _prefixed_summary(rows, label=str(item["traj_id"]), value_key="local_divergence_clip_chamfer", prefix="clip_chamfer")
+        )
     summary.update(
         {
             "traj_id": str(item["traj_id"]),
@@ -503,6 +738,7 @@ def _analyze_item(
             "apf_step_max": float(steps[-1]),
             "apf_sample_step": sample_step,
             "field_keys_loaded": ",".join(sorted(fields)),
+            "clip_cache_path": str(clip_cache_path) if clip_cache_path is not None else "",
         }
     )
     return rows, summary
@@ -521,8 +757,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         else _REPO_ROOT / "analysis" / "results" / "paper_suite" / "c2_local_divergence_probe"
     )
     field_weights = _parse_field_weights(args.field_weights)
+    divergence_modes = _parse_modes(args.divergence_modes)
     scales = _parse_ints(args.scales, [1, 2, 4])
     offsets = _parse_ints(args.offset_steps, [5000, 10000, 20000])
+    clip_cache_dir = ensure_dir(
+        resolve_path(args.clip_cache_dir)
+        if args.clip_cache_dir
+        else output_dir / "clip_embedding_cache"
+    )
     items = _iter_trajectories(root, include_random=bool(args.include_random))
     if args.max_trajectories is not None:
         items = items[: max(0, int(args.max_trajectories))]
@@ -537,6 +779,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         try:
             rows, summary = _analyze_item(
                 item,
+                divergence_modes=divergence_modes,
                 field_weights=field_weights,
                 scales=scales,
                 horizon_steps=int(args.horizon_steps),
@@ -544,6 +787,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 max_future_frames=int(args.max_future_frames),
                 spatial_downsample=int(args.spatial_downsample),
                 max_step_error=float(args.max_step_error) if args.max_step_error is not None else None,
+                clip_cache_dir=clip_cache_dir,
+                foundation_model=str(args.foundation_model),
+                force_clip_cache=bool(args.force_clip_cache),
             )
             all_rows.extend(rows)
             traj_rows.append(summary)
@@ -555,11 +801,30 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     rows_path = output_dir / "local_divergence_rows.csv"
     per_traj_path = output_dir / "local_divergence_by_trajectory.csv"
     summary_path = output_dir / "local_divergence_summary.json"
-    figure_path = output_dir / "local_divergence_vs_delta_h.png"
+    figure_apf_path = output_dir / "local_divergence_apf_vs_delta_h.png"
+    figure_clip_path = output_dir / "local_divergence_clip_chamfer_vs_delta_h.png"
     write_csv(rows_path, all_rows)
     write_csv(per_traj_path, traj_rows)
-    pooled = _summary(all_rows, label="pooled")
-    figure = _write_scatter(all_rows, figure_path, "C2 local divergence probe")
+    pooled: dict[str, Any] = {"label": "pooled"}
+    figures: dict[str, str | None] = {}
+    if "apf" in divergence_modes:
+        pooled["apf"] = _summary(all_rows, label="pooled", value_key="local_divergence_apf")
+        figures["apf"] = _write_scatter(
+            all_rows,
+            figure_apf_path,
+            "C2 local APF divergence probe",
+            value_key="local_divergence_apf",
+            ylabel="single-trajectory local APF divergence",
+        )
+    if "clip_chamfer" in divergence_modes:
+        pooled["clip_chamfer"] = _summary(all_rows, label="pooled", value_key="local_divergence_clip_chamfer")
+        figures["clip_chamfer"] = _write_scatter(
+            all_rows,
+            figure_clip_path,
+            "C2 local CLIP-chamfer divergence probe",
+            value_key="local_divergence_clip_chamfer",
+            ylabel="single-trajectory local CLIP chamfer divergence",
+        )
     summary = {
         "status": "ok" if all_rows else "empty",
         "trajectory_root": str(root),
@@ -568,15 +833,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "n_trajectories_scored": len(traj_rows),
         "n_rows": len(all_rows),
         "pooled": pooled,
+        "divergence_modes": sorted(divergence_modes),
         "field_weights": field_weights,
         "scales": scales,
         "horizon_steps": int(args.horizon_steps),
         "offset_steps": offsets,
         "max_future_frames": int(args.max_future_frames),
         "spatial_downsample": int(args.spatial_downsample),
+        "foundation_model": str(args.foundation_model),
+        "clip_cache_dir": str(clip_cache_dir),
         "rows_csv": str(rows_path),
         "per_trajectory_csv": str(per_traj_path),
-        "figure": figure,
+        "figures": figures,
+        "figure": figures.get("apf") or figures.get("clip_chamfer"),
         "failures": failures,
     }
     write_json(summary_path, summary)
@@ -632,6 +901,7 @@ def _self_test() -> None:
             output_dir=str(tmp / "out"),
             include_random=False,
             max_trajectories=None,
+            divergence_modes="apf",
             field_weights="A:1,P:0.25,F:0.25",
             scales="1,2",
             horizon_steps=10000,
@@ -639,6 +909,9 @@ def _self_test() -> None:
             max_future_frames=6,
             spatial_downsample=2,
             max_step_error=None,
+            clip_cache_dir=None,
+            foundation_model="clip",
+            force_clip_cache=False,
             strict=True,
         )
         summary = run(ns)
@@ -689,6 +962,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--include-random", action="store_true")
     parser.add_argument("--max-trajectories", type=int, default=None)
+    parser.add_argument(
+        "--divergence-modes",
+        default="apf,clip_chamfer",
+        help="Comma-separated divergence modes: apf,clip_chamfer. Default computes both.",
+    )
     parser.add_argument("--field-weights", default="A:1.0,P:0.25,F:0.25")
     parser.add_argument("--scales", default="1,2,4")
     parser.add_argument("--horizon-steps", type=int, default=30000)
@@ -696,6 +974,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-future-frames", type=int, default=24)
     parser.add_argument("--spatial-downsample", type=int, default=4)
     parser.add_argument("--max-step-error", type=float, default=None)
+    parser.add_argument("--foundation-model", default="clip")
+    parser.add_argument("--clip-cache-dir", default=None)
+    parser.add_argument("--force-clip-cache", action="store_true")
     parser.add_argument("--strict", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args(argv)
