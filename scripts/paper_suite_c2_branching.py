@@ -397,6 +397,20 @@ def _make_resume_command(
     return cmd
 
 
+def _make_resume_batch_command(*, jobs_path: Path, batch_size: int, force: bool) -> list[str]:
+    cmd = [
+        current_python(),
+        "scripts/flowlenia_minibang_resume_batch.py",
+        "--jobs-json",
+        str(jobs_path),
+        "--batch-size",
+        str(int(batch_size)),
+    ]
+    if force:
+        cmd.append("--overwrite")
+    return cmd
+
+
 def _write_smoke_fixture(output_root: Path, branch_root: Path) -> Path:
     out_dir = ensure_dir(output_root / "c2_branching")
     rows: list[dict[str, Any]] = []
@@ -539,6 +553,7 @@ def simulation(
     max_trajectories = int(_get(bcfg, "max_trajectories", 2))
     m_pairs = int(_get(bcfg, "m_pairs", 2))
     branches_per_time = int(_get(bcfg, "branches_per_time", 3))
+    resume_batch_size = int(_get(bcfg, "resume_batch_size", 1))
     refractory_steps = int(_get(bcfg, "refractory_steps", 5000))
     high_quantile = float(_get(bcfg, "high_quantile", 0.85))
     low_quantile = float(_get(bcfg, "low_quantile", 0.35))
@@ -564,6 +579,7 @@ def simulation(
     )
 
     rows: list[dict[str, Any]] = []
+    pending_batch_jobs: list[tuple[int, dict[str, Any]]] = []
     for _peak, item, centers, dh, covariates, _record in ranked[:max_trajectories]:
         metrics_path = Path(item["metrics_path"])
         source_traj_dir = Path(item["traj_dir"])
@@ -613,38 +629,70 @@ def simulation(
                                 component="c2-branch",
                             )
                             shutil.rmtree(branch_dir)
-                        log_event(
-                            f"C2 branching simulation running traj={traj_id} pair={pair['pair_id']} condition={condition} branch={branch_id} step={step}",
-                            component="c2-branch",
+                        if resume_batch_size > 1:
+                            status = "queued_batch" if not dry_run else "dry_run"
+                        else:
+                            log_event(
+                                f"C2 branching simulation running traj={traj_id} pair={pair['pair_id']} condition={condition} branch={branch_id} step={step}",
+                                component="c2-branch",
+                            )
+                            run_subprocess(cmd, dry_run=dry_run)
+                            status = "dry_run" if dry_run else ("exists" if _branch_output_ok(branch_dir) else "missing")
+                    row = {
+                        "traj_id": traj_id,
+                        "pair_id": int(pair["pair_id"]),
+                        "condition": condition,
+                        "step": step,
+                        "delta_h": delta_h,
+                        "branch_id": branch_id,
+                        "source_metrics_path": str(metrics_path),
+                        "source_traj_dir": str(source_traj_dir),
+                        "source_apf_dir": str(source_apf_dir),
+                        "branch_dir": str(branch_dir),
+                        "match_method": str(pair.get("match_method", "")),
+                        "match_covariate_distance": pair.get("match_covariate_distance", ""),
+                        "high_total_mass": pair.get("high_total_mass", ""),
+                        "low_total_mass": pair.get("low_total_mass", ""),
+                        "high_active_fraction": pair.get("high_active_fraction", ""),
+                        "low_active_fraction": pair.get("low_active_fraction", ""),
+                        "high_mean_lagrangian_speed": pair.get("high_mean_lagrangian_speed", ""),
+                        "low_mean_lagrangian_speed": pair.get("low_mean_lagrangian_speed", ""),
+                        "high_field_activity": pair.get("high_field_activity", ""),
+                        "low_field_activity": pair.get("low_field_activity", ""),
+                        "status": status,
+                        "command": command_to_str(cmd),
+                    }
+                    rows.append(row)
+                    if status == "queued_batch":
+                        pending_batch_jobs.append(
+                            (
+                                len(rows) - 1,
+                                {
+                                    "source_traj_dir": str(source_traj_dir),
+                                    "step": int(step),
+                                    "additional_steps": int(horizon_steps),
+                                    "output_dir": str(branch_dir),
+                                    "branch_seed": int(branch_seed),
+                                    "perturb_a_std": float(perturb_a_std),
+                                    "perturb_p_std": float(perturb_p_std),
+                                    "perturb_lagrangian_xy_std": float(perturb_lag_xy_std),
+                                },
+                            )
                         )
-                        run_subprocess(cmd, dry_run=dry_run)
-                        status = "dry_run" if dry_run else ("exists" if _branch_output_ok(branch_dir) else "missing")
-                    rows.append(
-                        {
-                            "traj_id": traj_id,
-                            "pair_id": int(pair["pair_id"]),
-                            "condition": condition,
-                            "step": step,
-                            "delta_h": delta_h,
-                            "branch_id": branch_id,
-                            "source_metrics_path": str(metrics_path),
-                            "source_traj_dir": str(source_traj_dir),
-                            "source_apf_dir": str(source_apf_dir),
-                            "branch_dir": str(branch_dir),
-                            "match_method": str(pair.get("match_method", "")),
-                            "match_covariate_distance": pair.get("match_covariate_distance", ""),
-                            "high_total_mass": pair.get("high_total_mass", ""),
-                            "low_total_mass": pair.get("low_total_mass", ""),
-                            "high_active_fraction": pair.get("high_active_fraction", ""),
-                            "low_active_fraction": pair.get("low_active_fraction", ""),
-                            "high_mean_lagrangian_speed": pair.get("high_mean_lagrangian_speed", ""),
-                            "low_mean_lagrangian_speed": pair.get("low_mean_lagrangian_speed", ""),
-                            "high_field_activity": pair.get("high_field_activity", ""),
-                            "low_field_activity": pair.get("low_field_activity", ""),
-                            "status": status,
-                            "command": command_to_str(cmd),
-                        }
-                    )
+
+    if pending_batch_jobs:
+        jobs_path = out_dir / "branch_resume_jobs.json"
+        write_json(jobs_path, {"jobs": [job for _idx, job in pending_batch_jobs]})
+        batch_cmd = _make_resume_batch_command(jobs_path=jobs_path, batch_size=resume_batch_size, force=force)
+        log_event(
+            f"C2 branching simulation running batched resume jobs={len(pending_batch_jobs)} batch_size={resume_batch_size}",
+            component="c2-branch",
+        )
+        run_subprocess(batch_cmd, dry_run=dry_run)
+        for row_idx, job in pending_batch_jobs:
+            branch_dir = Path(str(job["output_dir"]))
+            rows[row_idx]["command"] = command_to_str(batch_cmd)
+            rows[row_idx]["status"] = "dry_run" if dry_run else ("exists" if _branch_output_ok(branch_dir) else "missing")
 
     plan_path = out_dir / "branch_plan.csv"
     write_csv(plan_path, rows)

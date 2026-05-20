@@ -247,6 +247,10 @@ c2:
     m_pairs: 5
     branches_per_time: 3
     horizon_steps: 3000
+    # Set >1 to run C2 branch continuations through the batched resume runner.
+    # The runner batches compatible arbitrary snapshots/params with the same
+    # tensor shapes, horizon, snapshot cadence, and original RNG batch size.
+    resume_batch_size: 4
     refractory_steps: 5000
     high_quantile: 0.85
     low_quantile: 0.35

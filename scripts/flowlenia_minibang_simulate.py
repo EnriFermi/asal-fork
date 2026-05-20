@@ -1089,7 +1089,20 @@ def _prepare_metric_args(flat_args: dict[str, Any], *, rollout_steps: int, sampl
     grid = data.get("metric_tau_grid_steps", None)
     if grid is not None:
         grid_list = [int(x) for x in (OmegaConf.to_container(grid, resolve=True) if OmegaConf.is_config(grid) else grid)]
-        grid_list = [x for x in grid_list if 0 < x < int(data["metric_window_size_steps"])]
+        window_steps = int(data["metric_window_size_steps"])
+        window_frames = max(1, round(float(window_steps) / float(sample_every_steps)))
+        m_min = int(data.get("metric_m_min", 4))
+        m_samples = int(data.get("metric_m_samples", 48))
+        valid_grid: list[int] = []
+        for tau_steps in grid_list:
+            if not (0 < tau_steps < window_steps):
+                continue
+            tau_frames = max(1, round(float(tau_steps) / float(sample_every_steps)))
+            tseg = int(window_frames) - int(tau_frames)
+            m_count = tseg if m_samples <= 0 else min(tseg, m_samples)
+            if tseg >= 1 and m_count >= m_min:
+                valid_grid.append(int(tau_steps))
+        grid_list = valid_grid
         data["metric_tau_grid_steps"] = grid_list if grid_list else None
 
     if data.get("metric_range_start_steps", None) is None:
