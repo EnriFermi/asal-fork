@@ -246,6 +246,18 @@ c2:
     required: false
     branch_root: analysis/results/paper_suite/c2_branching/branches
     max_trajectories: 2
+    # Main C2 protocol: collapse Delta-H over admissible tau with the metric
+    # preprocessing phi, then sample high/low quantile-rank windows independently.
+    # Continuous Delta-H sampling remains available as selection_mode:
+    # delta_h_quantile_sweep.
+    selection_mode: tau_mean_ranked_high_low
+    n_high: 5
+    n_low: 5
+    selection_seed: 12345
+    n_points_per_trajectory: 10
+    point_quantile_min: 0.05
+    point_quantile_max: 0.95
+    # Legacy high/low fallback only.
     m_pairs: 2
     branches_per_time: 3
     # Set >1 to run C2 branch continuations through the batched resume runner.
@@ -254,14 +266,20 @@ c2:
     resume_batch_size: 4
     horizon_steps: 1000
     refractory_steps: 5000
-    high_quantile: 0.85
-    low_quantile: 0.35
+    high_quantile: 0.8
+    low_quantile: 0.2
     feature_max_apf_chunks: 4
     feature_max_snapshots_per_chunk: 8
     future_field_weights:
       A: 1.0
       P: 0.25
       F: 0.25
+    # Branch divergence metric used by the metrics layer. Use apf for the
+    # explicit APF multiscale L2 production metric, or override from CLI with
+    # --branching-metric clip_chamfer for CLIP embedding cloud Chamfer distance.
+    branching_metric: apf
+    clip_foundation_model: clip
+    clip_embedding_cache_dir: analysis/results/paper_suite/c2_branching/clip_embedding_cache
     future_field_scales: [1, 2, 4]
     future_max_frames: 32
     allow_debug_feature_fallback: false
@@ -454,6 +472,11 @@ smoke:
     branching:
       branch_root: analysis/results/paper_suite_smoke/c2_branching/branches
       max_trajectories: 1
+      selection_mode: tau_mean_ranked_high_low
+      n_high: 2
+      n_low: 2
+      selection_seed: 12345
+      n_points_per_trajectory: 4
       m_pairs: 2
       branches_per_time: 3
       horizon_steps: 64

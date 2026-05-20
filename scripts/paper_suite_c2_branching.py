@@ -38,7 +38,7 @@ from paper_suite_c2_flowlenia_metrics import _rollout_config as _c2_rollout_conf
 from paper_suite_metric_cache import compare_metrics_npz_metadata, sha256_text, stable_json
 
 
-BRANCH_PLAN_VERSION = "c2_branch_plan_v3_delta_h_sweep"
+BRANCH_PLAN_VERSION = "c2_branch_plan_v4_tau_mean_ranked_high_low"
 
 
 def _get(cfg: Any, key: str, default: Any = None) -> Any:
@@ -151,6 +151,127 @@ def _load_delta_h(path: Path) -> tuple[np.ndarray, np.ndarray]:
     if n == 0:
         raise ValueError(f"{path} has an empty delta-H series.")
     return centers[:n], dh[:n]
+
+
+def _npz_scalar(data: np.lib.npyio.NpzFile, key: str, default: Any = None) -> Any:
+    arr = _safe_arr(data, key)
+    if arr is None:
+        return default
+    try:
+        return np.asarray(arr).reshape(-1)[0].item()
+    except Exception:
+        return default
+
+
+def _npz_json(data: np.lib.npyio.NpzFile, key: str) -> dict[str, Any]:
+    raw = _npz_scalar(data, key, None)
+    if raw is None:
+        return {}
+    try:
+        return json.loads(str(raw))
+    except Exception:
+        return {}
+
+
+def _preprocess_delta_h_heatmap(delta_h_map: np.ndarray, *, mode: str, floor: float) -> np.ndarray:
+    x = np.asarray(delta_h_map, dtype=np.float64)
+    mode = str(mode or "clip").strip().lower()
+    if mode == "clip":
+        out = np.maximum(x, 0.0)
+    elif mode == "shift":
+        row_min = np.nanmin(x, axis=1, keepdims=True)
+        out = x - row_min
+    elif mode == "none":
+        out = x.copy()
+    else:
+        raise ValueError(f"Unknown Delta-H preprocessing mode {mode!r}.")
+    floor = float(floor or 0.0)
+    if floor > 0.0:
+        out = np.where(out >= floor, out, 0.0)
+    return out
+
+
+def _load_delta_h_energy(
+    path: Path,
+    *,
+    min_remaining_steps: int | None = None,
+    min_remaining_samples: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    with np.load(path, allow_pickle=False) as data:
+        dh_map_raw = _safe_arr(data, "delta_h_map")
+        if dh_map_raw is None:
+            centers, dh = _load_delta_h(path)
+            return centers, dh, {
+                "selection_energy_source": "delta_h_best_fallback",
+                "admissible_tau_count": 1,
+                "admissible_tau_steps": "",
+            }
+        dh_map = np.asarray(dh_map_raw, dtype=np.float64)
+        tau_steps = np.asarray(_safe_arr(data, "delta_h_tau_steps", np.arange(dh_map.shape[0])), dtype=np.float64).reshape(-1)
+        if dh_map.ndim != 2:
+            raise ValueError(f"{path} delta_h_map must be 2D, got {dh_map.shape}.")
+        if dh_map.shape[0] == tau_steps.size:
+            pass
+        elif dh_map.shape[1] == tau_steps.size:
+            dh_map = dh_map.T
+        else:
+            raise ValueError(f"{path} delta_h_map shape {dh_map.shape} is incompatible with tau grid size {tau_steps.size}.")
+
+        centers = _safe_arr(data, "delta_h_window_center_steps")
+        if centers is None:
+            starts = _safe_arr(data, "delta_h_window_start_steps", np.arange(dh_map.shape[1]))
+            centers = np.asarray(starts, dtype=np.float64).reshape(-1)
+        centers = np.asarray(centers, dtype=np.float64).reshape(-1)
+
+        metric_cfg = _npz_json(data, "metric_config_json")
+        sample_every = int(
+            _npz_scalar(
+                data,
+                "delta_h_sample_every_steps",
+                metric_cfg.get("sample_every_steps", metric_cfg.get("sample_stride_steps", 1)),
+            )
+        )
+        window_size_steps = _npz_scalar(data, "delta_h_window_size_steps", None)
+        if window_size_steps is None:
+            window_size_steps = int(metric_cfg.get("window_size_frames", 0)) * max(1, sample_every)
+        window_size_steps = int(window_size_steps)
+        if window_size_steps <= 0:
+            raise ValueError(f"{path} does not contain a usable Delta-H window size.")
+
+        m_min = int(metric_cfg.get("m_min", 4))
+        if min_remaining_steps is not None:
+            min_gap_steps = int(min_remaining_steps)
+        elif min_remaining_samples is not None:
+            min_gap_steps = int(min_remaining_samples) * max(1, sample_every)
+        else:
+            min_gap_steps = int(m_min) * max(1, sample_every)
+        admissible = np.isfinite(tau_steps) & (tau_steps < float(window_size_steps)) & (
+            (float(window_size_steps) - tau_steps) >= float(min_gap_steps)
+        )
+        if not np.any(admissible):
+            raise ValueError(
+                f"{path} has no admissible tau for branching energy: "
+                f"window_size_steps={window_size_steps}, min_remaining_steps={min_gap_steps}, tau_steps={tau_steps.tolist()}."
+            )
+
+        mode = str(metric_cfg.get("preprocess_mode", "clip")).strip().lower()
+        floor = float(metric_cfg.get("delta_h_floor", 0.0) or 0.0)
+        processed = _preprocess_delta_h_heatmap(dh_map, mode=mode, floor=floor)
+        energy = np.nanmean(processed[admissible], axis=0)
+        n = min(int(centers.size), int(energy.size))
+        meta = {
+            "selection_energy_source": "mean_tau_phi_delta_h_map",
+            "selection_preprocess_mode": mode,
+            "selection_delta_h_floor": floor,
+            "selection_window_size_steps": window_size_steps,
+            "selection_sample_every_steps": sample_every,
+            "selection_min_remaining_steps": int(min_gap_steps),
+            "admissible_tau_count": int(np.sum(admissible)),
+            "admissible_tau_steps": ",".join(str(int(round(x))) for x in tau_steps[admissible]),
+        }
+    if n == 0:
+        raise ValueError(f"{path} produced an empty branching energy profile.")
+    return centers[:n], energy[:n], meta
 
 
 def _validate_metric_item(item: dict[str, Any], flat_args: dict[str, Any]) -> dict[str, Any]:
@@ -353,6 +474,79 @@ def _is_delta_h_sweep_mode(mode: Any) -> bool:
     }
 
 
+def _is_ranked_high_low_mode(mode: Any) -> bool:
+    return str(mode or "paired_high_low").strip().lower() in {
+        "tau_mean_ranked_high_low",
+        "ranked_high_low",
+        "sampled_high_low",
+        "quantile_rank_high_low",
+        "mean_tau_high_low",
+    }
+
+
+def _quantile_ranks(values: np.ndarray) -> np.ndarray:
+    x = np.asarray(values, dtype=np.float64).reshape(-1)
+    out = np.full_like(x, np.nan, dtype=np.float64)
+    finite_idx = np.flatnonzero(np.isfinite(x))
+    if finite_idx.size == 0:
+        return out
+    vals = x[finite_idx]
+    order = np.argsort(vals, kind="mergesort")
+    ranks = np.empty(vals.size, dtype=np.float64)
+    i = 0
+    while i < vals.size:
+        j = i + 1
+        while j < vals.size and vals[order[j]] == vals[order[i]]:
+            j += 1
+        ranks[order[i:j]] = 0.5 * (i + j - 1)
+        i = j
+    denom = max(1, vals.size - 1)
+    out[finite_idx] = ranks / float(denom)
+    return out
+
+
+def _trajectory_end_step(apf_dir: Path) -> int | None:
+    chunks = list_apf_chunks(apf_dir)
+    if not chunks:
+        return None
+    return int(chunks[-1][2])
+
+
+def _apf_saved_steps(apf_dir: Path) -> np.ndarray:
+    chunks = list_apf_chunks(apf_dir)
+    parts: list[np.ndarray] = []
+    for path, start, end, _idx in chunks:
+        try:
+            with np.load(path, allow_pickle=False) as data:
+                if "steps" in data.files:
+                    steps = np.asarray(data["steps"], dtype=np.int64).reshape(-1)
+                    if steps.size:
+                        parts.append(steps)
+                        continue
+                n = int(np.asarray(data["A"]).shape[0]) if "A" in data.files else 0
+                if n > 0:
+                    parts.append(_apf_steps_from_chunk(data, start=int(start), end=int(end), n=n).astype(np.int64))
+        except Exception:
+            continue
+    if not parts:
+        return np.asarray([], dtype=np.int64)
+    return np.unique(np.concatenate(parts).astype(np.int64))
+
+
+def _nearest_apf_step(apf_dir: Path, requested_step: int, *, cache: dict[str, np.ndarray] | None = None) -> int:
+    key = str(apf_dir.resolve())
+    if cache is not None and key in cache:
+        steps = cache[key]
+    else:
+        steps = _apf_saved_steps(apf_dir)
+        if cache is not None:
+            cache[key] = steps
+    if steps.size == 0:
+        return int(requested_step)
+    idx = int(np.argmin(np.abs(steps.astype(np.float64) - float(requested_step))))
+    return int(steps[idx])
+
+
 def _as_float_list(raw: Any) -> list[float]:
     if raw is None:
         return []
@@ -452,6 +646,102 @@ def _select_delta_h_points(
             row[key] = float(value[chosen])
         points.append(row)
     return points
+
+
+def _select_ranked_high_low_points(
+    *,
+    centers: np.ndarray,
+    energy: np.ndarray,
+    covariates: dict[str, np.ndarray] | None,
+    n_high: int,
+    n_low: int,
+    q_high: float,
+    q_low: float,
+    horizon_steps: int,
+    trajectory_end_step: int | None,
+    seed: int,
+    energy_meta: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    c = np.asarray(centers, dtype=np.float64).reshape(-1)
+    e = np.asarray(energy, dtype=np.float64).reshape(-1)
+    n = min(c.size, e.size)
+    if n == 0:
+        return [], {"n_high_pool": 0, "n_low_pool": 0, "n_high_selected": 0, "n_low_selected": 0}
+    c = c[:n]
+    e = e[:n]
+    finite = np.isfinite(c) & np.isfinite(e)
+    if trajectory_end_step is not None:
+        finite &= (c + float(horizon_steps)) <= float(trajectory_end_step)
+    if int(np.sum(finite)) < 1:
+        return [], {
+            "n_high_pool": 0,
+            "n_low_pool": 0,
+            "n_high_selected": 0,
+            "n_low_selected": 0,
+            "trajectory_end_step": "" if trajectory_end_step is None else int(trajectory_end_step),
+        }
+
+    q_high = float(np.clip(q_high, 0.0, 1.0))
+    q_low = float(np.clip(q_low, 0.0, 1.0))
+    finite_values = e[finite]
+    high_threshold = float(np.nanquantile(finite_values, q_high))
+    low_threshold = float(np.nanquantile(finite_values, q_low))
+    high_pool = np.flatnonzero(finite & (e >= high_threshold))
+    low_pool = np.flatnonzero(finite & (e <= low_threshold))
+    rng = np.random.default_rng(int(seed))
+
+    def _draw(pool: np.ndarray, count: int) -> np.ndarray:
+        if pool.size == 0 or int(count) <= 0:
+            return np.asarray([], dtype=np.int64)
+        k = min(int(pool.size), int(count))
+        return rng.choice(pool, size=k, replace=False).astype(np.int64)
+
+    selected_high = _draw(high_pool, int(n_high))
+    selected_low = _draw(low_pool, int(n_low))
+    qrank = _quantile_ranks(e)
+    cov_full = covariates or {}
+    cov = {
+        key: np.asarray(value, dtype=np.float64).reshape(-1)[:n]
+        for key, value in cov_full.items()
+        if np.asarray(value).reshape(-1).size >= n
+    }
+    common_meta = {
+        "selection_method": "mean_tau_phi_delta_h_quantile_rank_sampling_without_replacement",
+        "selection_high_quantile": q_high,
+        "selection_low_quantile": q_low,
+        "selection_high_threshold": high_threshold,
+        "selection_low_threshold": low_threshold,
+        "n_high_pool": int(high_pool.size),
+        "n_low_pool": int(low_pool.size),
+        "n_high_requested": int(n_high),
+        "n_low_requested": int(n_low),
+        "n_high_selected": int(selected_high.size),
+        "n_low_selected": int(selected_low.size),
+        "trajectory_end_step": "" if trajectory_end_step is None else int(trajectory_end_step),
+    }
+    if energy_meta:
+        common_meta.update(energy_meta)
+
+    rows: list[dict[str, Any]] = []
+    for condition, selected in (("high", selected_high), ("low", selected_low)):
+        for local_id, original_idx in enumerate(selected.tolist()):
+            row: dict[str, Any] = {
+                "pair_id": int(local_id),
+                "point_id": int(local_id),
+                "condition": condition,
+                "window_index": int(original_idx),
+                "window_center_step": int(round(float(c[original_idx]))),
+                "step": int(round(float(c[original_idx]))),
+                "delta_h": float(e[original_idx]),
+                "delta_h_energy": float(e[original_idx]),
+                "delta_h_quantile_rank": float(qrank[original_idx]),
+                "target_quantile": q_high if condition == "high" else q_low,
+                **common_meta,
+            }
+            for key, value in cov.items():
+                row[f"point_{key}"] = float(value[original_idx])
+            rows.append(row)
+    return rows, common_meta
 
 
 def _branch_output_ok(branch_dir: Path) -> bool:
@@ -672,33 +962,54 @@ def simulation(
     branches_per_time = int(_get(bcfg, "branches_per_time", 3))
     resume_batch_size = int(_get(bcfg, "resume_batch_size", 1))
     refractory_steps = int(_get(bcfg, "refractory_steps", 5000))
-    high_quantile = float(_get(bcfg, "high_quantile", 0.85))
-    low_quantile = float(_get(bcfg, "low_quantile", 0.35))
+    high_quantile = float(_get(bcfg, "high_quantile", 0.8))
+    low_quantile = float(_get(bcfg, "low_quantile", 0.2))
+    n_high = int(_get(bcfg, "n_high", m_pairs))
+    n_low = int(_get(bcfg, "n_low", m_pairs))
+    selection_seed = int(_get(bcfg, "selection_seed", 12345))
+    energy_min_remaining_steps_raw = _get(bcfg, "energy_min_remaining_steps", None)
+    energy_min_remaining_samples_raw = _get(bcfg, "energy_min_samples", None)
+    energy_min_remaining_steps = None if energy_min_remaining_steps_raw is None else int(energy_min_remaining_steps_raw)
+    energy_min_remaining_samples = None if energy_min_remaining_samples_raw is None else int(energy_min_remaining_samples_raw)
     horizon_steps = int(_get(bcfg, "horizon_steps", 1000))
     perturb = _get(bcfg, "perturb", {})
     perturb_a_std = float(_get(perturb, "a_std", 1e-4))
     perturb_p_std = float(_get(perturb, "p_std", 1e-4))
     perturb_lag_xy_std = float(_get(perturb, "lagrangian_xy_std", 0.01))
 
-    ranked: list[tuple[float, dict[str, Any], np.ndarray, np.ndarray, dict[str, np.ndarray], dict[str, Any]]] = []
+    ranked: list[tuple[float, dict[str, Any], np.ndarray, np.ndarray, dict[str, np.ndarray], dict[str, Any], dict[str, Any]]] = []
     metric_records: list[dict[str, Any]] = []
     for item in metric_items:
         path = Path(item["metrics_path"])
         record = _validate_metric_item(item, flat_args)
-        centers, dh = _load_delta_h(path)
-        covariates = _activity_covariates(Path(item.get("apf_dir", Path(item["traj_dir"]) / "apf_logs")), centers)
+        apf_dir = Path(item.get("apf_dir", Path(item["traj_dir"]) / "apf_logs"))
+        if _is_ranked_high_low_mode(selection_mode):
+            centers, dh, selection_meta = _load_delta_h_energy(
+                path,
+                min_remaining_steps=energy_min_remaining_steps,
+                min_remaining_samples=energy_min_remaining_samples,
+            )
+            rank_score = float(np.nanmean(dh))
+            covariates = {}
+        else:
+            centers, dh = _load_delta_h(path)
+            selection_meta = {}
+            rank_score = float(np.nanmax(dh))
+            covariates = _activity_covariates(apf_dir, centers)
         metric_records.append(record)
-        ranked.append((float(np.nanmax(dh)), item, centers, dh, covariates, record))
+        ranked.append((rank_score, item, centers, dh, covariates, record, selection_meta))
     ranked.sort(key=lambda x: -x[0])
     log_event(
         f"C2 branching simulation ranked n_metric_items={len(ranked)} max_trajectories={max_trajectories} "
-        f"selection_mode={selection_mode} m_pairs={m_pairs} n_points_per_trajectory={n_points_per_trajectory} "
+        f"selection_mode={selection_mode} m_pairs={m_pairs} n_high={n_high} n_low={n_low} "
+        f"n_points_per_trajectory={n_points_per_trajectory} "
         f"branches_per_time={branches_per_time}",
         component="c2-branch",
     )
 
     rows: list[dict[str, Any]] = []
     pending_batch_jobs: list[tuple[int, dict[str, Any]]] = []
+    saved_steps_cache: dict[str, np.ndarray] = {}
 
     def _append_branch_row(
         *,
@@ -715,11 +1026,13 @@ def simulation(
         branch_dir: Path,
         extra: dict[str, Any] | None = None,
     ) -> None:
+        requested_step = int(step)
+        snapped_step = _nearest_apf_step(source_apf_dir, requested_step, cache=saved_steps_cache)
         branch_ready = _branch_output_ok(branch_dir)
         overwrite_incomplete = branch_dir.exists() and not branch_ready
         cmd = _make_resume_command(
             source_traj_dir=source_traj_dir,
-            step=step,
+            step=snapped_step,
             horizon_steps=horizon_steps,
             branch_dir=branch_dir,
             branch_seed=branch_seed,
@@ -743,7 +1056,8 @@ def simulation(
                 status = "queued_batch" if not dry_run else "dry_run"
             else:
                 log_event(
-                    f"C2 branching simulation running traj={traj_id} pair={pair_id} condition={condition} branch={branch_id} step={step}",
+                    f"C2 branching simulation running traj={traj_id} pair={pair_id} condition={condition} "
+                    f"branch={branch_id} step={snapped_step} requested_step={requested_step}",
                     component="c2-branch",
                 )
                 run_subprocess(cmd, dry_run=dry_run)
@@ -752,7 +1066,9 @@ def simulation(
             "traj_id": traj_id,
             "pair_id": int(pair_id),
             "condition": condition,
-            "step": int(step),
+            "step": int(snapped_step),
+            "requested_step": int(requested_step),
+            "step_snap_delta": int(snapped_step - requested_step),
             "delta_h": float(delta_h),
             "branch_id": int(branch_id),
             "source_metrics_path": str(metrics_path),
@@ -772,7 +1088,7 @@ def simulation(
                     len(rows) - 1,
                     {
                         "source_traj_dir": str(source_traj_dir),
-                        "step": int(step),
+                        "step": int(snapped_step),
                         "additional_steps": int(horizon_steps),
                         "output_dir": str(branch_dir),
                         "branch_seed": int(branch_seed),
@@ -783,11 +1099,76 @@ def simulation(
                 )
             )
 
-    for _peak, item, centers, dh, covariates, _record in ranked[:max_trajectories]:
+    for traj_order, (_peak, item, centers, dh, covariates, _record, selection_meta) in enumerate(ranked[:max_trajectories]):
         metrics_path = Path(item["metrics_path"])
         source_traj_dir = Path(item["traj_dir"])
         source_apf_dir = Path(item.get("apf_dir", source_traj_dir / "apf_logs"))
         traj_id = str(item["traj_id"])
+        if _is_ranked_high_low_mode(selection_mode):
+            trajectory_end = _trajectory_end_step(source_apf_dir)
+            points, select_summary = _select_ranked_high_low_points(
+                centers=centers,
+                energy=dh,
+                covariates=covariates,
+                n_high=n_high,
+                n_low=n_low,
+                q_high=high_quantile,
+                q_low=low_quantile,
+                horizon_steps=horizon_steps,
+                trajectory_end_step=trajectory_end,
+                seed=selection_seed + 10007 * traj_order,
+                energy_meta=selection_meta,
+            )
+            log_event(
+                f"C2 branching simulation traj={traj_id} selected_high={select_summary.get('n_high_selected', 0)} "
+                f"selected_low={select_summary.get('n_low_selected', 0)} high_pool={select_summary.get('n_high_pool', 0)} "
+                f"low_pool={select_summary.get('n_low_pool', 0)} source={metrics_path}",
+                component="c2-branch",
+            )
+            for point in points:
+                point_id = int(point["point_id"])
+                pair_id = int(point["pair_id"])
+                condition = str(point["condition"])
+                step = int(point["step"])
+                delta_h = float(point["delta_h"])
+                window_idx = int(point.get("window_index", point_id))
+                extra = {
+                    key: value
+                    for key, value in point.items()
+                    if key
+                    not in {
+                        "pair_id",
+                        "point_id",
+                        "condition",
+                        "step",
+                        "delta_h",
+                    }
+                }
+                for branch_id in range(branches_per_time):
+                    branch_seed = int(
+                        selection_seed
+                        + 1000003 * traj_order
+                        + 1009 * point_id
+                        + 131 * branch_id
+                        + (0 if condition == "high" else 7919)
+                    )
+                    branch_dir = branch_root / traj_id / f"rank_{condition}_{point_id:03d}_w_{window_idx:04d}_step_{step}" / f"branch_{branch_id:02d}"
+                    _append_branch_row(
+                        source_traj_dir=source_traj_dir,
+                        source_apf_dir=source_apf_dir,
+                        metrics_path=metrics_path,
+                        traj_id=traj_id,
+                        pair_id=pair_id,
+                        condition=condition,
+                        step=step,
+                        delta_h=delta_h,
+                        branch_id=branch_id,
+                        branch_seed=branch_seed,
+                        branch_dir=branch_dir,
+                        extra=extra,
+                    )
+            continue
+
         if _is_delta_h_sweep_mode(selection_mode):
             points = _select_delta_h_points(
                 centers=centers,
@@ -901,16 +1282,25 @@ def simulation(
     plan_path = out_dir / "branch_plan.csv"
     write_csv(plan_path, rows)
     csv_rows = read_csv(plan_path)
+    if _is_ranked_high_low_mode(selection_mode):
+        matching = "mean_tau_phi_delta_h_quantile_rank_sampling_without_replacement"
+    elif _is_delta_h_sweep_mode(selection_mode):
+        matching = "delta_h_quantile_sweep"
+    else:
+        matching = "activity_covariate_nearest_in_low_delta_h_pool"
     plan_meta = {
         "branch_plan_version": BRANCH_PLAN_VERSION,
         "branch_plan_rows_hash": sha256_text(stable_json(csv_rows)),
-        "matching": "delta_h_quantile_sweep" if _is_delta_h_sweep_mode(selection_mode) else "activity_covariate_nearest_in_low_delta_h_pool",
+        "matching": matching,
         "rollout_config": str(rollout_config),
         "metric_records": metric_records,
         "branching_config": {
             "max_trajectories": max_trajectories,
             "m_pairs": m_pairs,
+            "n_high": n_high,
+            "n_low": n_low,
             "selection_mode": selection_mode,
+            "selection_seed": selection_seed,
             "n_points_per_trajectory": n_points_per_trajectory,
             "point_quantiles": point_quantiles,
             "point_quantile_min": point_quantile_min,
@@ -920,6 +1310,8 @@ def simulation(
             "refractory_steps": refractory_steps,
             "high_quantile": high_quantile,
             "low_quantile": low_quantile,
+            "energy_min_remaining_steps": energy_min_remaining_steps,
+            "energy_min_samples": energy_min_remaining_samples,
         },
     }
     write_json(out_dir / "branch_plan_meta.json", plan_meta)

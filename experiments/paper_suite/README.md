@@ -370,12 +370,14 @@ scripts/paper_suite_c2_branching.py
 Simulation layer:
 
 - читает high-res C2 `metrics.npz`;
-- выбирает high Delta-H локальные времена;
-- подбирает matched low/mid Delta-H времена by activity covariates rather than
-  nearest time alone: total mass, active area, mean Lagrangian speed, and field
-  activity when available;
+- в основном режиме `delta_h_quantile_sweep` выбирает branch times across the
+  Delta-H distribution by target quantiles;
+- legacy `paired_high_low` mode still can choose high Delta-H times and matched
+  low/mid Delta-H times by activity covariates, but it is not the main C2
+  protocol;
 - пишет `branch_plan.csv` and `branch_plan_meta.json`;
-- при `--allow-heavy` запускает resumed branches через `scripts/flowlenia_minibang_resume.py`;
+- при `--allow-heavy` запускает resumed branches через `scripts/flowlenia_minibang_resume.py`
+  or the batched resume runner;
 - каждый branch получает small perturbation и отдельный `branch_seed`.
 
 Без `--allow-heavy` real branches не запускаются.
@@ -390,11 +392,14 @@ Metrics layer:
 - compact `branch_feature.npz` path оставлен только как smoke/debug fallback,
   not main evidence;
 - считает mean pairwise branch divergence внутри каждого selected time;
-- считает paired contrast:
+- считает main correlation:
 
 ```text
-B(high Delta-H) - B(low Delta-H)
+corr(Delta-H at branch time, future branch divergence)
 ```
+
+Legacy `paired_high_low` plans additionally write paired contrasts
+`B(high Delta-H) - B(low Delta-H)`.
 
 Outputs:
 
@@ -403,6 +408,7 @@ analysis/results/paper_suite/c2_branching/branch_plan.csv
 analysis/results/paper_suite/c2_branching/branch_plan_meta.json
 analysis/results/paper_suite/c2_branching/branching_scores.csv
 analysis/results/paper_suite/c2_branching/branching_pair_contrasts.csv
+analysis/results/paper_suite/c2_branching/branching_delta_h_correlation.csv
 analysis/results/paper_suite/c2_branching_metrics_summary.json
 ```
 
@@ -414,6 +420,8 @@ Default config is deliberately small:
 
 ```yaml
 max_trajectories: 2
+selection_mode: delta_h_quantile_sweep
+n_points_per_trajectory: 10
 m_pairs: 2
 branches_per_time: 3
 horizon_steps: 1000
@@ -422,7 +430,7 @@ future_field_scales: [1, 2, 4]
 future_max_frames: 32
 ```
 
-For the paper-quality C2-B run on A100, increase to the design-doc target, e.g. `m_pairs: 5`, `branches_per_time: 4`, and top `2-3` MSPD-opt trajectories.
+For the paper-quality C2-B run on A100, increase `n_points_per_trajectory`, `branches_per_time`, and `max_trajectories`. `m_pairs` is only for the legacy high/low fallback.
 
 ### C5 frustration / history dependence
 
