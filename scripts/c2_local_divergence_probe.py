@@ -173,7 +173,7 @@ def _metadata_time_len(data: np.lib.npyio.NpzFile) -> int | None:
     for key in ("steps", "state_t"):
         if key in data.files:
             n = int(np.asarray(data[key]).reshape(-1).size)
-            if n > 1:
+            if n >= 1:
                 return n
     return None
 
@@ -181,13 +181,31 @@ def _metadata_time_len(data: np.lib.npyio.NpzFile) -> int | None:
 def _normalize_apf_array(arr: np.ndarray, data: np.lib.npyio.NpzFile) -> np.ndarray:
     x = np.asarray(arr, dtype=np.float32)
     time_len = _metadata_time_len(data)
-    if x.ndim >= 5 and time_len is not None:
-        if int(x.shape[0]) == 1 and int(x.shape[1]) == time_len:
-            return x[0]
-        if int(x.shape[0]) == time_len and int(x.shape[1]) == 1:
-            return x[:, 0]
-    if x.ndim >= 5 and int(x.shape[0]) == 1:
-        return x[0]
+    if time_len is not None:
+        time_axes = [axis for axis, size in enumerate(x.shape) if int(size) == int(time_len)]
+        if time_axes:
+            axis = 0 if 0 in time_axes else time_axes[0]
+            if axis != 0:
+                x = np.moveaxis(x, axis, 0)
+
+    while x.ndim > 4:
+        if int(x.shape[1]) == 1:
+            x = np.squeeze(x, axis=1)
+            continue
+        tail_singletons = [axis for axis in range(4, x.ndim) if int(x.shape[axis]) == 1]
+        if tail_singletons:
+            x = np.squeeze(x, axis=tail_singletons[0])
+            continue
+        other_singletons = [axis for axis in range(1, x.ndim) if int(x.shape[axis]) == 1]
+        if other_singletons:
+            x = np.squeeze(x, axis=other_singletons[0])
+            continue
+        break
+
+    if time_len is None and x.ndim >= 5 and int(x.shape[0]) == 1:
+        x = x[0]
+    if x.ndim >= 5 and int(x.shape[1]) == 1:
+        x = x[:, 0]
     return x
 
 
@@ -637,14 +655,23 @@ def _self_test() -> None:
             F=f[None, ...],
             steps=steps,
         )
+        steps2 = steps + 60000
+        np.savez_compressed(
+            apf_batched / "P_steps_060000_119000__secs_60.000_119.000__idx_0001.npz",
+            A=a,
+            P=p,
+            F=f,
+            steps=steps2,
+        )
         steps_loaded, fields_loaded = _load_apf_series(
             apf_batched,
             field_weights={"A": 1.0, "P": 0.25, "F": 0.25},
             spatial_downsample=2,
         )
-        if steps_loaded.size != steps.size:
-            raise AssertionError(f"batched-axis APF load failed: got {steps_loaded.size}, expected {steps.size}")
-        if fields_loaded["A"].shape[0] != steps.size:
+        expected_steps = 2 * steps.size
+        if steps_loaded.size != expected_steps:
+            raise AssertionError(f"mixed-axis APF load failed: got {steps_loaded.size}, expected {expected_steps}")
+        if fields_loaded["A"].shape[0] != expected_steps:
             raise AssertionError("batched-axis APF field has wrong time length")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
