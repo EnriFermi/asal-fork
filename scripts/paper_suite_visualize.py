@@ -511,41 +511,58 @@ def _plot_cross(output_root: Path, figures: Path) -> dict[str, str]:
 def _plot_c2_branching(output_root: Path, figures: Path) -> dict[str, str]:
     scores_path = output_root / "c2_branching" / "branching_scores.csv"
     contrasts_path = output_root / "c2_branching" / "branching_pair_contrasts.csv"
-    if not scores_path.exists() or not contrasts_path.exists():
+    if not scores_path.exists():
         return {}
     scores = pd.read_csv(scores_path)
-    contrasts = pd.read_csv(contrasts_path)
-    if scores.empty or contrasts.empty:
+    contrasts = pd.read_csv(contrasts_path) if contrasts_path.exists() else pd.DataFrame()
+    if scores.empty:
         return {}
     plt = _ensure_matplotlib()
-    fig, axes = plt.subplots(1, 2, figsize=(8.4, 3.4))
-    ax0, ax1 = axes
-
-    for idx, row in enumerate(contrasts.itertuples()):
-        low = float(row.low_branching_score)
-        high = float(row.high_branching_score)
-        ax0.plot([0, 1], [low, high], color="#888888", alpha=0.7, linewidth=1)
-        ax0.scatter([0, 1], [low, high], color=["#4c78a8", "#d62728"], s=28, zorder=3)
-    diffs = contrasts["delta_branching_score"].astype(float).to_numpy()
-    if diffs.size:
-        ax0.set_title(f"paired branching; median delta={np.nanmedian(diffs):.3g}")
+    if contrasts.empty:
+        fig, ax1 = plt.subplots(figsize=(5.2, 3.6))
     else:
-        ax0.set_title("paired branching")
-    ax0.set_xticks([0, 1], ["low", "high"])
-    ax0.set_ylabel("branch divergence")
+        fig, axes = plt.subplots(1, 2, figsize=(8.4, 3.4))
+        ax0, ax1 = axes
+        for _idx, row in enumerate(contrasts.itertuples()):
+            low = float(row.low_branching_score)
+            high = float(row.high_branching_score)
+            ax0.plot([0, 1], [low, high], color="#888888", alpha=0.7, linewidth=1)
+            ax0.scatter([0, 1], [low, high], color=["#4c78a8", "#d62728"], s=28, zorder=3)
+        diffs = contrasts["delta_branching_score"].astype(float).to_numpy()
+        ax0.set_title(f"paired branching; median delta={np.nanmedian(diffs):.3g}" if diffs.size else "paired branching")
+        ax0.set_xticks([0, 1], ["low", "high"])
+        ax0.set_ylabel("branch divergence")
 
-    colors = np.where(scores["condition"].astype(str).to_numpy() == "high", "#d62728", "#4c78a8")
-    ax1.scatter(scores["delta_h"].astype(float), scores["branching_score"].astype(float), c=colors, s=36)
+    conditions = scores["condition"].astype(str).to_numpy() if "condition" in scores.columns else np.asarray(["sampled"] * len(scores))
+    palette = {"high": "#d62728", "low": "#4c78a8", "sampled": "#6f4e9b"}
+    colors = np.asarray([palette.get(str(cond), "#6f4e9b") for cond in conditions])
+    x = scores["delta_h"].astype(float).to_numpy()
+    y = scores["branching_score"].astype(float).to_numpy()
+    ax1.scatter(x, y, c=colors, s=36)
+    finite = np.isfinite(x) & np.isfinite(y)
+    title = "Delta-H vs future divergence"
+    if int(np.sum(finite)) >= 2 and float(np.std(x[finite])) > 1e-12 and float(np.std(y[finite])) > 1e-12:
+        r = float(np.corrcoef(x[finite], y[finite])[0, 1])
+        title = f"Delta-H vs future divergence; r={r:.3g}"
+        coef = np.polyfit(x[finite], y[finite], deg=1)
+        xline = np.linspace(float(np.nanmin(x[finite])), float(np.nanmax(x[finite])), 100)
+        ax1.plot(xline, coef[0] * xline + coef[1], color="#333333", linewidth=1, alpha=0.8)
     ax1.set_xlabel("Delta-H at branch time")
     ax1.set_ylabel("branch divergence")
-    ax1.set_title("Delta-H vs future divergence")
+    ax1.set_title(title)
     fig.tight_layout()
     out = figures / "c2_branching_sensitivity.png"
     fig.savefig(out, dpi=180)
     out_alias = figures / "c2_high_vs_low_branching_divergence.png"
     fig.savefig(out_alias, dpi=180)
+    out_corr = figures / "c2_delta_h_branching_correlation.png"
+    fig.savefig(out_corr, dpi=180)
     plt.close(fig)
-    return {"c2_branching_sensitivity": str(out), "c2_high_vs_low_branching_divergence": str(out_alias)}
+    return {
+        "c2_branching_sensitivity": str(out),
+        "c2_high_vs_low_branching_divergence": str(out_alias),
+        "c2_delta_h_branching_correlation": str(out_corr),
+    }
 
 
 def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, force: bool = False) -> dict[str, Any]:
