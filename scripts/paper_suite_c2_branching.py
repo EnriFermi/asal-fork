@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import shutil
@@ -37,7 +38,7 @@ from paper_suite_c2_flowlenia_metrics import _rollout_config as _c2_rollout_conf
 from paper_suite_metric_cache import compare_metrics_npz_metadata, sha256_text, stable_json
 
 
-BRANCH_PLAN_VERSION = "c2_branch_plan_v2_activity_matched"
+BRANCH_PLAN_VERSION = "c2_branch_plan_v3_delta_h_sweep"
 
 
 def _get(cfg: Any, key: str, default: Any = None) -> Any:
@@ -342,6 +343,117 @@ def _select_events(
     return pairs
 
 
+def _is_delta_h_sweep_mode(mode: Any) -> bool:
+    return str(mode or "paired_high_low").strip().lower() in {
+        "continuous",
+        "delta_h_sweep",
+        "delta_h_quantile_sweep",
+        "quantile_sweep",
+        "sampled_delta_h",
+    }
+
+
+def _as_float_list(raw: Any) -> list[float]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+    else:
+        try:
+            parts = list(raw)
+        except TypeError:
+            parts = [raw]
+    out: list[float] = []
+    for value in parts:
+        try:
+            out.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _empirical_quantile(values: np.ndarray, idx: int) -> float:
+    x = np.asarray(values, dtype=np.float64).reshape(-1)
+    if x.size == 0 or idx < 0 or idx >= x.size or not np.isfinite(x[idx]):
+        return float("nan")
+    finite = x[np.isfinite(x)]
+    if finite.size == 0:
+        return float("nan")
+    return float(np.mean(finite <= float(x[idx])))
+
+
+def _select_delta_h_points(
+    *,
+    centers: np.ndarray,
+    dh: np.ndarray,
+    covariates: dict[str, np.ndarray] | None = None,
+    n_points: int,
+    refractory_steps: int,
+    quantiles: list[float] | None = None,
+    quantile_min: float = 0.05,
+    quantile_max: float = 0.95,
+) -> list[dict[str, Any]]:
+    finite = np.isfinite(dh) & np.isfinite(centers)
+    if int(np.sum(finite)) < 1:
+        return []
+    c = np.asarray(centers, dtype=np.float64).reshape(-1)[finite]
+    h = np.asarray(dh, dtype=np.float64).reshape(-1)[finite]
+    cov_full = covariates or {}
+    cov = {
+        key: np.asarray(value, dtype=np.float64).reshape(-1)[finite]
+        for key, value in cov_full.items()
+        if np.asarray(value).reshape(-1).size == finite.size
+    }
+
+    if quantiles:
+        targets = [float(np.clip(q, 0.0, 1.0)) for q in quantiles]
+    else:
+        n = max(1, int(n_points))
+        q0 = float(np.clip(quantile_min, 0.0, 1.0))
+        q1 = float(np.clip(quantile_max, 0.0, 1.0))
+        if q1 < q0:
+            q0, q1 = q1, q0
+        targets = [float(q) for q in np.linspace(q0, q1, n)]
+
+    selected: list[int] = []
+    points: list[dict[str, Any]] = []
+    for target_q in targets:
+        target_h = float(np.nanquantile(h, target_q))
+        order = np.argsort(np.abs(h - target_h))
+        chosen: int | None = None
+        for idx in order:
+            i = int(idx)
+            if i in selected:
+                continue
+            step = float(c[i])
+            if any(abs(step - float(c[j])) < refractory_steps for j in selected):
+                continue
+            chosen = i
+            break
+        if chosen is None:
+            for idx in order:
+                i = int(idx)
+                if i not in selected:
+                    chosen = i
+                    break
+        if chosen is None:
+            continue
+        point_id = len(points)
+        selected.append(chosen)
+        row: dict[str, Any] = {
+            "point_id": int(point_id),
+            "step": int(round(float(c[chosen]))),
+            "delta_h": float(h[chosen]),
+            "target_quantile": float(target_q),
+            "delta_h_quantile": _empirical_quantile(h, chosen),
+            "selection_method": "nearest_delta_h_quantile_with_refractory",
+        }
+        for key, value in cov.items():
+            row[key] = float(value[chosen])
+        points.append(row)
+    return points
+
+
 def _branch_output_ok(branch_dir: Path) -> bool:
     if (branch_dir / "branch_feature.npz").exists() or (branch_dir / "metrics.npz").exists():
         return True
@@ -552,6 +664,11 @@ def simulation(
     flat_args = _c2_flat_metric_args(rollout_config)
     max_trajectories = int(_get(bcfg, "max_trajectories", 2))
     m_pairs = int(_get(bcfg, "m_pairs", 2))
+    selection_mode = str(_get(bcfg, "selection_mode", "paired_high_low"))
+    n_points_per_trajectory = int(_get(bcfg, "n_points_per_trajectory", max(1, 2 * m_pairs)))
+    point_quantiles = _as_float_list(_get(bcfg, "point_quantiles", None))
+    point_quantile_min = float(_get(bcfg, "point_quantile_min", 0.05))
+    point_quantile_max = float(_get(bcfg, "point_quantile_max", 0.95))
     branches_per_time = int(_get(bcfg, "branches_per_time", 3))
     resume_batch_size = int(_get(bcfg, "resume_batch_size", 1))
     refractory_steps = int(_get(bcfg, "refractory_steps", 5000))
@@ -574,17 +691,153 @@ def simulation(
         ranked.append((float(np.nanmax(dh)), item, centers, dh, covariates, record))
     ranked.sort(key=lambda x: -x[0])
     log_event(
-        f"C2 branching simulation ranked n_metric_items={len(ranked)} max_trajectories={max_trajectories} m_pairs={m_pairs} branches_per_time={branches_per_time}",
+        f"C2 branching simulation ranked n_metric_items={len(ranked)} max_trajectories={max_trajectories} "
+        f"selection_mode={selection_mode} m_pairs={m_pairs} n_points_per_trajectory={n_points_per_trajectory} "
+        f"branches_per_time={branches_per_time}",
         component="c2-branch",
     )
 
     rows: list[dict[str, Any]] = []
     pending_batch_jobs: list[tuple[int, dict[str, Any]]] = []
+
+    def _append_branch_row(
+        *,
+        source_traj_dir: Path,
+        source_apf_dir: Path,
+        metrics_path: Path,
+        traj_id: str,
+        pair_id: int,
+        condition: str,
+        step: int,
+        delta_h: float,
+        branch_id: int,
+        branch_seed: int,
+        branch_dir: Path,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        branch_ready = _branch_output_ok(branch_dir)
+        overwrite_incomplete = branch_dir.exists() and not branch_ready
+        cmd = _make_resume_command(
+            source_traj_dir=source_traj_dir,
+            step=step,
+            horizon_steps=horizon_steps,
+            branch_dir=branch_dir,
+            branch_seed=branch_seed,
+            perturb_a_std=perturb_a_std,
+            perturb_p_std=perturb_p_std,
+            perturb_lag_xy_std=perturb_lag_xy_std,
+            force=force or overwrite_incomplete,
+        )
+        if branch_ready and not force:
+            status = "exists"
+        elif not allow_heavy:
+            status = "skipped_heavy"
+        else:
+            if overwrite_incomplete:
+                log_event(
+                    f"C2 branching simulation removing incomplete branch output {branch_dir}",
+                    component="c2-branch",
+                )
+                shutil.rmtree(branch_dir)
+            if resume_batch_size > 1:
+                status = "queued_batch" if not dry_run else "dry_run"
+            else:
+                log_event(
+                    f"C2 branching simulation running traj={traj_id} pair={pair_id} condition={condition} branch={branch_id} step={step}",
+                    component="c2-branch",
+                )
+                run_subprocess(cmd, dry_run=dry_run)
+                status = "dry_run" if dry_run else ("exists" if _branch_output_ok(branch_dir) else "missing")
+        row = {
+            "traj_id": traj_id,
+            "pair_id": int(pair_id),
+            "condition": condition,
+            "step": int(step),
+            "delta_h": float(delta_h),
+            "branch_id": int(branch_id),
+            "source_metrics_path": str(metrics_path),
+            "source_traj_dir": str(source_traj_dir),
+            "source_apf_dir": str(source_apf_dir),
+            "branch_dir": str(branch_dir),
+            "selection_mode": selection_mode,
+            "status": status,
+            "command": command_to_str(cmd),
+        }
+        if extra:
+            row.update(extra)
+        rows.append(row)
+        if status == "queued_batch":
+            pending_batch_jobs.append(
+                (
+                    len(rows) - 1,
+                    {
+                        "source_traj_dir": str(source_traj_dir),
+                        "step": int(step),
+                        "additional_steps": int(horizon_steps),
+                        "output_dir": str(branch_dir),
+                        "branch_seed": int(branch_seed),
+                        "perturb_a_std": float(perturb_a_std),
+                        "perturb_p_std": float(perturb_p_std),
+                        "perturb_lagrangian_xy_std": float(perturb_lag_xy_std),
+                    },
+                )
+            )
+
     for _peak, item, centers, dh, covariates, _record in ranked[:max_trajectories]:
         metrics_path = Path(item["metrics_path"])
         source_traj_dir = Path(item["traj_dir"])
         source_apf_dir = Path(item.get("apf_dir", source_traj_dir / "apf_logs"))
         traj_id = str(item["traj_id"])
+        if _is_delta_h_sweep_mode(selection_mode):
+            points = _select_delta_h_points(
+                centers=centers,
+                dh=dh,
+                covariates=covariates,
+                n_points=n_points_per_trajectory,
+                refractory_steps=refractory_steps,
+                quantiles=point_quantiles or None,
+                quantile_min=point_quantile_min,
+                quantile_max=point_quantile_max,
+            )
+            log_event(
+                f"C2 branching simulation traj={traj_id} selected_points={len(points)} source={metrics_path}",
+                component="c2-branch",
+            )
+            for point in points:
+                point_id = int(point["point_id"])
+                step = int(point["step"])
+                delta_h = float(point["delta_h"])
+                target_q = float(point.get("target_quantile", float("nan")))
+                q_tag = int(round(1000.0 * target_q)) if np.isfinite(target_q) else point_id
+                extra = {
+                    "point_id": point_id,
+                    "target_quantile": point.get("target_quantile", ""),
+                    "delta_h_quantile": point.get("delta_h_quantile", ""),
+                    "selection_method": point.get("selection_method", ""),
+                    "point_total_mass": point.get("total_mass", ""),
+                    "point_active_fraction": point.get("active_fraction", ""),
+                    "point_mean_lagrangian_speed": point.get("mean_lagrangian_speed", ""),
+                    "point_field_activity": point.get("field_activity", ""),
+                }
+                for branch_id in range(branches_per_time):
+                    branch_seed = int(2000003 + 1009 * point_id + 131 * branch_id)
+                    branch_dir = branch_root / traj_id / f"point_{point_id:03d}_q_{q_tag:04d}_step_{step}" / f"branch_{branch_id:02d}"
+                    _append_branch_row(
+                        source_traj_dir=source_traj_dir,
+                        source_apf_dir=source_apf_dir,
+                        metrics_path=metrics_path,
+                        traj_id=traj_id,
+                        pair_id=point_id,
+                        condition="sampled",
+                        step=step,
+                        delta_h=delta_h,
+                        branch_id=branch_id,
+                        branch_seed=branch_seed,
+                        branch_dir=branch_dir,
+                        extra=extra,
+                    )
+            continue
+
         pairs = _select_events(
             centers=centers,
             dh=dh,
@@ -605,80 +858,31 @@ def simulation(
                 for branch_id in range(branches_per_time):
                     branch_seed = int(1000003 + 1009 * int(pair["pair_id"]) + 131 * branch_id + (0 if condition == "high" else 7919))
                     branch_dir = branch_root / traj_id / f"pair_{int(pair['pair_id']):03d}_{condition}_step_{step}" / f"branch_{branch_id:02d}"
-                    branch_ready = _branch_output_ok(branch_dir)
-                    overwrite_incomplete = branch_dir.exists() and not branch_ready
-                    cmd = _make_resume_command(
+                    _append_branch_row(
                         source_traj_dir=source_traj_dir,
+                        source_apf_dir=source_apf_dir,
+                        metrics_path=metrics_path,
+                        traj_id=traj_id,
+                        pair_id=int(pair["pair_id"]),
+                        condition=condition,
                         step=step,
-                        horizon_steps=horizon_steps,
-                        branch_dir=branch_dir,
+                        delta_h=delta_h,
+                        branch_id=branch_id,
                         branch_seed=branch_seed,
-                        perturb_a_std=perturb_a_std,
-                        perturb_p_std=perturb_p_std,
-                        perturb_lag_xy_std=perturb_lag_xy_std,
-                        force=force or overwrite_incomplete,
+                        branch_dir=branch_dir,
+                        extra={
+                            "match_method": str(pair.get("match_method", "")),
+                            "match_covariate_distance": pair.get("match_covariate_distance", ""),
+                            "high_total_mass": pair.get("high_total_mass", ""),
+                            "low_total_mass": pair.get("low_total_mass", ""),
+                            "high_active_fraction": pair.get("high_active_fraction", ""),
+                            "low_active_fraction": pair.get("low_active_fraction", ""),
+                            "high_mean_lagrangian_speed": pair.get("high_mean_lagrangian_speed", ""),
+                            "low_mean_lagrangian_speed": pair.get("low_mean_lagrangian_speed", ""),
+                            "high_field_activity": pair.get("high_field_activity", ""),
+                            "low_field_activity": pair.get("low_field_activity", ""),
+                        },
                     )
-                    if branch_ready and not force:
-                        status = "exists"
-                    elif not allow_heavy:
-                        status = "skipped_heavy"
-                    else:
-                        if overwrite_incomplete:
-                            log_event(
-                                f"C2 branching simulation removing incomplete branch output {branch_dir}",
-                                component="c2-branch",
-                            )
-                            shutil.rmtree(branch_dir)
-                        if resume_batch_size > 1:
-                            status = "queued_batch" if not dry_run else "dry_run"
-                        else:
-                            log_event(
-                                f"C2 branching simulation running traj={traj_id} pair={pair['pair_id']} condition={condition} branch={branch_id} step={step}",
-                                component="c2-branch",
-                            )
-                            run_subprocess(cmd, dry_run=dry_run)
-                            status = "dry_run" if dry_run else ("exists" if _branch_output_ok(branch_dir) else "missing")
-                    row = {
-                        "traj_id": traj_id,
-                        "pair_id": int(pair["pair_id"]),
-                        "condition": condition,
-                        "step": step,
-                        "delta_h": delta_h,
-                        "branch_id": branch_id,
-                        "source_metrics_path": str(metrics_path),
-                        "source_traj_dir": str(source_traj_dir),
-                        "source_apf_dir": str(source_apf_dir),
-                        "branch_dir": str(branch_dir),
-                        "match_method": str(pair.get("match_method", "")),
-                        "match_covariate_distance": pair.get("match_covariate_distance", ""),
-                        "high_total_mass": pair.get("high_total_mass", ""),
-                        "low_total_mass": pair.get("low_total_mass", ""),
-                        "high_active_fraction": pair.get("high_active_fraction", ""),
-                        "low_active_fraction": pair.get("low_active_fraction", ""),
-                        "high_mean_lagrangian_speed": pair.get("high_mean_lagrangian_speed", ""),
-                        "low_mean_lagrangian_speed": pair.get("low_mean_lagrangian_speed", ""),
-                        "high_field_activity": pair.get("high_field_activity", ""),
-                        "low_field_activity": pair.get("low_field_activity", ""),
-                        "status": status,
-                        "command": command_to_str(cmd),
-                    }
-                    rows.append(row)
-                    if status == "queued_batch":
-                        pending_batch_jobs.append(
-                            (
-                                len(rows) - 1,
-                                {
-                                    "source_traj_dir": str(source_traj_dir),
-                                    "step": int(step),
-                                    "additional_steps": int(horizon_steps),
-                                    "output_dir": str(branch_dir),
-                                    "branch_seed": int(branch_seed),
-                                    "perturb_a_std": float(perturb_a_std),
-                                    "perturb_p_std": float(perturb_p_std),
-                                    "perturb_lagrangian_xy_std": float(perturb_lag_xy_std),
-                                },
-                            )
-                        )
 
     if pending_batch_jobs:
         jobs_path = out_dir / "branch_resume_jobs.json"
@@ -700,12 +904,17 @@ def simulation(
     plan_meta = {
         "branch_plan_version": BRANCH_PLAN_VERSION,
         "branch_plan_rows_hash": sha256_text(stable_json(csv_rows)),
-        "matching": "activity_covariate_nearest_in_low_delta_h_pool",
+        "matching": "delta_h_quantile_sweep" if _is_delta_h_sweep_mode(selection_mode) else "activity_covariate_nearest_in_low_delta_h_pool",
         "rollout_config": str(rollout_config),
         "metric_records": metric_records,
         "branching_config": {
             "max_trajectories": max_trajectories,
             "m_pairs": m_pairs,
+            "selection_mode": selection_mode,
+            "n_points_per_trajectory": n_points_per_trajectory,
+            "point_quantiles": point_quantiles,
+            "point_quantile_min": point_quantile_min,
+            "point_quantile_max": point_quantile_max,
             "branches_per_time": branches_per_time,
             "horizon_steps": horizon_steps,
             "refractory_steps": refractory_steps,
@@ -816,15 +1025,31 @@ def _field_weights(raw: Any) -> dict[str, float]:
     return out or {"A": 1.0}
 
 
+def _branching_metric_mode(raw: Any) -> str:
+    value = str(raw or "apf").strip().lower()
+    aliases = {
+        "field": "apf",
+        "field_l2": "apf",
+        "apf_l2": "apf",
+        "future_apf_multiscale_l2": "apf",
+        "clip": "clip_chamfer",
+        "clip_cloud": "clip_chamfer",
+        "embedding_chamfer": "clip_chamfer",
+        "clip_chamfer_cosine": "clip_chamfer",
+        "future_clip_chamfer_cosine": "clip_chamfer",
+    }
+    value = aliases.get(value, value)
+    if value not in {"apf", "clip_chamfer"}:
+        raise ValueError(f"Unknown C2 branching metric {raw!r}; use 'apf' or 'clip_chamfer'.")
+    return value
+
+
 def _pool_spatial(arr: np.ndarray, scale: int) -> np.ndarray:
     x = np.asarray(arr, dtype=np.float32)
     scale = int(scale)
     if scale <= 1 or x.ndim < 4:
         return x
-    if x.ndim == 4:
-        y_axis, x_axis = 1, 2
-    else:
-        y_axis, x_axis = x.ndim - 3, x.ndim - 2
+    y_axis, x_axis = 1, 2
     h = int(x.shape[y_axis])
     w = int(x.shape[x_axis])
     h2 = (h // scale) * scale
@@ -951,14 +1176,226 @@ def _pairwise_future_field_divergence(
     return score, detail
 
 
-def metrics(config_path: str | Path, *, smoke: bool = False) -> dict[str, Any]:
+def _render_apf_rgb(fields: dict[str, np.ndarray]) -> np.ndarray:
+    if "P" not in fields:
+        raise ValueError("CLIP divergence requires P in branch APF fields.")
+    p = np.asarray(fields["P"], dtype=np.float32)
+    if p.ndim != 4:
+        raise ValueError(f"P must have shape (T,H,W,C), got {p.shape}.")
+    if p.shape[-1] < 3:
+        reps = int(math.ceil(3 / max(1, int(p.shape[-1]))))
+        p3 = np.tile(p, (1, 1, 1, reps))[..., :3]
+    else:
+        p3 = p[..., :3]
+    if "A" in fields:
+        a = np.asarray(fields["A"], dtype=np.float32)
+        if a.ndim != 4 or a.shape[0] != p.shape[0]:
+            raise ValueError(f"A must have shape (T,H,W,C) with T={p.shape[0]}, got {a.shape}.")
+        return np.clip(np.sum(a, axis=-1, keepdims=True) * p3, 0.0, 1.0).astype(np.float32)
+    return np.clip(p3, 0.0, 1.0).astype(np.float32)
+
+
+def _normalize_embeddings(z: np.ndarray) -> np.ndarray:
+    arr = np.asarray(z, dtype=np.float64)
+    norms = np.linalg.norm(arr, axis=-1, keepdims=True)
+    return arr / np.clip(norms, 1e-12, None)
+
+
+def _embedding_chamfer_cosine(z_a: np.ndarray, z_b: np.ndarray) -> float:
+    a = _normalize_embeddings(np.asarray(z_a, dtype=np.float64))
+    b = _normalize_embeddings(np.asarray(z_b, dtype=np.float64))
+    if a.ndim != 2 or b.ndim != 2 or a.shape[0] < 1 or b.shape[0] < 1:
+        return float("nan")
+    d = 1.0 - (a @ b.T)
+    return float(0.5 * (np.mean(np.min(d, axis=1)) + np.mean(np.min(d, axis=0))))
+
+
+def _clip_embedding_cache_path(
+    branch_dir: Path,
+    *,
+    cache_dir: Path,
+    foundation_model: str,
+    max_chunks: int,
+    max_frames: int,
+) -> Path:
+    payload = stable_json(
+        {
+            "branch_dir": str(branch_dir.resolve()),
+            "foundation_model": str(foundation_model),
+            "max_chunks": int(max_chunks),
+            "max_frames": int(max_frames),
+            "version": "c2_branch_clip_embeddings_v1",
+        }
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
+    safe_name = branch_dir.name.replace("/", "__")
+    return cache_dir / f"{safe_name}_{digest}.npz"
+
+
+def _load_or_compute_branch_clip_embeddings(
+    branch_dir: Path,
+    *,
+    fm: Any,
+    cache_dir: Path,
+    foundation_model: str,
+    max_chunks: int,
+    max_frames: int,
+    force: bool,
+) -> tuple[np.ndarray, Path]:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = _clip_embedding_cache_path(
+        branch_dir,
+        cache_dir=cache_dir,
+        foundation_model=foundation_model,
+        max_chunks=max_chunks,
+        max_frames=max_frames,
+    )
+    if cache_path.exists() and not force:
+        with np.load(cache_path, allow_pickle=False) as data:
+            return np.asarray(data["z"], dtype=np.float32), cache_path
+
+    import jax
+
+    fields = _branch_field_series(
+        branch_dir,
+        weights={"A": 1.0, "P": 1.0},
+        max_chunks=max_chunks,
+        max_frames=max_frames,
+    )
+    frames = _render_apf_rgb(fields)
+    zs: list[np.ndarray] = []
+    for frame in frames:
+        z = jax.device_get(fm.embed_img(frame))
+        zs.append(np.asarray(z, dtype=np.float32).reshape(-1))
+    z_arr = _normalize_embeddings(np.stack(zs, axis=0)).astype(np.float32)
+    np.savez_compressed(
+        cache_path,
+        z=z_arr,
+        branch_dir=np.asarray(str(branch_dir)),
+        foundation_model=np.asarray(str(foundation_model)),
+        max_chunks=np.asarray(int(max_chunks), dtype=np.int32),
+        max_frames=np.asarray(int(max_frames), dtype=np.int32),
+    )
+    return z_arr, cache_path
+
+
+def _pairwise_future_clip_chamfer_divergence(
+    branch_dirs: list[Path],
+    *,
+    fm: Any,
+    cache_dir: Path,
+    foundation_model: str,
+    max_chunks: int,
+    max_frames: int,
+    force_cache: bool,
+) -> tuple[float, dict[str, Any]]:
+    embeddings: list[np.ndarray] = []
+    cache_paths: list[str] = []
+    for branch_dir in branch_dirs:
+        try:
+            z, cache_path = _load_or_compute_branch_clip_embeddings(
+                branch_dir,
+                fm=fm,
+                cache_dir=cache_dir,
+                foundation_model=foundation_model,
+                max_chunks=max_chunks,
+                max_frames=max_frames,
+                force=force_cache,
+            )
+            embeddings.append(z)
+            cache_paths.append(str(cache_path))
+        except Exception:
+            continue
+    if len(embeddings) < 2:
+        return float("nan"), {"metric": "future_clip_chamfer_cosine", "n_branches": len(embeddings), "n_pairs": 0}
+    pair_vals = []
+    for i, j in combinations(range(len(embeddings)), 2):
+        d = _embedding_chamfer_cosine(embeddings[i], embeddings[j])
+        if np.isfinite(d):
+            pair_vals.append(float(d))
+    score = float(np.mean(pair_vals)) if pair_vals else float("nan")
+    return score, {
+        "metric": "future_clip_chamfer_cosine",
+        "n_branches": len(embeddings),
+        "n_pairs": len(pair_vals),
+        "foundation_model": str(foundation_model),
+        "max_future_frames": int(max_frames),
+        "clip_embedding_cache_n": len(cache_paths),
+    }
+
+
+def _average_ranks(values: np.ndarray) -> np.ndarray:
+    x = np.asarray(values, dtype=np.float64).reshape(-1)
+    order = np.argsort(x, kind="mergesort")
+    ranks = np.empty_like(x, dtype=np.float64)
+    i = 0
+    while i < order.size:
+        j = i + 1
+        while j < order.size and x[order[j]] == x[order[i]]:
+            j += 1
+        ranks[order[i:j]] = 0.5 * (i + j - 1) + 1.0
+        i = j
+    return ranks
+
+
+def _pearson_corr(x: np.ndarray, y: np.ndarray) -> float:
+    xx = np.asarray(x, dtype=np.float64).reshape(-1)
+    yy = np.asarray(y, dtype=np.float64).reshape(-1)
+    finite = np.isfinite(xx) & np.isfinite(yy)
+    if int(np.sum(finite)) < 2:
+        return float("nan")
+    xx = xx[finite]
+    yy = yy[finite]
+    sx = float(np.std(xx))
+    sy = float(np.std(yy))
+    if sx <= 1e-12 or sy <= 1e-12:
+        return float("nan")
+    return float(np.corrcoef(xx, yy)[0, 1])
+
+
+def _branching_correlation_summary(score_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    x: list[float] = []
+    y: list[float] = []
+    for row in score_rows:
+        try:
+            dh = float(row.get("delta_h", "nan"))
+            score = float(row.get("branching_score", "nan"))
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(dh) and np.isfinite(score):
+            x.append(dh)
+            y.append(score)
+    xx = np.asarray(x, dtype=np.float64)
+    yy = np.asarray(y, dtype=np.float64)
+    pearson = _pearson_corr(xx, yy)
+    spearman = _pearson_corr(_average_ranks(xx), _average_ranks(yy)) if xx.size >= 2 else float("nan")
+    return {
+        "n": int(xx.size),
+        "pearson_r": pearson,
+        "spearman_r": spearman,
+        "delta_h_min": float(np.nanmin(xx)) if xx.size else float("nan"),
+        "delta_h_max": float(np.nanmax(xx)) if xx.size else float("nan"),
+        "branching_score_min": float(np.nanmin(yy)) if yy.size else float("nan"),
+        "branching_score_max": float(np.nanmax(yy)) if yy.size else float("nan"),
+    }
+
+
+def metrics(
+    config_path: str | Path,
+    *,
+    smoke: bool = False,
+    branching_metric: str | None = None,
+    allow_stale_branch_plan: bool = False,
+    force_clip_cache: bool = False,
+) -> dict[str, Any]:
     cfg, _ = load_config(config_path, smoke=smoke)
     output_root = _output_root(cfg)
     bcfg = _branch_cfg(cfg)
     branch_root = _branch_root(cfg, output_root)
     out_dir = ensure_dir(output_root / "c2_branching")
     plan_path = out_dir / "branch_plan.csv"
-    log_event(f"C2 branching metrics start smoke={smoke} plan={plan_path}", component="c2-branch")
+    metric_mode = _branching_metric_mode(branching_metric or _get(bcfg, "branching_metric", _get(bcfg, "divergence_metric", "apf")))
+    log_event(f"C2 branching metrics start smoke={smoke} metric={metric_mode} plan={plan_path}", component="c2-branch")
     if smoke and not plan_path.exists():
         _write_smoke_fixture(output_root, branch_root)
     if not plan_path.exists():
@@ -972,13 +1409,23 @@ def metrics(config_path: str | Path, *, smoke: bool = False) -> dict[str, Any]:
     max_future_frames = int(_get(bcfg, "future_max_frames", max_snapshots))
     field_scales = [int(x) for x in _get(bcfg, "future_field_scales", [1, 2, 4])]
     weights = _field_weights(_get(bcfg, "future_field_weights", None))
+    clip_foundation_model = str(_get(bcfg, "clip_foundation_model", "clip"))
+    clip_cache_raw = _get(bcfg, "clip_embedding_cache_dir", None)
+    clip_cache_dir = ensure_dir(resolve_path(clip_cache_raw) if clip_cache_raw else out_dir / "clip_embedding_cache")
+    clip_fm = None
+    if metric_mode == "clip_chamfer" and not smoke:
+        import foundation_models
+
+        clip_fm = foundation_models.create_foundation_model(clip_foundation_model)
     allow_feature_fallback = bool(smoke or _get(bcfg, "allow_debug_feature_fallback", False))
     plan_rows = read_csv(plan_path)
-    if not smoke:
+    if not smoke and not allow_stale_branch_plan:
         c2_cfg = cfg.get("c2", {})
         rollout_config = _c2_rollout_config(c2_cfg)
         flat_args = _c2_flat_metric_args(rollout_config)
         _validate_branch_plan(plan_path, plan_rows, flat_args)
+    elif allow_stale_branch_plan:
+        log_event("C2 branching metrics using branch_plan without version/upstream validation by explicit request", component="c2-branch")
     groups: dict[tuple[str, str, str], list[dict[str, str]]] = {}
     for row in plan_rows:
         key = (str(row["traj_id"]), str(row["pair_id"]), str(row["condition"]))
@@ -992,19 +1439,32 @@ def metrics(config_path: str | Path, *, smoke: bool = False) -> dict[str, Any]:
             log_event(
                 f"C2 branching metrics group {group_idx}/{len(group_items)} traj={traj_id} pair={pair_id} condition={condition}",
                 component="c2-branch",
-            )
-        branch_dirs = [Path(str(row["branch_dir"])) for row in rows]
-        score, detail = _pairwise_future_field_divergence(
-            branch_dirs,
-            weights=weights,
-            scales=field_scales,
-            max_chunks=max_chunks,
-            max_frames=max_future_frames,
         )
+        branch_dirs = [Path(str(row["branch_dir"])) for row in rows]
+        if metric_mode == "clip_chamfer":
+            if clip_fm is None:
+                raise RuntimeError("CLIP foundation model was not initialized.")
+            score, detail = _pairwise_future_clip_chamfer_divergence(
+                branch_dirs,
+                fm=clip_fm,
+                cache_dir=clip_cache_dir,
+                foundation_model=clip_foundation_model,
+                max_chunks=max_chunks,
+                max_frames=max_future_frames,
+                force_cache=force_clip_cache,
+            )
+        else:
+            score, detail = _pairwise_future_field_divergence(
+                branch_dirs,
+                weights=weights,
+                scales=field_scales,
+                max_chunks=max_chunks,
+                max_frames=max_future_frames,
+            )
         used = [row for row in rows if _branch_output_ok(Path(str(row["branch_dir"])))]
         metric_name = str(detail.get("metric", "future_apf_multiscale_l2"))
         fallback_used = False
-        if not np.isfinite(score) and allow_feature_fallback:
+        if metric_mode == "apf" and not np.isfinite(score) and allow_feature_fallback:
             features = []
             used = []
             for row in rows:
@@ -1067,21 +1527,29 @@ def metrics(config_path: str | Path, *, smoke: bool = False) -> dict[str, Any]:
             }
         )
 
-    scores_path = out_dir / "branching_scores.csv"
-    contrasts_path = out_dir / "branching_pair_contrasts.csv"
+    suffix = "" if metric_mode == "apf" else f"_{metric_mode}"
+    scores_path = out_dir / f"branching_scores{suffix}.csv"
+    contrasts_path = out_dir / f"branching_pair_contrasts{suffix}.csv"
+    correlation_path = out_dir / f"branching_delta_h_correlation{suffix}.csv"
+    correlation_summary = _branching_correlation_summary(score_rows)
     write_csv(scores_path, score_rows)
     write_csv(contrasts_path, contrast_rows)
+    write_csv(correlation_path, [correlation_summary])
     summary = {
         "status": "ok",
+        "branching_metric_mode": metric_mode,
         "n_scores": len(score_rows),
         "n_pairs": len(contrast_rows),
         "branching_sign_test": sign_test_greater(row["delta_branching_score"] for row in contrast_rows),
+        "branching_delta_h_correlation": correlation_summary,
         "scores": str(scores_path),
         "contrasts": str(contrasts_path),
+        "correlation": str(correlation_path),
     }
-    write_json(output_root / "c2_branching_metrics_summary.json", summary)
+    summary_path = output_root / f"c2_branching_metrics_summary{suffix}.json"
+    write_json(summary_path, summary)
     log_event(
-        f"C2 branching metrics done n_scores={len(score_rows)} n_pairs={len(contrast_rows)} scores={scores_path}",
+        f"C2 branching metrics done metric={metric_mode} n_scores={len(score_rows)} n_pairs={len(contrast_rows)} scores={scores_path}",
         component="c2-branch",
     )
     return summary
@@ -1095,12 +1563,21 @@ def run(
     force: bool = False,
     allow_heavy: bool = False,
     dry_run: bool = False,
+    branching_metric: str | None = None,
+    allow_stale_branch_plan: bool = False,
+    force_clip_cache: bool = False,
 ) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if layer in {"simulation", "all"}:
         out["simulation"] = simulation(config_path, smoke=smoke, force=force, allow_heavy=allow_heavy, dry_run=dry_run)
     if layer in {"metrics", "all"}:
-        out["metrics"] = metrics(config_path, smoke=smoke)
+        out["metrics"] = metrics(
+            config_path,
+            smoke=smoke,
+            branching_metric=branching_metric,
+            allow_stale_branch_plan=allow_stale_branch_plan,
+            force_clip_cache=force_clip_cache,
+        )
     return out
 
 
@@ -1112,8 +1589,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--allow-heavy", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--branching-metric", choices=["apf", "clip_chamfer"], default=None)
+    parser.add_argument("--allow-stale-branch-plan", action="store_true")
+    parser.add_argument("--force-clip-cache", action="store_true")
     args = parser.parse_args(argv)
-    print(run(args.config, layer=args.layer, smoke=args.smoke, force=args.force, allow_heavy=args.allow_heavy, dry_run=args.dry_run))
+    print(
+        run(
+            args.config,
+            layer=args.layer,
+            smoke=args.smoke,
+            force=args.force,
+            allow_heavy=args.allow_heavy,
+            dry_run=args.dry_run,
+            branching_metric=args.branching_metric,
+            allow_stale_branch_plan=args.allow_stale_branch_plan,
+            force_clip_cache=args.force_clip_cache,
+        )
+    )
     return 0
 
 
