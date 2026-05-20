@@ -156,6 +156,10 @@ def _load_delta_h(metrics_path: Path) -> tuple[np.ndarray, np.ndarray, dict[str,
 
 
 def _steps_for_chunk(data: np.lib.npyio.NpzFile, *, start: int, end: int, n: int) -> np.ndarray:
+    if "steps" in data.files:
+        arr = np.asarray(data["steps"], dtype=np.float64).reshape(-1)
+        if arr.size == n:
+            return arr
     if "state_t" in data.files:
         state_t = np.asarray(data["state_t"], dtype=np.float64).reshape(-1)
         if state_t.size == n:
@@ -163,6 +167,28 @@ def _steps_for_chunk(data: np.lib.npyio.NpzFile, *, start: int, end: int, n: int
     if n <= 1:
         return np.asarray([float(start)], dtype=np.float64)
     return np.linspace(float(start), float(end), int(n), dtype=np.float64)
+
+
+def _metadata_time_len(data: np.lib.npyio.NpzFile) -> int | None:
+    for key in ("steps", "state_t"):
+        if key in data.files:
+            n = int(np.asarray(data[key]).reshape(-1).size)
+            if n > 1:
+                return n
+    return None
+
+
+def _normalize_apf_array(arr: np.ndarray, data: np.lib.npyio.NpzFile) -> np.ndarray:
+    x = np.asarray(arr, dtype=np.float32)
+    time_len = _metadata_time_len(data)
+    if x.ndim >= 5 and time_len is not None:
+        if int(x.shape[0]) == 1 and int(x.shape[1]) == time_len:
+            return x[0]
+        if int(x.shape[0]) == time_len and int(x.shape[1]) == 1:
+            return x[:, 0]
+    if x.ndim >= 5 and int(x.shape[0]) == 1:
+        return x[0]
+    return x
 
 
 def _avg_pool_spatial(arr: np.ndarray, factor: int) -> np.ndarray:
@@ -198,7 +224,7 @@ def _load_apf_series(
             for key in field_weights:
                 if key not in data.files:
                     continue
-                arr = np.asarray(data[key], dtype=np.float32)
+                arr = _normalize_apf_array(np.asarray(data[key], dtype=np.float32), data)
                 if arr.ndim < 4 or arr.shape[0] < 1:
                     continue
                 arr = _avg_pool_spatial(arr, spatial_downsample)
@@ -600,6 +626,26 @@ def _self_test() -> None:
         summary = run(ns)
         if summary["n_rows"] <= 0:
             raise AssertionError("self-test produced no rows")
+
+        traj_batched = root / "flow_opt_batched_axis"
+        apf_batched = traj_batched / "apf_logs"
+        apf_batched.mkdir(parents=True)
+        np.savez_compressed(
+            apf_batched / "P_steps_000000_059000__secs_0.000_59.000__idx_0000.npz",
+            A=a[None, ...],
+            P=p[None, ...],
+            F=f[None, ...],
+            steps=steps,
+        )
+        steps_loaded, fields_loaded = _load_apf_series(
+            apf_batched,
+            field_weights={"A": 1.0, "P": 0.25, "F": 0.25},
+            spatial_downsample=2,
+        )
+        if steps_loaded.size != steps.size:
+            raise AssertionError(f"batched-axis APF load failed: got {steps_loaded.size}, expected {steps.size}")
+        if fields_loaded["A"].shape[0] != steps.size:
+            raise AssertionError("batched-axis APF field has wrong time length")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
