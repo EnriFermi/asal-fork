@@ -115,6 +115,7 @@ def _selected_for_item(
     q_high: float,
     q_low: float,
     horizon_steps: int,
+    min_branch_step: int,
     selection_seed: int,
     energy_min_remaining_steps: int | None,
     energy_min_samples: int | None,
@@ -145,6 +146,7 @@ def _selected_for_item(
         horizon_steps=horizon_steps,
         trajectory_end_step=trajectory_end,
         seed=selection_seed + 10007 * traj_order,
+        min_step=min_branch_step,
         energy_meta=energy_meta,
     )
     for row in points:
@@ -170,6 +172,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     q_high = float(args.q_high if args.q_high is not None else _get(bcfg, "high_quantile", 0.8))
     q_low = float(args.q_low if args.q_low is not None else _get(bcfg, "low_quantile", 0.2))
     horizon_steps = int(args.horizon_steps if args.horizon_steps is not None else _get(bcfg, "horizon_steps", 1000))
+    min_branch_step = int(args.min_branch_step if args.min_branch_step is not None else _get(bcfg, "min_branch_step", _get(bcfg, "selection_min_step", 0)))
     selection_seed = int(args.selection_seed if args.selection_seed is not None else _get(bcfg, "selection_seed", 12345))
     energy_min_remaining_steps = _get(bcfg, "energy_min_remaining_steps", None)
     energy_min_samples = _get(bcfg, "energy_min_samples", None)
@@ -214,6 +217,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             q_high=q_high,
             q_low=q_low,
             horizon_steps=horizon_steps,
+            min_branch_step=min_branch_step,
             selection_seed=selection_seed,
             energy_min_remaining_steps=energy_min_remaining_steps,
             energy_min_samples=energy_min_samples,
@@ -286,7 +290,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     fig.suptitle(
         f"C2 branching start preview\nmean_tau phi(Delta-H), high q>={q_high:g}, low q<={q_low:g}, "
-        f"N_high={n_high}, N_low={n_low}",
+        f"N_high={n_high}, N_low={n_low}, min_step={min_branch_step}",
         fontsize=12,
     )
     if last_im is not None:
@@ -308,6 +312,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--q-high", type=float, default=None)
     parser.add_argument("--q-low", type=float, default=None)
     parser.add_argument("--horizon-steps", type=int, default=None)
+    parser.add_argument("--min-branch-step", type=int, default=None)
     parser.add_argument("--selection-seed", type=int, default=None)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--dpi", type=int, default=180)
