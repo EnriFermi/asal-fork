@@ -249,8 +249,8 @@ c2:
     # Continuous Delta-H sampling remains available as selection_mode:
     # delta_h_quantile_sweep.
     selection_mode: tau_mean_ranked_high_low
-    n_high: 5
-    n_low: 5
+    n_high: 3
+    n_low: 3
     selection_seed: 12345
     n_points_per_trajectory: 10
     point_quantile_min: 0.05
@@ -258,11 +258,11 @@ c2:
     # Legacy high/low fallback only.
     m_pairs: 5
     branches_per_time: 3
-    horizon_steps: 3000
+    horizon_steps: 20000
     # Set >1 to run C2 branch continuations through the batched resume runner.
     # The runner batches compatible arbitrary snapshots/params with the same
     # tensor shapes, horizon, snapshot cadence, and original RNG batch size.
-    resume_batch_size: 10
+    resume_batch_size: 20
     min_branch_step: 50000
     refractory_steps: 5000
     high_quantile: 0.8
@@ -283,8 +283,8 @@ c2:
     future_max_frames: 32
     allow_debug_feature_fallback: false
     perturb:
-      a_std: 0.01
-      p_std: 0.01
+      a_std: 0.02
+      p_std: 0.02
       lagrangian_xy_std: 1.0
 
 simulation:
