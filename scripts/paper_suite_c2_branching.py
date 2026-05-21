@@ -38,7 +38,7 @@ from paper_suite_c2_flowlenia_metrics import _rollout_config as _c2_rollout_conf
 from paper_suite_metric_cache import compare_metrics_npz_metadata, sha256_text, stable_json
 
 
-BRANCH_PLAN_VERSION = "c2_branch_plan_v5_min_step_perturb_metadata"
+BRANCH_PLAN_VERSION = "c2_branch_plan_v6_mid_stratum"
 
 
 def _get(cfg: Any, key: str, default: Any = None) -> Any:
@@ -661,8 +661,11 @@ def _select_ranked_high_low_points(
     covariates: dict[str, np.ndarray] | None,
     n_high: int,
     n_low: int,
+    n_mid: int,
     q_high: float,
     q_low: float,
+    q_mid_low: float = 0.4,
+    q_mid_high: float = 0.6,
     horizon_steps: int,
     trajectory_end_step: int | None,
     seed: int,
@@ -673,7 +676,14 @@ def _select_ranked_high_low_points(
     e = np.asarray(energy, dtype=np.float64).reshape(-1)
     n = min(c.size, e.size)
     if n == 0:
-        return [], {"n_high_pool": 0, "n_low_pool": 0, "n_high_selected": 0, "n_low_selected": 0}
+        return [], {
+            "n_high_pool": 0,
+            "n_mid_pool": 0,
+            "n_low_pool": 0,
+            "n_high_selected": 0,
+            "n_mid_selected": 0,
+            "n_low_selected": 0,
+        }
     c = c[:n]
     e = e[:n]
     finite = np.isfinite(c) & np.isfinite(e)
@@ -684,8 +694,10 @@ def _select_ranked_high_low_points(
     if int(np.sum(finite)) < 1:
         return [], {
             "n_high_pool": 0,
+            "n_mid_pool": 0,
             "n_low_pool": 0,
             "n_high_selected": 0,
+            "n_mid_selected": 0,
             "n_low_selected": 0,
             "min_branch_step": int(min_step),
             "trajectory_end_step": "" if trajectory_end_step is None else int(trajectory_end_step),
@@ -693,10 +705,17 @@ def _select_ranked_high_low_points(
 
     q_high = float(np.clip(q_high, 0.0, 1.0))
     q_low = float(np.clip(q_low, 0.0, 1.0))
+    q_mid_low = float(np.clip(q_mid_low, 0.0, 1.0))
+    q_mid_high = float(np.clip(q_mid_high, 0.0, 1.0))
+    if q_mid_high < q_mid_low:
+        q_mid_low, q_mid_high = q_mid_high, q_mid_low
     finite_values = e[finite]
     high_threshold = float(np.nanquantile(finite_values, q_high))
     low_threshold = float(np.nanquantile(finite_values, q_low))
+    qrank = np.full_like(e, np.nan, dtype=np.float64)
+    qrank[finite] = _quantile_ranks(e[finite])
     high_pool = np.flatnonzero(finite & (e >= high_threshold))
+    mid_pool = np.flatnonzero(finite & (qrank >= q_mid_low) & (qrank <= q_mid_high))
     low_pool = np.flatnonzero(finite & (e <= low_threshold))
     rng = np.random.default_rng(int(seed))
 
@@ -707,8 +726,8 @@ def _select_ranked_high_low_points(
         return rng.choice(pool, size=k, replace=False).astype(np.int64)
 
     selected_high = _draw(high_pool, int(n_high))
+    selected_mid = _draw(mid_pool, int(n_mid))
     selected_low = _draw(low_pool, int(n_low))
-    qrank = _quantile_ranks(e)
     cov_full = covariates or {}
     cov = {
         key: np.asarray(value, dtype=np.float64).reshape(-1)[:n]
@@ -719,13 +738,18 @@ def _select_ranked_high_low_points(
         "selection_method": "mean_tau_phi_delta_h_quantile_rank_sampling_without_replacement",
         "selection_high_quantile": q_high,
         "selection_low_quantile": q_low,
+        "selection_mid_quantile_low": q_mid_low,
+        "selection_mid_quantile_high": q_mid_high,
         "selection_high_threshold": high_threshold,
         "selection_low_threshold": low_threshold,
         "n_high_pool": int(high_pool.size),
+        "n_mid_pool": int(mid_pool.size),
         "n_low_pool": int(low_pool.size),
         "n_high_requested": int(n_high),
+        "n_mid_requested": int(n_mid),
         "n_low_requested": int(n_low),
         "n_high_selected": int(selected_high.size),
+        "n_mid_selected": int(selected_mid.size),
         "n_low_selected": int(selected_low.size),
         "min_branch_step": int(min_step),
         "trajectory_end_step": "" if trajectory_end_step is None else int(trajectory_end_step),
@@ -734,8 +758,9 @@ def _select_ranked_high_low_points(
         common_meta.update(energy_meta)
 
     rows: list[dict[str, Any]] = []
-    for condition, selected in (("high", selected_high), ("low", selected_low)):
+    for condition, selected in (("high", selected_high), ("mid", selected_mid), ("low", selected_low)):
         for local_id, original_idx in enumerate(selected.tolist()):
+            target_q = q_high if condition == "high" else q_low if condition == "low" else 0.5 * (q_mid_low + q_mid_high)
             row: dict[str, Any] = {
                 "pair_id": int(local_id),
                 "point_id": int(local_id),
@@ -746,7 +771,7 @@ def _select_ranked_high_low_points(
                 "delta_h": float(e[original_idx]),
                 "delta_h_energy": float(e[original_idx]),
                 "delta_h_quantile_rank": float(qrank[original_idx]),
-                "target_quantile": q_high if condition == "high" else q_low,
+                "target_quantile": float(target_q),
                 **common_meta,
             }
             for key, value in cov.items():
@@ -1014,8 +1039,11 @@ def simulation(
     refractory_steps = int(_get(bcfg, "refractory_steps", 5000))
     high_quantile = float(_get(bcfg, "high_quantile", 0.8))
     low_quantile = float(_get(bcfg, "low_quantile", 0.2))
+    mid_quantile_low = float(_get(bcfg, "mid_quantile_low", 0.4))
+    mid_quantile_high = float(_get(bcfg, "mid_quantile_high", 0.6))
     n_high = int(_get(bcfg, "n_high", m_pairs))
     n_low = int(_get(bcfg, "n_low", m_pairs))
+    n_mid = int(_get(bcfg, "n_mid", m_pairs))
     selection_seed = int(_get(bcfg, "selection_seed", 12345))
     energy_min_remaining_steps_raw = _get(bcfg, "energy_min_remaining_steps", None)
     energy_min_remaining_samples_raw = _get(bcfg, "energy_min_samples", None)
@@ -1052,7 +1080,7 @@ def simulation(
     ranked.sort(key=lambda x: -x[0])
     log_event(
         f"C2 branching simulation ranked n_metric_items={len(ranked)} max_trajectories={max_trajectories} "
-        f"selection_mode={selection_mode} m_pairs={m_pairs} n_high={n_high} n_low={n_low} "
+        f"selection_mode={selection_mode} m_pairs={m_pairs} n_high={n_high} n_mid={n_mid} n_low={n_low} "
         f"n_points_per_trajectory={n_points_per_trajectory} "
         f"branches_per_time={branches_per_time}",
         component="c2-branch",
@@ -1177,8 +1205,11 @@ def simulation(
                 covariates=covariates,
                 n_high=n_high,
                 n_low=n_low,
+                n_mid=n_mid,
                 q_high=high_quantile,
                 q_low=low_quantile,
+                q_mid_low=mid_quantile_low,
+                q_mid_high=mid_quantile_high,
                 horizon_steps=horizon_steps,
                 trajectory_end_step=trajectory_end,
                 seed=selection_seed + 10007 * traj_order,
@@ -1187,7 +1218,8 @@ def simulation(
             )
             log_event(
                 f"C2 branching simulation traj={traj_id} selected_high={select_summary.get('n_high_selected', 0)} "
-                f"selected_low={select_summary.get('n_low_selected', 0)} high_pool={select_summary.get('n_high_pool', 0)} "
+                f"selected_mid={select_summary.get('n_mid_selected', 0)} selected_low={select_summary.get('n_low_selected', 0)} "
+                f"high_pool={select_summary.get('n_high_pool', 0)} mid_pool={select_summary.get('n_mid_pool', 0)} "
                 f"low_pool={select_summary.get('n_low_pool', 0)} source={metrics_path}",
                 component="c2-branch",
             )
@@ -1211,12 +1243,13 @@ def simulation(
                     }
                 }
                 for branch_id in range(branches_per_time):
+                    condition_offset = {"high": 0, "mid": 3967, "low": 7919}.get(condition, 12347)
                     branch_seed = int(
                         selection_seed
                         + 1000003 * traj_order
                         + 1009 * point_id
                         + 131 * branch_id
-                        + (0 if condition == "high" else 7919)
+                        + condition_offset
                     )
                     branch_dir = branch_root / traj_id / f"rank_{condition}_{point_id:03d}_w_{window_idx:04d}_step_{step}" / f"branch_{branch_id:02d}"
                     _append_branch_row(
@@ -1376,6 +1409,7 @@ def simulation(
             "max_trajectories": max_trajectories,
             "m_pairs": m_pairs,
             "n_high": n_high,
+            "n_mid": n_mid,
             "n_low": n_low,
             "selection_mode": selection_mode,
             "selection_seed": selection_seed,
@@ -1388,6 +1422,8 @@ def simulation(
             "min_branch_step": min_branch_step,
             "refractory_steps": refractory_steps,
             "high_quantile": high_quantile,
+            "mid_quantile_low": mid_quantile_low,
+            "mid_quantile_high": mid_quantile_high,
             "low_quantile": low_quantile,
             "perturb_a_std": perturb_a_std,
             "perturb_p_std": perturb_p_std,

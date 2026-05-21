@@ -508,9 +508,9 @@ def _plot_cross(output_root: Path, figures: Path) -> dict[str, str]:
     return {"c6_cross_substrate_effects": str(out)}
 
 
-def _plot_c2_branching(output_root: Path, figures: Path) -> dict[str, str]:
-    scores_path = output_root / "c2_branching" / "branching_scores.csv"
-    contrasts_path = output_root / "c2_branching" / "branching_pair_contrasts.csv"
+def _plot_c2_branching_one(output_root: Path, figures: Path, *, suffix: str, label: str) -> dict[str, str]:
+    scores_path = output_root / "c2_branching" / f"branching_scores{suffix}.csv"
+    contrasts_path = output_root / "c2_branching" / f"branching_pair_contrasts{suffix}.csv"
     if not scores_path.exists():
         return {}
     scores = pd.read_csv(scores_path)
@@ -529,21 +529,21 @@ def _plot_c2_branching(output_root: Path, figures: Path) -> dict[str, str]:
             ax0.plot([0, 1], [low, high], color="#888888", alpha=0.7, linewidth=1)
             ax0.scatter([0, 1], [low, high], color=["#4c78a8", "#d62728"], s=28, zorder=3)
         diffs = contrasts["delta_branching_score"].astype(float).to_numpy()
-        ax0.set_title(f"paired branching; median delta={np.nanmedian(diffs):.3g}" if diffs.size else "paired branching")
+        ax0.set_title(f"{label}; median delta={np.nanmedian(diffs):.3g}" if diffs.size else label)
         ax0.set_xticks([0, 1], ["low", "high"])
         ax0.set_ylabel("branch divergence")
 
     conditions = scores["condition"].astype(str).to_numpy() if "condition" in scores.columns else np.asarray(["sampled"] * len(scores))
-    palette = {"high": "#d62728", "low": "#4c78a8", "sampled": "#6f4e9b"}
+    palette = {"high": "#d62728", "mid": "#ff7f0e", "low": "#4c78a8", "sampled": "#6f4e9b"}
     colors = np.asarray([palette.get(str(cond), "#6f4e9b") for cond in conditions])
     x = scores["delta_h"].astype(float).to_numpy()
     y = scores["branching_score"].astype(float).to_numpy()
     ax1.scatter(x, y, c=colors, s=36)
     finite = np.isfinite(x) & np.isfinite(y)
-    title = "Delta-H vs future divergence"
+    title = f"Delta-H vs future divergence ({label})"
     if int(np.sum(finite)) >= 2 and float(np.std(x[finite])) > 1e-12 and float(np.std(y[finite])) > 1e-12:
         r = float(np.corrcoef(x[finite], y[finite])[0, 1])
-        title = f"Delta-H vs future divergence; r={r:.3g}"
+        title = f"Delta-H vs future divergence ({label}); r={r:.3g}"
         coef = np.polyfit(x[finite], y[finite], deg=1)
         xline = np.linspace(float(np.nanmin(x[finite])), float(np.nanmax(x[finite])), 100)
         ax1.plot(xline, coef[0] * xline + coef[1], color="#333333", linewidth=1, alpha=0.8)
@@ -551,18 +551,28 @@ def _plot_c2_branching(output_root: Path, figures: Path) -> dict[str, str]:
     ax1.set_ylabel("branch divergence")
     ax1.set_title(title)
     fig.tight_layout()
-    out = figures / "c2_branching_sensitivity.png"
+    tag = suffix.lstrip("_")
+    name_suffix = f"_{tag}" if tag else ""
+    out = figures / f"c2_branching_sensitivity{name_suffix}.png"
     fig.savefig(out, dpi=180)
-    out_alias = figures / "c2_high_vs_low_branching_divergence.png"
+    out_alias = figures / f"c2_high_vs_low_branching_divergence{name_suffix}.png"
     fig.savefig(out_alias, dpi=180)
-    out_corr = figures / "c2_delta_h_branching_correlation.png"
+    out_corr = figures / f"c2_delta_h_branching_correlation{name_suffix}.png"
     fig.savefig(out_corr, dpi=180)
     plt.close(fig)
+    key_suffix = f"_{tag}" if tag else ""
     return {
-        "c2_branching_sensitivity": str(out),
-        "c2_high_vs_low_branching_divergence": str(out_alias),
-        "c2_delta_h_branching_correlation": str(out_corr),
+        f"c2_branching_sensitivity{key_suffix}": str(out),
+        f"c2_high_vs_low_branching_divergence{key_suffix}": str(out_alias),
+        f"c2_delta_h_branching_correlation{key_suffix}": str(out_corr),
     }
+
+
+def _plot_c2_branching(output_root: Path, figures: Path) -> dict[str, str]:
+    paths: dict[str, str] = {}
+    paths.update(_plot_c2_branching_one(output_root, figures, suffix="", label="APF multiscale L2"))
+    paths.update(_plot_c2_branching_one(output_root, figures, suffix="_clip_chamfer", label="CLIP Chamfer"))
+    return paths
 
 
 def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, force: bool = False) -> dict[str, Any]:
