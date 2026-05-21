@@ -262,10 +262,10 @@ c2:
     # Set >1 to run C2 branch continuations through the batched resume runner.
     # The runner batches compatible arbitrary snapshots/params with the same
     # tensor shapes, horizon, snapshot cadence, and original RNG batch size.
-    resume_batch_size: 4
+    resume_batch_size: 10
     refractory_steps: 5000
     high_quantile: 0.8
-    low_quantile: 0.2
+    low_quantile: 0.5
     feature_max_apf_chunks: 4
     feature_max_snapshots_per_chunk: 8
     future_field_weights:
