@@ -111,8 +111,11 @@ def _selected_for_item(
     item: dict[str, Any],
     traj_order: int,
     n_high: int,
+    n_mid: int,
     n_low: int,
     q_high: float,
+    q_mid_low: float,
+    q_mid_high: float,
     q_low: float,
     horizon_steps: int,
     min_branch_step: int,
@@ -140,8 +143,11 @@ def _selected_for_item(
         energy=energy,
         covariates=None,
         n_high=n_high,
+        n_mid=n_mid,
         n_low=n_low,
         q_high=q_high,
+        q_mid_low=q_mid_low,
+        q_mid_high=q_mid_high,
         q_low=q_low,
         horizon_steps=horizon_steps,
         trajectory_end_step=trajectory_end,
@@ -168,8 +174,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"No C2 metrics.npz items found under {trajectory_root}.")
 
     n_high = int(args.n_high if args.n_high is not None else _get(bcfg, "n_high", _get(bcfg, "m_pairs", 2)))
+    n_mid = int(args.n_mid if args.n_mid is not None else _get(bcfg, "n_mid", _get(bcfg, "m_pairs", 2)))
     n_low = int(args.n_low if args.n_low is not None else _get(bcfg, "n_low", _get(bcfg, "m_pairs", 2)))
     q_high = float(args.q_high if args.q_high is not None else _get(bcfg, "high_quantile", 0.8))
+    q_mid_low = float(args.q_mid_low if args.q_mid_low is not None else _get(bcfg, "mid_quantile_low", 0.4))
+    q_mid_high = float(args.q_mid_high if args.q_mid_high is not None else _get(bcfg, "mid_quantile_high", 0.6))
     q_low = float(args.q_low if args.q_low is not None else _get(bcfg, "low_quantile", 0.2))
     horizon_steps = int(args.horizon_steps if args.horizon_steps is not None else _get(bcfg, "horizon_steps", 1000))
     min_branch_step = int(args.min_branch_step if args.min_branch_step is not None else _get(bcfg, "min_branch_step", _get(bcfg, "selection_min_step", 0)))
@@ -213,8 +222,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             item=item,
             traj_order=panel_idx,
             n_high=n_high,
+            n_mid=n_mid,
             n_low=n_low,
             q_high=q_high,
+            q_mid_low=q_mid_low,
+            q_mid_high=q_mid_high,
             q_low=q_low,
             horizon_steps=horizon_steps,
             min_branch_step=min_branch_step,
@@ -242,12 +254,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         step_to_x = {int(round(float(step))): i for i, step in enumerate(centers)}
         for row in points:
             window_idx = int(row.get("window_index", step_to_x.get(int(row["window_center_step"]), 0)))
-            color = "#d62728" if row["condition"] == "high" else "#1f77b4"
-            marker = "v" if row["condition"] == "high" else "^"
+            condition = str(row["condition"])
+            color = {"high": "#d62728", "mid": "#ff7f0e", "low": "#1f77b4"}.get(condition, "#555555")
+            marker = {"high": "v", "mid": "o", "low": "^"}.get(condition, "o")
+            y_marker = len(tau_steps) - 0.7 if condition == "high" else 0.5 * max(0, len(tau_steps) - 1) if condition == "mid" else 0.7
             ax.axvline(window_idx, color=color, linewidth=1.5, alpha=0.9)
             ax.scatter(
                 [window_idx],
-                [len(tau_steps) - 0.7 if row["condition"] == "high" else 0.7],
+                [y_marker],
                 c=color,
                 marker=marker,
                 s=44,
@@ -279,6 +293,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ax.set_yticklabels([str(int(tau_steps[i])) for i in y_ticks])
         ax.set_title(
             f"{item['traj_id']}\nH {summary.get('n_high_selected', 0)}/{summary.get('n_high_pool', 0)}; "
+            f"M {summary.get('n_mid_selected', 0)}/{summary.get('n_mid_pool', 0)}; "
             f"L {summary.get('n_low_selected', 0)}/{summary.get('n_low_pool', 0)}",
             fontsize=9,
         )
@@ -289,8 +304,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         axes[panel_idx // n_cols][panel_idx % n_cols].axis("off")
 
     fig.suptitle(
-        f"C2 branching start preview\nmean_tau phi(Delta-H), high q>={q_high:g}, low q<={q_low:g}, "
-        f"N_high={n_high}, N_low={n_low}, min_step={min_branch_step}",
+        f"C2 branching start preview\nmean_tau phi(Delta-H), high q>={q_high:g}, "
+        f"mid {q_mid_low:g}<=p<={q_mid_high:g}, low q<={q_low:g}, "
+        f"N_high={n_high}, N_mid={n_mid}, N_low={n_low}, min_step={min_branch_step}",
         fontsize=12,
     )
     if last_im is not None:
@@ -308,8 +324,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", default=None)
     parser.add_argument("--max-trajectories", default=None, help="Integer or 'all'. Defaults to c2.branching.max_trajectories.")
     parser.add_argument("--n-high", type=int, default=None)
+    parser.add_argument("--n-mid", type=int, default=None)
     parser.add_argument("--n-low", type=int, default=None)
     parser.add_argument("--q-high", type=float, default=None)
+    parser.add_argument("--q-mid-low", type=float, default=None)
+    parser.add_argument("--q-mid-high", type=float, default=None)
     parser.add_argument("--q-low", type=float, default=None)
     parser.add_argument("--horizon-steps", type=int, default=None)
     parser.add_argument("--min-branch-step", type=int, default=None)

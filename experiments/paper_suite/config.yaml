@@ -249,8 +249,9 @@ c2:
     # Continuous Delta-H sampling remains available as selection_mode:
     # delta_h_quantile_sweep.
     selection_mode: tau_mean_ranked_high_low
-    n_high: 3
-    n_low: 3
+    n_high: 5
+    n_mid: 5
+    n_low: 5
     selection_seed: 12345
     n_points_per_trajectory: 10
     point_quantile_min: 0.05
@@ -266,7 +267,9 @@ c2:
     min_branch_step: 50000
     refractory_steps: 5000
     high_quantile: 0.8
-    low_quantile: 0.5
+    mid_quantile_low: 0.4
+    mid_quantile_high: 0.6
+    low_quantile: 0.2
     feature_max_apf_chunks: 4
     feature_max_snapshots_per_chunk: 8
     future_field_weights:
@@ -473,6 +476,7 @@ smoke:
       max_trajectories: 1
       selection_mode: tau_mean_ranked_high_low
       n_high: 2
+      n_mid: 2
       n_low: 2
       selection_seed: 12345
       n_points_per_trajectory: 4
