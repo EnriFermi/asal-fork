@@ -126,7 +126,7 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
             rows.append({"name": "synthetic_calibration", "layer": "simulation", "status": "ok", "message": str(result), "command": ""})
             log_event(f"simulation synthetic done result={result}", component="simulation")
 
-    if task in {"all", "paper_check", "paper_check_frustration", "paper_check_c1", "apf", "c2"}:
+    if task in {"all", "paper_check", "paper_check_frustration", "paper_check_c1", "apf", "c2", "nnopt_apf"}:
         sim_cfg = cfg.get("simulation", {})
         entries = sim_cfg.get("commands", [])
         for entry in entries:
@@ -193,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("config")
     parser.add_argument(
         "--task",
-        choices=["all", "synthetic", "paper_check", "paper_check_frustration", "paper_check_c1", "apf", "c2"],
+        choices=["all", "synthetic", "paper_check", "paper_check_frustration", "paper_check_c1", "apf", "c2", "nnopt_apf"],
         default="all",
     )
     parser.add_argument("--smoke", action="store_true")
