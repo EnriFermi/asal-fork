@@ -135,6 +135,7 @@ def _select_high_points(
     n_points: int,
     q_high: float,
     horizon_steps: int,
+    min_branch_step: int,
     energy_min_remaining_steps: int | None,
     energy_min_samples: int | None,
 ) -> list[dict[str, Any]]:
@@ -162,6 +163,8 @@ def _select_high_points(
         c = c[:n]
         e = e[:n]
         finite = np.isfinite(c) & np.isfinite(e)
+        if min_branch_step > 0:
+            finite &= c >= float(min_branch_step)
         if trajectory_end is not None:
             finite &= (c + float(horizon_steps)) <= float(trajectory_end)
         if not np.any(finite):
@@ -211,6 +214,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     n_points = int(args.n_points)
     q_high = float(args.q_high if args.q_high is not None else _get(bcfg, "high_quantile", 0.8))
     horizon_steps = int(args.horizon_steps if args.horizon_steps is not None else _get(bcfg, "horizon_steps", 1000))
+    min_branch_step = int(args.min_branch_step if args.min_branch_step is not None else _get(bcfg, "min_branch_step", _get(bcfg, "selection_min_step", 0)))
     perturb = _get(bcfg, "perturb", {})
     base_a_std = float(args.base_a_std if args.base_a_std is not None else _get(perturb, "a_std", 1e-4))
     base_p_std = float(args.base_p_std if args.base_p_std is not None else _get(perturb, "p_std", 1e-4))
@@ -231,6 +235,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         n_points=n_points,
         q_high=q_high,
         horizon_steps=horizon_steps,
+        min_branch_step=min_branch_step,
         energy_min_remaining_steps=energy_min_remaining_steps,
         energy_min_samples=energy_min_samples,
     )
@@ -309,6 +314,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "n_points": len(points),
         "strengths": strengths,
         "horizon_steps": horizon_steps,
+        "min_branch_step": min_branch_step,
         "base_a_std": base_a_std,
         "base_p_std": base_p_std,
         "base_lagrangian_xy_std": base_lag_xy_std,
@@ -327,6 +333,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--n-points", type=int, default=3)
     parser.add_argument("--q-high", type=float, default=None)
     parser.add_argument("--horizon-steps", type=int, default=None)
+    parser.add_argument("--min-branch-step", type=int, default=None)
     parser.add_argument("--strengths", default="0,0.1,1,3,10")
     parser.add_argument("--base-a-std", type=float, default=None)
     parser.add_argument("--base-p-std", type=float, default=None)
