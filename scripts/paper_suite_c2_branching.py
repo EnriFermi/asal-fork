@@ -384,8 +384,11 @@ def _select_events(
     refractory_steps: int,
     high_quantile: float,
     low_quantile: float,
+    min_step: int = 0,
 ) -> list[dict[str, Any]]:
     finite = np.isfinite(dh) & np.isfinite(centers)
+    if min_step > 0:
+        finite &= np.asarray(centers, dtype=np.float64).reshape(-1) >= float(min_step)
     if int(np.sum(finite)) < 2:
         return []
     c = centers[finite]
@@ -586,8 +589,11 @@ def _select_delta_h_points(
     quantiles: list[float] | None = None,
     quantile_min: float = 0.05,
     quantile_max: float = 0.95,
+    min_step: int = 0,
 ) -> list[dict[str, Any]]:
     finite = np.isfinite(dh) & np.isfinite(centers)
+    if min_step > 0:
+        finite &= np.asarray(centers, dtype=np.float64).reshape(-1) >= float(min_step)
     if int(np.sum(finite)) < 1:
         return []
     c = np.asarray(centers, dtype=np.float64).reshape(-1)[finite]
@@ -660,6 +666,7 @@ def _select_ranked_high_low_points(
     horizon_steps: int,
     trajectory_end_step: int | None,
     seed: int,
+    min_step: int = 0,
     energy_meta: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     c = np.asarray(centers, dtype=np.float64).reshape(-1)
@@ -670,6 +677,8 @@ def _select_ranked_high_low_points(
     c = c[:n]
     e = e[:n]
     finite = np.isfinite(c) & np.isfinite(e)
+    if min_step > 0:
+        finite &= c >= float(min_step)
     if trajectory_end_step is not None:
         finite &= (c + float(horizon_steps)) <= float(trajectory_end_step)
     if int(np.sum(finite)) < 1:
@@ -678,6 +687,7 @@ def _select_ranked_high_low_points(
             "n_low_pool": 0,
             "n_high_selected": 0,
             "n_low_selected": 0,
+            "min_branch_step": int(min_step),
             "trajectory_end_step": "" if trajectory_end_step is None else int(trajectory_end_step),
         }
 
@@ -717,6 +727,7 @@ def _select_ranked_high_low_points(
         "n_low_requested": int(n_low),
         "n_high_selected": int(selected_high.size),
         "n_low_selected": int(selected_low.size),
+        "min_branch_step": int(min_step),
         "trajectory_end_step": "" if trajectory_end_step is None else int(trajectory_end_step),
     }
     if energy_meta:
@@ -971,6 +982,7 @@ def simulation(
     energy_min_remaining_samples_raw = _get(bcfg, "energy_min_samples", None)
     energy_min_remaining_steps = None if energy_min_remaining_steps_raw is None else int(energy_min_remaining_steps_raw)
     energy_min_remaining_samples = None if energy_min_remaining_samples_raw is None else int(energy_min_remaining_samples_raw)
+    min_branch_step = int(_get(bcfg, "min_branch_step", _get(bcfg, "selection_min_step", 0)))
     horizon_steps = int(_get(bcfg, "horizon_steps", 1000))
     perturb = _get(bcfg, "perturb", {})
     perturb_a_std = float(_get(perturb, "a_std", 1e-4))
@@ -1117,6 +1129,7 @@ def simulation(
                 horizon_steps=horizon_steps,
                 trajectory_end_step=trajectory_end,
                 seed=selection_seed + 10007 * traj_order,
+                min_step=min_branch_step,
                 energy_meta=selection_meta,
             )
             log_event(
@@ -1179,6 +1192,7 @@ def simulation(
                 quantiles=point_quantiles or None,
                 quantile_min=point_quantile_min,
                 quantile_max=point_quantile_max,
+                min_step=min_branch_step,
             )
             log_event(
                 f"C2 branching simulation traj={traj_id} selected_points={len(points)} source={metrics_path}",
@@ -1227,6 +1241,7 @@ def simulation(
             refractory_steps=refractory_steps,
             high_quantile=high_quantile,
             low_quantile=low_quantile,
+            min_step=min_branch_step,
         )
         log_event(
             f"C2 branching simulation traj={traj_id} selected_pairs={len(pairs)} source={metrics_path}",
@@ -1307,6 +1322,7 @@ def simulation(
             "point_quantile_max": point_quantile_max,
             "branches_per_time": branches_per_time,
             "horizon_steps": horizon_steps,
+            "min_branch_step": min_branch_step,
             "refractory_steps": refractory_steps,
             "high_quantile": high_quantile,
             "low_quantile": low_quantile,
