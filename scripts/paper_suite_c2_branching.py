@@ -38,7 +38,7 @@ from paper_suite_c2_flowlenia_metrics import _rollout_config as _c2_rollout_conf
 from paper_suite_metric_cache import compare_metrics_npz_metadata, sha256_text, stable_json
 
 
-BRANCH_PLAN_VERSION = "c2_branch_plan_v4_tau_mean_ranked_high_low"
+BRANCH_PLAN_VERSION = "c2_branch_plan_v5_min_step_perturb_metadata"
 
 
 def _get(cfg: Any, key: str, default: Any = None) -> Any:
@@ -755,9 +755,46 @@ def _select_ranked_high_low_points(
     return rows, common_meta
 
 
-def _branch_output_ok(branch_dir: Path) -> bool:
-    if (branch_dir / "branch_feature.npz").exists() or (branch_dir / "metrics.npz").exists():
+def _expected_resume_metadata_from_plan_row(row: dict[str, Any]) -> dict[str, Any] | None:
+    required = ("step", "horizon_steps", "branch_seed", "perturb_a_std", "perturb_p_std", "perturb_lagrangian_xy_std")
+    if any(str(row.get(key, "")).strip() == "" for key in required):
+        return None
+    try:
+        step = int(float(row["step"]))
+        horizon = int(float(row["horizon_steps"]))
+        return {
+            "start_step": step,
+            "end_step": step + horizon,
+            "branch_seed": int(float(row["branch_seed"])),
+            "perturb_a_std": float(row["perturb_a_std"]),
+            "perturb_p_std": float(row["perturb_p_std"]),
+            "perturb_lagrangian_xy_std": float(row["perturb_lagrangian_xy_std"]),
+        }
+    except (TypeError, ValueError):
+        return None
+
+
+def _metadata_matches(found: dict[str, Any], expected: dict[str, Any] | None) -> bool:
+    if expected is None:
         return True
+    for key, value in expected.items():
+        if key not in found:
+            return False
+        try:
+            if isinstance(value, float):
+                if not math.isclose(float(found[key]), float(value), rel_tol=1e-9, abs_tol=1e-12):
+                    return False
+            else:
+                if int(found[key]) != int(value):
+                    return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
+def _branch_output_ok(branch_dir: Path, *, expected_metadata: dict[str, Any] | None = None) -> bool:
+    if (branch_dir / "branch_feature.npz").exists() or (branch_dir / "metrics.npz").exists():
+        return expected_metadata is None
     apf_dir = branch_dir / "apf_logs"
     metadata_path = branch_dir / "resume_metadata.json"
     if not apf_dir.exists() or not metadata_path.exists():
@@ -768,6 +805,8 @@ def _branch_output_ok(branch_dir: Path) -> bool:
     try:
         with open(metadata_path, "r") as f:
             metadata = json.load(f)
+        if not _metadata_matches(metadata, expected_metadata):
+            return False
         end_step = int(metadata["end_step"])
     except Exception:
         return False
@@ -1040,7 +1079,15 @@ def simulation(
     ) -> None:
         requested_step = int(step)
         snapped_step = _nearest_apf_step(source_apf_dir, requested_step, cache=saved_steps_cache)
-        branch_ready = _branch_output_ok(branch_dir)
+        expected_metadata = {
+            "start_step": int(snapped_step),
+            "end_step": int(snapped_step) + int(horizon_steps),
+            "branch_seed": int(branch_seed),
+            "perturb_a_std": float(perturb_a_std),
+            "perturb_p_std": float(perturb_p_std),
+            "perturb_lagrangian_xy_std": float(perturb_lag_xy_std),
+        }
+        branch_ready = _branch_output_ok(branch_dir, expected_metadata=expected_metadata)
         overwrite_incomplete = branch_dir.exists() and not branch_ready
         cmd = _make_resume_command(
             source_traj_dir=source_traj_dir,
@@ -1063,7 +1110,8 @@ def simulation(
                     f"C2 branching simulation removing incomplete branch output {branch_dir}",
                     component="c2-branch",
                 )
-                shutil.rmtree(branch_dir)
+                if not dry_run:
+                    shutil.rmtree(branch_dir)
             if resume_batch_size > 1:
                 status = "queued_batch" if not dry_run else "dry_run"
             else:
@@ -1073,7 +1121,7 @@ def simulation(
                     component="c2-branch",
                 )
                 run_subprocess(cmd, dry_run=dry_run)
-                status = "dry_run" if dry_run else ("exists" if _branch_output_ok(branch_dir) else "missing")
+                status = "dry_run" if dry_run else ("exists" if _branch_output_ok(branch_dir, expected_metadata=expected_metadata) else "missing")
         row = {
             "traj_id": traj_id,
             "pair_id": int(pair_id),
@@ -1083,6 +1131,11 @@ def simulation(
             "step_snap_delta": int(snapped_step - requested_step),
             "delta_h": float(delta_h),
             "branch_id": int(branch_id),
+            "branch_seed": int(branch_seed),
+            "horizon_steps": int(horizon_steps),
+            "perturb_a_std": float(perturb_a_std),
+            "perturb_p_std": float(perturb_p_std),
+            "perturb_lagrangian_xy_std": float(perturb_lag_xy_std),
             "source_metrics_path": str(metrics_path),
             "source_traj_dir": str(source_traj_dir),
             "source_apf_dir": str(source_apf_dir),
@@ -1291,8 +1344,18 @@ def simulation(
         run_subprocess(batch_cmd, dry_run=dry_run)
         for row_idx, job in pending_batch_jobs:
             branch_dir = Path(str(job["output_dir"]))
+            expected_metadata = {
+                "start_step": int(job["step"]),
+                "end_step": int(job["step"]) + int(job["additional_steps"]),
+                "branch_seed": int(job["branch_seed"]),
+                "perturb_a_std": float(job["perturb_a_std"]),
+                "perturb_p_std": float(job["perturb_p_std"]),
+                "perturb_lagrangian_xy_std": float(job["perturb_lagrangian_xy_std"]),
+            }
             rows[row_idx]["command"] = command_to_str(batch_cmd)
-            rows[row_idx]["status"] = "dry_run" if dry_run else ("exists" if _branch_output_ok(branch_dir) else "missing")
+            rows[row_idx]["status"] = "dry_run" if dry_run else (
+                "exists" if _branch_output_ok(branch_dir, expected_metadata=expected_metadata) else "missing"
+            )
 
     plan_path = out_dir / "branch_plan.csv"
     write_csv(plan_path, rows)
@@ -1326,6 +1389,9 @@ def simulation(
             "refractory_steps": refractory_steps,
             "high_quantile": high_quantile,
             "low_quantile": low_quantile,
+            "perturb_a_std": perturb_a_std,
+            "perturb_p_std": perturb_p_std,
+            "perturb_lagrangian_xy_std": perturb_lag_xy_std,
             "energy_min_remaining_steps": energy_min_remaining_steps,
             "energy_min_samples": energy_min_remaining_samples,
         },
@@ -1848,7 +1914,15 @@ def metrics(
                 f"C2 branching metrics group {group_idx}/{len(group_items)} traj={traj_id} pair={pair_id} condition={condition}",
                 component="c2-branch",
         )
-        branch_dirs = [Path(str(row["branch_dir"])) for row in rows]
+        valid_rows = [
+            row
+            for row in rows
+            if _branch_output_ok(
+                Path(str(row["branch_dir"])),
+                expected_metadata=_expected_resume_metadata_from_plan_row(row),
+            )
+        ]
+        branch_dirs = [Path(str(row["branch_dir"])) for row in valid_rows]
         if metric_mode == "clip_chamfer":
             if clip_fm is None:
                 raise RuntimeError("CLIP foundation model was not initialized.")
@@ -1869,13 +1943,13 @@ def metrics(
                 max_chunks=max_chunks,
                 max_frames=max_future_frames,
             )
-        used = [row for row in rows if _branch_output_ok(Path(str(row["branch_dir"])))]
+        used = list(valid_rows)
         metric_name = str(detail.get("metric", "future_apf_multiscale_l2"))
         fallback_used = False
         if metric_mode == "apf" and not np.isfinite(score) and allow_feature_fallback:
             features = []
             used = []
-            for row in rows:
+            for row in valid_rows:
                 branch_dir = Path(str(row["branch_dir"]))
                 try:
                     features.append(_feature_from_branch(branch_dir, max_chunks=max_chunks, max_snapshots_per_chunk=max_snapshots))
