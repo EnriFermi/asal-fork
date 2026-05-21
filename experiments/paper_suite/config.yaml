@@ -265,6 +265,7 @@ c2:
     # tensor shapes, horizon, snapshot cadence, and original RNG batch size.
     resume_batch_size: 4
     horizon_steps: 1000
+    min_branch_step: 50000
     refractory_steps: 5000
     high_quantile: 0.8
     low_quantile: 0.2
@@ -284,9 +285,9 @@ c2:
     future_max_frames: 32
     allow_debug_feature_fallback: false
     perturb:
-      a_std: 0.0001
-      p_std: 0.0001
-      lagrangian_xy_std: 0.01
+      a_std: 0.01
+      p_std: 0.01
+      lagrangian_xy_std: 1.0
 
 simulation:
   reuse_existing: true
