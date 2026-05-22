@@ -540,16 +540,31 @@ def _plot_c2_branching_one(output_root: Path, figures: Path, *, suffix: str, lab
     y = scores["branching_score"].astype(float).to_numpy()
     ax1.scatter(x, y, c=colors, s=36)
     finite = np.isfinite(x) & np.isfinite(y)
-    title = f"Delta-H vs future divergence ({label})"
+    title = f"Delta-H vs future divergence\n{label}"
+    corr_text = ""
     if int(np.sum(finite)) >= 2 and float(np.std(x[finite])) > 1e-12 and float(np.std(y[finite])) > 1e-12:
         r = float(np.corrcoef(x[finite], y[finite])[0, 1])
-        title = f"Delta-H vs future divergence ({label}); r={r:.3g}"
+        rx = pd.Series(x[finite]).rank(method="average").to_numpy(dtype=float)
+        ry = pd.Series(y[finite]).rank(method="average").to_numpy(dtype=float)
+        spearman = float(np.corrcoef(rx, ry)[0, 1]) if float(np.std(rx)) > 1e-12 and float(np.std(ry)) > 1e-12 else float("nan")
+        corr_text = f"Pearson r = {r:.3g}\nSpearman rho = {spearman:.3g}\nn = {int(np.sum(finite))}"
         coef = np.polyfit(x[finite], y[finite], deg=1)
         xline = np.linspace(float(np.nanmin(x[finite])), float(np.nanmax(x[finite])), 100)
         ax1.plot(xline, coef[0] * xline + coef[1], color="#333333", linewidth=1, alpha=0.8)
     ax1.set_xlabel("Delta-H at branch time")
     ax1.set_ylabel("branch divergence")
     ax1.set_title(title)
+    if corr_text:
+        ax1.text(
+            0.03,
+            0.97,
+            corr_text,
+            transform=ax1.transAxes,
+            ha="left",
+            va="top",
+            fontsize=9,
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="#cccccc", alpha=0.9),
+        )
     fig.tight_layout()
     tag = suffix.lstrip("_")
     name_suffix = f"_{tag}" if tag else ""

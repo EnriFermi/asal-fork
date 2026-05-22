@@ -7,14 +7,14 @@ cd "$ROOT_DIR"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 OUT_DIR="${OUT_DIR:-analysis/results/gol_transition_mspd/gpu_all_rules_${RUN_ID}}"
 
-conda run -n onerec python scripts/gol_transition_mspd_experiment.py \
+conda run --no-capture-output -n onerec python -u scripts/gol_transition_mspd_experiment.py \
   --experiment rule-sweep \
   --all-rules \
   --require-accelerator \
   --backend jax \
   --L 64 \
   --T 2048 \
-  --burn-in 128 \
+  --burn-in "${BURN_IN:-512}" \
   --window-size 64 \
   --window-step 16 \
   --n-cell-sample 256 \
@@ -22,8 +22,9 @@ conda run -n onerec python scripts/gol_transition_mspd_experiment.py \
   --distance js \
   --pair-sample 512 \
   --min-delta-h-nonzero-frac 0.5 \
-  --delta-h-nonzero-eps 1e-6 \
-  --initial-density 0.25 \
+  --delta-h-nonzero-eps "${DELTA_H_NONZERO_EPS:-1e-2}" \
+  --rule-initial-density-min "${RULE_INITIAL_DENSITY_MIN:-0.05}" \
+  --rule-initial-density-max "${RULE_INITIAL_DENSITY_MAX:-0.4}" \
   --random-seed 0 \
   --eval-batch-size "${RULE_EVAL_BATCH_SIZE:-64}" \
   --jax-metric-batch-size "${RULE_JAX_METRIC_BATCH_SIZE:-16}" \
