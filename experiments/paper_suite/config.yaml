@@ -315,6 +315,29 @@ simulation:
     dedupe_by_run_idx: false
     max_checkpoints: null
 
+  flow_lenia_nnopt_lagrangian_apf:
+    enabled: true
+    required: false
+    # NN-opt/CLIP-OE comparison rollouts use the exact same Flow-Lenia A-run
+    # simulation profile as MSPD-opt: 500k steps, 384x384 substrate, sparse APF
+    # chunks, and lagrangian tracks. This builder is opt-only by design.
+    rollout_config: experiments/paper_suite/flowlenia_arun_apf_500k.yaml
+    output_root: experiments/paper_check_flow_lenia/checkpoints/nnopt_lagrangian_apf_500k
+    rollout_steps: 500000
+    n_trajectories_per_checkpoint: 1
+    include_random_baselines: false
+    objective_label: clip_oe
+    traj_prefix: nnopt
+    # Match the MSPD A-run control-A seed convention for comparable initial
+    # conditions: seed = run_seed_base + 2 * source_run_idx.
+    run_seed_base: 400000
+    run_seed_mode: source_run_idx
+    batch_size: 9
+    optimized_checkpoint_roots:
+      - experiments/paper_check_flow_lenia/checkpoints/clip_oe/optimization
+    dedupe_by_run_idx: false
+    max_checkpoints: null
+
   plife_plus_c1_lagrangian:
     enabled: true
     required: true
@@ -372,6 +395,22 @@ simulation:
         - experiments/paper_check_flow_lenia/checkpoints/arun_lagrangian_apf_500k/manifest.json
       expected_globs:
         - experiments/paper_check_flow_lenia/checkpoints/arun_lagrangian_apf_500k/flow_opt_*/apf_logs/P_steps_*.npz
+      expected_npz_keys: [A, P, F, lagrangian_xy, lagrangian_c, resume_batch_rng_key, state_t, state_mass_cycle_start]
+      npz_key_check_limit: 3
+
+    - name: flow_lenia_nnopt_lagrangian_apf_500k
+      task: nnopt_apf
+      enabled: true
+      required: false
+      heavy: true
+      # Idempotent opt-only NN-opt builder. It skips complete trajectories and
+      # only simulates missing APF outputs unless --force is passed.
+      always_run: true
+      command: ["{python}", "scripts/paper_suite_flowlenia_nnopt_apf.py", "{config}"]
+      expected_paths:
+        - experiments/paper_check_flow_lenia/checkpoints/nnopt_lagrangian_apf_500k/manifest.json
+      expected_globs:
+        - experiments/paper_check_flow_lenia/checkpoints/nnopt_lagrangian_apf_500k/nnopt_*/apf_logs/P_steps_*.npz
       expected_npz_keys: [A, P, F, lagrangian_xy, lagrangian_c, resume_batch_rng_key, state_t, state_mass_cycle_start]
       npz_key_check_limit: 3
 
