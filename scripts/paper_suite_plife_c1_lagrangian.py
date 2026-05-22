@@ -37,6 +37,10 @@ def _section(cfg: Any) -> Any:
 
 def _load_base_config(path: Path) -> tuple[Any, Any]:
     cfg = OmegaConf.load(str(path))
+    return cfg, _flatten_base_config(cfg)
+
+
+def _flatten_base_config(cfg: Any) -> Any:
     flat = OmegaConf.merge(
         cfg.get("meta", {}),
         cfg.get("source", {}),
@@ -46,7 +50,57 @@ def _load_base_config(path: Path) -> tuple[Any, Any]:
         cfg.get("metric", {}),
         cfg.get("logging", {}),
     )
-    return cfg, flat
+    return flat
+
+
+def _set_path(cfg: Any, dotted: str, value: Any) -> None:
+    cur = cfg
+    parts = dotted.split(".")
+    for part in parts[:-1]:
+        cur = cur[part]
+    cur[parts[-1]] = value
+
+
+def _apply_section_base_overrides(base_cfg: Any, section: Any) -> None:
+    """Apply long-run C6.1 rollout overrides without editing the source config."""
+    mappings = [
+        ("rollout_steps", "substrate.rollout_steps", int),
+        ("substrate_rollout_steps", "substrate.rollout_steps", int),
+        ("total_steps", "protocol.total_steps", int),
+        ("protocol_total_steps", "protocol.total_steps", int),
+        ("warmup_steps", "protocol.warmup_steps", int),
+        ("protocol_warmup_steps", "protocol.warmup_steps", int),
+        ("late_window_start_steps", "evaluation.late_window_start_steps", int),
+        ("late_window_end_steps", "evaluation.late_window_end_steps", int),
+        ("sample_every_steps", "metric.sample_every_steps", int),
+        ("metric_window_size_steps", "metric.metric_window_size_steps", int),
+        ("metric_window_step_steps", "metric.metric_window_step_steps", int),
+        ("metric_tau_steps", "metric.metric_tau_steps", int),
+        ("metric_tau_mode", "metric.metric_tau_mode", str),
+        ("metric_tau_grid_steps", "metric.metric_tau_grid_steps", list),
+        ("metric_m_samples", "metric.metric_m_samples", int),
+        ("metric_m_min", "metric.metric_m_min", int),
+        ("metric_n_proj", "metric.metric_n_proj", int),
+        ("metric_null_reps", "metric.metric_null_reps", int),
+        ("metric_particle_samples", "metric.metric_particle_samples", int),
+        ("metric_dirs_seed", "metric.metric_dirs_seed", int),
+        ("metric_delta_h_floor", "metric.metric_delta_h_floor", float),
+        ("metric_msc_floor", "metric.metric_msc_floor", float),
+        ("metric_msc_term", "metric.metric_msc_term", str),
+        ("metric_msc_normalize_by_weight_sum", "metric.metric_msc_normalize_by_weight_sum", bool),
+        ("metric_alpha", "metric.metric_alpha", float),
+        ("metric_beta", "metric.metric_beta", float),
+        ("metric_eps", "metric.metric_eps", float),
+    ]
+    for key, dotted, caster in mappings:
+        value = _get(section, key, None)
+        if value is None:
+            continue
+        if caster is list:
+            value = [int(x) for x in value]
+        else:
+            value = caster(value)
+        _set_path(base_cfg, dotted, value)
 
 
 def _make_substrate(args: Any):
@@ -479,10 +533,11 @@ def _write_manifest(
     write_json(
         output_root / "manifest.json",
         {
-            "source_kind": "plife_plus_c1_control_ab_lagrangian",
+            "source_kind": "plife_plus_c1_lagrangian",
             "base_config": str(base_config),
             "trajectory_start_steps": int(expected_start),
             "trajectory_end_steps": int(expected_end),
+            "expected_samples": int(expected_samples),
             "n_trajectories": len(trajectories),
             "trajectories": trajectories,
             "commands": command_rows,
@@ -536,7 +591,7 @@ def run(
         log_event("PLife++ C1 lagrangian simulation disabled", component="plife-c1")
         return {"status": "disabled"}
 
-    output_root = resolve_path(_get(section, "output_root", "experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k"))
+    output_root = resolve_path(_get(section, "output_root", "experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_500k"))
     assert output_root is not None
     if smoke:
         output_root = resolve_path(_get(section, "smoke_output_root", "analysis/results/paper_suite_smoke/plife_plus_c1_lagrangian"))
@@ -546,7 +601,8 @@ def run(
     base_config = resolve_path(_get(section, "base_config", "experiments/paper_check_plife_plus/frustration_simulation/config.yaml"))
     if base_config is None or not base_config.exists():
         raise FileNotFoundError(f"PLife++ C1 base_config not found: {base_config}")
-    base_cfg, rollout_flat = _load_base_config(base_config)
+    base_cfg, _rollout_flat_unused = _load_base_config(base_config)
+    _apply_section_base_overrides(base_cfg, section)
     if smoke:
         base_cfg.substrate.rollout_steps = 48
         base_cfg.substrate.n_particles = 32
@@ -558,15 +614,7 @@ def run(
         base_cfg.metric.metric_window_size_steps = 8
         base_cfg.metric.metric_window_step_steps = 4
         base_cfg.metric.metric_tau_steps = 2
-        rollout_flat = OmegaConf.merge(
-            base_cfg.get("meta", {}),
-            base_cfg.get("source", {}),
-            base_cfg.get("substrate", {}),
-            base_cfg.get("protocol", {}),
-            base_cfg.get("evaluation", {}),
-            base_cfg.get("metric", {}),
-            base_cfg.get("logging", {}),
-        )
+    rollout_flat = _flatten_base_config(base_cfg)
 
     expected_start = int(base_cfg.evaluation.late_window_start_steps)
     expected_end = int(base_cfg.evaluation.late_window_end_steps)
