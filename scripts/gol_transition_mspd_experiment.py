@@ -1378,6 +1378,7 @@ def run_rule_sweep_experiment(
     n_rule_candidates: Optional[int] = 512,
     n_initial_boards: int = 4,
     initial_density: Optional[float] = None,
+    initial_density_range: Optional[Tuple[float, float]] = None,
     include_conway: bool = True,
     stream_per_init_csv: bool = True,
     progress_interval_rules: int = 64,
@@ -1397,6 +1398,15 @@ def run_rule_sweep_experiment(
     density = config.initial_density if initial_density is None else float(initial_density)
     if not (0.0 <= density <= 1.0):
         raise ValueError("initial_density must be in [0, 1].")
+    density_low: Optional[float] = None
+    density_high: Optional[float] = None
+    if initial_density_range is not None:
+        if len(initial_density_range) != 2:
+            raise ValueError("initial_density_range must be a pair: (low, high).")
+        density_low = float(initial_density_range[0])
+        density_high = float(initial_density_range[1])
+        if not (0.0 <= density_low <= density_high <= 1.0):
+            raise ValueError("initial_density_range must satisfy 0 <= low <= high <= 1.")
 
     if rule_candidates is None:
         rules = make_lifelike_rule_candidates(
@@ -1416,6 +1426,18 @@ def run_rule_sweep_experiment(
     if np.any(rules >= N_LIFELIKE_RULES):
         raise ValueError(f"Life-like rule IDs must be in [0, {N_LIFELIKE_RULES}).")
 
+    rng = np.random.default_rng(config.random_seed + 883)
+    if density_low is None or density_high is None:
+        initial_probabilities = np.full(n_initial_boards, density, dtype=np.float64)
+        density_mode = "fixed"
+    else:
+        initial_probabilities = rng.uniform(density_low, density_high, size=n_initial_boards).astype(np.float64)
+        density_mode = "uniform_per_board"
+    initial_boards = (
+        rng.random((n_initial_boards, config.L, config.L)) < initial_probabilities[:, None, None]
+    ).astype(np.uint8)
+    realized_densities = initial_boards.reshape(n_initial_boards, -1).mean(axis=1).astype(np.float64)
+
     rule_output_dir = Path(output_dir) if output_dir is not None else Path(config.output_dir) / "rule_sweep"
     rule_output_dir.mkdir(parents=True, exist_ok=True)
     with (rule_output_dir / "rule_sweep_config.json").open("w") as f:
@@ -1426,6 +1448,12 @@ def run_rule_sweep_experiment(
                 "n_rule_candidates": None if n_rule_candidates is None else int(n_rule_candidates),
                 "n_initial_boards": int(n_initial_boards),
                 "initial_density": density,
+                "initial_density_mode": density_mode,
+                "initial_density_range": None
+                if density_low is None or density_high is None
+                else [density_low, density_high],
+                "initial_board_probabilities": initial_probabilities.tolist(),
+                "initial_board_realized_densities": realized_densities.tolist(),
                 "include_conway": include_conway,
                 "stream_per_init_csv": stream_per_init_csv,
                 "progress_interval_rules": int(progress_interval_rules),
@@ -1436,12 +1464,11 @@ def run_rule_sweep_experiment(
             sort_keys=True,
         )
 
-    rng = np.random.default_rng(config.random_seed + 883)
-    initial_boards = (rng.random((n_initial_boards, config.L, config.L)) < density).astype(np.uint8)
-
     log_verbose(
         "Starting ASAL-style Life-like rule sweep: "
         f"rules={rules.size}, n_initial_boards={n_initial_boards}, "
+        f"initialization={density_mode}, p_min={initial_probabilities.min():.4f}, "
+        f"p_max={initial_probabilities.max():.4f}, "
         f"L={config.L}, T={config.T}, backend={config.backend}, "
         f"eval_batch_size={config.eval_batch_size}, pair_sample={config.pair_sample}, "
         f"min_delta_h_nonzero_frac>{config.min_delta_h_nonzero_frac}, "
@@ -1458,6 +1485,8 @@ def run_rule_sweep_experiment(
         "rule_label",
         "init_id",
         "seed",
+        "initial_p",
+        "initial_alive_fraction",
         "mspd_score",
         "raw_mspd_score",
         "delta_h_nonzero_frac",
@@ -1516,6 +1545,8 @@ def run_rule_sweep_experiment(
                         "rule_label": lifelike_rule_label(rule_id),
                         "init_id": init_id,
                         "seed": seed,
+                        "initial_p": float(initial_probabilities[init_id]),
+                        "initial_alive_fraction": float(realized_densities[init_id]),
                         "mspd_score": float(result.fitness_score),
                         "raw_mspd_score": float(result.mspd_score),
                         "delta_h_nonzero_frac": float(result.delta_h_nonzero_frac),
@@ -1617,6 +1648,8 @@ def run_rule_sweep_experiment(
         rule_label=np.asarray(lifelike_rule_label(best_rule_id)),
         initial_board=best_initial_board.astype(np.uint8),
         initial_boards=initial_boards.astype(np.uint8),
+        initial_board_probabilities=initial_probabilities.astype(np.float64),
+        initial_board_realized_densities=realized_densities.astype(np.float64),
         trajectory=best_trajectory.astype(np.uint8),
         DeltaH=best_result.delta_h,
         delta_h=best_result.delta_h,
@@ -1639,6 +1672,10 @@ def run_rule_sweep_experiment(
         "output_dir": str(rule_output_dir),
         "n_rules_evaluated": int(rules.size),
         "n_initial_boards": int(n_initial_boards),
+        "initial_density_mode": density_mode,
+        "initial_density_range": None
+        if density_low is None or density_high is None
+        else [density_low, density_high],
         "best_rule_id": int(best_rule_id),
         "best_rule_label": lifelike_rule_label(best_rule_id),
         "best_rule_mean_mspd_score": float(best_mean_score),
@@ -1660,6 +1697,8 @@ def run_rule_sweep_experiment(
         "per_init_rows": per_init_rows,
         "rules": rules,
         "initial_boards": initial_boards,
+        "initial_board_probabilities": initial_probabilities,
+        "initial_board_realized_densities": realized_densities,
         "best_result": best_result,
         "best_rule_id": best_rule_id,
         "best_rule_label": lifelike_rule_label(best_rule_id),
@@ -1964,6 +2003,18 @@ def parser_from_config() -> argparse.ArgumentParser:
     rule_group.add_argument("--all-rules", action="store_true", help="Evaluate all 262144 totalistic Life-like rules.")
     rule_group.add_argument("--n-rule-candidates", type=int, default=512)
     rule_group.add_argument("--n-rule-initial-boards", type=int, default=4)
+    rule_group.add_argument(
+        "--rule-initial-density-min",
+        type=float,
+        default=None,
+        help="If set with --rule-initial-density-max, sample each rule-sweep start p ~ Uniform(min, max).",
+    )
+    rule_group.add_argument(
+        "--rule-initial-density-max",
+        type=float,
+        default=None,
+        help="If set with --rule-initial-density-min, sample each rule-sweep start p ~ Uniform(min, max).",
+    )
     rule_group.add_argument("--include-conway-rule", dest="include_conway_rule", action="store_true", default=True)
     rule_group.add_argument("--no-include-conway-rule", dest="include_conway_rule", action="store_false")
     rule_group.add_argument("--stream-per-init-csv", dest="stream_per_init_csv", action="store_true", default=True)
@@ -2057,12 +2108,23 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if args.experiment == "rule-sweep":
         mode = "all" if args.all_rules else args.rule_candidate_mode
         n_rule_candidates = None if mode == "all" else args.n_rule_candidates
+        if (args.rule_initial_density_min is None) != (args.rule_initial_density_max is None):
+            raise ValueError(
+                "Set both --rule-initial-density-min and --rule-initial-density-max, or neither."
+            )
+        rule_initial_density_range = None
+        if args.rule_initial_density_min is not None:
+            rule_initial_density_range = (
+                float(args.rule_initial_density_min),
+                float(args.rule_initial_density_max),
+            )
         result = run_rule_sweep_experiment(
             config,
             output_dir=config.output_dir,
             rule_candidate_mode=mode,
             n_rule_candidates=n_rule_candidates,
             n_initial_boards=args.n_rule_initial_boards,
+            initial_density_range=rule_initial_density_range,
             include_conway=args.include_conway_rule,
             stream_per_init_csv=args.stream_per_init_csv,
             progress_interval_rules=args.progress_interval_rules,

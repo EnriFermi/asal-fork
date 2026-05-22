@@ -14,7 +14,7 @@ conda run --no-capture-output -n torchjax python scripts/gol_transition_mspd_exp
   --backend jax \
   --L 64 \
   --T 2048 \
-  --burn-in 128 \
+  --burn-in "${BURN_IN:-512}" \
   --window-size 64 \
   --window-step 16 \
   --n-cell-sample 256 \
@@ -22,12 +22,13 @@ conda run --no-capture-output -n torchjax python scripts/gol_transition_mspd_exp
   --distance js \
   --pair-sample 512 \
   --min-delta-h-nonzero-frac 0.5 \
-  --delta-h-nonzero-eps 1e-6 \
-  --initial-density 0.25 \
+  --delta-h-nonzero-eps "${DELTA_H_NONZERO_EPS:-1e-2}" \
+  --rule-initial-density-min "${RULE_INITIAL_DENSITY_MIN:-0.05}" \
+  --rule-initial-density-max "${RULE_INITIAL_DENSITY_MAX:-0.4}" \
   --random-seed 0 \
-  --eval-batch-size "${RULE_EVAL_BATCH_SIZE:-64}" \
-  --jax-metric-batch-size "${RULE_JAX_METRIC_BATCH_SIZE:-16}" \
-  --n-rule-initial-boards "${N_RULE_INITIAL_BOARDS:-4}" \
+  --eval-batch-size "${RULE_EVAL_BATCH_SIZE:-512}" \
+  --jax-metric-batch-size "${RULE_JAX_METRIC_BATCH_SIZE:-8}" \
+  --n-rule-initial-boards "${N_RULE_INITIAL_BOARDS:-8}" \
   --progress-interval-rules "${PROGRESS_INTERVAL_RULES:-64}" \
   --output-dir "$OUT_DIR" \
   --no-videos
