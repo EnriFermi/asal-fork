@@ -42,6 +42,13 @@ def _command_from_cfg(raw: Any, config_path: str | Path) -> list[str]:
     ]
 
 
+def _command_with_forwarded_flags(cmd: list[str], entry: Any, *, force: bool) -> list[str]:
+    out = list(cmd)
+    if force and bool(entry.get("pass_force", False)) and "--force" not in out:
+        out.append("--force")
+    return out
+
+
 def _glob_paths(pattern: str) -> list[Path]:
     root_pattern = str(resolve_path(pattern) if not Path(pattern).is_absolute() else pattern)
     return [Path(p) for p in sorted(glob.glob(root_pattern))]
@@ -152,7 +159,11 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
                 rows.append({"name": name, "layer": "simulation", "status": "exists", "message": "expected outputs already present", "command": ""})
                 log_event(f"simulation {name} exists", component="simulation")
                 continue
-            cmd = _command_from_cfg(entry.get("command", []), config_path)
+            cmd = _command_with_forwarded_flags(
+                _command_from_cfg(entry.get("command", []), config_path),
+                entry,
+                force=force,
+            )
             if not cmd:
                 rows.append({"name": name, "layer": "simulation", "status": pre_status, "message": pre_msg or "no command configured", "command": ""})
                 log_event(f"simulation {name} no command status={pre_status} message={pre_msg}", component="simulation")
