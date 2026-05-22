@@ -7,7 +7,7 @@ cd "$ROOT_DIR"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 OUT_DIR="${OUT_DIR:-analysis/results/gol_transition_mspd/gpu_all_rules_${RUN_ID}}"
 
-conda run -n onerec python scripts/gol_transition_mspd_experiment.py \
+conda run --no-capture-output -n torchjax python scripts/gol_transition_mspd_experiment.py \
   --experiment rule-sweep \
   --all-rules \
   --require-accelerator \
