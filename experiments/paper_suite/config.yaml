@@ -348,7 +348,7 @@ simulation:
     # horizon; C6.1 only uses a separate reusable single-trajectory source.
     rollout_steps: 24000
     total_steps: 24000
-    late_window_start_steps: 20000
+    late_window_start_steps: 4000
     late_window_end_steps: 24000
     sample_every_steps: 1
     metric_tau_mode: fixed
@@ -366,7 +366,7 @@ simulation:
     run_seed_mode: source_run_idx
     metric_seed_base: 800000
     selection_mode: loss
-    batch_size: 1
+    batch_size: 7
     jit_microbatch: 256
     optimized_checkpoint_roots:
       - experiments/paper_check_plife_plus/checkpoints/optimization_main
