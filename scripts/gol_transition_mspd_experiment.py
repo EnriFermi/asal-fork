@@ -1883,10 +1883,44 @@ def load_config_json(path: Path) -> Dict[str, Any]:
     return data
 
 
+def configure_jax_platform(platform_name: Optional[str]) -> None:
+    """Set JAX platform before any lazy JAX import happens."""
+    if platform_name:
+        os.environ.setdefault("JAX_PLATFORM_NAME", platform_name)
+
+
+def jax_device_summary(require_accelerator: bool = False) -> Dict[str, Any]:
+    """Return JAX backend/device info and optionally fail if only CPU is visible."""
+    import jax
+
+    devices = jax.devices()
+    backend = jax.default_backend()
+    device_rows = [
+        {
+            "id": idx,
+            "platform": getattr(device, "platform", ""),
+            "device_kind": getattr(device, "device_kind", str(device)),
+            "repr": str(device),
+        }
+        for idx, device in enumerate(devices)
+    ]
+    has_accelerator = any(str(row["platform"]).lower() not in {"cpu"} for row in device_rows)
+    if require_accelerator and not has_accelerator:
+        raise RuntimeError(
+            "JAX sees only CPU devices. Install/configure CUDA or jax-metal, or rerun without "
+            "--require-accelerator. Visible devices: "
+            + json.dumps(device_rows)
+        )
+    return {"backend": backend, "devices": device_rows, "has_accelerator": has_accelerator}
+
+
 def parser_from_config() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--experiment", choices=["ga", "rule-sweep"], default="ga")
     parser.add_argument("--config-json", type=str, default=None)
     parser.add_argument("--smoke", action="store_true", help="Use a tiny local sanity-check configuration.")
+    parser.add_argument("--jax-platform", type=str, default=None, help="Set JAX_PLATFORM_NAME before importing JAX.")
+    parser.add_argument("--require-accelerator", action="store_true", help="Fail if JAX sees only CPU devices.")
     parser.add_argument("--L", type=int, default=None)
     parser.add_argument("--T", type=int, default=None)
     parser.add_argument("--burn-in", type=int, default=None)
@@ -1925,6 +1959,16 @@ def parser_from_config() -> argparse.ArgumentParser:
     parser.add_argument("--verbose", dest="verbose", action="store_true", default=None)
     parser.add_argument("--quiet", dest="verbose", action="store_false")
     parser.add_argument("--progress-every", type=int, default=None)
+    rule_group = parser.add_argument_group("rule sweep")
+    rule_group.add_argument("--rule-candidate-mode", choices=["random", "linspace", "all"], default="random")
+    rule_group.add_argument("--all-rules", action="store_true", help="Evaluate all 262144 totalistic Life-like rules.")
+    rule_group.add_argument("--n-rule-candidates", type=int, default=512)
+    rule_group.add_argument("--n-rule-initial-boards", type=int, default=4)
+    rule_group.add_argument("--include-conway-rule", dest="include_conway_rule", action="store_true", default=True)
+    rule_group.add_argument("--no-include-conway-rule", dest="include_conway_rule", action="store_false")
+    rule_group.add_argument("--stream-per-init-csv", dest="stream_per_init_csv", action="store_true", default=True)
+    rule_group.add_argument("--no-stream-per-init-csv", dest="stream_per_init_csv", action="store_false")
+    rule_group.add_argument("--progress-interval-rules", type=int, default=64)
     return parser
 
 
@@ -2001,8 +2045,31 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = parser_from_config()
     args = parser.parse_args(argv)
+    configure_jax_platform(args.jax_platform)
     config = config_from_args(args)
-    result = run_experiment(config)
+    if config.backend == "jax" or args.require_accelerator:
+        device_info = jax_device_summary(require_accelerator=args.require_accelerator)
+        log_verbose(
+            "JAX devices: "
+            + ", ".join(f"{row['platform']}:{row['device_kind']}" for row in device_info["devices"]),
+            config.verbose,
+        )
+    if args.experiment == "rule-sweep":
+        mode = "all" if args.all_rules else args.rule_candidate_mode
+        n_rule_candidates = None if mode == "all" else args.n_rule_candidates
+        result = run_rule_sweep_experiment(
+            config,
+            output_dir=config.output_dir,
+            rule_candidate_mode=mode,
+            n_rule_candidates=n_rule_candidates,
+            n_initial_boards=args.n_rule_initial_boards,
+            include_conway=args.include_conway_rule,
+            stream_per_init_csv=args.stream_per_init_csv,
+            progress_interval_rules=args.progress_interval_rules,
+            verbose=config.verbose,
+        )
+    else:
+        result = run_experiment(config)
     print(json.dumps(result["summary"], indent=2, sort_keys=True))
 
 
