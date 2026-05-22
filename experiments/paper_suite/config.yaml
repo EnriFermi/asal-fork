@@ -118,16 +118,16 @@ datasets:
       # C6 uses the same optimized-vs-random C1-style check on PLife++, but
       # from a reusable single-trajectory source separate from C5/C6.5.
       source: lagrangian_root
-      lagrangian_root: experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k
+      lagrangian_root: experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_500k
       require_random: true
       expected_trajectory_start_steps: 20000
-      expected_trajectory_end_steps: 24000
+      expected_trajectory_end_steps: 500000
       metric:
-        metric_tau_mode: fixed
-        metric_tau_grid_steps: null
-        metric_tau_steps: 25
-        metric_window_size_steps: 100
-        metric_window_step_steps: 50
+        metric_tau_mode: max_grid
+        metric_tau_grid_steps: [250, 500, 750, 1000, 1250, 1500, 1750, 2000]
+        metric_tau_steps: 500
+        metric_window_size_steps: 2500
+        metric_window_step_steps: 1250
         metric_range_start_steps: 0
         metric_range_end_steps: null
         metric_m_samples: 48
@@ -344,8 +344,20 @@ simulation:
     enabled: true
     required: true
     base_config: experiments/paper_check_plife_plus/frustration_simulation/config.yaml
-    output_root: experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k
+    output_root: experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_500k
     smoke_output_root: analysis/results/paper_suite_smoke/plife_plus_c1_lagrangian
+    rollout_steps: 500000
+    total_steps: 500000
+    # Keep PLife++ frustration-simulation dynamics/protocol constants; only
+    # extend the rollout horizon and saved C6.1 trajectory window.
+    late_window_start_steps: 20000
+    late_window_end_steps: 500000
+    sample_every_steps: 25
+    metric_tau_mode: max_grid
+    metric_tau_grid_steps: [250, 500, 750, 1000, 1250, 1500, 1750, 2000]
+    metric_tau_steps: 500
+    metric_window_size_steps: 2500
+    metric_window_step_steps: 1250
     include_random_baselines: true
     num_random_baselines: 3
     expected_optimized_groups: 7
@@ -358,7 +370,7 @@ simulation:
     metric_seed_base: 800000
     selection_mode: loss
     batch_size: 9
-    jit_microbatch: 256
+    jit_microbatch: 2500
     optimized_checkpoint_roots:
       - experiments/paper_check_plife_plus/checkpoints/optimization_main
     dedupe_by_run_idx: false
@@ -429,7 +441,7 @@ simulation:
         - experiments/paper_check_plife_plus/checkpoints/frustration_simulation/trial_data/trial_*_lagrangian.npz
         - experiments/paper_check_plife_plus/checkpoints/frustration_simulation/trial_data/trial_*_embeddings.npz
 
-    - name: plife_plus_c1_lagrangian_24k
+    - name: plife_plus_c1_lagrangian_500k
       task: paper_check_c1
       enabled: true
       required: true
@@ -437,10 +449,10 @@ simulation:
       always_run: true
       command: ["{python}", "scripts/paper_suite_plife_c1_lagrangian.py", "{config}"]
       expected_paths:
-        - experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k/manifest.json
-        - experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k/trial_results.csv
+        - experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_500k/manifest.json
+        - experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_500k/trial_results.csv
       expected_globs:
-        - experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k/trial_data/trial_*_lagrangian.npz
+        - experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_500k/trial_data/trial_*_lagrangian.npz
       expected_npz_keys: [xy_control_a, sample_offsets_steps, xy_late_sample_steps, trajectory_start_steps, trajectory_end_steps]
       npz_key_check_limit: 3
 
