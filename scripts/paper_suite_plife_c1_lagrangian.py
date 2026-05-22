@@ -591,7 +591,7 @@ def run(
         log_event("PLife++ C1 lagrangian simulation disabled", component="plife-c1")
         return {"status": "disabled"}
 
-    output_root = resolve_path(_get(section, "output_root", "experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_500k"))
+    output_root = resolve_path(_get(section, "output_root", "experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k"))
     assert output_root is not None
     if smoke:
         output_root = resolve_path(_get(section, "smoke_output_root", "analysis/results/paper_suite_smoke/plife_plus_c1_lagrangian"))

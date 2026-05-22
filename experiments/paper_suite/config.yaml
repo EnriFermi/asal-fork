@@ -116,7 +116,7 @@ datasets:
       # C6 uses the same optimized-vs-random C1-style check on PLife++, but
       # from a reusable single-trajectory source separate from C5/C6.5.
       source: lagrangian_root
-      lagrangian_root: experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_500k
+      lagrangian_root: experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k
       require_random: true
       expected_trajectory_start_steps: 20000
       expected_trajectory_end_steps: 24000
@@ -342,7 +342,7 @@ simulation:
     enabled: true
     required: true
     base_config: experiments/paper_check_plife_plus/frustration_simulation/config.yaml
-    output_root: experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_500k
+    output_root: experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k
     smoke_output_root: analysis/results/paper_suite_smoke/plife_plus_c1_lagrangian
     # Keep PLife++ frustration-simulation dynamics/protocol constants and
     # horizon; C6.1 only uses a separate reusable single-trajectory source.
@@ -438,18 +438,19 @@ simulation:
         - experiments/paper_check_plife_plus/checkpoints/frustration_simulation/trial_data/trial_*_lagrangian.npz
         - experiments/paper_check_plife_plus/checkpoints/frustration_simulation/trial_data/trial_*_embeddings.npz
 
-    - name: plife_plus_c1_lagrangian_500k
+    - name: plife_plus_c1_lagrangian_24k
       task: paper_check_c1
       enabled: true
       required: true
       heavy: true
       always_run: true
+      pass_force: true
       command: ["{python}", "scripts/paper_suite_plife_c1_lagrangian.py", "{config}"]
       expected_paths:
-        - experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_500k/manifest.json
-        - experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_500k/trial_results.csv
+        - experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k/manifest.json
+        - experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k/trial_results.csv
       expected_globs:
-        - experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_500k/trial_data/trial_*_lagrangian.npz
+        - experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k/trial_data/trial_*_lagrangian.npz
       expected_npz_keys: [xy_control_a, sample_offsets_steps, xy_late_sample_steps, trajectory_start_steps, trajectory_end_steps]
       npz_key_check_limit: 3
 
