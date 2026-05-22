@@ -83,6 +83,14 @@ def _apply_section_base_overrides(base_cfg: Any, section: Any) -> None:
         ("metric_n_proj", "metric.metric_n_proj", int),
         ("metric_null_reps", "metric.metric_null_reps", int),
         ("metric_particle_samples", "metric.metric_particle_samples", int),
+        ("metric_dirs_seed", "metric.metric_dirs_seed", int),
+        ("metric_delta_h_floor", "metric.metric_delta_h_floor", float),
+        ("metric_msc_floor", "metric.metric_msc_floor", float),
+        ("metric_msc_term", "metric.metric_msc_term", str),
+        ("metric_msc_normalize_by_weight_sum", "metric.metric_msc_normalize_by_weight_sum", bool),
+        ("metric_alpha", "metric.metric_alpha", float),
+        ("metric_beta", "metric.metric_beta", float),
+        ("metric_eps", "metric.metric_eps", float),
     ]
     for key, dotted, caster in mappings:
         value = _get(section, key, None)

@@ -121,13 +121,13 @@ datasets:
       lagrangian_root: experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_500k
       require_random: true
       expected_trajectory_start_steps: 20000
-      expected_trajectory_end_steps: 500000
+      expected_trajectory_end_steps: 24000
       metric:
-        metric_tau_mode: max_grid
-        metric_tau_grid_steps: [250, 500, 750, 1000, 1250, 1500, 1750, 2000]
-        metric_tau_steps: 500
-        metric_window_size_steps: 2500
-        metric_window_step_steps: 1250
+        metric_tau_mode: fixed
+        metric_tau_grid_steps: null
+        metric_tau_steps: 25
+        metric_window_size_steps: 100
+        metric_window_step_steps: 50
         metric_range_start_steps: 0
         metric_range_end_steps: null
         metric_m_samples: 48
@@ -144,9 +144,9 @@ datasets:
         metric_msc_floor: 0.01
         metric_msc_term: floor_reconstruction_error
         metric_msc_normalize_by_weight_sum: true
-        metric_alpha: 0.0
+        metric_alpha: 1.0
         metric_beta: 1.0
-        metric_eps: 1.0e-12
+        metric_eps: 1.0e-3
     c5:
       metric:
         metric_tau_mode: fixed
@@ -171,9 +171,9 @@ datasets:
         metric_msc_floor: 0.01
         metric_msc_term: floor_reconstruction_error
         metric_msc_normalize_by_weight_sum: true
-        metric_alpha: 0.0
+        metric_alpha: 1.0
         metric_beta: 1.0
-        metric_eps: 1.0e-12
+        metric_eps: 1.0e-3
 
   boids:
     enabled: true
@@ -346,18 +346,17 @@ simulation:
     base_config: experiments/paper_check_plife_plus/frustration_simulation/config.yaml
     output_root: experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_500k
     smoke_output_root: analysis/results/paper_suite_smoke/plife_plus_c1_lagrangian
-    rollout_steps: 500000
-    total_steps: 500000
-    # Keep PLife++ frustration-simulation dynamics/protocol constants; only
-    # extend the rollout horizon and saved C6.1 trajectory window.
+    # Keep PLife++ frustration-simulation dynamics/protocol constants and
+    # horizon; C6.1 only uses a separate reusable single-trajectory source.
+    rollout_steps: 24000
+    total_steps: 24000
     late_window_start_steps: 20000
-    late_window_end_steps: 500000
-    sample_every_steps: 25
-    metric_tau_mode: max_grid
-    metric_tau_grid_steps: [250, 500, 750, 1000, 1250, 1500, 1750, 2000]
-    metric_tau_steps: 500
-    metric_window_size_steps: 2500
-    metric_window_step_steps: 1250
+    late_window_end_steps: 24000
+    sample_every_steps: 1
+    metric_tau_mode: fixed
+    metric_tau_steps: 25
+    metric_window_size_steps: 100
+    metric_window_step_steps: 50
     include_random_baselines: true
     num_random_baselines: 3
     expected_optimized_groups: 7
@@ -369,8 +368,8 @@ simulation:
     run_seed_mode: source_run_idx
     metric_seed_base: 800000
     selection_mode: loss
-    batch_size: 9
-    jit_microbatch: 2500
+    batch_size: 1
+    jit_microbatch: 256
     optimized_checkpoint_roots:
       - experiments/paper_check_plife_plus/checkpoints/optimization_main
     dedupe_by_run_idx: false
