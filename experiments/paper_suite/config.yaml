@@ -243,7 +243,7 @@ c2:
     enabled: true
     required: false
     branch_root: analysis/results/paper_suite/c2_branching/branches
-    max_trajectories: 5
+    max_trajectories: 9
     # Main C2 protocol: collapse Delta-H over admissible tau with the metric
     # preprocessing phi, then sample high/low quantile-rank windows independently.
     # Continuous Delta-H sampling remains available as selection_mode:
@@ -263,7 +263,7 @@ c2:
     # Set >1 to run C2 branch continuations through the batched resume runner.
     # The runner batches compatible arbitrary snapshots/params with the same
     # tensor shapes, horizon, snapshot cadence, and original RNG batch size.
-    resume_batch_size: 20
+    resume_batch_size: 30
     min_branch_step: 50000
     refractory_steps: 5000
     high_quantile: 0.8
