@@ -1225,6 +1225,35 @@ def _c5_claim_label(dataset_name: str) -> str:
     return "C6.5" if str(dataset_name) == "plife_plus" else "C5"
 
 
+def _is_c6_transfer_dataset(dataset_name: str) -> bool:
+    return str(dataset_name) in {"plife_plus", "boids"}
+
+
+def _append_existing_cross_rows(
+    *,
+    dataset_name: str,
+    ds_out: Path,
+    cross_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    summary_path = ds_out / "dataset_summary.json"
+    if not summary_path.exists():
+        return {"status": "skipped", "reason": "not a C6 transfer dataset and no existing dataset_summary.json"}
+    try:
+        status = json.loads(summary_path.read_text())
+    except Exception as exc:
+        return {"status": "skipped", "reason": f"could not read existing dataset_summary.json: {exc}"}
+    c1_summary = status.get("c1")
+    if isinstance(c1_summary, dict) and c1_summary:
+        cross_rows.append({"dataset": dataset_name, "claim": _c1_claim_label(dataset_name), "metric": "eval_score_mspd", **c1_summary})
+    c5_summary = status.get("c5")
+    if isinstance(c5_summary, dict) and c5_summary:
+        cross_rows.append({"dataset": dataset_name, "claim": _c5_claim_label(dataset_name), "metric": c5_summary.get("metric", "frustration"), **c5_summary})
+    status = dict(status)
+    status["status"] = status.get("status", "ok")
+    status["reused_for_c6"] = True
+    return status
+
+
 def _write_analysis_config(output_dir: Path, ds_cfg: Any, frustration_root: Path) -> Path:
     explicit = cfg_get(ds_cfg, "analysis_config", None)
     if explicit is not None:
@@ -1500,6 +1529,15 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
     for dataset_name, ds in datasets:
         ds_out = ensure_dir(output_root / dataset_name)
         log_event(f"{dataset_name}: dataset start output={ds_out}", component="posthoc")
+        if task == "c6" and not _is_c6_transfer_dataset(dataset_name):
+            status = _append_existing_cross_rows(dataset_name=dataset_name, ds_out=ds_out, cross_rows=cross_rows)
+            overview[dataset_name] = status
+            log_event(
+                f"{dataset_name}: skipped C6 recompute for non-transfer dataset status={status.get('status')} "
+                f"reason={status.get('reason', 'reused existing summary')}",
+                component="posthoc",
+            )
+            continue
         c1_apf_source = _c1_uses_apf(ds)
         c1_lagrangian_source = _c1_uses_lagrangian_root(ds)
         needs_frustration_rows = task in {"all", "c5", "c6"} or (
