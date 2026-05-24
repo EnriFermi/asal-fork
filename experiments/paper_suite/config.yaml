@@ -120,7 +120,7 @@ datasets:
       source: lagrangian_root
       lagrangian_root: experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k
       require_random: true
-      expected_trajectory_start_steps: 20000
+      expected_trajectory_start_steps: 4000
       expected_trajectory_end_steps: 24000
       metric:
         metric_tau_mode: fixed
@@ -292,6 +292,20 @@ c2:
       p_std: 0.01
       lagrangian_xy_std: 1.0
 
+c4:
+  enabled: true
+  # Posthoc-only comparison of already simulated 500k Flow-Lenia APF rollouts:
+  # MSPD-opt optimized, MSPD random controls, and NN-opt optimized checkpoints.
+  output_dir: c4_nnopt_vs_mspd
+  include_random: true
+  foundation_model: clip
+  max_clip_frames: 128
+  clip_range_start_steps: 50000
+  clip_range_end_steps: 500000
+  stat_seed: 0
+  stat_max_exact_permutations: 100000
+  stat_permutation_reps: 20000
+
 simulation:
   reuse_existing: true
   allow_optimization_rerun: false
@@ -350,7 +364,7 @@ simulation:
     # horizon; C6.1 only uses a separate reusable single-trajectory source.
     rollout_steps: 24000
     total_steps: 24000
-    late_window_start_steps: 20000
+    late_window_start_steps: 4000
     late_window_end_steps: 24000
     sample_every_steps: 1
     metric_tau_mode: fixed

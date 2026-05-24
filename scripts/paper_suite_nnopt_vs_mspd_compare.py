@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import hashlib
 import json
 import math
@@ -18,7 +19,7 @@ for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "scripts")):
 from flowlenia_minibang_common import list_apf_chunks
 from flowlenia_minibang_simulate import compute_metrics_for_run, expected_delta_h_metric_metadata
 from paper_suite_c2_flowlenia_metrics import _apf_status, _flat_metric_args, _iter_trajectories
-from paper_suite_common import ensure_dir, load_config, log_event, resolve_path, write_csv, write_json
+from paper_suite_common import ensure_dir, load_config, log_event, read_csv, resolve_path, write_csv, write_json
 from paper_suite_metric_cache import compare_metrics_npz_metadata, stable_json
 
 
@@ -75,6 +76,34 @@ def _source_specs(cfg: Any) -> list[dict[str, Any]]:
             "section": "flow_lenia_nnopt_lagrangian_apf",
         },
     ]
+
+
+def _c4_section(cfg: Any) -> Any:
+    return _get(cfg, "c4", {})
+
+
+def _c4_out_dir(cfg: Any, output_root: Path) -> Path:
+    section = _c4_section(cfg)
+    raw = _get(section, "output_dir", None)
+    if raw is None or str(raw).strip() == "":
+        return ensure_dir(output_root / "c4_nnopt_vs_mspd")
+    path = Path(str(raw))
+    if path.is_absolute():
+        return ensure_dir(path)
+    if len(path.parts) == 1:
+        return ensure_dir(output_root / path)
+    resolved = resolve_path(str(raw))
+    return ensure_dir(resolved if resolved is not None else output_root / "c4_nnopt_vs_mspd")
+
+
+def _condition_label(objective_key: str, candidate_kind: str) -> str:
+    if objective_key == "mspd_opt" and candidate_kind == "random":
+        return "Random"
+    if objective_key == "mspd_opt":
+        return "MSPD-opt"
+    if objective_key == "nn_opt":
+        return "NN-opt"
+    return str(objective_key)
 
 
 def _repair_item_paths(root: Path, item: dict[str, Any]) -> dict[str, Any]:
@@ -334,86 +363,269 @@ def _compute_clip_oe_loss(
     }
 
 
+def _finite_metric(rows: list[dict[str, Any]], condition: str, metric: str) -> np.ndarray:
+    vals = []
+    for row in rows:
+        if str(row.get("condition", "")) != condition:
+            continue
+        try:
+            value = float(row.get(metric, np.nan))
+        except Exception:
+            value = float("nan")
+        if np.isfinite(value):
+            vals.append(value)
+    return np.asarray(vals, dtype=np.float64)
+
+
+def _as_float(value: Any) -> float:
+    try:
+        if value is None or str(value) == "":
+            return float("nan")
+        return float(value)
+    except Exception:
+        return float("nan")
+
+
+def _cliffs_delta(a: np.ndarray, b: np.ndarray) -> float:
+    if a.size == 0 or b.size == 0:
+        return float("nan")
+    gt = 0
+    lt = 0
+    for x in a:
+        gt += int(np.sum(x > b))
+        lt += int(np.sum(x < b))
+    return float((gt - lt) / float(a.size * b.size))
+
+
+def _one_sided_permutation_test(
+    treatment: np.ndarray,
+    control: np.ndarray,
+    *,
+    seed: int,
+    max_exact: int,
+    reps: int,
+) -> dict[str, Any]:
+    treatment = np.asarray(treatment, dtype=np.float64)
+    control = np.asarray(control, dtype=np.float64)
+    treatment = treatment[np.isfinite(treatment)]
+    control = control[np.isfinite(control)]
+    observed = float(np.mean(treatment) - np.mean(control)) if treatment.size and control.size else float("nan")
+    p_value = float("nan")
+    method = "insufficient_data"
+    n_permutations = 0
+    if treatment.size and control.size:
+        combined = np.concatenate([treatment, control], axis=0)
+        n_treat = int(treatment.size)
+        total_combinations = math.comb(int(combined.size), n_treat)
+        if total_combinations <= int(max_exact):
+            method = "exact_permutation_mean_difference"
+            hits = 0
+            n_permutations = 0
+            for idx_tuple in itertools.combinations(range(int(combined.size)), n_treat):
+                mask = np.zeros(int(combined.size), dtype=bool)
+                mask[list(idx_tuple)] = True
+                stat = float(np.mean(combined[mask]) - np.mean(combined[~mask]))
+                hits += int(stat >= observed - 1e-15)
+                n_permutations += 1
+            p_value = float(hits / max(1, n_permutations))
+        else:
+            method = "monte_carlo_permutation_mean_difference"
+            rng = np.random.default_rng(int(seed))
+            hits = 1
+            n_permutations = int(reps)
+            for _ in range(n_permutations):
+                perm = rng.permutation(combined)
+                stat = float(np.mean(perm[:n_treat]) - np.mean(perm[n_treat:]))
+                hits += int(stat >= observed - 1e-15)
+            p_value = float(hits / float(n_permutations + 1))
+    return {
+        "n_treatment": int(treatment.size),
+        "n_control": int(control.size),
+        "treatment_mean": float(np.mean(treatment)) if treatment.size else float("nan"),
+        "control_mean": float(np.mean(control)) if control.size else float("nan"),
+        "mean_difference": observed,
+        "treatment_median": float(np.median(treatment)) if treatment.size else float("nan"),
+        "control_median": float(np.median(control)) if control.size else float("nan"),
+        "median_difference": float(np.median(treatment) - np.median(control)) if treatment.size and control.size else float("nan"),
+        "cliffs_delta": _cliffs_delta(treatment, control),
+        "p_value_one_sided_greater": p_value,
+        "test_method": method,
+        "n_permutations": int(n_permutations),
+    }
+
+
+def _hypothesis_rows(
+    run_rows: list[dict[str, Any]],
+    *,
+    seed: int,
+    max_exact: int,
+    reps: int,
+) -> list[dict[str, Any]]:
+    specs = [
+        {
+            "hypothesis": "mspd_opt_nn_opt_score_gt_random",
+            "family": "cross_transfer",
+            "treatment_condition": "MSPD-opt",
+            "control_condition": "Random",
+            "metric": "nn_opt_score",
+            "metric_direction": "higher_is_better",
+        },
+        {
+            "hypothesis": "nn_opt_mspd_metric_gt_random",
+            "family": "cross_transfer",
+            "treatment_condition": "NN-opt",
+            "control_condition": "Random",
+            "metric": "mspd_metric",
+            "metric_direction": "higher_is_better",
+        },
+        {
+            "hypothesis": "mspd_opt_mspd_metric_gt_random",
+            "family": "direct_sanity_check",
+            "treatment_condition": "MSPD-opt",
+            "control_condition": "Random",
+            "metric": "mspd_metric",
+            "metric_direction": "higher_is_better",
+        },
+        {
+            "hypothesis": "nn_opt_nn_opt_score_gt_random",
+            "family": "direct_sanity_check",
+            "treatment_condition": "NN-opt",
+            "control_condition": "Random",
+            "metric": "nn_opt_score",
+            "metric_direction": "higher_is_better",
+        },
+    ]
+    rows: list[dict[str, Any]] = []
+    for spec in specs:
+        treatment = _finite_metric(run_rows, str(spec["treatment_condition"]), str(spec["metric"]))
+        control = _finite_metric(run_rows, str(spec["control_condition"]), str(spec["metric"]))
+        stats = _one_sided_permutation_test(
+            treatment,
+            control,
+            seed=seed,
+            max_exact=max_exact,
+            reps=reps,
+        )
+        rows.append({**spec, "alternative": "treatment_greater_than_control", **stats})
+    return rows
+
+
 def _plot(out_path: Path, run_rows: list[dict[str, Any]], tau_rows: list[dict[str, Any]]) -> None:
     import matplotlib.pyplot as plt
 
-    colors = {"MSPD-opt": "#d62728", "NN-opt": "#1f77b4"}
-    objectives = ["MSPD-opt", "NN-opt"]
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.8), constrained_layout=True)
+    conditions = ["Random", "MSPD-opt", "NN-opt"]
+    x_by_condition = {name: idx for idx, name in enumerate(conditions)}
+    condition_colors = {"Random": "#777777", "MSPD-opt": "#d62728", "NN-opt": "#1f77b4"}
+    fig, ax_mspd = plt.subplots(figsize=(8.6, 4.8), constrained_layout=True)
+    ax_nn = ax_mspd.twinx()
 
-    ax = axes[0]
-    for objective in objectives:
-        taus = sorted({int(r["tau_steps"]) for r in tau_rows if r["objective"] == objective})
-        if not taus:
+    for condition in conditions:
+        rows = [row for row in run_rows if str(row.get("condition", "")) == condition]
+        if not rows:
             continue
-        xs, med, lo, hi = [], [], [], []
-        for tau in taus:
-            vals = np.asarray(
-                [float(r["score_by_tau"]) for r in tau_rows if r["objective"] == objective and int(r["tau_steps"]) == tau],
-                dtype=np.float64,
+        x0 = float(x_by_condition[condition])
+        jitter = np.linspace(-0.11, 0.11, len(rows)) if len(rows) > 1 else np.asarray([0.0])
+        color = condition_colors[condition]
+        mspd = np.asarray([_as_float(row.get("mspd_metric", np.nan)) for row in rows], dtype=np.float64)
+        nn_score = np.asarray([_as_float(row.get("nn_opt_score", np.nan)) for row in rows], dtype=np.float64)
+        finite_mspd = np.isfinite(mspd)
+        finite_nn = np.isfinite(nn_score)
+        if np.any(finite_mspd):
+            ax_mspd.scatter(
+                np.full(int(np.sum(finite_mspd)), x0) + jitter[finite_mspd] - 0.06,
+                mspd[finite_mspd],
+                marker="o",
+                s=44,
+                color=color,
+                edgecolor="white",
+                linewidth=0.5,
+                alpha=0.85,
+                label="MSPD metric" if condition == conditions[0] else None,
             )
-            vals = vals[np.isfinite(vals)]
-            if vals.size == 0:
-                continue
-            xs.append(tau)
-            med.append(float(np.median(vals)))
-            lo.append(float(np.percentile(vals, 25)))
-            hi.append(float(np.percentile(vals, 75)))
-        if xs:
-            ax.plot(xs, med, marker="o", color=colors[objective], label=objective)
-            ax.fill_between(xs, lo, hi, color=colors[objective], alpha=0.18, linewidth=0)
-    ax.set_xscale("log")
-    ax.set_xlabel("tau steps")
-    ax.set_ylabel("MSPD score")
-    ax.set_title("MSPD tau profile")
-    ax.legend(frameon=False)
+            med = float(np.median(mspd[finite_mspd]))
+            ax_mspd.plot([x0 - 0.22, x0 - 0.02], [med, med], color=color, linewidth=2.2)
+        if np.any(finite_nn):
+            ax_nn.scatter(
+                np.full(int(np.sum(finite_nn)), x0) + jitter[finite_nn] + 0.06,
+                nn_score[finite_nn],
+                marker="s",
+                s=40,
+                color=color,
+                edgecolor="white",
+                linewidth=0.5,
+                alpha=0.75,
+                label="NN-opt score" if condition == conditions[0] else None,
+            )
+            med = float(np.median(nn_score[finite_nn]))
+            ax_nn.plot([x0 + 0.02, x0 + 0.22], [med, med], color=color, linewidth=2.2, linestyle="--")
 
-    ax = axes[1]
-    for x, objective in enumerate(objectives):
-        vals = np.asarray([float(r.get("clip_oe_loss", np.nan)) for r in run_rows if r["objective"] == objective], dtype=np.float64)
-        vals = vals[np.isfinite(vals)]
-        if vals.size == 0:
-            continue
-        jitter = np.linspace(-0.08, 0.08, vals.size) if vals.size > 1 else np.asarray([0.0])
-        ax.scatter(np.full(vals.size, x) + jitter, vals, color=colors[objective], alpha=0.75)
-        ax.plot([x - 0.18, x + 0.18], [np.median(vals), np.median(vals)], color="black", linewidth=2)
-    ax.set_xticks(range(len(objectives)), objectives)
-    ax.set_ylabel("CLIP-OE loss (lower is better)")
-    ax.set_title("CLIP-OE objective")
+    ax_mspd.set_xticks(range(len(conditions)), conditions)
+    ax_mspd.set_ylabel("MSPD metric (log-tau integral; higher is better)")
+    ax_nn.set_ylabel("NN-opt score (-CLIP-OE loss; higher is better)")
+    ax_mspd.set_title("C4: MSPD-opt vs NN-opt vs random on both metrics")
+    ax_mspd.grid(axis="y", color="#dddddd", linewidth=0.8, alpha=0.7)
+    handles_m, labels_m = ax_mspd.get_legend_handles_labels()
+    handles_n, labels_n = ax_nn.get_legend_handles_labels()
+    ax_mspd.legend(handles_m + handles_n, labels_m + labels_n, loc="best", frameon=False)
 
-    ax = axes[2]
-    for objective in objectives:
-        xs = np.asarray([float(r.get("mspd_log_tau_integral", np.nan)) for r in run_rows if r["objective"] == objective], dtype=np.float64)
-        ys = np.asarray([float(r.get("clip_oe_loss", np.nan)) for r in run_rows if r["objective"] == objective], dtype=np.float64)
-        finite = np.isfinite(xs) & np.isfinite(ys)
-        if np.any(finite):
-            ax.scatter(xs[finite], ys[finite], label=objective, color=colors[objective], alpha=0.8)
-    ax.set_xlabel("MSPD score integrated over log tau")
-    ax.set_ylabel("CLIP-OE loss")
-    ax.set_title("Head-to-head plane")
-    ax.legend(frameon=False)
-
-    fig.suptitle("MSPD-opt vs NN-opt Flow-Lenia posthoc comparison", fontsize=14)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=180)
+    alias = out_path.parent / "nnopt_vs_mspd_comparison.png"
+    if alias != out_path:
+        fig.savefig(alias, dpi=180)
     plt.close(fig)
+
+
+def _plot_from_existing(config_path: str | Path) -> dict[str, Any]:
+    cfg, _ = load_config(config_path)
+    output_root = ensure_dir(resolve_path(cfg.get("meta", {}).get("output_root", "analysis/results/paper_suite")) or Path("analysis/results/paper_suite"))
+    out_dir = _c4_out_dir(cfg, output_root)
+    run_table = out_dir / "objective_run_scores.csv"
+    tau_table = out_dir / "tau_profiles.csv"
+    if not run_table.exists():
+        raise FileNotFoundError(f"C4 run score table not found: {run_table}")
+    run_rows = [dict(row) for row in read_csv(run_table)]
+    tau_rows = [dict(row) for row in read_csv(tau_table)] if tau_table.exists() else []
+    fig_path = out_dir / "c4_nnopt_vs_mspd_dual_axis.png"
+    _plot(fig_path, run_rows, tau_rows)
+    summary_path = out_dir / "c4_nnopt_vs_mspd_summary.json"
+    summary = {"status": "ok", "figure": str(fig_path), "run_scores": str(run_table), "tau_profiles": str(tau_table)}
+    write_json(summary_path, summary)
+    return summary
 
 
 def run(
     config_path: str | Path,
     *,
+    smoke: bool = False,
     force_metrics: bool = False,
     force_clip: bool = False,
     skip_clip: bool = False,
-    include_random: bool = False,
-    max_clip_frames: int | None = 128,
+    include_random: bool | None = None,
+    max_clip_frames: int | None = None,
     clip_range_start_steps: int | None = None,
     clip_range_end_steps: int | None = None,
     foundation_model: str | None = None,
+    plot_only: bool = False,
 ) -> dict[str, Any]:
-    cfg, _ = load_config(config_path)
+    cfg, _ = load_config(config_path, smoke=smoke)
     output_root = ensure_dir(resolve_path(cfg.get("meta", {}).get("output_root", "analysis/results/paper_suite")) or Path("analysis/results/paper_suite"))
-    out_dir = ensure_dir(output_root / "nnopt_vs_mspd")
+    out_dir = _c4_out_dir(cfg, output_root)
+    c4_cfg = _c4_section(cfg)
+    if smoke:
+        summary = {"status": "smoke_skipped", "reason": "C4 uses precomputed 500k APF/NN-opt artifacts", "output_dir": str(out_dir)}
+        write_json(out_dir / "c4_nnopt_vs_mspd_summary.json", summary)
+        return summary
+    if plot_only:
+        return _plot_from_existing(config_path)
+    if include_random is None:
+        include_random = bool(_get(c4_cfg, "include_random", True))
+    if max_clip_frames is None:
+        raw_max = _get(c4_cfg, "max_clip_frames", 128)
+        max_clip_frames = None if raw_max is None else int(raw_max)
+    stat_seed = int(_get(c4_cfg, "stat_seed", 0))
+    stat_max_exact = int(_get(c4_cfg, "stat_max_exact_permutations", 100_000))
+    stat_reps = int(_get(c4_cfg, "stat_permutation_reps", 20_000))
     clip_cache_dir = ensure_dir(out_dir / "clip_cache")
     rollout_config = _rollout_config_from_section(cfg, "flow_lenia_arun_lagrangian_apf")
     flat_args = _flat_metric_args(rollout_config)
@@ -422,11 +634,23 @@ def run(
     flat_args["metrics_strict"] = True
 
     if clip_range_start_steps is None:
-        clip_range_start_steps = int(flat_args.get("metric_range_start_steps", 0) or 0)
+        configured_start = _get(c4_cfg, "clip_range_start_steps", None)
+        clip_range_start_steps = (
+            int(configured_start)
+            if configured_start is not None
+            else int(flat_args.get("metric_range_start_steps", 0) or 0)
+        )
     if clip_range_end_steps is None:
-        clip_range_end_steps = int(flat_args.get("metric_range_end_steps", flat_args.get("rollout_steps", 500_000)) or 500_000)
+        configured_end = _get(c4_cfg, "clip_range_end_steps", None)
+        clip_range_end_steps = (
+            int(configured_end)
+            if configured_end is not None
+            else int(flat_args.get("metric_range_end_steps", flat_args.get("rollout_steps", 500_000)) or 500_000)
+        )
     if foundation_model is None:
-        foundation_model = str(_get(_get(cfg.get("c2", {}), "branching", {}), "clip_foundation_model", "clip"))
+        foundation_model = str(
+            _get(c4_cfg, "foundation_model", _get(_get(cfg.get("c2", {}), "branching", {}), "clip_foundation_model", "clip"))
+        )
 
     fm = None
     if not skip_clip:
@@ -452,10 +676,12 @@ def run(
             )
             per_tau, scalar = _metric_scalar_rows(metrics_path)
             for row in per_tau:
+                condition = _condition_label(objective_key, str(item.get("candidate_kind", "optimized")))
                 row.update(
                     {
                         "objective": objective,
                         "objective_key": objective_key,
+                        "condition": condition,
                         "traj_id": traj_id,
                         "candidate_kind": str(item.get("candidate_kind", "optimized")),
                         "metrics_path": str(metrics_path),
@@ -482,15 +708,23 @@ def run(
                     end_steps=clip_range_end_steps,
                     force_clip=force_clip,
                 )
+            condition = _condition_label(objective_key, str(item.get("candidate_kind", "optimized")))
+            nn_opt_loss = float(clip_payload.get("clip_oe_loss", float("nan")))
+            nn_opt_score = -nn_opt_loss if np.isfinite(nn_opt_loss) else float("nan")
+            mspd_metric = float(scalar.get("mspd_log_tau_integral", float("nan")))
             run_rows.append(
                 {
                     "objective": objective,
                     "objective_key": objective_key,
+                    "condition": condition,
                     "traj_id": traj_id,
                     "candidate_kind": str(item.get("candidate_kind", "optimized")),
                     "apf_dir": str(item["apf_dir"]),
                     "metrics_path": str(metrics_path),
                     "metrics_status": metrics_status,
+                    "mspd_metric": mspd_metric,
+                    "nn_opt_loss": nn_opt_loss,
+                    "nn_opt_score": nn_opt_score,
                     **scalar,
                     **clip_payload,
                 }
@@ -498,22 +732,27 @@ def run(
 
     run_table = out_dir / "objective_run_scores.csv"
     tau_table = out_dir / "tau_profiles.csv"
+    stats_table = out_dir / "hypothesis_tests.csv"
     write_csv(run_table, run_rows)
     write_csv(tau_table, tau_rows)
-    fig_path = out_dir / "nnopt_vs_mspd_comparison.png"
+    stats_rows = _hypothesis_rows(run_rows, seed=stat_seed, max_exact=stat_max_exact, reps=stat_reps)
+    write_csv(stats_table, stats_rows)
+    fig_path = out_dir / "c4_nnopt_vs_mspd_dual_axis.png"
     _plot(fig_path, run_rows, tau_rows)
 
-    summary_by_objective = {}
-    for objective in sorted({row["objective"] for row in run_rows}):
-        rows = [row for row in run_rows if row["objective"] == objective]
-        summary_by_objective[objective] = {
+    summary_by_condition = {}
+    for condition in sorted({row["condition"] for row in run_rows}):
+        rows = [row for row in run_rows if row["condition"] == condition]
+        summary_by_condition[condition] = {
             "n": len(rows),
-            "median_mspd_log_tau_integral": float(np.nanmedian([float(r["mspd_log_tau_integral"]) for r in rows])) if rows else float("nan"),
+            "median_mspd_metric": float(np.nanmedian([float(r["mspd_metric"]) for r in rows])) if rows else float("nan"),
             "median_mspd_best_score": float(np.nanmedian([float(r["mspd_best_score"]) for r in rows])) if rows else float("nan"),
-            "median_clip_oe_loss": float(np.nanmedian([float(r["clip_oe_loss"]) for r in rows])) if rows and not skip_clip else float("nan"),
+            "median_nn_opt_loss": float(np.nanmedian([float(r["nn_opt_loss"]) for r in rows])) if rows and not skip_clip else float("nan"),
+            "median_nn_opt_score": float(np.nanmedian([float(r["nn_opt_score"]) for r in rows])) if rows and not skip_clip else float("nan"),
         }
     summary = {
         "status": "ok",
+        "claim": "C4",
         "rollout_config": str(rollout_config),
         "foundation_model": str(foundation_model),
         "clip_range_start_steps": None if clip_range_start_steps is None else int(clip_range_start_steps),
@@ -521,28 +760,35 @@ def run(
         "max_clip_frames": None if max_clip_frames is None else int(max_clip_frames),
         "run_scores": str(run_table),
         "tau_profiles": str(tau_table),
+        "hypothesis_tests": str(stats_table),
         "figure": str(fig_path),
-        "summary_by_objective": summary_by_objective,
+        "summary_by_condition": summary_by_condition,
+        "hypotheses": stats_rows,
     }
+    write_json(out_dir / "c4_nnopt_vs_mspd_summary.json", summary)
     write_json(out_dir / "nnopt_vs_mspd_summary.json", summary)
     return summary
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Compare MSPD-opt and NN-opt Flow-Lenia APF rollouts posthoc.")
+    parser = argparse.ArgumentParser(description="C4: compare MSPD-opt, NN-opt, and random Flow-Lenia APF rollouts posthoc.")
     parser.add_argument("config")
+    parser.add_argument("--smoke", action="store_true", help="Write a smoke skip summary.")
     parser.add_argument("--force-metrics", action="store_true", help="Recompute Delta-H/MSPD metrics from APF logs.")
     parser.add_argument("--force-clip", action="store_true", help="Recompute cached CLIP embeddings and CLIP-OE losses.")
     parser.add_argument("--skip-clip", action="store_true", help="Only compute MSPD tau profiles.")
-    parser.add_argument("--include-random", action="store_true", help="Include random MSPD A-run baselines if present.")
-    parser.add_argument("--max-clip-frames", type=int, default=128)
+    parser.add_argument("--include-random", dest="include_random", action="store_true", default=None, help="Include random MSPD A-run baselines.")
+    parser.add_argument("--no-random", dest="include_random", action="store_false", help="Exclude random MSPD A-run baselines.")
+    parser.add_argument("--max-clip-frames", type=int, default=None)
     parser.add_argument("--clip-range-start-steps", type=int, default=None)
     parser.add_argument("--clip-range-end-steps", type=int, default=None)
     parser.add_argument("--foundation-model", default=None)
+    parser.add_argument("--plot-only", action="store_true", help="Regenerate the C4 plot from existing CSV outputs only.")
     args = parser.parse_args(argv)
     print(
         run(
             args.config,
+            smoke=args.smoke,
             force_metrics=args.force_metrics,
             force_clip=args.force_clip,
             skip_clip=args.skip_clip,
@@ -551,6 +797,7 @@ def main(argv: list[str] | None = None) -> int:
             clip_range_start_steps=args.clip_range_start_steps,
             clip_range_end_steps=args.clip_range_end_steps,
             foundation_model=args.foundation_model,
+            plot_only=args.plot_only,
         )
     )
     return 0

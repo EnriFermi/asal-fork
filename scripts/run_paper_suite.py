@@ -60,6 +60,13 @@ def _metrics(config: str, task: str, *, smoke: bool, force: bool) -> None:
         if smoke:
             args.append("--smoke")
         _call("paper_suite_c2_branching.py", config, *args)
+    if task in {"all", "c4"}:
+        args = []
+        if smoke:
+            args.append("--smoke")
+        if force:
+            args.extend(["--force-metrics", "--force-clip"])
+        _call("paper_suite_nnopt_vs_mspd_compare.py", config, *args)
 
 
 def _c2_branching_simulation(config: str, *, smoke: bool, force: bool, allow_heavy: bool, dry_run: bool) -> None:
@@ -86,6 +93,12 @@ def _visualization(config: str, task: str, *, smoke: bool, force: bool) -> None:
     if task == "nnopt_apf":
         log_event("visualization skipped for nnopt_apf task", component="runner")
         return
+    if task == "c4":
+        args = ["--plot-only"]
+        if smoke:
+            args.append("--smoke")
+        _call("paper_suite_nnopt_vs_mspd_compare.py", config, *args)
+        return
     vis_task = task if task in {"synthetic", "c1", "c2", "c5", "c6"} else "all"
     args = ["--task", vis_task]
     if smoke:
@@ -104,6 +117,8 @@ def _simulation_task(task: str) -> str:
         return "paper_check_frustration"
     if task in {"c1", "c6"}:
         return "paper_check"
+    if task == "c4":
+        return "c4_apf"
     if task == "nnopt_apf":
         return "nnopt_apf"
     return "all"
@@ -113,7 +128,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="One-button MSPD paper experiment suite.")
     parser.add_argument("config", help="experiments/paper_suite/config.yaml")
     parser.add_argument("--layer", choices=["simulation", "metrics", "visualization", "all"], default="all")
-    parser.add_argument("--task", choices=["all", "synthetic", "c1", "c2", "c5", "c6", "nnopt_apf"], default="all")
+    parser.add_argument("--task", choices=["all", "synthetic", "c1", "c2", "c4", "c5", "c6", "nnopt_apf"], default="all")
     parser.add_argument("--smoke", action="store_true", help="Use small CPU smoke settings and generated tiny posthoc fixtures.")
     parser.add_argument("--force", action="store_true", help="Recompute outputs even when present.")
     parser.add_argument("--allow-heavy", action="store_true", help="Allow configured heavy real simulation commands.")
