@@ -8,8 +8,8 @@ for Flow-Lenia/PLife++ as closely as the discrete CA setting allows:
 
 * C1: MSPD-optimized CA candidate(s) versus matched random controls.
 * C2: Delta-H predicts sensitivity to small future perturbations.
-* C5: structured "walls"/cell-shuffle perturbations create more future
-  divergence than matched random-control perturbations.
+* C5: history-dependence/frustration assay with control_a, control_b, and
+  walls variants, matching the Flow-Lenia/PLife++ contract.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import json
 import math
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -33,6 +33,8 @@ if str(REPO_ROOT / "scripts") not in sys.path:
 from gol_transition_mspd_experiment import (  # noqa: E402
     CONWAY_LIFE_RULE,
     ExperimentConfig,
+    compute_transition_mspd_batch_auto,
+    compute_transition_mspd_auto,
     lifelike_rule_label,
     simulate_lifelike_rule_batch,
 )
@@ -48,15 +50,21 @@ DEFAULT_POSTHOC_CONFIG: dict[str, Any] = {
     "seed": 0,
     "optimized_top_k": 1,
     "random_controls": 32,
+    "c1_eval_mode": "fresh_holdout",
+    "c1_holdout_n_initial_boards": 32,
+    "c1_holdout_density_mode": "source",
+    "c1_holdout_density": None,
+    "c1_holdout_density_range": None,
+    "c1_eval_batch_size": None,
     "c2_branch_windows": 24,
     "c2_branches_per_window": 4,
     "c2_horizon": 64,
     "c2_perturb_fraction": 0.01,
     "c5_random_controls": None,
-    "c5_anchors": 12,
-    "c5_branches_per_anchor": 4,
-    "c5_horizon": 64,
-    "c5_control_flip_fraction": 0.01,
+    "c5_n_trials": 4,
+    "c5_warmup_steps": None,
+    "c5_late_window_start_steps": None,
+    "c5_late_window_end_steps": None,
     "c5_wall_grid_split": 2,
 }
 
@@ -72,6 +80,8 @@ class LoadedCAResult:
     initial_boards: np.ndarray
     best_trajectory: np.ndarray
     best_delta_h: np.ndarray
+    initial_probabilities: np.ndarray
+    initial_density_range: tuple[float, float] | None
     per_rule_scores: dict[int, dict[int, float]]
     rule_labels: dict[int, str]
     random_initial_boards: dict[int, np.ndarray]
@@ -130,10 +140,19 @@ def _flatten_posthoc_config(payload: dict[str, Any]) -> dict[str, Any]:
 
     c1 = payload.get("c1") or {}
     if isinstance(c1, dict):
-        if "optimized_top_k" in c1:
-            flat["optimized_top_k"] = c1["optimized_top_k"]
-        if "random_controls" in c1:
-            flat["random_controls"] = c1["random_controls"]
+        mapping = {
+            "optimized_top_k": "optimized_top_k",
+            "random_controls": "random_controls",
+            "eval_mode": "c1_eval_mode",
+            "holdout_n_initial_boards": "c1_holdout_n_initial_boards",
+            "holdout_density_mode": "c1_holdout_density_mode",
+            "holdout_density": "c1_holdout_density",
+            "holdout_density_range": "c1_holdout_density_range",
+            "eval_batch_size": "c1_eval_batch_size",
+        }
+        for src, dst in mapping.items():
+            if src in c1:
+                flat[dst] = c1[src]
 
     c2 = payload.get("c2") or {}
     if isinstance(c2, dict):
@@ -151,10 +170,10 @@ def _flatten_posthoc_config(payload: dict[str, Any]) -> dict[str, Any]:
     if isinstance(c5, dict):
         mapping = {
             "random_controls": "c5_random_controls",
-            "anchors": "c5_anchors",
-            "branches_per_anchor": "c5_branches_per_anchor",
-            "horizon": "c5_horizon",
-            "control_flip_fraction": "c5_control_flip_fraction",
+            "n_trials": "c5_n_trials",
+            "warmup_steps": "c5_warmup_steps",
+            "late_window_start_steps": "c5_late_window_start_steps",
+            "late_window_end_steps": "c5_late_window_end_steps",
             "wall_grid_split": "c5_wall_grid_split",
         }
         for src, dst in mapping.items():
@@ -196,6 +215,24 @@ def _load_config(input_dir: Path) -> tuple[str, ExperimentConfig]:
         "Point --input-dir at a completed GoL/CA MSPD result directory, or set input_dir: null "
         "in experiments/gol_transition_mspd/ca_posthoc_claims.yaml to auto-pick the latest completed run."
     )
+
+
+def _rule_sweep_density_range(input_dir: Path) -> tuple[float, float] | None:
+    path = input_dir / "rule_sweep_config.json"
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return None
+    raw = payload.get("initial_density_range", None)
+    if raw is None:
+        return None
+    try:
+        low, high = list(raw)[:2]
+        return float(low), float(high)
+    except Exception:
+        return None
 
 
 def _completed_input_dirs(root: Path) -> list[Path]:
@@ -284,6 +321,12 @@ def load_ca_result(input_dir: Path) -> LoadedCAResult:
             best_rule_label = str(np.asarray(data["rule_label"]).item())
             best_initial_board = np.asarray(data["initial_board"], dtype=np.uint8)
             initial_boards = np.asarray(data["initial_boards"], dtype=np.uint8)
+            initial_probabilities = np.asarray(
+                data["initial_board_probabilities"]
+                if "initial_board_probabilities" in data
+                else np.full((initial_boards.shape[0],), config.initial_density),
+                dtype=np.float64,
+            )
             best_trajectory = np.asarray(data["trajectory"], dtype=np.uint8)
             best_delta_h = np.asarray(data["delta_h"] if "delta_h" in data else data["DeltaH"], dtype=np.float64)
         per_rule_scores, rule_labels = _load_rule_sweep_scores(input_dir / "rule_sweep_per_init_scores.csv")
@@ -298,6 +341,8 @@ def load_ca_result(input_dir: Path) -> LoadedCAResult:
             initial_boards=initial_boards,
             best_trajectory=best_trajectory,
             best_delta_h=best_delta_h,
+            initial_probabilities=initial_probabilities,
+            initial_density_range=_rule_sweep_density_range(input_dir),
             per_rule_scores=per_rule_scores,
             rule_labels=rule_labels,
             random_initial_boards={},
@@ -320,6 +365,8 @@ def load_ca_result(input_dir: Path) -> LoadedCAResult:
             initial_boards=best_initial_board[None, ...],
             best_trajectory=best_trajectory,
             best_delta_h=best_delta_h,
+            initial_probabilities=np.asarray([config.initial_density], dtype=np.float64),
+            initial_density_range=None,
             per_rule_scores=per_rule_scores,
             rule_labels=rule_labels,
             random_initial_boards=random_initial_boards,
@@ -369,7 +416,227 @@ def _sample_random_rule_ids(
     return [int(x) for x in picked.tolist()]
 
 
-def run_c1(
+def _density_range_from_raw(raw: Any) -> tuple[float, float] | None:
+    if raw is None:
+        return None
+    try:
+        low, high = list(raw)[:2]
+        low_f = float(low)
+        high_f = float(high)
+        if not (0.0 <= low_f <= high_f <= 1.0):
+            raise ValueError
+        return low_f, high_f
+    except Exception as exc:
+        raise ValueError(f"Invalid holdout density range {raw!r}; expected [low, high] in [0,1].") from exc
+
+
+def _make_c1_holdout_boards(
+    loaded: LoadedCAResult,
+    *,
+    n_initial_boards: int,
+    density_mode: str,
+    density: float | None,
+    density_range: tuple[float, float] | None,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[int]]:
+    if n_initial_boards <= 0:
+        raise ValueError("c1.holdout_n_initial_boards must be positive.")
+    rng = np.random.default_rng(int(seed))
+    mode = str(density_mode or "source").strip().lower()
+    if mode == "source":
+        if density_range is not None:
+            probs = rng.uniform(density_range[0], density_range[1], size=n_initial_boards)
+        elif loaded.initial_density_range is not None:
+            low, high = loaded.initial_density_range
+            probs = rng.uniform(low, high, size=n_initial_boards)
+        else:
+            probs = np.full((n_initial_boards,), float(loaded.config.initial_density), dtype=np.float64)
+    elif mode in {"fixed", "constant"}:
+        p = float(loaded.config.initial_density if density is None else density)
+        probs = np.full((n_initial_boards,), p, dtype=np.float64)
+    elif mode in {"uniform", "uniform_range"}:
+        if density_range is None:
+            raise ValueError("c1.holdout_density_mode=uniform requires c1.holdout_density_range.")
+        probs = rng.uniform(density_range[0], density_range[1], size=n_initial_boards)
+    else:
+        raise ValueError(f"Unknown c1.holdout_density_mode={density_mode!r}; use source, fixed, or uniform.")
+    boards = (rng.random((n_initial_boards, loaded.config.L, loaded.config.L)) < probs[:, None, None]).astype(np.uint8)
+    alive = boards.reshape(n_initial_boards, -1).mean(axis=1).astype(np.float64)
+    seeds = [int(seed + 10_000_019 + 9176 * i) for i in range(n_initial_boards)]
+    return boards, probs.astype(np.float64), alive, seeds
+
+
+def _run_c1_fresh_holdout(
+    loaded: LoadedCAResult,
+    output_dir: Path,
+    *,
+    optimized_top_k: int,
+    random_controls: int,
+    holdout_n_initial_boards: int,
+    holdout_density_mode: str,
+    holdout_density: float | None,
+    holdout_density_range: tuple[float, float] | None,
+    eval_batch_size: int | None,
+    backend: str,
+    seed: int,
+) -> dict[str, Any]:
+    out = ensure_dir(output_dir / "c1")
+    rng = np.random.default_rng(seed)
+    ranked = _rank_rules(loaded.per_rule_scores)
+    optimized_rules = _optimized_rule_ids(loaded, optimized_top_k)
+    random_rules = _sample_random_rule_ids(ranked, set(optimized_rules), random_controls, rng)
+    selected_rules = optimized_rules + random_rules
+
+    if loaded.mode != "rule_sweep":
+        raise ValueError(
+            "Strict C1 fresh holdout is defined for rule_sweep CA runs. "
+            "For GA initial-board runs, use c1.eval_mode: saved_score or run a rule-sweep artifact."
+        )
+
+    holdout_boards, holdout_p, holdout_alive, holdout_board_seeds = _make_c1_holdout_boards(
+        loaded,
+        n_initial_boards=holdout_n_initial_boards,
+        density_mode=holdout_density_mode,
+        density=holdout_density,
+        density_range=holdout_density_range,
+        seed=seed + 1_000_003,
+    )
+    metric_cfg = replace(
+        loaded.config,
+        backend=backend,
+        eval_batch_size=int(eval_batch_size or loaded.config.eval_batch_size),
+    )
+
+    score_rows: list[dict[str, Any]] = []
+    eval_pairs = [(rule_id, init_id) for rule_id in selected_rules for init_id in range(holdout_boards.shape[0])]
+    batch_size = max(1, int(eval_batch_size or metric_cfg.eval_batch_size))
+    _log(
+        "C1 fresh holdout evaluating "
+        f"rules={len(selected_rules)} holdout_boards={holdout_boards.shape[0]} "
+        f"total_trajectories={len(eval_pairs)} batch_size={batch_size}"
+    )
+    for start in range(0, len(eval_pairs), batch_size):
+        stop = min(start + batch_size, len(eval_pairs))
+        chunk = eval_pairs[start:stop]
+        boards = np.stack([holdout_boards[init_id] for _rule_id, init_id in chunk], axis=0)
+        rules = np.asarray([rule_id for rule_id, _init_id in chunk], dtype=np.uint32)
+        trajectories = simulate_lifelike_rule_batch(boards, rules, metric_cfg.T, backend=backend)
+        metric_seeds = [
+            int((seed + 20_000_033 + 1009 * (abs(int(rule_id)) + 1) + 9176 * int(init_id)) % (2**31 - 1))
+            for rule_id, init_id in chunk
+        ]
+        results = compute_transition_mspd_batch_auto(trajectories, metric_cfg, metric_seeds)
+        for (rule_id, init_id), result, metric_seed in zip(chunk, results, metric_seeds):
+            group = "optimized" if rule_id in set(optimized_rules) else "random"
+            score_rows.append(
+                {
+                    "claim": "C1",
+                    "eval_mode": "fresh_holdout_initial_boards",
+                    "group": group,
+                    "rule_id": int(rule_id),
+                    "rule_label": loaded.rule_labels.get(int(rule_id), lifelike_rule_label(int(rule_id))),
+                    "holdout_init_id": int(init_id),
+                    "holdout_board_seed": int(holdout_board_seeds[init_id]),
+                    "metric_seed": int(metric_seed),
+                    "initial_p": float(holdout_p[init_id]),
+                    "initial_alive_fraction": float(holdout_alive[init_id]),
+                    "mspd_score": float(result.fitness_score),
+                    "raw_mspd_score": float(result.mspd_score),
+                    "delta_h_nonzero_frac": float(result.delta_h_nonzero_frac),
+                    "passes_delta_h_filter": int(result.passes_delta_h_filter),
+                }
+            )
+
+    rule_level_rows: list[dict[str, Any]] = []
+    for group, rule_ids in [("optimized", optimized_rules), ("random", random_rules)]:
+        for rule_id in rule_ids:
+            rows = [row for row in score_rows if int(row["rule_id"]) == int(rule_id)]
+            values = np.asarray([row["mspd_score"] for row in rows], dtype=np.float64)
+            raw_values = np.asarray([row["raw_mspd_score"] for row in rows], dtype=np.float64)
+            rule_level_rows.append(
+                {
+                    "group": group,
+                    "rule_id": int(rule_id),
+                    "rule_label": loaded.rule_labels.get(int(rule_id), lifelike_rule_label(int(rule_id))),
+                    "training_mean_mspd": _rule_mean(loaded.per_rule_scores[int(rule_id)]),
+                    "holdout_mean_mspd": float(np.mean(values)) if values.size else float("nan"),
+                    "holdout_median_mspd": float(np.median(values)) if values.size else float("nan"),
+                    "holdout_std_mspd": float(np.std(values, ddof=0)) if values.size else float("nan"),
+                    "holdout_mean_raw_mspd": float(np.mean(raw_values)) if raw_values.size else float("nan"),
+                    "n_holdout_initial_boards": int(values.size),
+                }
+            )
+
+    random_by_init: dict[int, list[float]] = {}
+    for row in score_rows:
+        if row["group"] == "random":
+            random_by_init.setdefault(int(row["holdout_init_id"]), []).append(float(row["mspd_score"]))
+    contrast_rows: list[dict[str, Any]] = []
+    deltas: list[float] = []
+    for row in score_rows:
+        if row["group"] != "optimized":
+            continue
+        init_id = int(row["holdout_init_id"])
+        baseline = np.asarray(random_by_init.get(init_id, []), dtype=np.float64)
+        if baseline.size == 0:
+            continue
+        delta = float(row["mspd_score"]) - float(np.median(baseline))
+        deltas.append(delta)
+        contrast_rows.append(
+            {
+                "claim": "C1",
+                "eval_mode": "fresh_holdout_initial_boards",
+                "opt_rule_id": int(row["rule_id"]),
+                "opt_rule_label": row["rule_label"],
+                "holdout_init_id": init_id,
+                "optimized_mspd": float(row["mspd_score"]),
+                "random_median_mspd": float(np.median(baseline)),
+                "random_mean_mspd": float(np.mean(baseline)),
+                "delta_vs_random_median": delta,
+                "n_random_controls_for_init": int(baseline.size),
+            }
+        )
+
+    opt_values = np.asarray([row["holdout_mean_mspd"] for row in rule_level_rows if row["group"] == "optimized"], dtype=np.float64)
+    random_values = np.asarray([row["holdout_mean_mspd"] for row in rule_level_rows if row["group"] == "random"], dtype=np.float64)
+    summary = {
+        "claim": "C1",
+        "mode": loaded.mode,
+        "input_dir": str(loaded.input_dir),
+        "c1_eval_mode": "fresh_holdout_initial_boards",
+        "optimized_top_k": int(len(optimized_rules)),
+        "random_controls": int(len(random_rules)),
+        "optimized_rule_ids": optimized_rules,
+        "random_rule_ids": random_rules,
+        "holdout_n_initial_boards": int(holdout_boards.shape[0]),
+        "holdout_density_mode": str(holdout_density_mode),
+        "holdout_density_range": None if holdout_density_range is None else list(holdout_density_range),
+        "holdout_initial_p_min": float(np.min(holdout_p)),
+        "holdout_initial_p_max": float(np.max(holdout_p)),
+        "optimized_holdout_mean_mspd": float(np.mean(opt_values)) if opt_values.size else float("nan"),
+        "random_holdout_mean_mspd": float(np.mean(random_values)) if random_values.size else float("nan"),
+        "random_holdout_median_mspd": float(np.median(random_values)) if random_values.size else float("nan"),
+        "delta_vs_random_median_sign_test": sign_test_greater(deltas),
+    }
+
+    write_csv(out / "c1_checkpoint_scores.csv", score_rows)
+    write_csv(out / "c1_rule_level_scores.csv", rule_level_rows)
+    write_csv(out / "c1_group_contrasts.csv", contrast_rows)
+    write_json(out / "c1_summary.json", summary)
+    np.savez_compressed(
+        out / "c1_holdout_initial_boards.npz",
+        boards=holdout_boards.astype(np.uint8),
+        initial_p=holdout_p.astype(np.float64),
+        initial_alive_fraction=holdout_alive.astype(np.float64),
+        board_seeds=np.asarray(holdout_board_seeds, dtype=np.int64),
+        optimized_rule_ids=np.asarray(optimized_rules, dtype=np.int64),
+        random_rule_ids=np.asarray(random_rules, dtype=np.int64),
+    )
+    _plot_c1(out, rule_level_rows, contrast_rows)
+    return summary
+
+
+def _run_c1_saved_score(
     loaded: LoadedCAResult,
     output_dir: Path,
     *,
@@ -455,6 +722,8 @@ def run_c1(
         "random_mean_mspd": float(np.mean(random_values)) if random_values.size else float("nan"),
         "random_median_mspd": float(np.median(random_values)) if random_values.size else float("nan"),
         "delta_vs_random_median_sign_test": stat,
+        "c1_eval_mode": "matched_initial_boards_from_saved_ca_scores",
+        "selection_holdout_note": "No tau-selection holdout is applied here; the CA transition-law MSPD score has no tau grid. For rule-sweep runs this is still not an independent new-initial-state holdout.",
     }
 
     write_csv(out / "c1_checkpoint_scores.csv", score_rows)
@@ -463,6 +732,47 @@ def run_c1(
     write_json(out / "c1_summary.json", summary)
     _plot_c1(out, rule_level_rows, contrast_rows)
     return summary
+
+
+def run_c1(
+    loaded: LoadedCAResult,
+    output_dir: Path,
+    *,
+    optimized_top_k: int,
+    random_controls: int,
+    eval_mode: str,
+    holdout_n_initial_boards: int,
+    holdout_density_mode: str,
+    holdout_density: float | None,
+    holdout_density_range: tuple[float, float] | None,
+    eval_batch_size: int | None,
+    backend: str,
+    seed: int,
+) -> dict[str, Any]:
+    mode = str(eval_mode or "fresh_holdout").strip().lower()
+    if mode in {"fresh", "fresh_holdout", "fresh_holdout_initial_boards", "holdout"}:
+        return _run_c1_fresh_holdout(
+            loaded,
+            output_dir,
+            optimized_top_k=optimized_top_k,
+            random_controls=random_controls,
+            holdout_n_initial_boards=holdout_n_initial_boards,
+            holdout_density_mode=holdout_density_mode,
+            holdout_density=holdout_density,
+            holdout_density_range=holdout_density_range,
+            eval_batch_size=eval_batch_size,
+            backend=backend,
+            seed=seed,
+        )
+    if mode in {"saved", "saved_score", "matched_saved_scores", "legacy"}:
+        return _run_c1_saved_score(
+            loaded,
+            output_dir,
+            optimized_top_k=optimized_top_k,
+            random_controls=random_controls,
+            seed=seed,
+        )
+    raise ValueError(f"Unknown c1.eval_mode={eval_mode!r}; use fresh_holdout or saved_score.")
 
 
 def _window_starts(config: ExperimentConfig, delta_h: np.ndarray, trajectory_len: int, horizon: int) -> np.ndarray:
@@ -491,28 +801,6 @@ def _small_bit_flip(state: np.ndarray, fraction: float, rng: np.random.Generator
     n_flip = min(n_flip, flat.size)
     idx = rng.choice(flat.size, size=n_flip, replace=False)
     flat[idx] ^= np.uint8(1)
-    return out
-
-
-def _block_shuffle(state: np.ndarray, grid_split: int, rng: np.random.Generator) -> np.ndarray:
-    board = np.asarray(state, dtype=np.uint8)
-    if grid_split <= 1:
-        return _small_bit_flip(board, 0.5, rng)
-    h, w = board.shape
-    if h % grid_split != 0 or w % grid_split != 0:
-        raise ValueError(f"Board shape {board.shape} is not divisible by grid_split={grid_split}")
-    bh, bw = h // grid_split, w // grid_split
-    blocks = []
-    for i in range(grid_split):
-        for j in range(grid_split):
-            blocks.append(board[i * bh : (i + 1) * bh, j * bw : (j + 1) * bw].copy())
-    perm = rng.permutation(len(blocks))
-    out = np.empty_like(board)
-    k = 0
-    for i in range(grid_split):
-        for j in range(grid_split):
-            out[i * bh : (i + 1) * bh, j * bw : (j + 1) * bw] = blocks[int(perm[k])]
-            k += 1
     return out
 
 
@@ -546,6 +834,8 @@ def run_c2(
     picked = _quantile_window_indices(loaded.best_delta_h, starts, n_windows)
     if picked.size < 2:
         raise ValueError("C2 requires at least two valid Delta-H windows before trajectory end.")
+    if int(branches_per_window) < 2:
+        raise ValueError("C2 requires branches_per_window >= 2 for pairwise branch divergence.")
 
     branch_initials: list[np.ndarray] = []
     branch_meta: list[dict[str, Any]] = []
@@ -564,12 +854,12 @@ def run_c2(
             )
 
     branches = _simulate_branches(branch_initials, loaded.best_rule_id, horizon, backend)
-    branch_rows: list[dict[str, Any]] = []
+    branch_detail_rows: list[dict[str, Any]] = []
     for idx, meta in enumerate(branch_meta):
         t0 = int(meta["t0"])
         base_future = loaded.best_trajectory[t0 : t0 + horizon + 1]
         hamming_t = np.mean(branches[idx, 1:] != base_future[1:], axis=(1, 2))
-        branch_rows.append(
+        branch_detail_rows.append(
             {
                 "claim": "C2",
                 "rule_id": loaded.best_rule_id,
@@ -585,9 +875,35 @@ def run_c2(
         )
 
     window_rows: list[dict[str, Any]] = []
+    pair_rows: list[dict[str, Any]] = []
     for window_idx in picked:
-        rows = [row for row in branch_rows if int(row["window_idx"]) == int(window_idx)]
-        vals = np.asarray([row["mean_future_hamming"] for row in rows], dtype=np.float64)
+        branch_indices = [
+            idx for idx, meta in enumerate(branch_meta)
+            if int(meta["window_idx"]) == int(window_idx)
+        ]
+        original_vals = np.asarray(
+            [row["mean_future_hamming"] for row in branch_detail_rows if int(row["window_idx"]) == int(window_idx)],
+            dtype=np.float64,
+        )
+        pair_vals = []
+        for local_i, idx_i in enumerate(branch_indices):
+            for idx_j in branch_indices[local_i + 1 :]:
+                pair_hamming = float(np.mean(branches[idx_i, 1:] != branches[idx_j, 1:]))
+                pair_vals.append(pair_hamming)
+                pair_rows.append(
+                    {
+                        "claim": "C2",
+                        "rule_id": loaded.best_rule_id,
+                        "rule_label": loaded.best_rule_label,
+                        "window_idx": int(window_idx),
+                        "t0": int(loaded.config.burn_in + int(window_idx) * int(loaded.config.window_step)),
+                        "delta_h": float(loaded.best_delta_h[int(window_idx)]),
+                        "branch_rep_i": int(branch_meta[idx_i]["branch_rep"]),
+                        "branch_rep_j": int(branch_meta[idx_j]["branch_rep"]),
+                        "pairwise_future_hamming": pair_hamming,
+                    }
+                )
+        pair_arr = np.asarray(pair_vals, dtype=np.float64)
         window_rows.append(
             {
                 "claim": "C2",
@@ -596,14 +912,17 @@ def run_c2(
                 "window_idx": int(window_idx),
                 "t0": int(loaded.config.burn_in + int(window_idx) * int(loaded.config.window_step)),
                 "delta_h": float(loaded.best_delta_h[int(window_idx)]),
-                "mean_future_hamming": float(np.mean(vals)),
-                "std_future_hamming": float(np.std(vals, ddof=0)),
-                "n_branches": int(vals.size),
+                "branching_score": float(np.mean(pair_arr)) if pair_arr.size else float("nan"),
+                "branching_metric": "pairwise_future_hamming",
+                "mean_branch_vs_original_hamming": float(np.mean(original_vals)) if original_vals.size else float("nan"),
+                "std_branch_vs_original_hamming": float(np.std(original_vals, ddof=0)) if original_vals.size else float("nan"),
+                "n_branches": int(len(branch_indices)),
+                "n_branch_pairs": int(pair_arr.size),
             }
         )
 
     x = np.asarray([row["delta_h"] for row in window_rows], dtype=np.float64)
-    y = np.asarray([row["mean_future_hamming"] for row in window_rows], dtype=np.float64)
+    y = np.asarray([row["branching_score"] for row in window_rows], dtype=np.float64)
     corr = _correlation_summary(x, y)
     high_low = _high_low_delta_summary(window_rows)
     summary = {
@@ -616,64 +935,206 @@ def run_c2(
         "branches_per_window": int(branches_per_window),
         "horizon_steps": int(horizon),
         "perturb_fraction": float(perturb_fraction),
+        "branching_metric": "pairwise_future_hamming",
         "correlation": corr,
         "high_low_delta": high_low,
     }
-    write_csv(out / "c2_branching_scores.csv", branch_rows)
+    write_csv(out / "c2_branching_scores.csv", window_rows)
     write_csv(out / "c2_branching_window_scores.csv", window_rows)
+    write_csv(out / "c2_branch_detail_rows.csv", branch_detail_rows)
+    write_csv(out / "c2_branch_pair_scores.csv", pair_rows)
     write_csv(out / "c2_delta_h_correlation.csv", [corr])
     write_json(out / "c2_branching_metrics_summary.json", summary)
     _plot_c2(out, window_rows)
     return summary
 
 
-def _trajectory_frustration_scores(
-    trajectory: np.ndarray,
+def _make_initial_board(config: ExperimentConfig, seed: int, density: float) -> np.ndarray:
+    rng = np.random.default_rng(int(seed))
+    return (rng.random((config.L, config.L)) < float(density)).astype(np.uint8)
+
+
+def _lifelike_step_dead_boundary_batch(boards: np.ndarray, rules: np.ndarray) -> np.ndarray:
+    boards_u8 = boards.astype(np.uint8, copy=False)
+    rules_u32 = rules.astype(np.uint32, copy=False)
+    padded = np.pad(boards_u8.astype(np.int16), ((0, 0), (1, 1), (1, 1)), mode="constant")
+    neighbors = np.zeros_like(boards_u8, dtype=np.int16)
+    for di in range(3):
+        for dj in range(3):
+            if di == 1 and dj == 1:
+                continue
+            neighbors += padded[:, di : di + boards_u8.shape[1], dj : dj + boards_u8.shape[2]]
+    update_idx = boards_u8.astype(np.uint32) * np.uint32(9) + neighbors.astype(np.uint32)
+    return ((rules_u32[:, None, None] >> update_idx) & np.uint32(1)).astype(np.uint8)
+
+
+def _simulate_walled_warmup(initial_board: np.ndarray, rule_id: int, warmup_steps: int, grid_split: int) -> np.ndarray:
+    board = np.asarray(initial_board, dtype=np.uint8)
+    if warmup_steps <= 0:
+        return board.copy()
+    if grid_split <= 1:
+        return _simulate_full_trajectory(board, rule_id, warmup_steps, backend="numpy")[-1]
+    h, w = board.shape
+    if h % grid_split != 0 or w % grid_split != 0:
+        raise ValueError(f"Board shape {board.shape} is not divisible by C5 wall_grid_split={grid_split}")
+    bh, bw = h // grid_split, w // grid_split
+    blocks = []
+    for i in range(grid_split):
+        for j in range(grid_split):
+            blocks.append(board[i * bh : (i + 1) * bh, j * bw : (j + 1) * bw].copy())
+    block_batch = np.stack(blocks, axis=0)
+    rules = np.full((block_batch.shape[0],), int(rule_id), dtype=np.uint32)
+    for _ in range(int(warmup_steps)):
+        block_batch = _lifelike_step_dead_boundary_batch(block_batch, rules)
+    out = np.empty_like(board)
+    k = 0
+    for i in range(grid_split):
+        for j in range(grid_split):
+            out[i * bh : (i + 1) * bh, j * bw : (j + 1) * bw] = block_batch[k]
+            k += 1
+    return out
+
+
+def _simulate_late_control(initial_board: np.ndarray, rule_id: int, late_start: int, late_end: int, backend: str) -> np.ndarray:
+    prefix = _simulate_full_trajectory(initial_board, rule_id, late_start, backend)
+    late = _simulate_full_trajectory(prefix[-1], rule_id, late_end - late_start, backend)
+    return late
+
+
+def _simulate_late_walls(
+    initial_board: np.ndarray,
     rule_id: int,
-    label: str,
-    group: str,
-    item_id: str,
-    config: ExperimentConfig,
-    *,
-    horizon: int,
-    anchors: Sequence[int],
-    branches_per_anchor: int,
-    control_flip_fraction: float,
+    warmup_steps: int,
+    late_start: int,
+    late_end: int,
     wall_grid_split: int,
     backend: str,
-    rng: np.random.Generator,
-) -> list[dict[str, Any]]:
-    branch_initials: list[np.ndarray] = []
-    branch_meta: list[dict[str, Any]] = []
-    for anchor_idx, t0 in enumerate(anchors):
-        base_state = trajectory[int(t0)]
-        for rep in range(branches_per_anchor):
-            branch_initials.append(_small_bit_flip(base_state, control_flip_fraction, rng))
-            branch_meta.append({"anchor_idx": anchor_idx, "t0": int(t0), "branch_rep": rep, "condition": "control_b"})
-            branch_initials.append(_block_shuffle(base_state, wall_grid_split, rng))
-            branch_meta.append({"anchor_idx": anchor_idx, "t0": int(t0), "branch_rep": rep, "condition": "walls"})
+) -> np.ndarray:
+    if warmup_steps > late_start:
+        raise ValueError(f"C5 warmup_steps={warmup_steps} must be <= late_window_start_steps={late_start}.")
+    merged = _simulate_walled_warmup(initial_board, rule_id, warmup_steps, wall_grid_split)
+    if late_start > warmup_steps:
+        post = _simulate_full_trajectory(merged, rule_id, late_start - warmup_steps, backend)
+        start = post[-1]
+    else:
+        start = merged
+    return _simulate_full_trajectory(start, rule_id, late_end - late_start, backend)
 
-    branches = _simulate_branches(branch_initials, rule_id, horizon, backend)
-    raw_rows: list[dict[str, Any]] = []
-    for idx, meta in enumerate(branch_meta):
-        t0 = int(meta["t0"])
-        base_future = trajectory[t0 : t0 + horizon + 1]
-        hamming_t = np.mean(branches[idx, 1:] != base_future[1:], axis=(1, 2))
-        raw_rows.append(
-            {
-                "claim": "C5",
-                "group": group,
-                "item_id": item_id,
-                "rule_id": int(rule_id),
-                "rule_label": label,
-                **meta,
-                "horizon_steps": int(horizon),
-                "mean_future_hamming": float(np.mean(hamming_t)),
-                "final_future_hamming": float(hamming_t[-1]),
-                "max_future_hamming": float(np.max(hamming_t)),
-            }
-        )
-    return raw_rows
+
+def _delta_h_for_late_trajectory(
+    trajectory: np.ndarray,
+    config: ExperimentConfig,
+    seed: int,
+    metric_backend: str,
+) -> np.ndarray:
+    metric_cfg = replace(config, burn_in=0, backend=metric_backend)
+    result = compute_transition_mspd_auto(trajectory, metric_cfg, metric_seed=int(seed))
+    return np.asarray(result.delta_h, dtype=np.float64)
+
+
+def _aligned_l2(a: np.ndarray, b: np.ndarray) -> float:
+    n = min(int(a.size), int(b.size))
+    if n == 0:
+        return float("nan")
+    diff = np.asarray(a[:n], dtype=np.float64) - np.asarray(b[:n], dtype=np.float64)
+    return float(np.sqrt(np.mean(diff * diff)))
+
+
+def _aligned_mean_abs(a: np.ndarray, b: np.ndarray) -> float:
+    n = min(int(a.size), int(b.size))
+    if n == 0:
+        return float("nan")
+    return float(np.mean(np.abs(np.asarray(a[:n], dtype=np.float64) - np.asarray(b[:n], dtype=np.float64))))
+
+
+def _trajectory_hamming_distance(a: np.ndarray, b: np.ndarray) -> float:
+    n = min(int(a.shape[0]), int(b.shape[0]))
+    if n == 0:
+        return float("nan")
+    return float(np.mean(a[:n] != b[:n]))
+
+
+def _c5_trial(
+    loaded: LoadedCAResult,
+    *,
+    group: str,
+    rule_id: int,
+    trial_idx: int,
+    density: float,
+    seed_x: int,
+    seed_x1: int,
+    warmup_steps: int,
+    late_start: int,
+    late_end: int,
+    wall_grid_split: int,
+    backend: str,
+) -> dict[str, Any]:
+    simulation_rule_id = rule_id if rule_id >= 0 else CONWAY_LIFE_RULE
+    label = loaded.rule_labels.get(rule_id, lifelike_rule_label(simulation_rule_id))
+    x0 = _make_initial_board(loaded.config, seed_x, density)
+    x1 = _make_initial_board(loaded.config, seed_x1, density)
+
+    control_a = _simulate_late_control(x0, simulation_rule_id, late_start, late_end, backend)
+    control_b = _simulate_late_control(x1, simulation_rule_id, late_start, late_end, backend)
+    walls = _simulate_late_walls(
+        x0,
+        simulation_rule_id,
+        warmup_steps,
+        late_start,
+        late_end,
+        wall_grid_split,
+        backend,
+    )
+
+    dh_a = _delta_h_for_late_trajectory(control_a, loaded.config, seed_x + 17, backend)
+    dh_b = _delta_h_for_late_trajectory(control_b, loaded.config, seed_x1 + 17, backend)
+    dh_w = _delta_h_for_late_trajectory(walls, loaded.config, seed_x + 31, backend)
+
+    baseline_l2 = _aligned_l2(dh_a, dh_b)
+    walls_a_l2 = _aligned_l2(dh_a, dh_w)
+    walls_b_l2 = _aligned_l2(dh_b, dh_w)
+    walls_effect_l2 = 0.5 * (walls_a_l2 + walls_b_l2)
+
+    baseline_abs = _aligned_mean_abs(dh_a, dh_b)
+    walls_a_abs = _aligned_mean_abs(dh_a, dh_w)
+    walls_b_abs = _aligned_mean_abs(dh_b, dh_w)
+    walls_effect_abs = 0.5 * (walls_a_abs + walls_b_abs)
+
+    baseline_hamming = _trajectory_hamming_distance(control_a, control_b)
+    walls_a_hamming = _trajectory_hamming_distance(control_a, walls)
+    walls_b_hamming = _trajectory_hamming_distance(control_b, walls)
+    walls_effect_hamming = 0.5 * (walls_a_hamming + walls_b_hamming)
+
+    return {
+        "claim": "C5",
+        "group": group,
+        "trial_idx": int(trial_idx),
+        "rule_id": int(rule_id),
+        "rule_label": label,
+        "seed_x": int(seed_x),
+        "seed_x1": int(seed_x1),
+        "initial_density": float(density),
+        "warmup_steps": int(warmup_steps),
+        "late_window_start_steps": int(late_start),
+        "late_window_end_steps": int(late_end),
+        "late_window_steps": int(late_end - late_start),
+        "wall_grid_split": int(wall_grid_split),
+        "delta_h_l2__baseline_distance": float(baseline_l2),
+        "delta_h_l2__walls_effect_distance": float(walls_effect_l2),
+        "delta_h_l2__walls_effect_distance_ctrl_a": float(walls_a_l2),
+        "delta_h_l2__walls_effect_distance_ctrl_b": float(walls_b_l2),
+        "delta_h_l2__anchor_effect_minus_baseline": float(walls_effect_l2 - baseline_l2),
+        "delta_h_mean_abs__baseline_distance": float(baseline_abs),
+        "delta_h_mean_abs__walls_effect_distance": float(walls_effect_abs),
+        "delta_h_mean_abs__walls_effect_distance_ctrl_a": float(walls_a_abs),
+        "delta_h_mean_abs__walls_effect_distance_ctrl_b": float(walls_b_abs),
+        "delta_h_mean_abs__anchor_effect_minus_baseline": float(walls_effect_abs - baseline_abs),
+        "state_hamming__baseline_distance": float(baseline_hamming),
+        "state_hamming__walls_effect_distance": float(walls_effect_hamming),
+        "state_hamming__walls_effect_distance_ctrl_a": float(walls_a_hamming),
+        "state_hamming__walls_effect_distance_ctrl_b": float(walls_b_hamming),
+        "state_hamming__anchor_effect_minus_baseline": float(walls_effect_hamming - baseline_hamming),
+    }
 
 
 def run_c5(
@@ -682,118 +1143,123 @@ def run_c5(
     *,
     optimized_top_k: int,
     random_controls: int,
-    n_anchors: int,
-    branches_per_anchor: int,
-    horizon: int,
-    control_flip_fraction: float,
+    n_trials: int,
+    warmup_steps: int | None,
+    late_window_start_steps: int | None,
+    late_window_end_steps: int | None,
     wall_grid_split: int,
     backend: str,
     seed: int,
 ) -> dict[str, Any]:
     out = ensure_dir(output_dir / "c5")
     rng = np.random.default_rng(seed)
-    max_anchor = loaded.config.T - int(horizon)
-    if max_anchor <= loaded.config.burn_in:
-        raise ValueError("C5 horizon leaves no valid post-burn-in anchor times.")
-    anchors = np.unique(np.rint(np.linspace(loaded.config.burn_in, max_anchor, n_anchors)).astype(np.int64))
+    late_start = int(loaded.config.burn_in if late_window_start_steps is None else late_window_start_steps)
+    late_end = int(loaded.config.T if late_window_end_steps is None else late_window_end_steps)
+    warmup = int(max(0, late_start // 2) if warmup_steps is None else warmup_steps)
+    if not (0 <= warmup <= late_start < late_end):
+        raise ValueError(
+            "C5 requires 0 <= warmup_steps <= late_window_start_steps < late_window_end_steps; "
+            f"got warmup={warmup}, late_start={late_start}, late_end={late_end}."
+        )
 
     ranked = _rank_rules(loaded.per_rule_scores)
     optimized_rules = _optimized_rule_ids(loaded, optimized_top_k)
     random_rules = _sample_random_rule_ids(ranked, set(optimized_rules), random_controls, rng)
 
-    init_boards = loaded.initial_boards
-    if init_boards.ndim != 3 or init_boards.shape[0] == 0:
-        init_boards = loaded.best_initial_board[None, ...]
-    init_ids = list(range(int(init_boards.shape[0])))
-
-    raw_rows: list[dict[str, Any]] = []
+    trial_rows: list[dict[str, Any]] = []
     run_rows: list[dict[str, Any]] = []
+    density_values = loaded.initial_probabilities
+    if density_values.size == 0:
+        density_values = np.asarray([loaded.config.initial_density], dtype=np.float64)
 
-    def add_item(group: str, rule_id: int, init_id: int, trajectory: np.ndarray) -> None:
-        label = loaded.rule_labels.get(rule_id, lifelike_rule_label(rule_id) if rule_id >= 0 else str(rule_id))
-        item_id = f"{group}_rule{rule_id}_init{init_id}"
-        simulation_rule_id = rule_id if rule_id >= 0 else CONWAY_LIFE_RULE
-        rows = _trajectory_frustration_scores(
-            trajectory,
-            simulation_rule_id,
-            label,
-            group,
-            item_id,
-            loaded.config,
-            horizon=horizon,
-            anchors=anchors,
-            branches_per_anchor=branches_per_anchor,
-            control_flip_fraction=control_flip_fraction,
-            wall_grid_split=wall_grid_split,
-            backend=backend,
-            rng=rng,
-        )
-        raw_rows.extend(rows)
-        control_vals = np.asarray([row["mean_future_hamming"] for row in rows if row["condition"] == "control_b"], dtype=np.float64)
-        wall_vals = np.asarray([row["mean_future_hamming"] for row in rows if row["condition"] == "walls"], dtype=np.float64)
-        run_rows.append(
-            {
-                "claim": "C5",
-                "group": group,
-                "item_id": item_id,
-                "rule_id": int(rule_id),
-                "rule_label": label,
-                "init_id": int(init_id),
-                "d_control_a_control_b": float(np.mean(control_vals)),
-                "d_control_a_walls": float(np.mean(wall_vals)),
-                "frustration_effect": float(np.mean(wall_vals) - np.mean(control_vals)),
-                "n_anchor_reps": int(min(control_vals.size, wall_vals.size)),
-            }
-        )
+    def evaluate_candidate(group: str, rule_id: int) -> None:
+        label = loaded.rule_labels.get(rule_id, lifelike_rule_label(rule_id if rule_id >= 0 else CONWAY_LIFE_RULE))
+        candidate_rows: list[dict[str, Any]] = []
+        for trial_idx in range(int(n_trials)):
+            density = float(density_values[trial_idx % density_values.size])
+            seed_x = int(seed + 1000003 * (abs(rule_id) + 1) + 9176 * trial_idx + (0 if group == "optimized" else 50000019))
+            seed_x1 = int(seed_x + 104729)
+            row = _c5_trial(
+                loaded,
+                group=group,
+                rule_id=rule_id,
+                trial_idx=trial_idx,
+                density=density,
+                seed_x=seed_x,
+                seed_x1=seed_x1,
+                warmup_steps=warmup,
+                late_start=late_start,
+                late_end=late_end,
+                wall_grid_split=wall_grid_split,
+                backend=backend,
+            )
+            candidate_rows.append(row)
+            trial_rows.append(row)
+        run_row = {
+            "claim": "C5",
+            "group": group,
+            "rule_id": int(rule_id),
+            "rule_label": label,
+            "n_trials": int(len(candidate_rows)),
+        }
+        metric_cols = [
+            "delta_h_l2__anchor_effect_minus_baseline",
+            "delta_h_mean_abs__anchor_effect_minus_baseline",
+            "state_hamming__anchor_effect_minus_baseline",
+        ]
+        for col in metric_cols:
+            vals = np.asarray([row[col] for row in candidate_rows], dtype=np.float64)
+            run_row[col] = float(np.mean(vals))
+        run_rows.append(run_row)
 
     for rule_id in optimized_rules:
-        for init_id in init_ids:
-            if (
-                rule_id == loaded.best_rule_id
-                and loaded.best_trajectory.shape[0] == loaded.config.T + 1
-                and np.array_equal(init_boards[init_id], loaded.best_initial_board)
-            ):
-                trajectory = loaded.best_trajectory
-            else:
-                trajectory = _simulate_full_trajectory(init_boards[init_id], rule_id, loaded.config.T, backend)
-            add_item("optimized", rule_id, init_id, trajectory)
-
+        evaluate_candidate("optimized", rule_id)
     for rule_id in random_rules:
-        if rule_id < 0:
-            board = loaded.random_initial_boards.get(rule_id)
-            if board is None:
-                continue
-            trajectory = _simulate_full_trajectory(board, CONWAY_LIFE_RULE, loaded.config.T, backend)
-            add_item("random", rule_id, 0, trajectory)
-        else:
-            for init_id in init_ids:
-                trajectory = _simulate_full_trajectory(init_boards[init_id], rule_id, loaded.config.T, backend)
-                add_item("random", rule_id, init_id, trajectory)
+        evaluate_candidate("random", rule_id)
 
-    opt_effects = np.asarray([row["frustration_effect"] for row in run_rows if row["group"] == "optimized"], dtype=np.float64)
-    random_effects = np.asarray([row["frustration_effect"] for row in run_rows if row["group"] == "random"], dtype=np.float64)
+    metric_cols = [
+        "delta_h_l2__anchor_effect_minus_baseline",
+        "delta_h_mean_abs__anchor_effect_minus_baseline",
+        "state_hamming__anchor_effect_minus_baseline",
+    ]
+    random_rows = [row for row in run_rows if row["group"] == "random"]
+    opt_rows = [row for row in run_rows if row["group"] == "optimized"]
+    for col in metric_cols:
+        random_vals = np.asarray([row[col] for row in random_rows], dtype=np.float64)
+        random_median = float(np.median(random_vals)) if random_vals.size else float("nan")
+        for row in opt_rows:
+            row[f"{col}__random_median"] = random_median
+            row[f"{col}__delta_vs_random_median"] = float(row[col] - random_median)
+
+    primary_col = "delta_h_l2__anchor_effect_minus_baseline"
+    opt_effects = np.asarray([row[primary_col] for row in opt_rows], dtype=np.float64)
+    random_effects = np.asarray([row[primary_col] for row in random_rows], dtype=np.float64)
     random_median = float(np.median(random_effects)) if random_effects.size else float("nan")
-    deltas = [float(v - random_median) for v in opt_effects if np.isfinite(random_median)]
+    deltas = [float(row[f"{primary_col}__delta_vs_random_median"]) for row in opt_rows if np.isfinite(row.get(f"{primary_col}__delta_vs_random_median", np.nan))]
+    summary_rows = [
+        {"claim": "C5", "metric": col, **sign_test_greater([row.get(f"{col}__delta_vs_random_median", np.nan) for row in opt_rows])}
+        for col in metric_cols
+    ]
     summary = {
         "claim": "C5",
         "mode": loaded.mode,
         "input_dir": str(loaded.input_dir),
         "optimized_top_k": int(len(optimized_rules)),
         "random_controls": int(len(random_rules)),
-        "n_initial_boards": int(len(init_ids)),
-        "n_anchors": int(len(anchors)),
-        "branches_per_anchor": int(branches_per_anchor),
-        "horizon_steps": int(horizon),
-        "control_flip_fraction": float(control_flip_fraction),
+        "n_trials": int(n_trials),
+        "warmup_steps": int(warmup),
+        "late_window_start_steps": int(late_start),
+        "late_window_end_steps": int(late_end),
         "wall_grid_split": int(wall_grid_split),
+        "primary_metric": primary_col,
         "optimized_mean_frustration_effect": float(np.mean(opt_effects)) if opt_effects.size else float("nan"),
         "random_mean_frustration_effect": float(np.mean(random_effects)) if random_effects.size else float("nan"),
         "random_median_frustration_effect": random_median,
         "optimized_gt_random_median_sign_test": sign_test_greater(deltas),
     }
-    write_csv(out / "c5_frustration_branch_rows.csv", raw_rows)
+    write_csv(out / "c5_frustration_trial_metrics.csv", trial_rows)
     write_csv(out / "c5_frustration_run_level.csv", run_rows)
-    write_csv(out / "c5_frustration_metric_summary.csv", [summary])
+    write_csv(out / "c5_frustration_metric_summary.csv", summary_rows)
     write_json(out / "c5_frustration_summary.json", summary)
     _plot_c5(out, run_rows)
     return summary
@@ -861,8 +1327,9 @@ def _high_low_delta_summary(window_rows: list[dict[str, Any]]) -> dict[str, Any]
         return {}
     rows = sorted(window_rows, key=lambda row: float(row["delta_h"]))
     half = len(rows) // 2
-    low = np.asarray([row["mean_future_hamming"] for row in rows[:half]], dtype=np.float64)
-    high = np.asarray([row["mean_future_hamming"] for row in rows[-half:]], dtype=np.float64)
+    score_key = "branching_score" if "branching_score" in rows[0] else "mean_future_hamming"
+    low = np.asarray([row[score_key] for row in rows[:half]], dtype=np.float64)
+    high = np.asarray([row[score_key] for row in rows[-half:]], dtype=np.float64)
     delta = float(np.mean(high) - np.mean(low)) if low.size and high.size else float("nan")
     return {
         "n_low": int(low.size),
@@ -897,8 +1364,9 @@ def _boxplot(ax: Any, values: list[list[float]], labels: list[str]) -> None:
 
 def _plot_c1(out: Path, rule_level_rows: list[dict[str, Any]], contrast_rows: list[dict[str, Any]]) -> None:
     plt = _matplotlib()
-    opt = [float(row["mean_mspd"]) for row in rule_level_rows if row["group"] == "optimized"]
-    rnd = [float(row["mean_mspd"]) for row in rule_level_rows if row["group"] == "random"]
+    score_key = "holdout_mean_mspd" if rule_level_rows and "holdout_mean_mspd" in rule_level_rows[0] else "mean_mspd"
+    opt = [float(row[score_key]) for row in rule_level_rows if row["group"] == "optimized"]
+    rnd = [float(row[score_key]) for row in rule_level_rows if row["group"] == "random"]
     fig, ax = plt.subplots(figsize=(5.8, 4.2), dpi=150)
     _boxplot(ax, [rnd, opt], ["random", "optimized"])
     ax.scatter(np.ones(len(rnd)), rnd, s=16, alpha=0.55, color="#6b7280")
@@ -925,7 +1393,8 @@ def _plot_c1(out: Path, rule_level_rows: list[dict[str, Any]], contrast_rows: li
 def _plot_c2(out: Path, window_rows: list[dict[str, Any]]) -> None:
     plt = _matplotlib()
     x = np.asarray([row["delta_h"] for row in window_rows], dtype=np.float64)
-    y = np.asarray([row["mean_future_hamming"] for row in window_rows], dtype=np.float64)
+    score_key = "branching_score" if window_rows and "branching_score" in window_rows[0] else "mean_future_hamming"
+    y = np.asarray([row[score_key] for row in window_rows], dtype=np.float64)
     fig, ax = plt.subplots(figsize=(5.6, 4.2), dpi=150)
     ax.scatter(x, y, s=32, color="#7c3aed", alpha=0.8)
     if x.size >= 2 and np.std(x) > 0.0:
@@ -933,7 +1402,7 @@ def _plot_c2(out: Path, window_rows: list[dict[str, Any]]) -> None:
         xs = np.linspace(float(np.min(x)), float(np.max(x)), 100)
         ax.plot(xs, coeff[0] * xs + coeff[1], color="#111827", linewidth=1.2)
     ax.set_xlabel("Delta-H")
-    ax.set_ylabel("future Hamming divergence")
+    ax.set_ylabel("pairwise future Hamming divergence")
     ax.set_title("C2 CA Delta-H vs perturbation sensitivity")
     fig.tight_layout()
     fig.savefig(out / "c2_ca_delta_h_branching_sensitivity.png")
@@ -947,11 +1416,11 @@ def _plot_c2(out: Path, window_rows: list[dict[str, Any]]) -> None:
     ax2 = ax1.twinx()
     ax2.plot(
         [row["window_idx"] for row in ordered],
-        [row["mean_future_hamming"] for row in ordered],
+        [row[score_key] for row in ordered],
         color="#dc2626",
         label="divergence",
     )
-    ax2.set_ylabel("future Hamming divergence", color="#dc2626")
+    ax2.set_ylabel("pairwise future Hamming divergence", color="#dc2626")
     ax1.set_title("C2 sampled windows")
     fig.tight_layout()
     fig.savefig(out / "c2_ca_delta_h_trace_sampled_windows.png")
@@ -960,14 +1429,15 @@ def _plot_c2(out: Path, window_rows: list[dict[str, Any]]) -> None:
 
 def _plot_c5(out: Path, run_rows: list[dict[str, Any]]) -> None:
     plt = _matplotlib()
-    opt = [float(row["frustration_effect"]) for row in run_rows if row["group"] == "optimized"]
-    rnd = [float(row["frustration_effect"]) for row in run_rows if row["group"] == "random"]
+    primary_col = "delta_h_l2__anchor_effect_minus_baseline"
+    opt = [float(row[primary_col]) for row in run_rows if row["group"] == "optimized"]
+    rnd = [float(row[primary_col]) for row in run_rows if row["group"] == "random"]
     fig, ax = plt.subplots(figsize=(5.8, 4.2), dpi=150)
     ax.axhline(0.0, color="black", linewidth=0.8)
     _boxplot(ax, [rnd, opt], ["random", "optimized"])
     ax.scatter(np.ones(len(rnd)), rnd, s=14, alpha=0.5, color="#6b7280")
     ax.scatter(np.full(len(opt), 2), opt, s=24, alpha=0.85, color="#059669")
-    ax.set_ylabel("d(control_a,walls) - d(control_a,control_b)")
+    ax.set_ylabel("Delta-H L2: walls effect - control baseline")
     ax.set_title("C5 CA frustration contrast")
     fig.tight_layout()
     fig.savefig(out / "c5_ca_frustration_contrast.png")
@@ -1000,6 +1470,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--optimized-top-k", type=int, default=None)
     parser.add_argument("--random-controls", type=int, default=None)
+    parser.add_argument("--c1-eval-mode", choices=["fresh_holdout", "saved_score"], default=None)
+    parser.add_argument("--c1-holdout-n-initial-boards", type=int, default=None)
+    parser.add_argument("--c1-holdout-density-mode", choices=["source", "fixed", "uniform"], default=None)
+    parser.add_argument("--c1-holdout-density", type=float, default=None)
+    parser.add_argument("--c1-holdout-density-range", type=float, nargs=2, default=None)
+    parser.add_argument("--c1-eval-batch-size", type=int, default=None)
 
     parser.add_argument("--c2-branch-windows", type=int, default=None)
     parser.add_argument("--c2-branches-per-window", type=int, default=None)
@@ -1007,10 +1483,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--c2-perturb-fraction", type=float, default=None)
 
     parser.add_argument("--c5-random-controls", type=int, default=None)
-    parser.add_argument("--c5-anchors", type=int, default=None)
-    parser.add_argument("--c5-branches-per-anchor", type=int, default=None)
-    parser.add_argument("--c5-horizon", type=int, default=None)
-    parser.add_argument("--c5-control-flip-fraction", type=float, default=None)
+    parser.add_argument("--c5-n-trials", type=int, default=None)
+    parser.add_argument("--c5-warmup-steps", type=int, default=None)
+    parser.add_argument("--c5-late-window-start-steps", type=int, default=None)
+    parser.add_argument("--c5-late-window-end-steps", type=int, default=None)
     parser.add_argument("--c5-wall-grid-split", type=int, default=None)
     return parser.parse_args(argv)
 
@@ -1045,12 +1521,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         "available_completed_input_dirs": [str(path) for path in completed_dirs],
     }
     if cfg["task"] in {"all", "c1"}:
-        _log("C1: optimized-vs-random MSPD contrast")
+        _log(f"C1: optimized-vs-random MSPD contrast mode={cfg['c1_eval_mode']}")
         summaries["c1"] = run_c1(
             loaded,
             output_dir,
             optimized_top_k=int(cfg["optimized_top_k"]),
             random_controls=int(cfg["random_controls"]),
+            eval_mode=str(cfg["c1_eval_mode"]),
+            holdout_n_initial_boards=int(cfg["c1_holdout_n_initial_boards"]),
+            holdout_density_mode=str(cfg["c1_holdout_density_mode"]),
+            holdout_density=None if cfg["c1_holdout_density"] is None else float(cfg["c1_holdout_density"]),
+            holdout_density_range=_density_range_from_raw(cfg["c1_holdout_density_range"]),
+            eval_batch_size=None if cfg["c1_eval_batch_size"] is None else int(cfg["c1_eval_batch_size"]),
+            backend=backend,
             seed=int(cfg["seed"]) + 101,
         )
     if cfg["task"] in {"all", "c2"}:
@@ -1066,16 +1549,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             seed=int(cfg["seed"]) + 202,
         )
     if cfg["task"] in {"all", "c5"}:
-        _log("C5: structured cell-shuffle frustration contrast")
+        _log("C5: control_a/control_b/walls history-dependence contrast")
         summaries["c5"] = run_c5(
             loaded,
             output_dir,
             optimized_top_k=int(cfg["optimized_top_k"]),
             random_controls=int(cfg["c5_random_controls"] if cfg["c5_random_controls"] is not None else cfg["random_controls"]),
-            n_anchors=int(cfg["c5_anchors"]),
-            branches_per_anchor=int(cfg["c5_branches_per_anchor"]),
-            horizon=int(cfg["c5_horizon"]),
-            control_flip_fraction=float(cfg["c5_control_flip_fraction"]),
+            n_trials=int(cfg["c5_n_trials"]),
+            warmup_steps=None if cfg["c5_warmup_steps"] is None else int(cfg["c5_warmup_steps"]),
+            late_window_start_steps=None
+            if cfg["c5_late_window_start_steps"] is None
+            else int(cfg["c5_late_window_start_steps"]),
+            late_window_end_steps=None
+            if cfg["c5_late_window_end_steps"] is None
+            else int(cfg["c5_late_window_end_steps"]),
             wall_grid_split=int(cfg["c5_wall_grid_split"]),
             backend=backend,
             seed=int(cfg["seed"]) + 303,

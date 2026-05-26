@@ -20,9 +20,21 @@ seed: 0
 
 c1:
   # For rule-sweep, optimized candidates are top-K rules by transition-law MSPD.
-  # For GA initial-board runs, this is ignored and the optimized Conway board is used.
+  # Strict mode selects top-K using the completed sweep, then re-evaluates top-K
+  # and random controls on fresh Bernoulli holdout boards that were not in the
+  # sweep. This is the paper-facing C1 for CA.
+  eval_mode: fresh_holdout
   optimized_top_k: 1
   random_controls: 32
+  holdout_n_initial_boards: 32
+  # source = reuse the sweep's initialization law:
+  # fixed initial_density if the sweep was fixed-p, or p~Uniform(low, high)
+  # if the sweep used initial_density_range.
+  holdout_density_mode: source
+  holdout_density: null
+  holdout_density_range: null
+  # null means reuse ExperimentConfig.eval_batch_size from the saved run.
+  eval_batch_size: null
 
 c2:
   # Samples windows across the saved Delta-H distribution, branches from those
@@ -33,11 +45,16 @@ c2:
   perturb_fraction: 0.01
 
 c5:
-  # CA frustration analogue:
-  # d(control_a, walls/block-shuffle) - d(control_a, control_b/small-bit-flip).
+  # CA version of the paper-suite frustration/history assay:
+  # control_a: global rollout from seed_x.
+  # control_b: global rollout from independent seed_x1.
+  # walls: same seed_x as control_a, but warmup is run in isolated spatial blocks;
+  #        blocks are then merged and the normal toroidal CA runs to the late window.
+  # Primary score is Delta-H trace distance:
+  # D(control, walls) - D(control_a, control_b).
   random_controls: 32
-  anchors: 12
-  branches_per_anchor: 4
-  horizon: 64
-  control_flip_fraction: 0.01
+  n_trials: 4
+  warmup_steps: null
+  late_window_start_steps: null
+  late_window_end_steps: null
   wall_grid_split: 2
