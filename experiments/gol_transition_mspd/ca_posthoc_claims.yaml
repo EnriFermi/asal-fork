@@ -1,0 +1,42 @@
+# Posthoc C1/C2/C5 checks for transition-law MSPD cellular automata runs.
+# This is downstream-only: it reads an existing optimization/rule-sweep output
+# directory and does not rerun the GA or all-rule sweep.
+
+# Use a concrete finished run for reproducibility. Set to null to use the most
+# recently modified completed directory under results_root.
+input_dir: analysis/results/gol_transition_mspd/rule_sweep_20260522_023120
+results_root: analysis/results/gol_transition_mspd
+
+# Default: <input_dir>/posthoc_claims
+output_dir: null
+
+# all | c1 | c2 | c5
+task: all
+
+# null means reuse backend from the saved GoL MSPD run. For GPU/CUDA, set jax.
+backend: jax
+seed: 0
+
+c1:
+  # For rule-sweep, optimized candidates are top-K rules by transition-law MSPD.
+  # For GA initial-board runs, this is ignored and the optimized Conway board is used.
+  optimized_top_k: 1
+  random_controls: 32
+
+c2:
+  # Samples windows across the saved Delta-H distribution, branches from those
+  # states with small bit flips, and correlates Delta-H with future Hamming divergence.
+  branch_windows: 24
+  branches_per_window: 4
+  horizon: 64
+  perturb_fraction: 0.01
+
+c5:
+  # CA frustration analogue:
+  # d(control_a, walls/block-shuffle) - d(control_a, control_b/small-bit-flip).
+  random_controls: 32
+  anchors: 12
+  branches_per_anchor: 4
+  horizon: 64
+  control_flip_fraction: 0.01
+  wall_grid_split: 2
