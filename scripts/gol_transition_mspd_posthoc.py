@@ -775,10 +775,14 @@ def run_c1(
     raise ValueError(f"Unknown c1.eval_mode={eval_mode!r}; use fresh_holdout or saved_score.")
 
 
-def _window_starts(config: ExperimentConfig, delta_h: np.ndarray, trajectory_len: int, horizon: int) -> np.ndarray:
-    starts = config.burn_in + np.arange(delta_h.size, dtype=np.int64) * int(config.window_step)
+def _window_branch_times(config: ExperimentConfig, delta_h: np.ndarray, trajectory_len: int, horizon: int) -> np.ndarray:
+    centers = (
+        int(config.burn_in)
+        + np.arange(delta_h.size, dtype=np.int64) * int(config.window_step)
+        + int(config.window_size) // 2
+    )
     max_start = int(trajectory_len) - 1 - int(horizon)
-    return starts[starts <= max_start]
+    return centers[centers <= max_start]
 
 
 def _quantile_window_indices(delta_h: np.ndarray, starts: np.ndarray, n_windows: int) -> np.ndarray:
@@ -830,8 +834,8 @@ def run_c2(
 ) -> dict[str, Any]:
     out = ensure_dir(output_dir / "c2")
     rng = np.random.default_rng(seed)
-    starts = _window_starts(loaded.config, loaded.best_delta_h, loaded.best_trajectory.shape[0], horizon)
-    picked = _quantile_window_indices(loaded.best_delta_h, starts, n_windows)
+    branch_times = _window_branch_times(loaded.config, loaded.best_delta_h, loaded.best_trajectory.shape[0], horizon)
+    picked = _quantile_window_indices(loaded.best_delta_h, branch_times, n_windows)
     if picked.size < 2:
         raise ValueError("C2 requires at least two valid Delta-H windows before trajectory end.")
     if int(branches_per_window) < 2:
@@ -840,7 +844,9 @@ def run_c2(
     branch_initials: list[np.ndarray] = []
     branch_meta: list[dict[str, Any]] = []
     for window_idx in picked:
-        t0 = int(loaded.config.burn_in + int(window_idx) * int(loaded.config.window_step))
+        window_start = int(loaded.config.burn_in + int(window_idx) * int(loaded.config.window_step))
+        window_center = int(window_start + int(loaded.config.window_size) // 2)
+        t0 = window_center
         base_state = loaded.best_trajectory[t0]
         for rep in range(branches_per_window):
             branch_initials.append(_small_bit_flip(base_state, perturb_fraction, rng))
@@ -848,6 +854,8 @@ def run_c2(
                 {
                     "window_idx": int(window_idx),
                     "t0": t0,
+                    "window_start_t": window_start,
+                    "window_center_t": window_center,
                     "branch_rep": rep,
                     "delta_h": float(loaded.best_delta_h[int(window_idx)]),
                 }
@@ -896,7 +904,9 @@ def run_c2(
                         "rule_id": loaded.best_rule_id,
                         "rule_label": loaded.best_rule_label,
                         "window_idx": int(window_idx),
-                        "t0": int(loaded.config.burn_in + int(window_idx) * int(loaded.config.window_step)),
+                        "t0": int(branch_meta[idx_i]["t0"]),
+                        "window_start_t": int(branch_meta[idx_i]["window_start_t"]),
+                        "window_center_t": int(branch_meta[idx_i]["window_center_t"]),
                         "delta_h": float(loaded.best_delta_h[int(window_idx)]),
                         "branch_rep_i": int(branch_meta[idx_i]["branch_rep"]),
                         "branch_rep_j": int(branch_meta[idx_j]["branch_rep"]),
@@ -910,7 +920,9 @@ def run_c2(
                 "rule_id": loaded.best_rule_id,
                 "rule_label": loaded.best_rule_label,
                 "window_idx": int(window_idx),
-                "t0": int(loaded.config.burn_in + int(window_idx) * int(loaded.config.window_step)),
+                "t0": int(loaded.config.burn_in + int(window_idx) * int(loaded.config.window_step) + int(loaded.config.window_size) // 2),
+                "window_start_t": int(loaded.config.burn_in + int(window_idx) * int(loaded.config.window_step)),
+                "window_center_t": int(loaded.config.burn_in + int(window_idx) * int(loaded.config.window_step) + int(loaded.config.window_size) // 2),
                 "delta_h": float(loaded.best_delta_h[int(window_idx)]),
                 "branching_score": float(np.mean(pair_arr)) if pair_arr.size else float("nan"),
                 "branching_metric": "pairwise_future_hamming",
@@ -936,6 +948,7 @@ def run_c2(
         "horizon_steps": int(horizon),
         "perturb_fraction": float(perturb_fraction),
         "branching_metric": "pairwise_future_hamming",
+        "branch_time_alignment": "delta_h_window_center",
         "correlation": corr,
         "high_low_delta": high_low,
     }
