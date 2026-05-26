@@ -515,7 +515,15 @@ def _hypothesis_rows(
     return rows
 
 
-def _plot(out_path: Path, run_rows: list[dict[str, Any]], tau_rows: list[dict[str, Any]]) -> None:
+def _plot_metric_scatter(
+    out_path: Path,
+    rows: list[dict[str, Any]],
+    *,
+    x_key: str,
+    title: str,
+    x_label: str,
+    write_legacy_aliases: bool = False,
+) -> None:
     import matplotlib.pyplot as plt
 
     conditions = ["Random", "MSPD-opt", "NN-opt"]
@@ -524,11 +532,11 @@ def _plot(out_path: Path, run_rows: list[dict[str, Any]], tau_rows: list[dict[st
     fig, ax = plt.subplots(figsize=(6.4, 5.4), constrained_layout=True)
 
     for condition in conditions:
-        rows = [row for row in run_rows if str(row.get("condition", "")) == condition]
-        if not rows:
+        condition_rows = [row for row in rows if str(row.get("condition", "")) == condition]
+        if not condition_rows:
             continue
-        mspd = np.asarray([_as_float(row.get("mspd_metric", np.nan)) for row in rows], dtype=np.float64)
-        nn_score = np.asarray([_as_float(row.get("nn_opt_score", np.nan)) for row in rows], dtype=np.float64)
+        mspd = np.asarray([_as_float(row.get(x_key, np.nan)) for row in condition_rows], dtype=np.float64)
+        nn_score = np.asarray([_as_float(row.get("nn_opt_score", np.nan)) for row in condition_rows], dtype=np.float64)
         finite = np.isfinite(mspd) & np.isfinite(nn_score)
         if not np.any(finite):
             continue
@@ -555,21 +563,83 @@ def _plot(out_path: Path, run_rows: list[dict[str, Any]], tau_rows: list[dict[st
                 alpha=0.95,
             )
 
-    ax.set_xlabel("MSPD metric (log-tau integral; higher is better)")
+    ax.set_xlabel(x_label)
     ax.set_ylabel("-NN-opt loss (-CLIP-OE; higher is better)")
-    ax.set_title("C4: MSPD vs NN-opt score")
+    ax.set_title(title)
     ax.grid(color="#dddddd", linewidth=0.8, alpha=0.7)
     ax.legend(loc="best", frameon=False)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=180)
-    scatter_alias = out_path.parent / "c4_nnopt_vs_mspd_scatter.png"
-    if scatter_alias != out_path:
-        fig.savefig(scatter_alias, dpi=180)
-    alias = out_path.parent / "nnopt_vs_mspd_comparison.png"
-    if alias != out_path:
-        fig.savefig(alias, dpi=180)
+    if write_legacy_aliases:
+        scatter_alias = out_path.parent / "c4_nnopt_vs_mspd_scatter.png"
+        if scatter_alias != out_path:
+            fig.savefig(scatter_alias, dpi=180)
+        alias = out_path.parent / "nnopt_vs_mspd_comparison.png"
+        if alias != out_path:
+            fig.savefig(alias, dpi=180)
     plt.close(fig)
+
+
+def _plot(out_path: Path, run_rows: list[dict[str, Any]], tau_rows: list[dict[str, Any]]) -> None:
+    _plot_metric_scatter(
+        out_path,
+        run_rows,
+        x_key="mspd_metric",
+        title="C4: MSPD vs NN-opt score",
+        x_label="MSPD metric (log-tau integral; higher is better)",
+        write_legacy_aliases=True,
+    )
+
+
+def _run_key(row: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(row.get("objective_key", "")),
+        str(row.get("candidate_kind", "")),
+        str(row.get("traj_id", "")),
+    )
+
+
+def _plot_tau_scatters(out_dir: Path, run_rows: list[dict[str, Any]], tau_rows: list[dict[str, Any]]) -> dict[str, str]:
+    run_by_key = {_run_key(row): row for row in run_rows}
+    tau_values = sorted(
+        {
+            int(_as_float(row.get("tau_steps")))
+            for row in tau_rows
+            if np.isfinite(_as_float(row.get("tau_steps")))
+        }
+    )
+    paths: dict[str, str] = {}
+    tau_dir = ensure_dir(out_dir / "tau_scatters")
+    for tau in tau_values:
+        rows: list[dict[str, Any]] = []
+        for tau_row in tau_rows:
+            row_tau = _as_float(tau_row.get("tau_steps"))
+            if not np.isfinite(row_tau) or int(row_tau) != int(tau):
+                continue
+            run_row = run_by_key.get(_run_key(tau_row))
+            if run_row is None:
+                continue
+            rows.append(
+                {
+                    **run_row,
+                    "mspd_tau_score": _as_float(tau_row.get("score_by_tau")),
+                    "tau_steps": int(tau),
+                    "tau_selected": int(_as_float(tau_row.get("selected", 0))) if np.isfinite(_as_float(tau_row.get("selected", 0))) else 0,
+                }
+            )
+        if not rows:
+            continue
+        out = tau_dir / f"c4_nnopt_vs_mspd_tau_{int(tau):05d}.png"
+        _plot_metric_scatter(
+            out,
+            rows,
+            x_key="mspd_tau_score",
+            title=f"C4: MSPD(tau={int(tau)}) vs NN-opt score",
+            x_label=f"MSPD score at tau={int(tau)} steps (higher is better)",
+        )
+        paths[f"tau_{int(tau):05d}"] = str(out)
+    return paths
 
 
 def _plot_from_existing(config_path: str | Path) -> dict[str, Any]:
@@ -584,8 +654,15 @@ def _plot_from_existing(config_path: str | Path) -> dict[str, Any]:
     tau_rows = [dict(row) for row in read_csv(tau_table)] if tau_table.exists() else []
     fig_path = out_dir / "c4_nnopt_vs_mspd_dual_axis.png"
     _plot(fig_path, run_rows, tau_rows)
+    tau_figures = _plot_tau_scatters(out_dir, run_rows, tau_rows)
     summary_path = out_dir / "c4_nnopt_vs_mspd_summary.json"
-    summary = {"status": "ok", "figure": str(fig_path), "run_scores": str(run_table), "tau_profiles": str(tau_table)}
+    summary = {
+        "status": "ok",
+        "figure": str(fig_path),
+        "tau_figures": tau_figures,
+        "run_scores": str(run_table),
+        "tau_profiles": str(tau_table),
+    }
     write_json(summary_path, summary)
     return summary
 
@@ -735,6 +812,7 @@ def run(
     write_csv(stats_table, stats_rows)
     fig_path = out_dir / "c4_nnopt_vs_mspd_dual_axis.png"
     _plot(fig_path, run_rows, tau_rows)
+    tau_figures = _plot_tau_scatters(out_dir, run_rows, tau_rows)
 
     summary_by_condition = {}
     for condition in sorted({row["condition"] for row in run_rows}):
@@ -758,6 +836,7 @@ def run(
         "tau_profiles": str(tau_table),
         "hypothesis_tests": str(stats_table),
         "figure": str(fig_path),
+        "tau_figures": tau_figures,
         "summary_by_condition": summary_by_condition,
         "hypotheses": stats_rows,
     }
