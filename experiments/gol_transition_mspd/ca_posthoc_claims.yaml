@@ -2,9 +2,10 @@
 # This is downstream-only: it reads an existing optimization/rule-sweep output
 # directory and does not rerun the GA or all-rule sweep.
 
-# Use a concrete finished run for reproducibility. Set to null to use the most
-# recently modified completed directory under results_root.
-input_dir: analysis/results/gol_transition_mspd/rule_sweep_20260522_023120
+# Set a concrete finished run for reproducibility, or keep null to use the most
+# recently modified completed directory under results_root. A completed directory
+# must contain best_rule_result.npz or best_result.npz plus its run config.
+input_dir: null
 results_root: analysis/results/gol_transition_mspd
 
 # Default: <input_dir>/posthoc_claims
