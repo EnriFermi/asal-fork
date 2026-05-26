@@ -15,6 +15,13 @@ from typing import Any, Iterable
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 FIGURE_SUFFIXES = (".png", ".pdf", ".svg")
+CELLULAR_DYNAMICS_ROOTS = ("analysis/results/gol_transition_mspd",)
+CELLULAR_DYNAMICS_FIGURE_DIRS = {"figures", "plots", "posthoc_claims"}
+EXCLUDED_OVERLEAF_FIGURES = {
+    "figures/c2_delta_h_branching_correlation.png",
+    "figures/c2_branching_sensitivity.png",
+    "figures/c2_high_vs_low_branching_divergence.png",
+}
 
 EXPECTED_MAIN_FIGURES = (
     "figures/synthetic_calibration_grid.png",
@@ -26,8 +33,8 @@ EXPECTED_MAIN_FIGURES = (
     "figures/c1_flow_lenia_delta_h_heatmaps.png",
     "figures/c1_flow_lenia_delta_h_eval_optimized_vs_random_median.png",
     "figures/c1_flow_lenia_delta_h_eval_optimized_vs_random_grid.png",
-    "figures/c2_branching_sensitivity.png",
-    "figures/c2_delta_h_branching_correlation.png",
+    "figures/c2_branching_sensitivity_clip_chamfer.png",
+    "figures/c2_delta_h_branching_correlation_clip_chamfer.png",
     "figures/c5_flow_lenia_frustration_contrast.png",
     "figures/c5_flow_lenia_embedding_vs_mspd.png",
     "figures/c1_plife_plus_paired_contrast.png",
@@ -48,8 +55,9 @@ SUPPORTING_TABLES = (
     "synthetic_calibration/tau_profiles.csv",
     "synthetic_calibration/role_recovery.csv",
     "synthetic_calibration/event_localization.csv",
-    "c2_branching/branching_scores.csv",
-    "c2_branching/branching_delta_h_correlation.csv",
+    "synthetic_calibration/synthetic_calibration_summary.json",
+    "c2_branching/branching_scores_clip_chamfer.csv",
+    "c2_branching/branching_delta_h_correlation_clip_chamfer.csv",
 )
 
 
@@ -131,8 +139,27 @@ def _iter_all_figures(output_root: Path, *, out_dir: Path) -> Iterable[Path]:
         rel = _stable_rel(path, output_root)
         if rel.startswith("c4_nnopt_vs_mspd/") or rel.startswith("nnopt_vs_mspd/"):
             continue
+        if rel in EXCLUDED_OVERLEAF_FIGURES:
+            continue
         if path.suffix.lower() in FIGURE_SUFFIXES:
             yield path
+
+
+def _iter_cellular_dynamics_figures(roots: Iterable[str | Path], *, out_dir: Path) -> Iterable[Path]:
+    for raw_root in roots:
+        root = _resolve(raw_root)
+        if root is None or not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            if _is_under(path, out_dir):
+                continue
+            if path.suffix.lower() not in FIGURE_SUFFIXES:
+                continue
+            rel_parts = path.resolve().relative_to(root.resolve()).parts
+            if CELLULAR_DYNAMICS_FIGURE_DIRS.intersection(rel_parts[:-1]):
+                yield path
 
 
 def _stable_rel(path: Path, root: Path) -> str:
@@ -140,6 +167,13 @@ def _stable_rel(path: Path, root: Path) -> str:
         return path.resolve().relative_to(root.resolve()).as_posix()
     except Exception:
         return path.resolve().as_posix()
+
+
+def _collection_rel(path: Path, output_root: Path) -> str:
+    rel = _stable_rel(path, output_root)
+    if rel == path.resolve().as_posix():
+        return _stable_rel(path, _REPO_ROOT)
+    return rel
 
 
 def _sanitize(value: str) -> str:
@@ -150,9 +184,14 @@ def _sanitize(value: str) -> str:
 
 
 def _dest_name(path: Path, output_root: Path, used: set[str]) -> str:
-    rel = _stable_rel(path, output_root)
+    rel = _collection_rel(path, output_root)
     if rel.startswith("figures/"):
         base = Path(rel).name
+    elif "analysis/results/gol_transition_mspd/" in rel:
+        parts = Path(rel).parts
+        idx = parts.index("gol_transition_mspd")
+        tail = [part for part in parts[idx + 1 :] if part not in {"plots", "figures"}]
+        base = _sanitize("cellular_dynamics__" + "__".join(tail))
     else:
         base = _sanitize(rel)
     if base not in used:
@@ -164,6 +203,15 @@ def _dest_name(path: Path, output_root: Path, used: set[str]) -> str:
     name = f"{stem}__{digest}{suffix}"
     used.add(name)
     return name
+
+
+def _table_dest_name(rel: str) -> str:
+    if rel.startswith("synthetic_calibration/"):
+        name = Path(rel).name
+        if name.startswith("synthetic_calibration_"):
+            return _sanitize(name)
+        return _sanitize(f"synthetic_calibration_{name}")
+    return _sanitize(rel)
 
 
 def _copy_file(src: Path, dst: Path, *, overwrite: bool) -> str:
@@ -216,6 +264,7 @@ def collect(
     clean: bool = False,
     overwrite: bool = True,
     include_tables: bool = True,
+    include_cellular_dynamics: bool = True,
     strict: bool = True,
 ) -> dict[str, Any]:
     config = Path(config_path)
@@ -234,6 +283,9 @@ def collect(
         found.setdefault(path, set()).add("summary")
     for path in _iter_all_figures(output_root, out_dir=out_dir):
         found.setdefault(path, set()).add("recursive")
+    if include_cellular_dynamics:
+        for path in _iter_cellular_dynamics_figures(CELLULAR_DYNAMICS_ROOTS, out_dir=out_dir):
+            found.setdefault(path, set()).add("cellular_dynamics")
     for rel in EXPECTED_MAIN_FIGURES:
         path = output_root / rel
         found.setdefault(path, set()).add("expected")
@@ -241,9 +293,9 @@ def collect(
     rows: list[dict[str, Any]] = []
     used_names: set[str] = set()
     missing_expected: list[str] = []
-    for src in sorted(found, key=lambda p: _stable_rel(p, output_root)):
+    for src in sorted(found, key=lambda p: _collection_rel(p, output_root)):
         sources = ",".join(sorted(found[src]))
-        rel = _stable_rel(src, output_root)
+        rel = _collection_rel(src, output_root)
         if not src.exists():
             status = "missing"
             dest_name = ""
@@ -277,7 +329,7 @@ def collect(
             dest_name = ""
             dest_path = ""
             if src.exists():
-                dest_name = _sanitize(rel)
+                dest_name = _table_dest_name(rel)
                 dest = table_dir / dest_name
                 status = _copy_file(src, dest, overwrite=overwrite)
                 dest_path = str(dest)
@@ -307,14 +359,21 @@ def collect(
 
     copied_figures = [row for row in rows if row["kind"] == "figure" and row["status"] in {"copied", "exists"}]
     missing_figures = [row for row in rows if row["kind"] == "figure" and row["status"] == "missing"]
+    cellular_figures = [
+        row
+        for row in copied_figures
+        if "cellular_dynamics" in str(row.get("source_tags", "")).split(",")
+    ]
     summary = {
         "status": "ok",
         "output_root": str(output_root),
         "output_dir": str(out_dir),
         "n_figures": len(copied_figures),
+        "n_cellular_dynamics_figures": len(cellular_figures),
         "n_missing_figures": len(missing_figures),
         "missing_expected": missing_expected,
         "missing_supporting": missing_supporting,
+        "cellular_dynamics_roots": [str(_resolve(root)) for root in CELLULAR_DYNAMICS_ROOTS],
         "manifest": str(out_dir / "manifest.csv"),
         "latex_include_snippets": str(out_dir / "latex_include_snippets.tex"),
     }
@@ -343,6 +402,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--clean", action="store_true", help="Delete destination directory before copying.")
     parser.add_argument("--no-overwrite", action="store_true", help="Do not overwrite existing copied files.")
     parser.add_argument("--no-tables", action="store_true", help="Do not copy supporting CSV/JSON tables.")
+    parser.add_argument("--no-cellular-dynamics", action="store_true", help="Do not copy cellular dynamics figures.")
     parser.add_argument("--allow-missing", action="store_true", help="Do not fail on missing expected figures/tables.")
     args = parser.parse_args(argv)
     print(
@@ -354,6 +414,7 @@ def main(argv: list[str] | None = None) -> int:
                 clean=args.clean,
                 overwrite=not args.no_overwrite,
                 include_tables=not args.no_tables,
+                include_cellular_dynamics=not args.no_cellular_dynamics,
                 strict=not args.allow_missing,
             ),
             indent=2,
