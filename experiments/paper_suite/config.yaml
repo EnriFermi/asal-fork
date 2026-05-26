@@ -43,6 +43,10 @@ synthetic:
     heatmaps_enabled: true
     heatmap_cmap: coolwarm
     heatmap_max_runs: null
+    frame_montage_enabled: true
+    frame_montage_frames: 6
+    frame_montage_seed: 0
+    frame_montage_max_particles: null
     # null means: visualize MSC_r at each run's selected tau. Set an integer
     # tau step to force a common tau across synthetic families.
     msc_r_tau_steps: null

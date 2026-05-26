@@ -18,6 +18,7 @@ FIGURE_SUFFIXES = (".png", ".pdf", ".svg")
 
 EXPECTED_MAIN_FIGURES = (
     "figures/synthetic_calibration_grid.png",
+    "figures/synthetic_frame_montage.png",
     "figures/synthetic_msc_by_scale.png",
     "figures/synthetic_delta_h_heatmaps.png",
     "figures/c1_flow_lenia_paired_contrast.png",
@@ -37,7 +38,6 @@ EXPECTED_MAIN_FIGURES = (
     "figures/c5_plife_plus_frustration_contrast.png",
     "figures/c5_plife_plus_embedding_vs_mspd.png",
     "figures/c6_cross_substrate_effects.png",
-    "c4_nnopt_vs_mspd/c4_nnopt_vs_mspd_dual_axis.png",
 )
 
 SUPPORTING_TABLES = (
@@ -50,9 +50,6 @@ SUPPORTING_TABLES = (
     "synthetic_calibration/event_localization.csv",
     "c2_branching/branching_scores.csv",
     "c2_branching/branching_delta_h_correlation.csv",
-    "c4_nnopt_vs_mspd/objective_run_scores.csv",
-    "c4_nnopt_vs_mspd/hypothesis_tests.csv",
-    "c4_nnopt_vs_mspd/c4_nnopt_vs_mspd_summary.json",
 )
 
 
@@ -99,9 +96,6 @@ def _iter_summary_figures(output_root: Path) -> Iterable[Path]:
     for summary in (
         output_root / "visualization_summary.json",
         output_root / "synthetic_calibration" / "visualization_summary.json",
-        output_root / "c4_nnopt_vs_mspd" / "c4_nnopt_vs_mspd_summary.json",
-        output_root / "c4_nnopt_vs_mspd" / "nnopt_vs_mspd_summary.json",
-        output_root / "nnopt_vs_mspd" / "nnopt_vs_mspd_summary.json",
     ):
         if not summary.exists():
             continue
@@ -133,6 +127,9 @@ def _iter_all_figures(output_root: Path, *, out_dir: Path) -> Iterable[Path]:
         if not path.is_file():
             continue
         if _is_under(path, out_dir):
+            continue
+        rel = _stable_rel(path, output_root)
+        if rel.startswith("c4_nnopt_vs_mspd/") or rel.startswith("nnopt_vs_mspd/"):
             continue
         if path.suffix.lower() in FIGURE_SUFFIXES:
             yield path
@@ -251,7 +248,7 @@ def collect(
             status = "missing"
             dest_name = ""
             dest_path = ""
-            if "expected" in found[src]:
+            if any(tag.startswith("expected") for tag in found[src]):
                 missing_expected.append(rel)
         else:
             dest_name = _dest_name(src, output_root, used_names)
