@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -14,7 +15,7 @@ for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "scripts")):
 import numpy as np
 import pandas as pd
 
-from paper_suite_common import dataset_items, ensure_dir, load_config, log_event, resolve_path, write_json
+from paper_suite_common import dataset_items, ensure_dir, load_config, log_event, resolve_path, sign_test_greater, write_json
 from paper_suite_synthetic import visualize as visualize_synthetic
 
 
@@ -35,6 +36,102 @@ def _ensure_matplotlib():
 
 def _output_root(cfg: Any) -> Path:
     return ensure_dir(resolve_path(cfg.get("meta", {}).get("output_root", "analysis/results/paper_suite")) or Path("analysis/results/paper_suite"))
+
+
+_FAMILY_ORDER = ["S0", "S1", "S3", "S4", "S5", "S6", "S7", "S8"]
+
+
+def _read_csv_if_exists(*paths: Path) -> pd.DataFrame:
+    for path in paths:
+        if path.exists() and path.stat().st_size > 1:
+            return pd.read_csv(path)
+    return pd.DataFrame()
+
+
+def _synthetic_table(output_root: Path, short_name: str) -> pd.DataFrame:
+    return _read_csv_if_exists(
+        output_root / "synthetic_calibration" / f"{short_name}.csv",
+        output_root / f"synthetic_calibration_{short_name}.csv",
+        output_root / f"{short_name}.csv",
+    )
+
+
+def _finite_array(values: Any) -> np.ndarray:
+    arr = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=np.float64)
+    return arr[np.isfinite(arr)]
+
+
+def _median_or_nan(values: Any) -> float:
+    arr = _finite_array(values)
+    return float(np.nanmedian(arr)) if arr.size else float("nan")
+
+
+def _mad_or_eps(values: Any, eps: float = 1e-12) -> float:
+    arr = _finite_array(values)
+    if arr.size == 0:
+        return eps
+    med = float(np.nanmedian(arr))
+    mad = float(np.nanmedian(np.abs(arr - med)))
+    return max(mad, eps)
+
+
+def _format_p(value: Any) -> str:
+    try:
+        p = float(value)
+    except Exception:
+        return "n/a"
+    if not np.isfinite(p):
+        return "n/a"
+    return f"{p:.2g}" if p < 0.01 else f"{p:.3f}"
+
+
+def _maybe_log_y(ax: Any, values: Any) -> None:
+    arr = _finite_array(values)
+    positive = arr[arr > 0]
+    if positive.size < 2:
+        return
+    ratio = float(np.nanmax(positive) / max(np.nanmin(positive), 1e-300))
+    if ratio > 200.0:
+        if np.any(arr <= 0):
+            ax.set_yscale("symlog", linthresh=max(float(np.nanmin(positive)) * 0.5, 1e-12))
+        else:
+            ax.set_yscale("log")
+
+
+def _save(fig: Any, path: Path, *, dpi: int = 220) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=dpi)
+    return str(path)
+
+
+def _plot_family_points(
+    ax: Any,
+    df: pd.DataFrame,
+    *,
+    value_col: str,
+    families: list[str],
+    color: str,
+    ylabel: str,
+) -> np.ndarray:
+    x = np.arange(len(families), dtype=np.float64)
+    medians = []
+    for i, family in enumerate(families):
+        sub = df[df["family"].astype(str) == family]
+        vals = pd.to_numeric(sub[value_col], errors="coerce").dropna().to_numpy(dtype=np.float64)
+        med = float(np.nanmedian(vals)) if vals.size else float("nan")
+        medians.append(med)
+        if vals.size:
+            ax.bar(i, med, color=color, alpha=0.22, width=0.68, edgecolor="none", zorder=1)
+            jitter = np.linspace(-0.08, 0.08, vals.size) if vals.size > 1 else np.asarray([0.0])
+            ax.scatter(i + jitter, vals, s=42, color=color, edgecolor="white", linewidth=0.6, zorder=3)
+    ax.set_xticks(x, families)
+    ax.set_ylabel(ylabel)
+    ax.grid(axis="y", color="#dddddd", linewidth=0.7, alpha=0.7)
+    return np.asarray(medians, dtype=np.float64)
+
+
+def _add_panel_label(ax: Any, label: str) -> None:
+    ax.text(-0.12, 1.08, label, transform=ax.transAxes, fontsize=13, fontweight="bold", va="top", ha="left")
 
 
 def _plot_synthetic(output_root: Path, figures: Path) -> dict[str, str]:
@@ -128,6 +225,188 @@ def _plot_synthetic(output_root: Path, figures: Path) -> dict[str, str]:
         plt.close(fig)
         out_paths["synthetic_decomposition_grid"] = str(decomp)
     return out_paths
+
+
+def _plot_synthetic_summary_clean(output_root: Path, figures: Path) -> dict[str, str]:
+    scores = _synthetic_table(output_root, "per_family_scores")
+    role = _synthetic_table(output_root, "role_recovery")
+    event = _synthetic_table(output_root, "event_localization")
+    if scores.empty or "family" not in scores.columns or "score" not in scores.columns:
+        return {}
+    families = [f for f in _FAMILY_ORDER if f in set(scores["family"].astype(str))]
+    if not families:
+        return {}
+    amp_col = "amp" if "amp" in scores.columns else "delta_h_processed_mean"
+    if amp_col not in scores.columns:
+        amp_col = "delta_h_mean" if "delta_h_mean" in scores.columns else ""
+
+    plt = _ensure_matplotlib()
+    fig, axes = plt.subplots(2, 2, figsize=(11.0, 7.4), constrained_layout=True)
+    ax_a, ax_b, ax_c, ax_d = axes.ravel()
+
+    score_medians = _plot_family_points(
+        ax_a,
+        scores,
+        value_col="score",
+        families=families,
+        color="#4c78a8",
+        ylabel="selected MSPD score",
+    )
+    _maybe_log_y(ax_a, scores["score"])
+    ax_a.set_title("Selected MSPD by synthetic family")
+    _add_panel_label(ax_a, "A")
+    ax_a.text(0.5, 0.95, "null controls", transform=ax_a.get_xaxis_transform(), ha="center", va="top", fontsize=9, color="#555555")
+    positive_x = [families.index(fam) for fam in ("S6", "S8") if fam in families]
+    if positive_x:
+        ax_a.text(float(np.mean(positive_x)), 0.95, "positive controls", transform=ax_a.get_xaxis_transform(), ha="center", va="top", fontsize=9, color="#6f4e9b")
+
+    if amp_col:
+        _plot_family_points(
+            ax_b,
+            scores,
+            value_col=amp_col,
+            families=families,
+            color="#f58518",
+            ylabel="Delta-H amplitude / processed mean",
+        )
+        _maybe_log_y(ax_b, scores[amp_col])
+    ax_b.set_title("Delta-H amplitude")
+    _add_panel_label(ax_b, "B")
+
+    role_families = [f for f in ["S4", "S6", "S7", "S8"] if not role.empty and f in set(role["family"].astype(str))]
+    if role_families and "ari" in role.columns:
+        _plot_family_points(
+            ax_c,
+            role,
+            value_col="ari",
+            families=role_families,
+            color="#54a24b",
+            ylabel="role recovery ARI",
+        )
+        ax_c.axhline(1.0, color="#333333", linestyle="--", linewidth=1.0)
+        ax_c.set_ylim(-0.05, 1.08)
+    else:
+        ax_c.text(0.5, 0.5, "role recovery table missing", ha="center", va="center", transform=ax_c.transAxes)
+    ax_c.set_title("Role recovery")
+    _add_panel_label(ax_c, "C")
+
+    event_families = [f for f in ["S5", "S6", "S8"] if not event.empty and f in set(event["family"].astype(str))]
+    error_col = "event_error_steps" if "event_error_steps" in event.columns else "peak_error_steps"
+    if event_families and error_col in event.columns:
+        _plot_family_points(
+            ax_d,
+            event,
+            value_col=error_col,
+            families=event_families,
+            color="#b279a2",
+            ylabel="event localization error (steps)",
+        )
+        ax_d.axhline(0.0, color="#333333", linestyle="--", linewidth=1.0)
+        if "S5" in event_families:
+            ax_d.text(event_families.index("S5"), 0.96, "global switch edge case", transform=ax_d.get_xaxis_transform(), ha="center", va="top", fontsize=8, color="#555555")
+    else:
+        ax_d.text(0.5, 0.5, "event localization table missing", ha="center", va="center", transform=ax_d.transAxes)
+    ax_d.set_title("Event localization")
+    _add_panel_label(ax_d, "D")
+
+    for ax in axes.ravel():
+        ax.tick_params(axis="both", labelsize=9)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    out = figures / "synthetic_calibration_summary_clean.png"
+    _save(fig, out)
+    plt.close(fig)
+    return {"synthetic_calibration_summary_clean": str(out)}
+
+
+def _metric_window_centers(data: Any) -> np.ndarray:
+    starts = np.asarray(data["window_start_steps"], dtype=np.float64) if "window_start_steps" in data.files else np.arange(np.asarray(data["delta_h_map"]).shape[1], dtype=np.float64)
+    window_size = 0.0
+    if "_metric_config_json" in data.files:
+        try:
+            cfg = json.loads(str(np.asarray(data["_metric_config_json"]).item()))
+            window_size = float(cfg.get("window_size_steps", cfg.get("window_size_frames", 0.0)))
+        except Exception:
+            window_size = 0.0
+    return starts + 0.5 * window_size
+
+
+def _load_synthetic_heatmap_item(row: pd.Series) -> dict[str, Any] | None:
+    path = Path(str(row.get("metrics_path", "")))
+    if not path.exists():
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            key = "delta_h_processed_map" if "delta_h_processed_map" in data.files else "delta_h_map"
+            z = np.asarray(data[key], dtype=np.float64)
+            tau = np.asarray(data["tau_steps"], dtype=np.float64) if "tau_steps" in data.files else np.arange(z.shape[0], dtype=np.float64)
+            centers = _metric_window_centers(data)
+    except Exception:
+        return None
+    if z.ndim != 2 or z.size == 0:
+        return None
+    return {"z": z, "tau": tau, "centers": centers, "path": str(path)}
+
+
+def _plot_synthetic_delta_h_heatmaps_clean(output_root: Path, figures: Path) -> dict[str, str]:
+    scores = _synthetic_table(output_root, "per_family_scores")
+    events = _synthetic_table(output_root, "event_localization")
+    if scores.empty or "family" not in scores.columns or "metrics_path" not in scores.columns:
+        return {}
+    families = [f for f in ["S0", "S1", "S4", "S6", "S8"] if f in set(scores["family"].astype(str))]
+    loaded: list[tuple[str, dict[str, Any]]] = []
+    for family in families:
+        sub = scores[scores["family"].astype(str) == family].sort_values("seed" if "seed" in scores.columns else "family")
+        if sub.empty:
+            continue
+        item = _load_synthetic_heatmap_item(sub.iloc[0])
+        if item is not None:
+            loaded.append((family, item))
+    if not loaded:
+        return {}
+    finite_vals = np.concatenate([item["z"][np.isfinite(item["z"])] for _family, item in loaded if np.any(np.isfinite(item["z"]))])
+    vmax = float(np.nanpercentile(finite_vals, 99.0)) if finite_vals.size else 1.0
+    vmax = max(vmax, 1e-12)
+
+    plt = _ensure_matplotlib()
+    fig, axes = plt.subplots(1, len(loaded), figsize=(3.0 * len(loaded) + 0.9, 3.8), constrained_layout=True, squeeze=False)
+    ims = []
+    for ax, (family, item) in zip(axes.ravel(), loaded, strict=True):
+        z = item["z"]
+        tau = item["tau"]
+        centers = item["centers"]
+        x0, x1 = float(np.nanmin(centers)), float(np.nanmax(centers))
+        if centers.size > 1:
+            step = float(np.nanmedian(np.diff(centers)))
+            x0 -= 0.5 * step
+            x1 += 0.5 * step
+        y0, y1 = float(np.nanmin(tau)), float(np.nanmax(tau))
+        im = ax.imshow(z, aspect="auto", origin="lower", interpolation="nearest", extent=[x0, x1, y0, y1], cmap="magma", vmin=0.0, vmax=vmax)
+        ims.append(im)
+        if family in {"S6", "S8"} and not events.empty:
+            ev = events[events["family"].astype(str) == family]
+            if not ev.empty and {"event_start", "event_end"}.issubset(ev.columns):
+                for rec in ev.itertuples():
+                    ax.axvspan(
+                        float(rec.event_start),
+                        float(rec.event_end),
+                        facecolor="#6baed6",
+                        edgecolor="#2166ac",
+                        alpha=0.22,
+                        linewidth=1.0,
+                        zorder=3,
+                    )
+        ax.set_title(family, fontsize=13, fontweight="bold")
+        ax.set_xlabel("window center step", fontsize=10)
+        ax.tick_params(axis="both", labelsize=9)
+    axes.ravel()[0].set_ylabel("tau", fontsize=10)
+    cbar = fig.colorbar(ims[-1], ax=axes.ravel().tolist(), fraction=0.025, pad=0.015)
+    cbar.set_label("processed Delta-H", fontsize=10)
+    out = figures / "synthetic_delta_h_heatmaps_clean.png"
+    _save(fig, out)
+    plt.close(fig)
+    return {"synthetic_delta_h_heatmaps_clean": str(out)}
 
 
 def _plot_c1_tau_profiles(dataset: str, ds_dir: Path, figures: Path) -> dict[str, str]:
@@ -240,6 +519,113 @@ def _load_c1_eval_map(row: pd.Series) -> dict[str, Any] | None:
     except Exception:
         return None
     return out
+
+
+def _selected_eval_scores_from_tau_table(path: Path) -> pd.DataFrame:
+    if not path.exists() or path.stat().st_size <= 1:
+        return pd.DataFrame()
+    raw = pd.read_csv(path)
+    required = {"group", "candidate_kind", "candidate_idx", "split", "tau_steps", "score"}
+    if raw.empty or not required.issubset(raw.columns):
+        return pd.DataFrame()
+    rows = []
+    for (group, kind, candidate_idx), sub in raw.groupby(["group", "candidate_kind", "candidate_idx"], dropna=False):
+        sel = sub[sub["split"].astype(str) == "selection"].copy()
+        ev = sub[sub["split"].astype(str) == "eval"].copy()
+        if sel.empty:
+            continue
+        sel["score_numeric"] = pd.to_numeric(sel["score"], errors="coerce")
+        sel = sel.dropna(subset=["score_numeric"])
+        if sel.empty:
+            continue
+        tau = sel.loc[sel["score_numeric"].idxmax(), "tau_steps"]
+        ev_same = ev[pd.to_numeric(ev["tau_steps"], errors="coerce") == float(tau)]
+        if ev_same.empty:
+            continue
+        score = pd.to_numeric(ev_same.iloc[0]["score"], errors="coerce")
+        if not np.isfinite(float(score)):
+            continue
+        rows.append(
+            {
+                "optimized_run_idx": group,
+                "candidate_kind": str(kind),
+                "candidate_idx": candidate_idx,
+                "eval_score_mspd": float(score),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _load_c1_raw_scores(ds_dir: Path) -> pd.DataFrame:
+    path = ds_dir / "checkpoint_scores.csv"
+    if path.exists() and path.stat().st_size > 1:
+        df = pd.read_csv(path)
+        if not df.empty and {"candidate_kind", "eval_score_mspd"}.issubset(df.columns):
+            if "optimized_run_idx" not in df.columns:
+                group_col = "group" if "group" in df.columns else None
+                if group_col is not None:
+                    df["optimized_run_idx"] = df[group_col]
+            if "optimized_run_idx" in df.columns:
+                return df
+    return _selected_eval_scores_from_tau_table(ds_dir / "c1_tau_opt_random_by_item.csv")
+
+
+def _c1_group_deltas(raw: pd.DataFrame) -> tuple[list[Any], np.ndarray, dict[Any, np.ndarray], dict[Any, float]]:
+    groups = []
+    deltas = []
+    random_values: dict[Any, np.ndarray] = {}
+    optimized_values: dict[Any, float] = {}
+    if raw.empty:
+        return groups, np.asarray([], dtype=np.float64), random_values, optimized_values
+    raw = raw.copy()
+    raw["score_numeric"] = pd.to_numeric(raw["eval_score_mspd"], errors="coerce")
+    for group, sub in raw.groupby("optimized_run_idx", sort=True):
+        opt = sub[sub["candidate_kind"].astype(str) == "optimized"]["score_numeric"].dropna().to_numpy(dtype=np.float64)
+        rand = sub[sub["candidate_kind"].astype(str) == "random"]["score_numeric"].dropna().to_numpy(dtype=np.float64)
+        if opt.size == 0 or rand.size == 0:
+            continue
+        opt_val = float(opt[0])
+        rand_med = float(np.nanmedian(rand))
+        groups.append(group)
+        deltas.append(opt_val - rand_med)
+        random_values[group] = rand
+        optimized_values[group] = opt_val
+    return groups, np.asarray(deltas, dtype=np.float64), random_values, optimized_values
+
+
+def _plot_c1_paired_raw_clean(dataset: str, ds_dir: Path, figures: Path) -> dict[str, str]:
+    raw = _load_c1_raw_scores(ds_dir)
+    groups, deltas, random_values, optimized_values = _c1_group_deltas(raw)
+    if not groups:
+        return {}
+    stats = sign_test_greater(deltas)
+    plt = _ensure_matplotlib()
+    fig, ax = plt.subplots(figsize=(max(6.2, 0.62 * len(groups) + 2.2), 4.2), constrained_layout=True)
+    for i, group in enumerate(groups):
+        rand = random_values[group]
+        opt = optimized_values[group]
+        jitter = np.linspace(-0.11, 0.11, rand.size) if rand.size > 1 else np.asarray([0.0])
+        ax.scatter(i + jitter, rand, s=28, color="#9a9a9a", alpha=0.85, edgecolor="white", linewidth=0.4, zorder=2)
+        rand_med = float(np.nanmedian(rand))
+        ax.plot([i - 0.18, i + 0.18], [rand_med, rand_med], color="#222222", linewidth=1.4, zorder=3)
+        ax.plot([i, i], [rand_med, opt], color="#777777", linewidth=0.9, alpha=0.65, zorder=1)
+        ax.scatter(i, opt, s=76, color="#4c78a8", edgecolor="white", linewidth=0.8, zorder=4)
+    ax.set_xticks(np.arange(len(groups)), [str(g) for g in groups], rotation=35 if len(groups) > 10 else 0, ha="right" if len(groups) > 10 else "center")
+    ax.set_xlabel("matched group id")
+    ax.set_ylabel("held-out MSPD score")
+    text = (
+        f"n_positive={stats['n_positive']}/{stats['n_nonzero']}   "
+        f"median_delta={float(stats['median']):.3g}   "
+        f"sign_test_p={_format_p(stats['sign_test_greater_p'])}"
+    )
+    ax.set_title(f"C1 optimized vs matched random controls: {dataset}\n{text}")
+    ax.grid(axis="y", color="#dddddd", linewidth=0.7, alpha=0.75)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    out = figures / f"c1_{dataset}_paired_raw_clean.png"
+    _save(fig, out)
+    plt.close(fig)
+    return {f"c1_{dataset}_paired_raw_clean": str(out)}
 
 
 def _symmetric_heatmap_limit(arrays: list[np.ndarray], *, percentile: float = 98.0) -> float:
@@ -485,27 +871,223 @@ def _plot_c5(dataset: str, ds_dir: Path, figures: Path) -> dict[str, str]:
     return paths
 
 
-def _plot_cross(output_root: Path, figures: Path) -> dict[str, str]:
-    path = output_root / "cross_substrate_summary.csv"
-    if not path.exists():
+def _preferred_c5_delta_col(df: pd.DataFrame) -> str | None:
+    delta_cols = [c for c in df.columns if c.endswith("__delta_vs_random_median")]
+    preferred_names = [
+        "embedding_cloud_chamfer_cosine__anchor_effect_minus_baseline__delta_vs_random_median",
+        "anchor_effect_minus_baseline__delta_vs_random_median",
+        "embedding_synced_cosine__anchor_effect_minus_baseline__delta_vs_random_median",
+    ]
+    for name in preferred_names:
+        if name in delta_cols:
+            return name
+    preferred = [c for c in delta_cols if "embedding" in c and "minus_baseline" in c]
+    return preferred[0] if preferred else (delta_cols[0] if delta_cols else None)
+
+
+def _preferred_c5_metric_name(metrics: list[str]) -> str | None:
+    preferred = [
+        "embedding_cloud_chamfer_cosine__anchor_effect_minus_baseline",
+        "anchor_effect_minus_baseline",
+        "embedding_synced_cosine__anchor_effect_minus_baseline",
+    ]
+    for name in preferred:
+        if name in metrics:
+            return name
+    emb = [m for m in metrics if "embedding" in m and "minus_baseline" in m]
+    return emb[0] if emb else (metrics[0] if metrics else None)
+
+
+def _parse_random_values(value: Any) -> np.ndarray:
+    if value is None or (isinstance(value, float) and not np.isfinite(value)):
+        return np.asarray([], dtype=np.float64)
+    parts = str(value).replace(",", ";").split(";")
+    vals = []
+    for part in parts:
+        try:
+            v = float(part)
+        except Exception:
+            continue
+        if np.isfinite(v):
+            vals.append(v)
+    return np.asarray(vals, dtype=np.float64)
+
+
+def _c5_raw_delta_frame(ds_dir: Path) -> pd.DataFrame:
+    run_path = ds_dir / "frustration_run_level.csv"
+    if run_path.exists() and run_path.stat().st_size > 1:
+        run_df = pd.read_csv(run_path)
+        col = _preferred_c5_delta_col(run_df)
+        if col is not None:
+            rand_col = col.replace("__delta_vs_random_median", "__random_median")
+            metric = col.replace("__delta_vs_random_median", "")
+            out = pd.DataFrame(
+                {
+                    "group": run_df["optimized_run_idx"].to_numpy() if "optimized_run_idx" in run_df.columns else np.arange(len(run_df)),
+                    "delta": pd.to_numeric(run_df[col], errors="coerce"),
+                    "random_median": pd.to_numeric(run_df[rand_col], errors="coerce") if rand_col in run_df.columns else np.nan,
+                    "metric": metric,
+                }
+            )
+            return out.dropna(subset=["delta"])
+
+    point_path = ds_dir / "frustration_pointwise_opt_gt_random_by_group.csv"
+    if not point_path.exists() or point_path.stat().st_size <= 1:
+        return pd.DataFrame()
+    point_df = pd.read_csv(point_path)
+    if point_df.empty or not {"metric", "optimized_run_idx", "opt_value", "random_values"}.issubset(point_df.columns):
+        return pd.DataFrame()
+    metric = _preferred_c5_metric_name([str(x) for x in point_df["metric"].dropna().unique().tolist()])
+    if metric is None:
+        return pd.DataFrame()
+    rows = []
+    sub = point_df[point_df["metric"].astype(str) == metric]
+    for rec in sub.itertuples():
+        rand = _parse_random_values(getattr(rec, "random_values"))
+        try:
+            opt = float(getattr(rec, "opt_value"))
+        except Exception:
+            continue
+        if rand.size == 0 or not np.isfinite(opt):
+            continue
+        rows.append(
+            {
+                "group": getattr(rec, "optimized_run_idx"),
+                "delta": opt - float(np.nanmedian(rand)),
+                "random_median": float(np.nanmedian(rand)),
+                "random_values": rand,
+                "metric": metric,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _plot_c5_frustration_clean(dataset: str, ds_dir: Path, figures: Path) -> dict[str, str]:
+    df = _c5_raw_delta_frame(ds_dir)
+    if df.empty or "delta" not in df.columns:
         return {}
-    df = pd.read_csv(path)
-    if df.empty or "median" not in df.columns:
+    y = pd.to_numeric(df["delta"], errors="coerce").to_numpy(dtype=np.float64)
+    finite = np.isfinite(y)
+    if not np.any(finite):
+        return {}
+    groups = df["group"].to_numpy() if "group" in df.columns else np.arange(len(df))
+    stats = sign_test_greater(y[finite])
+    plt = _ensure_matplotlib()
+    fig, ax = plt.subplots(figsize=(max(6.2, 0.62 * len(y) + 2.2), 4.0), constrained_layout=True)
+    x = np.arange(len(y), dtype=np.float64)
+    colors = np.where(y >= 0, "#2ca02c", "#d62728")
+    ax.axhline(0.0, color="#333333", linewidth=1.0)
+    ax.bar(x[finite], y[finite], color=colors[finite], alpha=0.82, width=0.62)
+    ax.scatter(x[finite], y[finite], color=colors[finite], edgecolor="white", linewidth=0.6, s=44, zorder=3)
+    ax.set_xticks(x, [str(g) for g in groups], rotation=35 if len(groups) > 10 else 0, ha="right" if len(groups) > 10 else "center")
+    ax.set_xlabel("matched group id")
+    ax.set_ylabel("F(opt) - median F(random)")
+    metric_label = str(df["metric"].iloc[0]) if "metric" in df.columns and not df.empty else "frustration"
+    text = (
+        f"n_positive={stats['n_positive']}/{stats['n_nonzero']}   "
+        f"median_delta={float(stats['median']):.3g}   "
+        f"sign_test_p={_format_p(stats['sign_test_greater_p'])}"
+    )
+    ax.set_title(f"C5 frustration contrast: {dataset}\n{text}")
+    ax.grid(axis="y", color="#dddddd", linewidth=0.7, alpha=0.75)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.text(0.01, -0.22, f"metric: {metric_label}", transform=ax.transAxes, ha="left", va="top", fontsize=8, color="#555555")
+    out = figures / f"c5_{dataset}_frustration_clean.png"
+    _save(fig, out)
+    plt.close(fig)
+    return {f"c5_{dataset}_frustration_clean": str(out)}
+
+
+def _bootstrap_median_ci(values: np.ndarray, *, n_boot: int = 2000) -> tuple[float, float] | None:
+    arr = np.asarray(values, dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    if arr.size < 2:
+        return None
+    rng = np.random.default_rng(12345)
+    boots = np.empty(n_boot, dtype=np.float64)
+    for i in range(n_boot):
+        boots[i] = float(np.nanmedian(rng.choice(arr, size=arr.size, replace=True)))
+    return float(np.nanpercentile(boots, 2.5)), float(np.nanpercentile(boots, 97.5))
+
+
+def _claim_deltas_for_cross(output_root: Path, dataset: str, kind: str) -> tuple[np.ndarray, float, str] | None:
+    ds_dir = output_root / dataset
+    if kind == "c1":
+        raw = _load_c1_raw_scores(ds_dir)
+        _groups, deltas, random_values, _optimized = _c1_group_deltas(raw)
+        if deltas.size == 0:
+            return None
+        rand_all = np.concatenate(list(random_values.values())) if random_values else deltas
+        return deltas, _mad_or_eps(rand_all), "held-out MSPD"
+    df = _c5_raw_delta_frame(ds_dir)
+    if df.empty:
+        return None
+    deltas = pd.to_numeric(df["delta"], errors="coerce").to_numpy(dtype=np.float64)
+    if "random_values" in df.columns:
+        random_chunks = [np.asarray(v, dtype=np.float64) for v in df["random_values"] if isinstance(v, np.ndarray) and v.size]
+        denom_source = np.concatenate(random_chunks) if random_chunks else pd.to_numeric(df.get("random_median", pd.Series(dtype=float)), errors="coerce").to_numpy(dtype=np.float64)
+    else:
+        denom_source = pd.to_numeric(df.get("random_median", pd.Series(dtype=float)), errors="coerce").to_numpy(dtype=np.float64)
+    metric = str(df["metric"].iloc[0]) if "metric" in df.columns and not df.empty else "frustration"
+    return deltas[np.isfinite(deltas)], _mad_or_eps(denom_source), metric
+
+
+def _plot_cross(output_root: Path, figures: Path) -> dict[str, str]:
+    rows = [
+        ("flow_lenia", "Flow-Lenia C1 MSPD contrast", "c1"),
+        ("flow_lenia", "Flow-Lenia C5 frustration contrast", "c5"),
+        ("plife_plus", "PLife++ C6.1 MSPD contrast", "c1"),
+        ("plife_plus", "PLife++ C6.5 frustration contrast", "c5"),
+    ]
+    items = []
+    for dataset, label, kind in rows:
+        loaded = _claim_deltas_for_cross(output_root, dataset, kind)
+        if loaded is None:
+            continue
+        deltas, denom, metric = loaded
+        z = np.asarray(deltas, dtype=np.float64) / float(denom)
+        z = z[np.isfinite(z)]
+        if z.size == 0:
+            continue
+        items.append((label, z, sign_test_greater(deltas), metric, denom))
+    if not items:
         return {}
     plt = _ensure_matplotlib()
-    fig, ax = plt.subplots(figsize=(7, 3.8))
-    labels = [f"{r.dataset}\n{r.claim}" for r in df.itertuples()]
-    vals = df["median"].astype(float).to_numpy()
-    ax.axhline(0.0, color="#777777", linewidth=1)
-    ax.bar(np.arange(vals.size), vals, color="#4c78a8")
-    ax.set_xticks(np.arange(vals.size), labels, rotation=30, ha="right")
-    ax.set_ylabel("median delta")
-    ax.set_title("Cross-substrate paper-suite effects")
-    fig.tight_layout()
-    out = figures / "c6_cross_substrate_effects.png"
-    fig.savefig(out, dpi=180)
+    fig, ax = plt.subplots(figsize=(9.0, max(3.8, 0.82 * len(items) + 1.4)), constrained_layout=True)
+    ax.axvline(0.0, color="#333333", linewidth=1.0)
+    y_positions = np.arange(len(items), dtype=np.float64)
+    for y, (label, z, stats, metric, denom) in zip(y_positions, items, strict=True):
+        jitter = np.linspace(-0.09, 0.09, z.size) if z.size > 1 else np.asarray([0.0])
+        ax.scatter(z, y + jitter, color="#4c78a8", alpha=0.72, s=36, edgecolor="white", linewidth=0.5)
+        med = float(np.nanmedian(z))
+        ci = _bootstrap_median_ci(z)
+        if ci is not None:
+            ax.plot([ci[0], ci[1]], [y, y], color="#111111", linewidth=2.0)
+        ax.scatter(med, y, s=90, color="#111111", edgecolor="white", linewidth=0.8, zorder=4)
+        ax.text(
+            0.99,
+            y,
+            f"n+={stats['n_positive']}/{stats['n_nonzero']}, p={_format_p(stats['sign_test_greater_p'])}",
+            transform=ax.get_yaxis_transform(),
+            ha="right",
+            va="center",
+            fontsize=9,
+            color="#333333",
+        )
+    ax.set_yticks(y_positions, [item[0] for item in items])
+    ax.invert_yaxis()
+    ax.set_xlabel("normalized matched delta, delta / (MAD random + eps)")
+    ax.set_title("Cross-substrate normalized effect-size summary")
+    ax.grid(axis="x", color="#dddddd", linewidth=0.7, alpha=0.75)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    out = figures / "cross_substrate_effects_clean.png"
+    _save(fig, out)
+    alias = figures / "c6_cross_substrate_effects.png"
+    _save(fig, alias)
     plt.close(fig)
-    return {"c6_cross_substrate_effects": str(out)}
+    return {"cross_substrate_effects_clean": str(out), "c6_cross_substrate_effects": str(alias)}
 
 
 def _plot_c2_branching_one(output_root: Path, figures: Path, *, suffix: str, label: str) -> dict[str, str]:
@@ -590,6 +1172,100 @@ def _plot_c2_branching(output_root: Path, figures: Path) -> dict[str, str]:
     return paths
 
 
+def _rank_correlation(x: np.ndarray, y: np.ndarray) -> float:
+    rx = pd.Series(x).rank(method="average").to_numpy(dtype=np.float64)
+    ry = pd.Series(y).rank(method="average").to_numpy(dtype=np.float64)
+    if rx.size < 2 or float(np.nanstd(rx)) <= 1e-12 or float(np.nanstd(ry)) <= 1e-12:
+        return float("nan")
+    return float(np.corrcoef(rx, ry)[0, 1])
+
+
+def _bootstrap_regression_band(x: np.ndarray, y: np.ndarray, x_grid: np.ndarray, *, n_boot: int = 1000) -> tuple[np.ndarray, np.ndarray] | None:
+    if x.size < 3:
+        return None
+    rng = np.random.default_rng(54321)
+    preds = []
+    for _ in range(n_boot):
+        idx = rng.integers(0, x.size, size=x.size)
+        xb = x[idx]
+        yb = y[idx]
+        if float(np.nanstd(xb)) <= 1e-12:
+            continue
+        coef = np.polyfit(xb, yb, deg=1)
+        preds.append(coef[0] * x_grid + coef[1])
+    if not preds:
+        return None
+    arr = np.vstack(preds)
+    return np.nanpercentile(arr, 2.5, axis=0), np.nanpercentile(arr, 97.5, axis=0)
+
+
+def _plot_c2_clip_chamfer_association_clean(output_root: Path, figures: Path) -> dict[str, str]:
+    scores_path = output_root / "c2_branching" / "branching_scores_clip_chamfer.csv"
+    if not scores_path.exists() or scores_path.stat().st_size <= 1:
+        return {}
+    scores = pd.read_csv(scores_path)
+    if scores.empty or not {"delta_h", "branching_score"}.issubset(scores.columns):
+        return {}
+    x = pd.to_numeric(scores["delta_h"], errors="coerce").to_numpy(dtype=np.float64)
+    y = pd.to_numeric(scores["branching_score"], errors="coerce").to_numpy(dtype=np.float64)
+    finite = np.isfinite(x) & np.isfinite(y)
+    x = x[finite]
+    y = y[finite]
+    sub = scores.loc[finite].copy()
+    if x.size < 2:
+        return {}
+    if "condition" in sub.columns:
+        strata = sub["condition"].astype(str).to_numpy()
+    else:
+        q = pd.qcut(pd.Series(x), q=min(3, np.unique(x).size), labels=False, duplicates="drop")
+        labels = np.asarray(["low", "mid", "high"])
+        strata = labels[np.asarray(q.fillna(0), dtype=int).clip(0, labels.size - 1)]
+    palette = {"low": "#4c78a8", "mid": "#f58518", "high": "#d62728"}
+    colors = [palette.get(str(s), "#6f4e9b") for s in strata]
+    pearson = float(np.corrcoef(x, y)[0, 1]) if float(np.nanstd(x)) > 1e-12 and float(np.nanstd(y)) > 1e-12 else float("nan")
+    spearman = _rank_correlation(x, y)
+
+    plt = _ensure_matplotlib()
+    fig, ax = plt.subplots(figsize=(7.0, 5.0), constrained_layout=True)
+    for stratum in ["low", "mid", "high"]:
+        mask = np.asarray([str(s) == stratum for s in strata])
+        if np.any(mask):
+            ax.scatter(x[mask], y[mask], s=48, color=palette[stratum], alpha=0.86, edgecolor="white", linewidth=0.6, label=stratum)
+    other = np.asarray([str(s) not in palette for s in strata])
+    if np.any(other):
+        ax.scatter(x[other], y[other], s=48, color="#6f4e9b", alpha=0.86, edgecolor="white", linewidth=0.6, label="sampled")
+    if x.size >= 2 and float(np.nanstd(x)) > 1e-12:
+        coef = np.polyfit(x, y, deg=1)
+        x_grid = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 160)
+        y_hat = coef[0] * x_grid + coef[1]
+        band = _bootstrap_regression_band(x, y, x_grid)
+        if band is not None:
+            ax.fill_between(x_grid, band[0], band[1], color="#333333", alpha=0.14, linewidth=0)
+        ax.plot(x_grid, y_hat, color="#333333", linewidth=1.5)
+    ax.set_xlabel("Delta-H at branch time")
+    ax.set_ylabel("future CLIP-Chamfer branch divergence")
+    ax.set_title(f"C2 Delta-H / CLIP-Chamfer association\nPearson r={pearson:.3g}, Spearman r={spearman:.3g}, n={x.size}")
+    ax.text(
+        0.02,
+        0.02,
+        "stratified branch sample; correlation is descriptive across sampled branch states.",
+        transform=ax.transAxes,
+        ha="left",
+        va="bottom",
+        fontsize=9,
+        color="#333333",
+        bbox={"facecolor": "white", "edgecolor": "#cccccc", "alpha": 0.92, "pad": 3},
+    )
+    ax.grid(color="#dddddd", linewidth=0.7, alpha=0.75)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(title="Delta-H stratum", frameon=False, loc="best")
+    out = figures / "c2_clip_chamfer_association_clean.png"
+    _save(fig, out)
+    plt.close(fig)
+    return {"c2_clip_chamfer_association_clean": str(out)}
+
+
 def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, force: bool = False) -> dict[str, Any]:
     cfg, _ = load_config(config_path, smoke=smoke)
     output_root = _output_root(cfg)
@@ -598,16 +1274,21 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
     log_event(f"visualization start task={task} smoke={smoke} force={force} figures={figures}", component="visualization")
     if task in {"all", "synthetic"}:
         paths.update(_plot_synthetic(output_root, figures))
+        paths.update(_plot_synthetic_summary_clean(output_root, figures))
+        paths.update(_plot_synthetic_delta_h_heatmaps_clean(output_root, figures))
         synthetic_result = visualize_synthetic(config_path, smoke=smoke, force=force)
         paths.update({str(k): str(v) for k, v in synthetic_result.get("figure_paths", {}).items()})
     if task in {"all", "c2"}:
         paths.update(_plot_c2_branching(output_root, figures))
+        paths.update(_plot_c2_clip_chamfer_association_clean(output_root, figures))
     if task in {"all", "c1", "c5", "c6"}:
         for dataset, _ds in dataset_items(cfg):
             ds_dir = output_root / dataset
             if task in {"all", "c1", "c6"}:
+                paths.update(_plot_c1_paired_raw_clean(dataset, ds_dir, figures))
                 paths.update(_plot_c1(dataset, ds_dir, figures))
             if task in {"all", "c5", "c6"}:
+                paths.update(_plot_c5_frustration_clean(dataset, ds_dir, figures))
                 paths.update(_plot_c5(dataset, ds_dir, figures))
         paths.update(_plot_cross(output_root, figures))
     write_json(output_root / "visualization_summary.json", {"figure_paths": paths})
