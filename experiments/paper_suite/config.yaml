@@ -118,7 +118,7 @@ datasets:
       source: lagrangian_root
       lagrangian_root: experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k
       require_random: true
-      expected_trajectory_start_steps: 20000
+      expected_trajectory_start_steps: 4000
       expected_trajectory_end_steps: 24000
       metric:
         metric_tau_mode: fixed
