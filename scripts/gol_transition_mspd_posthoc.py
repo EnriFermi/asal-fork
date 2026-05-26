@@ -182,6 +182,8 @@ def _experiment_config_from_dict(payload: dict[str, Any]) -> ExperimentConfig:
 
 
 def _load_config(input_dir: Path) -> tuple[str, ExperimentConfig]:
+    if not input_dir.exists():
+        raise FileNotFoundError(f"CA MSPD input_dir does not exist: {input_dir}")
     rule_cfg = input_dir / "rule_sweep_config.json"
     ga_cfg = input_dir / "config.json"
     if rule_cfg.exists():
@@ -189,19 +191,40 @@ def _load_config(input_dir: Path) -> tuple[str, ExperimentConfig]:
         return "rule_sweep", _experiment_config_from_dict(payload.get("base_config", {}))
     if ga_cfg.exists():
         return "ga_initial_board", _experiment_config_from_dict(json.loads(ga_cfg.read_text()))
-    raise FileNotFoundError(f"No rule_sweep_config.json or config.json in {input_dir}")
+    raise FileNotFoundError(
+        f"No rule_sweep_config.json or config.json in {input_dir}. "
+        "Point --input-dir at a completed GoL/CA MSPD result directory, or set input_dir: null "
+        "in experiments/gol_transition_mspd/ca_posthoc_claims.yaml to auto-pick the latest completed run."
+    )
 
 
-def _latest_completed_input_dir(root: Path) -> Path:
+def _completed_input_dirs(root: Path) -> list[Path]:
     candidates: list[Path] = []
     for path in root.glob("*"):
         if not path.is_dir():
             continue
-        if (path / "best_rule_result.npz").exists() or (path / "best_result.npz").exists():
+        has_result = (path / "best_rule_result.npz").exists() or (path / "best_result.npz").exists()
+        has_config = (path / "rule_sweep_config.json").exists() or (path / "config.json").exists()
+        if has_result and has_config:
             candidates.append(path)
+    return sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _latest_completed_input_dir(root: Path) -> Path:
+    candidates = _completed_input_dirs(root)
     if not candidates:
-        raise FileNotFoundError(f"No completed GoL MSPD result directories found under {root}")
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+        partials = sorted(
+            [p for p in root.glob("*") if p.is_dir() and ((p / "rule_sweep_config.json").exists() or (p / "config.json").exists())],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )[:10]
+        partial_msg = "\n".join(f"  partial: {p}" for p in partials)
+        raise FileNotFoundError(
+            f"No completed GoL MSPD result directories found under {root}. "
+            "Completed means best_rule_result.npz or best_result.npz plus rule_sweep_config.json/config.json.\n"
+            + (partial_msg if partial_msg else "No partial config directories found either.")
+        )
+    return candidates[0]
 
 
 def _load_rule_sweep_scores(per_init_path: Path) -> tuple[dict[int, dict[int, float]], dict[int, str]]:
@@ -1005,6 +1028,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     loaded = load_ca_result(input_dir)
     backend = cfg.get("backend") or loaded.config.backend
+    completed_dirs = _completed_input_dirs(_resolve_path(cfg["results_root"]))[:10]
     _log(
         "CA MSPD posthoc start: "
         f"mode={loaded.mode} input_dir={input_dir} output_dir={output_dir} "
@@ -1018,6 +1042,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "best_rule_id": loaded.best_rule_id,
         "best_rule_label": loaded.best_rule_label,
         "config": cfg,
+        "available_completed_input_dirs": [str(path) for path in completed_dirs],
     }
     if cfg["task"] in {"all", "c1"}:
         _log("C1: optimized-vs-random MSPD contrast")
