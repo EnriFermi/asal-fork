@@ -112,7 +112,7 @@ rollout:
 
 minibang:
   checkpoint_dir: experiments/opt_msc/checkpoints/test_run_longrun_check
-  output_root: experiments/opt_msc/checkpoints/minibang_golden_set/run_longrun_check_v2
+  output_root: experiments/flow_lenia_mspd/checkpoints/minibang_golden_set/run_longrun_check_v2
   n_trajectories: 100
   batch_size: 20 
   selection_mode: loss_quantile_biased
