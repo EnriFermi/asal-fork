@@ -1362,6 +1362,108 @@ def _plot_synthetic_msc_by_scale_from_table(
     return {"synthetic_msc_by_scale": str(out_suite), "synthetic_msc_by_scale_local": str(out_local)}, []
 
 
+def _frame_indices_for_montage(T: int, n_frames: int) -> np.ndarray:
+    if T <= 0:
+        return np.asarray([], dtype=np.int32)
+    n = max(1, min(int(n_frames), int(T)))
+    return np.unique(np.linspace(0, int(T) - 1, num=n, dtype=np.int32))
+
+
+def _plot_synthetic_frame_montage(
+    *,
+    cfg: Any,
+    dirs: dict[str, Path],
+    suite_figures: Path,
+    force: bool,
+) -> tuple[dict[str, str], list[dict[str, Any]]]:
+    syn = cfg.get("synthetic", {})
+    vis_cfg = syn.get("visualization", {}) if syn is not None else {}
+    families = [str(x) for x in (syn.get("families", list(FAMILIES)) or list(FAMILIES))]
+    families = [family for family in FAMILIES if family in set(families)]
+    seed = _cfg_int(vis_cfg, "frame_montage_seed", 0)
+    n_frames = _cfg_int(vis_cfg, "frame_montage_frames", 6)
+    max_particles = _cfg_optional_int(vis_cfg, "frame_montage_max_particles")
+    out_suite = suite_figures / "synthetic_frame_montage.png"
+    out_local = dirs["figures"] / "synthetic_frame_montage.png"
+    sim_paths = [dirs["simulation"] / f"{family}_seed_{seed:03d}.npz" for family in families]
+    missing = [str(path) for path in sim_paths if not path.exists()]
+    if missing:
+        return {}, [
+            {
+                "artifact": "synthetic_frame_montage",
+                "status": "missing_inputs",
+                "message": ";".join(missing),
+                "path": str(out_suite),
+            }
+        ]
+    if _figure_fresh(out_suite, sim_paths, force=force) and _figure_fresh(out_local, sim_paths, force=force):
+        return {"synthetic_frame_montage": str(out_suite), "synthetic_frame_montage_local": str(out_local)}, []
+
+    payloads = [(family, _load_simulation_payload(path), path) for family, path in zip(families, sim_paths, strict=True)]
+    if not payloads:
+        return {}, [
+            {
+                "artifact": "synthetic_frame_montage",
+                "status": "empty_inputs",
+                "message": "no configured families",
+                "path": str(out_suite),
+            }
+        ]
+    T_values = [int(np.asarray(payload["xy"]).shape[0]) for _family, payload, _path in payloads]
+    T = min(T_values)
+    frame_idx = _frame_indices_for_montage(T, n_frames)
+    if frame_idx.size == 0:
+        return {}, [
+            {
+                "artifact": "synthetic_frame_montage",
+                "status": "empty_trajectory",
+                "message": "T=0",
+                "path": str(out_suite),
+            }
+        ]
+
+    plt = _ensure_matplotlib()
+    palette = _label_palette_rgb().astype(np.float32) / 255.0
+    fig_w = max(7.5, 1.75 * float(frame_idx.size))
+    fig_h = max(5.0, 1.25 * float(len(payloads)))
+    fig, axes = plt.subplots(len(payloads), frame_idx.size, figsize=(fig_w, fig_h), squeeze=False)
+    for row_idx, (family, payload, _path) in enumerate(payloads):
+        xy = np.asarray(payload["xy"], dtype=np.float32)
+        labels = np.asarray(payload["labels"], dtype=np.int32).reshape(-1)
+        labels_t = payload.get("labels_t")
+        metadata = dict(payload.get("metadata", {}))
+        domain = float(metadata.get("domain_size", syn.get("domain_size", 1.0)))
+        particle_ids = np.arange(xy.shape[1], dtype=np.int32)
+        if max_particles is not None and particle_ids.size > int(max_particles):
+            particle_ids = particle_ids[: max(0, int(max_particles))]
+        for col_idx, t in enumerate(frame_idx.tolist()):
+            ax = axes[row_idx, col_idx]
+            frame = np.mod(xy[int(t), particle_ids], domain)
+            if labels_t is not None:
+                label_values = np.asarray(labels_t, dtype=np.int32)[int(t), particle_ids]
+            else:
+                label_values = labels[particle_ids]
+            colors = palette[np.mod(label_values, palette.shape[0])]
+            ax.scatter(frame[:, 0], frame[:, 1], s=9, c=colors, linewidths=0, alpha=0.9)
+            ax.set_xlim(0.0, domain)
+            ax.set_ylim(0.0, domain)
+            ax.set_aspect("equal", adjustable="box")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_linewidth(0.45)
+                spine.set_color("#cccccc")
+            if row_idx == 0:
+                ax.set_title(f"t={int(t)}", fontsize=9)
+            if col_idx == 0:
+                ax.set_ylabel(family, rotation=0, labelpad=16, va="center", fontsize=10, fontweight="bold")
+    fig.suptitle("Synthetic calibration trajectories", fontsize=12)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.98))
+    _save_figure_to_many(fig, [out_suite, out_local], dpi=200)
+    plt.close(fig)
+    return {"synthetic_frame_montage": str(out_suite), "synthetic_frame_montage_local": str(out_local)}, []
+
+
 def _heatmap_tick_positions(n: int, *, max_ticks: int = 7) -> np.ndarray:
     if n <= 0:
         return np.asarray([], dtype=np.int32)
@@ -1513,6 +1615,7 @@ def visualize(config_path: str | Path, *, smoke: bool = False, force: bool = Fal
     heatmap_max_runs = _cfg_optional_int(vis_cfg, "heatmap_max_runs")
     msc_r_tau_steps = _cfg_optional_int(vis_cfg, "msc_r_tau_steps")
     heatmap_cmap = str(vis_cfg.get("heatmap_cmap", "coolwarm") if vis_cfg is not None else "coolwarm")
+    frame_montage_enabled = _cfg_bool(vis_cfg, "frame_montage_enabled", True)
     paths: dict[str, str] = {}
     rows: list[dict[str, Any]] = []
     skip_rows: list[dict[str, Any]] = []
@@ -1546,6 +1649,31 @@ def visualize(config_path: str | Path, *, smoke: bool = False, force: bool = Fal
         f"time={_format_duration(time.perf_counter() - msc_start)}",
         component="synthetic",
     )
+
+    if frame_montage_enabled:
+        montage_start = time.perf_counter()
+        montage_paths, montage_skips = _plot_synthetic_frame_montage(
+            cfg=cfg,
+            dirs=dirs,
+            suite_figures=suite_figures,
+            force=force,
+        )
+        paths.update(montage_paths)
+        skip_rows.extend(montage_skips)
+        log_event(
+            f"synthetic visualization frame montage done status={'written_or_exists' if montage_paths else 'skipped'} "
+            f"time={_format_duration(time.perf_counter() - montage_start)}",
+            component="synthetic",
+        )
+    else:
+        skip_rows.append(
+            {
+                "artifact": "synthetic_frame_montage",
+                "status": "disabled",
+                "message": "synthetic.visualization.frame_montage_enabled=false",
+                "path": str(suite_figures / "synthetic_frame_montage.png"),
+            }
+        )
 
     family_runs: dict[str, list[np.ndarray]] = {}
     family_refs: dict[str, tuple[np.ndarray, np.ndarray]] = {}
