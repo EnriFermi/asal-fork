@@ -1378,11 +1378,18 @@ def _plot_synthetic_frame_montage(
 ) -> tuple[dict[str, str], list[dict[str, Any]]]:
     syn = cfg.get("synthetic", {})
     vis_cfg = syn.get("visualization", {}) if syn is not None else {}
+    render_cfg = syn.get("render", {}) if syn is not None else {}
     families = [str(x) for x in (syn.get("families", list(FAMILIES)) or list(FAMILIES))]
     families = [family for family in FAMILIES if family in set(families)]
     seed = _cfg_int(vis_cfg, "frame_montage_seed", 0)
     n_frames = _cfg_int(vis_cfg, "frame_montage_frames", 6)
     max_particles = _cfg_optional_int(vis_cfg, "frame_montage_max_particles")
+    trail_steps = int(max(0, _cfg_int(vis_cfg, "frame_montage_trail_steps", _cfg_int(render_cfg, "trail_steps", 16))))
+    particle_stride = int(
+        max(1, _cfg_int(vis_cfg, "frame_montage_particle_stride", _cfg_int(render_cfg, "particle_stride", 1)))
+    )
+    point_size = float(max(4, _cfg_int(vis_cfg, "frame_montage_point_size", 16)))
+    trail_linewidth = float(max(0.1, _cfg_float(vis_cfg, "frame_montage_trail_linewidth", 0.55)))
     out_suite = suite_figures / "synthetic_frame_montage.png"
     out_local = dirs["figures"] / "synthetic_frame_montage.png"
     sim_paths = [dirs["simulation"] / f"{family}_seed_{seed:03d}.npz" for family in families]
@@ -1396,7 +1403,8 @@ def _plot_synthetic_frame_montage(
                 "path": str(out_suite),
             }
         ]
-    if _figure_fresh(out_suite, sim_paths, force=force) and _figure_fresh(out_local, sim_paths, force=force):
+    figure_deps = [*sim_paths, Path(__file__)]
+    if _figure_fresh(out_suite, figure_deps, force=force) and _figure_fresh(out_local, figure_deps, force=force):
         return {"synthetic_frame_montage": str(out_suite), "synthetic_frame_montage_local": str(out_local)}, []
 
     payloads = [(family, _load_simulation_payload(path), path) for family, path in zip(families, sim_paths, strict=True)]
@@ -1423,6 +1431,8 @@ def _plot_synthetic_frame_montage(
         ]
 
     plt = _ensure_matplotlib()
+    from matplotlib.collections import LineCollection
+
     palette = _label_palette_rgb().astype(np.float32) / 255.0
     fig_w = max(7.5, 1.75 * float(frame_idx.size))
     fig_h = max(5.0, 1.25 * float(len(payloads)))
@@ -1430,21 +1440,80 @@ def _plot_synthetic_frame_montage(
     for row_idx, (family, payload, _path) in enumerate(payloads):
         xy = np.asarray(payload["xy"], dtype=np.float32)
         labels = np.asarray(payload["labels"], dtype=np.int32).reshape(-1)
-        labels_t = payload.get("labels_t")
+        labels_t_raw = payload.get("labels_t")
+        labels_t = None if labels_t_raw is None else np.asarray(labels_t_raw, dtype=np.int32)
         metadata = dict(payload.get("metadata", {}))
         domain = float(metadata.get("domain_size", syn.get("domain_size", 1.0)))
-        particle_ids = np.arange(xy.shape[1], dtype=np.int32)
+        if not np.isfinite(domain) or domain <= 0:
+            domain = 1.0
+        N = int(xy.shape[1])
+        if labels.size != N:
+            labels = np.zeros(N, dtype=np.int32)
+        dynamic_labels = labels_t is not None and labels_t.shape[:2] == xy.shape[:2]
+        fallback_labels = np.arange(N, dtype=np.int32) if np.unique(labels).size <= 1 and not dynamic_labels else labels
+        particle_ids = np.arange(N, dtype=np.int32)[::particle_stride]
         if max_particles is not None and particle_ids.size > int(max_particles):
             particle_ids = particle_ids[: max(0, int(max_particles))]
+        periodic_offsets = np.asarray(
+            [[dx, dy] for dx in (-domain, 0.0, domain) for dy in (-domain, 0.0, domain)],
+            dtype=np.float32,
+        )
         for col_idx, t in enumerate(frame_idx.tolist()):
             ax = axes[row_idx, col_idx]
-            frame = np.mod(xy[int(t), particle_ids], domain)
-            if labels_t is not None:
-                label_values = np.asarray(labels_t, dtype=np.int32)[int(t), particle_ids]
-            else:
-                label_values = labels[particle_ids]
+            t_i = int(t)
+            positions_wrapped = np.mod(xy[t_i], domain)
+            frame = positions_wrapped[particle_ids]
+            draw_labels = labels_t[t_i] if dynamic_labels else fallback_labels
+            label_values = draw_labels[particle_ids]
             colors = palette[np.mod(label_values, palette.shape[0])]
-            ax.scatter(frame[:, 0], frame[:, 1], s=9, c=colors, linewidths=0, alpha=0.9)
+            if trail_steps > 0 and t_i > 0 and particle_ids.size:
+                start_t = max(0, t_i - trail_steps)
+                segments = []
+                segment_colors = []
+                for pid, color in zip(particle_ids.tolist(), colors, strict=True):
+                    hist = xy[start_t : t_i + 1, int(pid), :]
+                    if hist.shape[0] < 2:
+                        continue
+                    hist_unwrapped = _unwrap_periodic_xy(hist[:, None, :], domain=domain)[:, 0, :]
+                    hist_end_wrapped = np.mod(hist_unwrapped[-1], domain)
+                    hist_aligned = hist_unwrapped + (positions_wrapped[int(pid)] - hist_end_wrapped)[None, :]
+                    denom = max(1, hist_aligned.shape[0] - 2)
+                    for offset in periodic_offsets:
+                        shifted = hist_aligned + offset[None, :]
+                        seg = np.stack([shifted[:-1], shifted[1:]], axis=1)
+                        if (
+                            np.nanmax(seg[:, :, 0]) < 0.0
+                            or np.nanmin(seg[:, :, 0]) > domain
+                            or np.nanmax(seg[:, :, 1]) < 0.0
+                            or np.nanmin(seg[:, :, 1]) > domain
+                        ):
+                            continue
+                        for seg_idx, part in enumerate(seg):
+                            alpha = 0.14 + 0.28 * (float(seg_idx) / float(denom))
+                            segments.append(part)
+                            segment_colors.append((float(color[0]), float(color[1]), float(color[2]), alpha))
+                if segments:
+                    ax.add_collection(
+                        LineCollection(
+                            segments,
+                            colors=segment_colors,
+                            linewidths=trail_linewidth,
+                            capstyle="round",
+                            joinstyle="round",
+                            zorder=1,
+                        )
+                    )
+            ax.scatter(
+                frame[:, 0],
+                frame[:, 1],
+                s=point_size,
+                c=colors,
+                edgecolors="#ffffff",
+                linewidths=0.35,
+                alpha=0.95,
+                zorder=2,
+            )
+            ax.set_facecolor("#f8f8f6")
             ax.set_xlim(0.0, domain)
             ax.set_ylim(0.0, domain)
             ax.set_aspect("equal", adjustable="box")
