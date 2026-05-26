@@ -299,7 +299,7 @@ c4:
   foundation_model: clip
   max_clip_frames: 128
   clip_range_start_steps: 50000
-  clip_range_end_steps: 500000
+  clip_range_end_steps: 300000
   stat_seed: 0
   stat_max_exact_permutations: 100000
   stat_permutation_reps: 20000
