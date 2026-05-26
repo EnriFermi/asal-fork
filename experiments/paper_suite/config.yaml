@@ -290,6 +290,20 @@ c2:
       p_std: 0.02
       lagrangian_xy_std: 1.0
 
+c4:
+  enabled: true
+  # Posthoc-only comparison of already simulated 500k Flow-Lenia APF rollouts:
+  # MSPD-opt optimized, MSPD random controls, and NN-opt optimized checkpoints.
+  output_dir: c4_nnopt_vs_mspd
+  include_random: true
+  foundation_model: clip
+  max_clip_frames: 128
+  clip_range_start_steps: 50000
+  clip_range_end_steps: 500000
+  stat_seed: 0
+  stat_max_exact_permutations: 100000
+  stat_permutation_reps: 20000
+
 simulation:
   reuse_existing: true
   allow_optimization_rerun: false
