@@ -519,62 +519,53 @@ def _plot(out_path: Path, run_rows: list[dict[str, Any]], tau_rows: list[dict[st
     import matplotlib.pyplot as plt
 
     conditions = ["Random", "MSPD-opt", "NN-opt"]
-    x_by_condition = {name: idx for idx, name in enumerate(conditions)}
     condition_colors = {"Random": "#777777", "MSPD-opt": "#d62728", "NN-opt": "#1f77b4"}
-    fig, ax_mspd = plt.subplots(figsize=(8.6, 4.8), constrained_layout=True)
-    ax_nn = ax_mspd.twinx()
+    condition_markers = {"Random": "o", "MSPD-opt": "^", "NN-opt": "s"}
+    fig, ax = plt.subplots(figsize=(6.4, 5.4), constrained_layout=True)
 
     for condition in conditions:
         rows = [row for row in run_rows if str(row.get("condition", "")) == condition]
         if not rows:
             continue
-        x0 = float(x_by_condition[condition])
-        jitter = np.linspace(-0.11, 0.11, len(rows)) if len(rows) > 1 else np.asarray([0.0])
-        color = condition_colors[condition]
         mspd = np.asarray([_as_float(row.get("mspd_metric", np.nan)) for row in rows], dtype=np.float64)
         nn_score = np.asarray([_as_float(row.get("nn_opt_score", np.nan)) for row in rows], dtype=np.float64)
-        finite_mspd = np.isfinite(mspd)
-        finite_nn = np.isfinite(nn_score)
-        if np.any(finite_mspd):
-            ax_mspd.scatter(
-                np.full(int(np.sum(finite_mspd)), x0) + jitter[finite_mspd] - 0.06,
-                mspd[finite_mspd],
-                marker="o",
-                s=44,
-                color=color,
-                edgecolor="white",
-                linewidth=0.5,
-                alpha=0.85,
-                label="MSPD metric" if condition == conditions[0] else None,
+        finite = np.isfinite(mspd) & np.isfinite(nn_score)
+        if not np.any(finite):
+            continue
+        ax.scatter(
+            mspd[finite],
+            nn_score[finite],
+            marker=condition_markers[condition],
+            s=58,
+            color=condition_colors[condition],
+            edgecolor="white",
+            linewidth=0.7,
+            alpha=0.88,
+            label=f"{condition} (n={int(np.sum(finite))})",
+        )
+        if int(np.sum(finite)) >= 2:
+            ax.scatter(
+                [float(np.median(mspd[finite]))],
+                [float(np.median(nn_score[finite]))],
+                marker="X",
+                s=130,
+                color=condition_colors[condition],
+                edgecolor="black",
+                linewidth=0.8,
+                alpha=0.95,
             )
-            med = float(np.median(mspd[finite_mspd]))
-            ax_mspd.plot([x0 - 0.22, x0 - 0.02], [med, med], color=color, linewidth=2.2)
-        if np.any(finite_nn):
-            ax_nn.scatter(
-                np.full(int(np.sum(finite_nn)), x0) + jitter[finite_nn] + 0.06,
-                nn_score[finite_nn],
-                marker="s",
-                s=40,
-                color=color,
-                edgecolor="white",
-                linewidth=0.5,
-                alpha=0.75,
-                label="NN-opt score" if condition == conditions[0] else None,
-            )
-            med = float(np.median(nn_score[finite_nn]))
-            ax_nn.plot([x0 + 0.02, x0 + 0.22], [med, med], color=color, linewidth=2.2, linestyle="--")
 
-    ax_mspd.set_xticks(range(len(conditions)), conditions)
-    ax_mspd.set_ylabel("MSPD metric (log-tau integral; higher is better)")
-    ax_nn.set_ylabel("NN-opt score (-CLIP-OE loss; higher is better)")
-    ax_mspd.set_title("C4: MSPD-opt vs NN-opt vs random on both metrics")
-    ax_mspd.grid(axis="y", color="#dddddd", linewidth=0.8, alpha=0.7)
-    handles_m, labels_m = ax_mspd.get_legend_handles_labels()
-    handles_n, labels_n = ax_nn.get_legend_handles_labels()
-    ax_mspd.legend(handles_m + handles_n, labels_m + labels_n, loc="best", frameon=False)
+    ax.set_xlabel("MSPD metric (log-tau integral; higher is better)")
+    ax.set_ylabel("-NN-opt loss (-CLIP-OE; higher is better)")
+    ax.set_title("C4: MSPD vs NN-opt score")
+    ax.grid(color="#dddddd", linewidth=0.8, alpha=0.7)
+    ax.legend(loc="best", frameon=False)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=180)
+    scatter_alias = out_path.parent / "c4_nnopt_vs_mspd_scatter.png"
+    if scatter_alias != out_path:
+        fig.savefig(scatter_alias, dpi=180)
     alias = out_path.parent / "nnopt_vs_mspd_comparison.png"
     if alias != out_path:
         fig.savefig(alias, dpi=180)
