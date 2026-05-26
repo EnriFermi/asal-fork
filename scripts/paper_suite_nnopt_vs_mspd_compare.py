@@ -116,7 +116,7 @@ def _repair_item_paths(root: Path, item: dict[str, Any]) -> dict[str, Any]:
     if not Path(out.get("apf_dir", "")).exists() and default_apf_dir.exists():
         out["apf_dir"] = default_apf_dir
     default_metrics = default_traj_dir / "metrics.npz"
-    if not Path(out.get("metrics_path", "")).exists() and default_metrics.exists():
+    if not Path(out.get("metrics_path", "")).exists() and (default_traj_dir.exists() or default_apf_dir.exists()):
         out["metrics_path"] = default_metrics
     return out
 
@@ -170,7 +170,12 @@ def _ensure_delta_h_metrics(
         },
     }
     compute_metrics_for_run(run_row, flat_args)
-    return metrics_path, "computed"
+    computed_path = Path(run_row["traj_dir"]) / "metrics.npz"
+    if not computed_path.exists():
+        raise FileNotFoundError(
+            f"{item['traj_id']}: Delta-H/MSPD metrics computation finished but did not write {computed_path}"
+        )
+    return computed_path, "computed"
 
 
 def _metric_scalar_rows(metrics_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
