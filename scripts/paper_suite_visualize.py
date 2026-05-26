@@ -137,15 +137,11 @@ def _add_panel_label(ax: Any, label: str) -> None:
 def _plot_synthetic(output_root: Path, figures: Path) -> dict[str, str]:
     tau_path = output_root / "synthetic_calibration" / "tau_profiles.csv"
     score_path = output_root / "synthetic_calibration" / "per_family_scores.csv"
-    role_path = output_root / "synthetic_calibration" / "role_recovery.csv"
-    event_path = output_root / "synthetic_calibration" / "event_localization.csv"
     if not tau_path.exists() or not score_path.exists():
         return {}
     plt = _ensure_matplotlib()
     tau = pd.read_csv(tau_path)
     scores = pd.read_csv(score_path)
-    role = pd.read_csv(role_path) if role_path.exists() and role_path.stat().st_size > 1 else pd.DataFrame()
-    event = pd.read_csv(event_path) if event_path.exists() and event_path.stat().st_size > 1 else pd.DataFrame()
     families = [f for f in ["S0", "S1", "S3", "S4", "S5", "S6", "S7", "S8"] if f in set(tau["family"])]
     if not families:
         return {}
@@ -173,7 +169,7 @@ def _plot_synthetic(output_root: Path, figures: Path) -> dict[str, str]:
     plt.close(fig)
     out_paths = {"synthetic_calibration_grid": str(path)}
     if {"amp_by_tau", "msc_by_tau", "delta_h_mean"}.issubset(tau.columns):
-        fig, axes = plt.subplots(len(families), 6, figsize=(17, max(2.2, 1.8 * len(families))), squeeze=False)
+        fig, axes = plt.subplots(len(families), 4, figsize=(12.0, max(2.2, 1.8 * len(families))), squeeze=False)
         for row_idx, family in enumerate(families):
             sub = tau[tau["family"] == family].sort_values("tau_steps")
             for col_idx, (col, title) in enumerate(
@@ -192,33 +188,6 @@ def _plot_synthetic(output_root: Path, figures: Path) -> dict[str, str]:
                 ax.set_xscale("log")
                 ax.set_title(title if row_idx == 0 else "")
                 ax.set_ylabel(family if col_idx == 0 else "")
-            ax_event = axes[row_idx, 4]
-            event_error_col = "event_error_steps" if "event_error_steps" in event.columns else "peak_error_steps"
-            if not event.empty and "family" in event.columns and event_error_col in event.columns:
-                ev = event[event["family"] == family][event_error_col].astype(float).to_numpy()
-            else:
-                ev = np.asarray([], dtype=np.float64)
-            if ev.size:
-                ax_event.scatter(np.arange(ev.size), ev, color="#9467bd", s=28)
-                ax_event.axhline(float(np.nanmedian(ev)), color="#111111", linewidth=1)
-            else:
-                ax_event.text(0.5, 0.5, "n/a", ha="center", va="center", transform=ax_event.transAxes)
-            ax_event.set_title("event error" if row_idx == 0 else "")
-            ax_event.set_xticks([])
-
-            ax_role = axes[row_idx, 5]
-            if not role.empty and "family" in role.columns and "ari" in role.columns:
-                ari = pd.to_numeric(role[role["family"] == family]["ari"], errors="coerce").dropna().to_numpy()
-            else:
-                ari = np.asarray([], dtype=np.float64)
-            if ari.size:
-                ax_role.scatter(np.arange(ari.size), ari, color="#2ca02c", s=28)
-                ax_role.set_ylim(-0.05, 1.05)
-                ax_role.axhline(float(np.nanmedian(ari)), color="#111111", linewidth=1)
-            else:
-                ax_role.text(0.5, 0.5, "n/a", ha="center", va="center", transform=ax_role.transAxes)
-            ax_role.set_title("ARI" if row_idx == 0 else "")
-            ax_role.set_xticks([])
         fig.tight_layout()
         decomp = figures / "synthetic_decomposition_grid.png"
         fig.savefig(decomp, dpi=180)
@@ -229,8 +198,6 @@ def _plot_synthetic(output_root: Path, figures: Path) -> dict[str, str]:
 
 def _plot_synthetic_summary_clean(output_root: Path, figures: Path) -> dict[str, str]:
     scores = _synthetic_table(output_root, "per_family_scores")
-    role = _synthetic_table(output_root, "role_recovery")
-    event = _synthetic_table(output_root, "event_localization")
     if scores.empty or "family" not in scores.columns or "score" not in scores.columns:
         return {}
     families = [f for f in _FAMILY_ORDER if f in set(scores["family"].astype(str))]
@@ -241,8 +208,8 @@ def _plot_synthetic_summary_clean(output_root: Path, figures: Path) -> dict[str,
         amp_col = "delta_h_mean" if "delta_h_mean" in scores.columns else ""
 
     plt = _ensure_matplotlib()
-    fig, axes = plt.subplots(2, 2, figsize=(11.0, 7.4), constrained_layout=True)
-    ax_a, ax_b, ax_c, ax_d = axes.ravel()
+    fig, axes = plt.subplots(1, 2, figsize=(11.0, 3.9), constrained_layout=True)
+    ax_a, ax_b = axes.ravel()
 
     score_medians = _plot_family_points(
         ax_a,
@@ -273,43 +240,7 @@ def _plot_synthetic_summary_clean(output_root: Path, figures: Path) -> dict[str,
     ax_b.set_title("Delta-H amplitude")
     _add_panel_label(ax_b, "B")
 
-    role_families = [f for f in ["S4", "S6", "S7", "S8"] if not role.empty and f in set(role["family"].astype(str))]
-    if role_families and "ari" in role.columns:
-        _plot_family_points(
-            ax_c,
-            role,
-            value_col="ari",
-            families=role_families,
-            color="#54a24b",
-            ylabel="role recovery ARI",
-        )
-        ax_c.axhline(1.0, color="#333333", linestyle="--", linewidth=1.0)
-        ax_c.set_ylim(-0.05, 1.08)
-    else:
-        ax_c.text(0.5, 0.5, "role recovery table missing", ha="center", va="center", transform=ax_c.transAxes)
-    ax_c.set_title("Role recovery")
-    _add_panel_label(ax_c, "C")
-
-    event_families = [f for f in ["S5", "S6", "S8"] if not event.empty and f in set(event["family"].astype(str))]
-    error_col = "event_error_steps" if "event_error_steps" in event.columns else "peak_error_steps"
-    if event_families and error_col in event.columns:
-        _plot_family_points(
-            ax_d,
-            event,
-            value_col=error_col,
-            families=event_families,
-            color="#b279a2",
-            ylabel="event localization error (steps)",
-        )
-        ax_d.axhline(0.0, color="#333333", linestyle="--", linewidth=1.0)
-        if "S5" in event_families:
-            ax_d.text(event_families.index("S5"), 0.96, "global switch edge case", transform=ax_d.get_xaxis_transform(), ha="center", va="top", fontsize=8, color="#555555")
-    else:
-        ax_d.text(0.5, 0.5, "event localization table missing", ha="center", va="center", transform=ax_d.transAxes)
-    ax_d.set_title("Event localization")
-    _add_panel_label(ax_d, "D")
-
-    for ax in axes.ravel():
+    for ax in axes:
         ax.tick_params(axis="both", labelsize=9)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
@@ -354,7 +285,7 @@ def _plot_synthetic_delta_h_heatmaps_clean(output_root: Path, figures: Path) -> 
     events = _synthetic_table(output_root, "event_localization")
     if scores.empty or "family" not in scores.columns or "metrics_path" not in scores.columns:
         return {}
-    families = [f for f in ["S0", "S1", "S4", "S6", "S8"] if f in set(scores["family"].astype(str))]
+    families = [f for f in ["S0", "S1", "S4", "S5", "S6", "S8"] if f in set(scores["family"].astype(str))]
     loaded: list[tuple[str, dict[str, Any]]] = []
     for family in families:
         sub = scores[scores["family"].astype(str) == family].sort_values("seed" if "seed" in scores.columns else "family")
