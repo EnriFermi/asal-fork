@@ -1435,15 +1435,44 @@ def _plot_synthetic_frame_montage(
 
     palette = _label_palette_rgb().astype(np.float32) / 255.0
     cell_inches = float(max(0.65, _cfg_float(vis_cfg, "frame_montage_cell_inches", 1.12)))
-    fig_w = max(2.5, cell_inches * float(frame_idx.size))
-    fig_h = max(2.5, cell_inches * float(len(payloads)))
-    fig, axes = plt.subplots(
-        len(payloads),
-        frame_idx.size,
-        figsize=(fig_w, fig_h),
-        squeeze=False,
-        gridspec_kw={"wspace": 0.025, "hspace": 0.025},
+    label_col_ratio = float(max(0.08, _cfg_float(vis_cfg, "frame_montage_label_col_ratio", 0.18)))
+    time_row_ratio = float(max(0.08, _cfg_float(vis_cfg, "frame_montage_time_row_ratio", 0.14)))
+    n_rows = len(payloads)
+    n_cols = int(frame_idx.size)
+    fig_w = max(2.5, cell_inches * (float(n_cols) + label_col_ratio))
+    fig_h = max(2.5, cell_inches * (float(n_rows) + time_row_ratio))
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    grid = fig.add_gridspec(
+        n_rows + 1,
+        n_cols + 1,
+        width_ratios=[label_col_ratio, *([1.0] * n_cols)],
+        height_ratios=[time_row_ratio, *([1.0] * n_rows)],
+        wspace=0.025,
+        hspace=0.025,
     )
+    corner_ax = fig.add_subplot(grid[0, 0])
+    corner_ax.axis("off")
+    for col_idx, t in enumerate(frame_idx.tolist()):
+        label_ax = fig.add_subplot(grid[0, col_idx + 1])
+        label_ax.axis("off")
+        label_ax.text(0.5, 0.5, f"t={int(t)}", ha="center", va="center", fontsize=8, color="#222222")
+    axes = np.empty((n_rows, n_cols), dtype=object)
+    for row_idx, (family, _payload, _path) in enumerate(payloads):
+        label_ax = fig.add_subplot(grid[row_idx + 1, 0])
+        label_ax.axis("off")
+        label_ax.text(
+            0.5,
+            0.5,
+            family,
+            ha="center",
+            va="center",
+            rotation=90,
+            fontsize=9,
+            fontweight="bold",
+            color="#222222",
+        )
+        for col_idx in range(n_cols):
+            axes[row_idx, col_idx] = fig.add_subplot(grid[row_idx + 1, col_idx + 1])
     for row_idx, (family, payload, _path) in enumerate(payloads):
         xy = np.asarray(payload["xy"], dtype=np.float32)
         labels = np.asarray(payload["labels"], dtype=np.int32).reshape(-1)
@@ -1529,33 +1558,6 @@ def _plot_synthetic_frame_montage(
             for spine in ax.spines.values():
                 spine.set_linewidth(0.45)
                 spine.set_color("#cccccc")
-            if row_idx == 0:
-                ax.text(
-                    0.025,
-                    0.965,
-                    f"t={int(t)}",
-                    transform=ax.transAxes,
-                    ha="left",
-                    va="top",
-                    fontsize=7,
-                    color="#222222",
-                    bbox={"facecolor": "#f8f8f6", "edgecolor": "none", "alpha": 0.82, "pad": 1.2},
-                    zorder=3,
-                )
-            if col_idx == 0:
-                ax.text(
-                    0.025,
-                    0.035,
-                    family,
-                    transform=ax.transAxes,
-                    ha="left",
-                    va="bottom",
-                    fontsize=8,
-                    fontweight="bold",
-                    color="#222222",
-                    bbox={"facecolor": "#f8f8f6", "edgecolor": "none", "alpha": 0.82, "pad": 1.2},
-                    zorder=3,
-                )
     fig.subplots_adjust(left=0.006, right=0.994, bottom=0.006, top=0.994, wspace=0.025, hspace=0.025)
     _save_figure_to_many(fig, [out_suite, out_local], dpi=200)
     plt.close(fig)
