@@ -28,6 +28,7 @@ from paper_suite_common import (
 )
 from paper_suite_synthetic import simulate as simulate_synthetic
 from paper_suite_c2_branching import simulation as simulate_c2_branching
+from paper_suite_c2_plife_plus import simulation as simulate_c2_plife_plus
 
 
 def _command_from_cfg(raw: Any, config_path: str | Path) -> list[str]:
@@ -192,6 +193,10 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
         result = simulate_c2_branching(config_path, smoke=smoke, force=force, allow_heavy=allow_heavy, dry_run=dry_run)
         rows.append({"name": "c2_branching", "layer": "simulation", "status": str(result.get("status", "ok")), "message": str(result), "command": ""})
         log_event(f"simulation C2 branching pre-metrics check done result={result}", component="simulation")
+        log_event("simulation PLife++ C2 branching check start", component="simulation")
+        result = simulate_c2_plife_plus(config_path, smoke=smoke, force=force, allow_heavy=allow_heavy, dry_run=dry_run)
+        rows.append({"name": "c2_plife_plus_branching", "layer": "simulation", "status": str(result.get("status", "ok")), "message": str(result), "command": ""})
+        log_event(f"simulation PLife++ C2 branching check done result={result}", component="simulation")
 
     manifest = output_root / "simulation_layer_manifest.csv"
     write_csv(manifest, rows, fieldnames=["name", "layer", "status", "message", "command"])

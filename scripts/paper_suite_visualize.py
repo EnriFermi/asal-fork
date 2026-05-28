@@ -1197,6 +1197,72 @@ def _plot_c2_clip_chamfer_association_clean(output_root: Path, figures: Path) ->
     return {"c2_clip_chamfer_association_clean": str(out)}
 
 
+def _plot_c2_plife_plus_branching(output_root: Path, figures: Path) -> dict[str, str]:
+    scores_path = output_root / "c2_plife_plus_branching" / "branching_scores.csv"
+    corr_path = output_root / "c2_plife_plus_branching" / "branching_delta_h_correlation.csv"
+    if not scores_path.exists():
+        return {}
+    try:
+        scores = pd.read_csv(scores_path)
+    except pd.errors.EmptyDataError:
+        return {}
+    if scores.empty or not {"delta_h", "branching_score"}.issubset(scores.columns):
+        return {}
+    x = pd.to_numeric(scores["delta_h"], errors="coerce").to_numpy(dtype=np.float64)
+    y = pd.to_numeric(scores["branching_score"], errors="coerce").to_numpy(dtype=np.float64)
+    finite = np.isfinite(x) & np.isfinite(y)
+    if not np.any(finite):
+        return {}
+    x = x[finite]
+    y = y[finite]
+    cond = scores.loc[finite, "condition"].astype(str).to_numpy() if "condition" in scores.columns else np.asarray(["sampled"] * x.size)
+    palette = {"high": "#d62728", "mid": "#ff7f0e", "low": "#4c78a8", "sampled": "#6f4e9b"}
+    colors = np.asarray([palette.get(c, "#6f4e9b") for c in cond])
+    pearson = float("nan")
+    spearman = float("nan")
+    if corr_path.exists():
+        corr = pd.read_csv(corr_path)
+        if not corr.empty:
+            pearson = float(pd.to_numeric(corr.get("pearson_r", pd.Series([np.nan])).iloc[0], errors="coerce"))
+            spearman = float(pd.to_numeric(corr.get("spearman_r", pd.Series([np.nan])).iloc[0], errors="coerce"))
+    if not np.isfinite(pearson) and x.size >= 2 and float(np.std(x)) > 1e-12 and float(np.std(y)) > 1e-12:
+        pearson = float(np.corrcoef(x, y)[0, 1])
+        spearman = _rank_correlation(x, y)
+
+    plt = _ensure_matplotlib()
+    fig, ax = plt.subplots(figsize=(6.0, 4.4), constrained_layout=True)
+    ax.scatter(x, y, c=colors, s=46, alpha=0.9, edgecolor="white", linewidth=0.5)
+    if x.size >= 2 and float(np.std(x)) > 1e-12:
+        coef = np.polyfit(x, y, deg=1)
+        xs = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 120)
+        ax.plot(xs, coef[0] * xs + coef[1], color="#222222", linewidth=1.2)
+    ax.set_xlabel("Delta-H at branch time")
+    ax.set_ylabel("future CLIP-Chamfer branch divergence")
+    ax.set_title(f"C2 PLife++ Delta-H / branch sensitivity\nPearson r={pearson:.3g}, Spearman r={spearman:.3g}, n={x.size}")
+    ax.text(
+        0.02,
+        0.02,
+        "stratified branch sample; correlation is descriptive across sampled PLife++ branch states.",
+        transform=ax.transAxes,
+        ha="left",
+        va="bottom",
+        fontsize=9,
+        color="#555555",
+    )
+    ax.grid(color="#dddddd", linewidth=0.7, alpha=0.75)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    out = figures / "c2_plife_plus_branching_sensitivity.png"
+    _save(fig, out)
+    out_corr = figures / "c2_plife_plus_delta_h_branching_correlation.png"
+    _save(fig, out_corr)
+    plt.close(fig)
+    return {
+        "c2_plife_plus_branching_sensitivity": str(out),
+        "c2_plife_plus_delta_h_branching_correlation": str(out_corr),
+    }
+
+
 def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, force: bool = False) -> dict[str, Any]:
     cfg, _ = load_config(config_path, smoke=smoke)
     output_root = _output_root(cfg)
@@ -1212,6 +1278,7 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
     if task in {"all", "c2"}:
         paths.update(_plot_c2_branching(output_root, figures))
         paths.update(_plot_c2_clip_chamfer_association_clean(output_root, figures))
+        paths.update(_plot_c2_plife_plus_branching(output_root, figures))
     if task in {"all", "c1", "c5", "c6"}:
         for dataset, _ds in dataset_items(cfg):
             ds_dir = output_root / dataset

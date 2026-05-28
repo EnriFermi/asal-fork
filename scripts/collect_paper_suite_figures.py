@@ -35,6 +35,8 @@ EXPECTED_MAIN_FIGURES = (
     "figures/c1_flow_lenia_delta_h_eval_optimized_vs_random_grid.png",
     "figures/c2_branching_sensitivity_clip_chamfer.png",
     "figures/c2_delta_h_branching_correlation_clip_chamfer.png",
+    "figures/c2_plife_plus_branching_sensitivity.png",
+    "figures/c2_plife_plus_delta_h_branching_correlation.png",
     "figures/c5_flow_lenia_frustration_contrast.png",
     "figures/c5_flow_lenia_embedding_vs_mspd.png",
     "figures/c1_plife_plus_paired_contrast.png",
@@ -58,6 +60,8 @@ SUPPORTING_TABLES = (
     "synthetic_calibration/synthetic_calibration_summary.json",
     "c2_branching/branching_scores_clip_chamfer.csv",
     "c2_branching/branching_delta_h_correlation_clip_chamfer.csv",
+    "c2_plife_plus_branching/branching_scores.csv",
+    "c2_plife_plus_branching/branching_delta_h_correlation.csv",
 )
 
 
@@ -84,7 +88,8 @@ def _output_root(config_path: Path, *, smoke: bool) -> Path:
     cfg = _load_yaml(config_path)
     if smoke:
         smoke_cfg = cfg.get("smoke", {}) if isinstance(cfg.get("smoke", {}), dict) else {}
-        raw = smoke_cfg.get("output_root")
+        smoke_meta = smoke_cfg.get("meta", {}) if isinstance(smoke_cfg.get("meta", {}), dict) else {}
+        raw = smoke_meta.get("output_root", smoke_cfg.get("output_root"))
         if raw:
             return _resolve(raw) or (_REPO_ROOT / "analysis/results/paper_suite_smoke")
     meta = cfg.get("meta", {}) if isinstance(cfg.get("meta", {}), dict) else {}

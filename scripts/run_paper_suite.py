@@ -60,6 +60,14 @@ def _metrics(config: str, task: str, *, smoke: bool, force: bool) -> None:
         if smoke:
             args.append("--smoke")
         _call("paper_suite_c2_branching.py", config, *args)
+        if not smoke:
+            _call("paper_suite_c2_branching.py", config, "--layer", "metrics", "--branching-metric", "clip_chamfer")
+        args = ["--layer", "metrics"]
+        if smoke:
+            args.append("--smoke")
+        if force:
+            args.append("--force")
+        _call("paper_suite_c2_plife_plus.py", config, *args)
     if task in {"all", "c4"}:
         args = []
         if smoke:
@@ -82,11 +90,35 @@ def _c2_branching_simulation(config: str, *, smoke: bool, force: bool, allow_hea
     _call("paper_suite_c2_branching.py", config, *args)
 
 
-def _c2_branching_metrics(config: str, *, smoke: bool) -> None:
+def _c2_branching_metrics(config: str, *, smoke: bool, branching_metric: str | None = None) -> None:
     args = ["--layer", "metrics"]
     if smoke:
         args.append("--smoke")
+    if branching_metric:
+        args.extend(["--branching-metric", branching_metric])
     _call("paper_suite_c2_branching.py", config, *args)
+
+
+def _c2_plife_plus_simulation(config: str, *, smoke: bool, force: bool, allow_heavy: bool, dry_run: bool) -> None:
+    args = ["--layer", "simulation"]
+    if smoke:
+        args.append("--smoke")
+    if force:
+        args.append("--force")
+    if allow_heavy:
+        args.append("--allow-heavy")
+    if dry_run:
+        args.append("--dry-run")
+    _call("paper_suite_c2_plife_plus.py", config, *args)
+
+
+def _c2_plife_plus_metrics(config: str, *, smoke: bool, force: bool = False) -> None:
+    args = ["--layer", "metrics"]
+    if smoke:
+        args.append("--smoke")
+    if force:
+        args.append("--force")
+    _call("paper_suite_c2_plife_plus.py", config, *args)
 
 
 def _visualization(config: str, task: str, *, smoke: bool, force: bool) -> None:
@@ -154,6 +186,19 @@ def main(argv: list[str] | None = None) -> int:
         )
         log_event("starting C2 branch metrics", component="runner")
         _c2_branching_metrics(args.config, smoke=args.smoke)
+        if not args.smoke:
+            log_event("starting C2 CLIP-Chamfer branch metrics", component="runner")
+            _c2_branching_metrics(args.config, smoke=args.smoke, branching_metric="clip_chamfer")
+        log_event("starting PLife++ C2 branch simulation after PLife++ C2 metrics", component="runner")
+        _c2_plife_plus_simulation(
+            args.config,
+            smoke=args.smoke,
+            force=args.force,
+            allow_heavy=args.allow_heavy,
+            dry_run=args.dry_run,
+        )
+        log_event("starting PLife++ C2 branch metrics", component="runner")
+        _c2_plife_plus_metrics(args.config, smoke=args.smoke, force=True)
     if args.layer in {"visualization", "all"}:
         log_event("starting visualization layer", component="runner")
         _visualization(args.config, args.task, smoke=args.smoke, force=args.force)
