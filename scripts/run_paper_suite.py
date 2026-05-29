@@ -125,6 +125,14 @@ def _visualization(config: str, task: str, *, smoke: bool, force: bool) -> None:
     if task == "nnopt_apf":
         log_event("visualization skipped for nnopt_apf task", component="runner")
         return
+    if task == "plife_videos":
+        args = []
+        if smoke:
+            args.append("--smoke")
+        if force:
+            args.append("--force")
+        _call("render_plife_videos.py", config, *args)
+        return
     if task == "c4":
         args = ["--plot-only"]
         if smoke:
@@ -160,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="One-button MSPD paper experiment suite.")
     parser.add_argument("config", help="experiments/paper_suite/config.yaml")
     parser.add_argument("--layer", choices=["simulation", "metrics", "visualization", "all"], default="all")
-    parser.add_argument("--task", choices=["all", "synthetic", "c1", "c2", "c4", "c5", "c6", "nnopt_apf"], default="all")
+    parser.add_argument("--task", choices=["all", "synthetic", "c1", "c2", "c4", "c5", "c6", "nnopt_apf", "plife_videos"], default="all")
     parser.add_argument("--smoke", action="store_true", help="Use small CPU smoke settings and generated tiny posthoc fixtures.")
     parser.add_argument("--force", action="store_true", help="Recompute outputs even when present.")
     parser.add_argument("--allow-heavy", action="store_true", help="Allow configured heavy real simulation commands.")
@@ -169,10 +177,10 @@ def main(argv: list[str] | None = None) -> int:
 
     master_log = init_suite_logging(args.config, smoke=args.smoke, layer=args.layer, task=args.task)
     log_event(f"master log: {master_log}", component="runner")
-    if args.layer in {"simulation", "all"}:
+    if args.layer in {"simulation", "all"} and args.task != "plife_videos":
         log_event("starting simulation layer", component="runner")
         _simulation(args.config, args.task, smoke=args.smoke, force=args.force, allow_heavy=args.allow_heavy, dry_run=args.dry_run)
-    if args.layer in {"metrics", "all"}:
+    if args.layer in {"metrics", "all"} and args.task != "plife_videos":
         log_event("starting metrics layer", component="runner")
         _metrics(args.config, args.task, smoke=args.smoke, force=args.force)
     if args.layer == "all" and args.task in {"all", "c2"}:
