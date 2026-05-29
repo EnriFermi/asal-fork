@@ -27,6 +27,19 @@ def _record_skip(plot: str, reason: str) -> None:
     log_event(f"{plot} skipped: {reason}", component="visualization")
 
 
+def _remove_stale_figures(plot: str, paths: list[Path]) -> None:
+    removed = []
+    for path in paths:
+        try:
+            if path.exists():
+                path.unlink()
+                removed.append(str(path))
+        except Exception as exc:
+            log_event(f"{plot} could not remove stale figure {path}: {type(exc).__name__}: {exc}", component="visualization")
+    if removed:
+        log_event(f"{plot} removed stale figures: {', '.join(removed)}", component="visualization")
+
+
 def _ensure_matplotlib():
     import tempfile
 
@@ -1208,27 +1221,37 @@ def _plot_c2_clip_chamfer_association_clean(output_root: Path, figures: Path) ->
 def _plot_c2_plife_plus_branching(output_root: Path, figures: Path) -> dict[str, str]:
     scores_path = output_root / "c2_plife_plus_branching" / "branching_scores.csv"
     corr_path = output_root / "c2_plife_plus_branching" / "branching_delta_h_correlation.csv"
+    stale_outputs = [
+        figures / "c2_plife_plus_branching_sensitivity.png",
+        figures / "c2_plife_plus_delta_h_branching_correlation.png",
+        figures / "c2_plife_plus_clip_chamfer_association_clean.png",
+    ]
     if not scores_path.exists():
         _record_skip("c2_plife_plus_branching", f"missing scores table {scores_path}")
+        _remove_stale_figures("c2_plife_plus_branching", stale_outputs)
         return {}
     try:
         scores = pd.read_csv(scores_path)
     except pd.errors.EmptyDataError:
         _record_skip("c2_plife_plus_branching", f"empty scores table {scores_path}")
+        _remove_stale_figures("c2_plife_plus_branching", stale_outputs)
         return {}
     if scores.empty or not {"delta_h", "branching_score"}.issubset(scores.columns):
         _record_skip("c2_plife_plus_branching", f"no score rows or missing columns in {scores_path}")
+        _remove_stale_figures("c2_plife_plus_branching", stale_outputs)
         return {}
     x = pd.to_numeric(scores["delta_h"], errors="coerce").to_numpy(dtype=np.float64)
     y = pd.to_numeric(scores["branching_score"], errors="coerce").to_numpy(dtype=np.float64)
     finite = np.isfinite(x) & np.isfinite(y)
     if not np.any(finite):
         _record_skip("c2_plife_plus_branching", f"no finite delta_h/branching_score pairs in {scores_path}")
+        _remove_stale_figures("c2_plife_plus_branching", stale_outputs)
         return {}
     x = x[finite]
     y = y[finite]
     if x.size < 2:
         _record_skip("c2_plife_plus_branching", f"fewer than two finite score rows in {scores_path}")
+        _remove_stale_figures("c2_plife_plus_branching", stale_outputs)
         return {}
     cond = scores.loc[finite, "condition"].astype(str).to_numpy() if "condition" in scores.columns else np.asarray(["sampled"] * x.size)
     palette = {"low": "#4c78a8", "mid": "#f58518", "high": "#d62728", "sampled": "#6f4e9b"}

@@ -22,6 +22,11 @@ EXCLUDED_OVERLEAF_FIGURES = {
     "figures/c2_branching_sensitivity.png",
     "figures/c2_high_vs_low_branching_divergence.png",
 }
+PLIFE_C2_ASSOCIATION_FIGURES = {
+    "figures/c2_plife_plus_branching_sensitivity.png",
+    "figures/c2_plife_plus_delta_h_branching_correlation.png",
+    "figures/c2_plife_plus_clip_chamfer_association_clean.png",
+}
 
 EXPECTED_MAIN_FIGURES = (
     "figures/synthetic_calibration_grid.png",
@@ -105,6 +110,23 @@ def _read_json(path: Path) -> dict[str, Any]:
         return payload if isinstance(payload, dict) else {}
     except Exception:
         return {}
+
+
+def _csv_data_row_count(path: Path) -> int:
+    try:
+        with path.open("r", newline="") as f:
+            return sum(1 for _ in csv.DictReader(f))
+    except Exception:
+        return 0
+
+
+def _figure_skip_reason(rel: str, output_root: Path) -> str | None:
+    if rel in PLIFE_C2_ASSOCIATION_FIGURES:
+        scores = output_root / "c2_plife_plus_branching" / "branching_scores.csv"
+        n_rows = _csv_data_row_count(scores)
+        if n_rows <= 0:
+            return f"skipped_plife_c2_association_no_branch_scores:{scores}"
+    return None
 
 
 def _iter_summary_figures(output_root: Path) -> Iterable[Path]:
@@ -303,7 +325,12 @@ def collect(
     for src in sorted(found, key=lambda p: _collection_rel(p, output_root)):
         sources = ",".join(sorted(found[src]))
         rel = _collection_rel(src, output_root)
-        if not src.exists():
+        skip_reason = _figure_skip_reason(rel, output_root)
+        if skip_reason is not None:
+            status = skip_reason
+            dest_name = ""
+            dest_path = ""
+        elif not src.exists():
             status = "missing"
             dest_name = ""
             dest_path = ""
