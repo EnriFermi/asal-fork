@@ -19,6 +19,14 @@ from paper_suite_common import dataset_items, ensure_dir, load_config, log_event
 from paper_suite_synthetic import visualize as visualize_synthetic
 
 
+_VISUALIZATION_SKIPS: list[dict[str, str]] = []
+
+
+def _record_skip(plot: str, reason: str) -> None:
+    _VISUALIZATION_SKIPS.append({"plot": plot, "reason": reason})
+    log_event(f"{plot} skipped: {reason}", component="visualization")
+
+
 def _ensure_matplotlib():
     import tempfile
 
@@ -1201,17 +1209,21 @@ def _plot_c2_plife_plus_branching(output_root: Path, figures: Path) -> dict[str,
     scores_path = output_root / "c2_plife_plus_branching" / "branching_scores.csv"
     corr_path = output_root / "c2_plife_plus_branching" / "branching_delta_h_correlation.csv"
     if not scores_path.exists():
+        _record_skip("c2_plife_plus_branching", f"missing scores table {scores_path}")
         return {}
     try:
         scores = pd.read_csv(scores_path)
     except pd.errors.EmptyDataError:
+        _record_skip("c2_plife_plus_branching", f"empty scores table {scores_path}")
         return {}
     if scores.empty or not {"delta_h", "branching_score"}.issubset(scores.columns):
+        _record_skip("c2_plife_plus_branching", f"no score rows or missing columns in {scores_path}")
         return {}
     x = pd.to_numeric(scores["delta_h"], errors="coerce").to_numpy(dtype=np.float64)
     y = pd.to_numeric(scores["branching_score"], errors="coerce").to_numpy(dtype=np.float64)
     finite = np.isfinite(x) & np.isfinite(y)
     if not np.any(finite):
+        _record_skip("c2_plife_plus_branching", f"no finite delta_h/branching_score pairs in {scores_path}")
         return {}
     x = x[finite]
     y = y[finite]
@@ -1257,6 +1269,7 @@ def _plot_c2_plife_plus_branching(output_root: Path, figures: Path) -> dict[str,
     out_corr = figures / "c2_plife_plus_delta_h_branching_correlation.png"
     _save(fig, out_corr)
     plt.close(fig)
+    log_event(f"C2 PLife++ plots wrote {out} and {out_corr}", component="visualization")
     return {
         "c2_plife_plus_branching_sensitivity": str(out),
         "c2_plife_plus_delta_h_branching_correlation": str(out_corr),
@@ -1264,6 +1277,7 @@ def _plot_c2_plife_plus_branching(output_root: Path, figures: Path) -> dict[str,
 
 
 def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, force: bool = False) -> dict[str, Any]:
+    _VISUALIZATION_SKIPS.clear()
     cfg, _ = load_config(config_path, smoke=smoke)
     output_root = _output_root(cfg)
     figures = ensure_dir(output_root / "figures")
@@ -1289,9 +1303,14 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
                 paths.update(_plot_c5_frustration_clean(dataset, ds_dir, figures))
                 paths.update(_plot_c5(dataset, ds_dir, figures))
         paths.update(_plot_cross(output_root, figures))
-    write_json(output_root / "visualization_summary.json", {"figure_paths": paths})
-    log_event(f"visualization done n_figures={len(paths)} summary={output_root / 'visualization_summary.json'}", component="visualization")
-    return {"n_figures": len(paths), "figure_paths": paths}
+    summary = {"figure_paths": paths, "skipped_plots": list(_VISUALIZATION_SKIPS)}
+    write_json(output_root / "visualization_summary.json", summary)
+    log_event(
+        f"visualization done n_figures={len(paths)} n_skipped={len(_VISUALIZATION_SKIPS)} "
+        f"summary={output_root / 'visualization_summary.json'}",
+        component="visualization",
+    )
+    return {"n_figures": len(paths), **summary}
 
 
 def main(argv: list[str] | None = None) -> int:

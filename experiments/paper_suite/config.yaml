@@ -294,6 +294,34 @@ c2:
       a_std: 0.02
       p_std: 0.02
       lagrangian_xy_std: 1.0
+  plife_plus:
+    enabled: true
+    required: false
+    trajectory_root: experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k
+    output_dir: analysis/results/paper_suite/c2_plife_plus_branching
+    branch_root: analysis/results/paper_suite/c2_plife_plus_branching/branches
+    max_trajectories: 9
+    n_high: 5
+    n_mid: 5
+    n_low: 5
+    branches_per_time: 3
+    horizon_steps: 1000
+    refractory_steps: 250
+    future_sample_every_steps: 25
+    branching_metric: clip_chamfer
+    clip_foundation_model: clip
+    clip_embedding_cache_dir: analysis/results/paper_suite/c2_plife_plus_branching/clip_embedding_cache
+    clip_max_future_frames: 32
+    render_img_size: 128
+    divergence_max_particles: 128
+    domain_size: 1.0
+    # PLife++ C2 branches are heavy because they resume the substrate from the
+    # saved optimized checkpoint parameters and initial seed, then perturb the
+    # state at sampled Delta-H windows.
+    perturb:
+      x_std: 0.003
+      v_std: 0.0
+      c_std: 0.01
 
 c4:
   enabled: true
@@ -553,3 +581,25 @@ smoke:
       m_pairs: 2
       branches_per_time: 3
       horizon_steps: 64
+    plife_plus:
+      required: false
+      trajectory_root: analysis/results/paper_suite_smoke/smoke_inputs/plife_plus/frustration_simulation
+      output_dir: analysis/results/paper_suite_smoke/c2_plife_plus_branching
+      branch_root: analysis/results/paper_suite_smoke/c2_plife_plus_branching/branches
+      max_trajectories: 1
+      n_high: 1
+      n_mid: 1
+      n_low: 1
+      branches_per_time: 2
+      horizon_steps: 16
+      refractory_steps: 0
+      future_sample_every_steps: 4
+      branching_metric: clip_chamfer
+      clip_embedding_cache_dir: analysis/results/paper_suite_smoke/c2_plife_plus_branching/clip_embedding_cache
+      clip_max_future_frames: 4
+      render_img_size: 64
+      divergence_max_particles: 32
+      perturb:
+        x_std: 0.01
+        v_std: 0.0
+        c_std: 0.01
