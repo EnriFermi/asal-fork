@@ -63,7 +63,7 @@ METRICS_MANIFEST_COLUMNS = [
     "trajectory_end_steps",
 ]
 
-PLIFE_BRANCH_PLAN_VERSION = "c2_plife_branch_plan_v2_flow_style"
+PLIFE_BRANCH_PLAN_VERSION = "c2_plife_branch_plan_v3_flow_style_perturb_paths"
 
 BRANCH_PLAN_COLUMNS = [
     "point_id",
@@ -676,7 +676,7 @@ def _branch_output_npz_from_row(branch_root: Path, row: dict[str, Any]) -> Path:
     return _branch_output_path(branch_root, row, rep)
 
 
-def _branch_plan_meta_current(plan_path: Path) -> tuple[bool, str]:
+def _branch_plan_meta_current(plan_path: Path, *, expected_config_summary: dict[str, Any] | None = None) -> tuple[bool, str]:
     if not plan_path.exists():
         return False, f"missing branch plan {plan_path}"
     meta_path = plan_path.with_name("branch_plan_meta.json")
@@ -696,6 +696,10 @@ def _branch_plan_meta_current(plan_path: Path) -> tuple[bool, str]:
     metrics_hash = _metrics_manifest_identity_hash(plan_path.parent)
     if metrics_hash and str(meta.get("metrics_manifest_identity_hash", "")) != metrics_hash:
         return False, "branch_plan.csv was built from stale PLife++ C2 metrics_manifest/metrics files"
+    if expected_config_summary is not None:
+        found = meta.get("branching_config", {})
+        if stable_json(found) != stable_json(expected_config_summary):
+            return False, "branch_plan.csv was built from stale PLife++ C2 branching/perturb config"
     return True, "ok"
 
 
@@ -1168,6 +1172,59 @@ def _write_branch_plan_with_meta(out_dir: Path, rows: list[dict[str, Any]], *, m
     return plan_path
 
 
+def _branching_config_summary(cfg: Any) -> dict[str, Any]:
+    c2_cfg = _plife_c2_cfg(cfg)
+    branch_cfg = _get(cfg.get("c2", {}), "branching", {})
+    selection_mode = str(_get(c2_cfg, "selection_mode", _get(branch_cfg, "selection_mode", "tau_mean_ranked_high_low")))
+    n_high = int(_get(c2_cfg, "n_high", _get(branch_cfg, "n_high", 5)))
+    n_mid = int(_get(c2_cfg, "n_mid", _get(branch_cfg, "n_mid", 5)))
+    n_low = int(_get(c2_cfg, "n_low", _get(branch_cfg, "n_low", 5)))
+    m_pairs = int(_get(c2_cfg, "m_pairs", _get(branch_cfg, "m_pairs", 5)))
+    selection_seed = int(_get(c2_cfg, "selection_seed", _get(branch_cfg, "selection_seed", 12345)))
+    n_points_per_trajectory = int(_get(c2_cfg, "n_points_per_trajectory", _get(branch_cfg, "n_points_per_trajectory", max(1, 2 * m_pairs))))
+    point_quantiles = _as_float_list(_get(c2_cfg, "point_quantiles", _get(branch_cfg, "point_quantiles", None)))
+    point_quantile_min = float(_get(c2_cfg, "point_quantile_min", _get(branch_cfg, "point_quantile_min", 0.05)))
+    point_quantile_max = float(_get(c2_cfg, "point_quantile_max", _get(branch_cfg, "point_quantile_max", 0.95)))
+    high_quantile = float(_get(c2_cfg, "high_quantile", _get(branch_cfg, "high_quantile", 0.8)))
+    low_quantile = float(_get(c2_cfg, "low_quantile", _get(branch_cfg, "low_quantile", 0.2)))
+    mid_quantile_low = float(_get(c2_cfg, "mid_quantile_low", _get(branch_cfg, "mid_quantile_low", 0.4)))
+    mid_quantile_high = float(_get(c2_cfg, "mid_quantile_high", _get(branch_cfg, "mid_quantile_high", 0.6)))
+    refractory_steps = int(_get(c2_cfg, "refractory_steps", _get(branch_cfg, "refractory_steps", 0)))
+    min_branch_step = int(_get(c2_cfg, "min_branch_step", _get(c2_cfg, "selection_min_step", 0)))
+    horizon_steps = int(_get(c2_cfg, "horizon_steps", _get(branch_cfg, "horizon_steps", 1000)))
+    branches_per_time = int(_get(c2_cfg, "branches_per_time", _get(branch_cfg, "branches_per_time", 3)))
+    energy_min_remaining_steps_raw = _get(c2_cfg, "energy_min_remaining_steps", _get(branch_cfg, "energy_min_remaining_steps", None))
+    energy_min_remaining_samples_raw = _get(c2_cfg, "energy_min_samples", _get(branch_cfg, "energy_min_samples", None))
+    energy_min_remaining_steps = None if energy_min_remaining_steps_raw is None else int(energy_min_remaining_steps_raw)
+    energy_min_remaining_samples = None if energy_min_remaining_samples_raw is None else int(energy_min_remaining_samples_raw)
+    perturb_cfg = _get(c2_cfg, "perturb", {})
+    return {
+        "selection_mode": selection_mode,
+        "selection_seed": selection_seed,
+        "n_high": n_high,
+        "n_mid": n_mid,
+        "n_low": n_low,
+        "m_pairs": m_pairs,
+        "n_points_per_trajectory": n_points_per_trajectory,
+        "point_quantiles": point_quantiles,
+        "point_quantile_min": point_quantile_min,
+        "point_quantile_max": point_quantile_max,
+        "high_quantile": high_quantile,
+        "mid_quantile_low": mid_quantile_low,
+        "mid_quantile_high": mid_quantile_high,
+        "low_quantile": low_quantile,
+        "refractory_steps": refractory_steps,
+        "min_branch_step": min_branch_step,
+        "horizon_steps": horizon_steps,
+        "branches_per_time": branches_per_time,
+        "energy_min_remaining_steps": energy_min_remaining_steps,
+        "energy_min_samples": energy_min_remaining_samples,
+        "perturb_x_std": float(_get(perturb_cfg, "x_std", 0.003)),
+        "perturb_v_std": float(_get(perturb_cfg, "v_std", 0.0)),
+        "perturb_c_std": float(_get(perturb_cfg, "c_std", 0.01)),
+    }
+
+
 def _build_branch_plan_rows(cfg: Any, output_root: Path, out_dir: Path, branch_root: Path) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
     c2_cfg = _plife_c2_cfg(cfg)
     branch_cfg = _get(cfg.get("c2", {}), "branching", {})
@@ -1202,31 +1259,7 @@ def _build_branch_plan_rows(cfg: Any, output_root: Path, out_dir: Path, branch_r
     perturb_v_std = float(_get(perturb_cfg, "v_std", 0.0))
     perturb_c_std = float(_get(perturb_cfg, "c_std", 0.01))
 
-    config_summary = {
-        "selection_mode": selection_mode,
-        "selection_seed": selection_seed,
-        "n_high": n_high,
-        "n_mid": n_mid,
-        "n_low": n_low,
-        "m_pairs": m_pairs,
-        "n_points_per_trajectory": n_points_per_trajectory,
-        "point_quantiles": point_quantiles,
-        "point_quantile_min": point_quantile_min,
-        "point_quantile_max": point_quantile_max,
-        "high_quantile": high_quantile,
-        "mid_quantile_low": mid_quantile_low,
-        "mid_quantile_high": mid_quantile_high,
-        "low_quantile": low_quantile,
-        "refractory_steps": refractory_steps,
-        "min_branch_step": min_branch_step,
-        "horizon_steps": horizon_steps,
-        "branches_per_time": branches_per_time,
-        "energy_min_remaining_steps": energy_min_remaining_steps,
-        "energy_min_samples": energy_min_remaining_samples,
-        "perturb_x_std": perturb_x_std,
-        "perturb_v_std": perturb_v_std,
-        "perturb_c_std": perturb_c_std,
-    }
+    config_summary = _branching_config_summary(cfg)
 
     ranked: list[tuple[float, int, dict[str, str], np.ndarray, np.ndarray, dict[str, Any]]] = []
     for item_idx, row in enumerate(manifest_rows):
@@ -1329,7 +1362,10 @@ def _build_branch_plan_rows(cfg: Any, output_root: Path, out_dir: Path, branch_r
             except (TypeError, ValueError):
                 target_q_value = float("nan")
             q_tag = int(round(1000.0 * target_q_value)) if np.isfinite(target_q_value) else global_point_id
-            point_dir = branch_root / _safe_path_id(traj_id) / f"point_{global_point_id:04d}_{condition}_q_{q_tag:04d}_step_{step}"
+            perturb_tag = _safe_path_id(
+                f"h_{horizon_steps:.6g}_x_{perturb_x_std:.6g}_v_{perturb_v_std:.6g}_c_{perturb_c_std:.6g}"
+            )
+            point_dir = branch_root / _safe_path_id(traj_id) / perturb_tag / f"point_{global_point_id:04d}_{condition}_q_{q_tag:04d}_step_{step}"
             for branch_id in range(branches_per_time):
                 condition_offset = {"high": 0, "mid": 3967, "low": 7919, "sampled": 12347}.get(condition, 12347)
                 branch_seed = int(selection_seed + 1000003 * traj_order + 1009 * global_point_id + 131 * branch_id + condition_offset)
@@ -1398,7 +1434,8 @@ def simulation(
         return {"status": "disabled"}
     branch_root = _branch_root(cfg, output_root)
     plan_path = out_dir / "branch_plan.csv"
-    plan_ok, plan_reason = _branch_plan_meta_current(plan_path)
+    expected_config_summary = _branching_config_summary(cfg)
+    plan_ok, plan_reason = _branch_plan_meta_current(plan_path, expected_config_summary=expected_config_summary)
     if force or not plan_ok:
         try:
             rows, matching, config_summary = _build_branch_plan_rows(cfg, output_root, out_dir, branch_root)
