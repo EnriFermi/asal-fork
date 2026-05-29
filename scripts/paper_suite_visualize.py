@@ -1227,9 +1227,11 @@ def _plot_c2_plife_plus_branching(output_root: Path, figures: Path) -> dict[str,
         return {}
     x = x[finite]
     y = y[finite]
+    if x.size < 2:
+        _record_skip("c2_plife_plus_branching", f"fewer than two finite score rows in {scores_path}")
+        return {}
     cond = scores.loc[finite, "condition"].astype(str).to_numpy() if "condition" in scores.columns else np.asarray(["sampled"] * x.size)
-    palette = {"high": "#d62728", "mid": "#ff7f0e", "low": "#4c78a8", "sampled": "#6f4e9b"}
-    colors = np.asarray([palette.get(c, "#6f4e9b") for c in cond])
+    palette = {"low": "#4c78a8", "mid": "#f58518", "high": "#d62728", "sampled": "#6f4e9b"}
     pearson = float("nan")
     spearman = float("nan")
     if corr_path.exists():
@@ -1242,15 +1244,24 @@ def _plot_c2_plife_plus_branching(output_root: Path, figures: Path) -> dict[str,
         spearman = _rank_correlation(x, y)
 
     plt = _ensure_matplotlib()
-    fig, ax = plt.subplots(figsize=(6.0, 4.4), constrained_layout=True)
-    ax.scatter(x, y, c=colors, s=46, alpha=0.9, edgecolor="white", linewidth=0.5)
-    if x.size >= 2 and float(np.std(x)) > 1e-12:
+    fig, ax = plt.subplots(figsize=(7.0, 5.0), constrained_layout=True)
+    for stratum in ["low", "mid", "high"]:
+        mask = np.asarray([str(c) == stratum for c in cond])
+        if np.any(mask):
+            ax.scatter(x[mask], y[mask], s=48, color=palette[stratum], alpha=0.86, edgecolor="white", linewidth=0.6, label=stratum)
+    other = np.asarray([str(c) not in {"low", "mid", "high"} for c in cond])
+    if np.any(other):
+        ax.scatter(x[other], y[other], s=48, color=palette["sampled"], alpha=0.86, edgecolor="white", linewidth=0.6, label="sampled")
+    if x.size >= 2 and float(np.nanstd(x)) > 1e-12:
         coef = np.polyfit(x, y, deg=1)
-        xs = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 120)
-        ax.plot(xs, coef[0] * xs + coef[1], color="#222222", linewidth=1.2)
+        xs = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 160)
+        band = _bootstrap_regression_band(x, y, xs)
+        if band is not None:
+            ax.fill_between(xs, band[0], band[1], color="#333333", alpha=0.14, linewidth=0)
+        ax.plot(xs, coef[0] * xs + coef[1], color="#222222", linewidth=1.5)
     ax.set_xlabel("Delta-H at branch time")
     ax.set_ylabel("future CLIP-Chamfer branch divergence")
-    ax.set_title(f"C2 PLife++ Delta-H / branch sensitivity\nPearson r={pearson:.3g}, Spearman r={spearman:.3g}, n={x.size}")
+    ax.set_title(f"C2 PLife++ Delta-H / CLIP-Chamfer association\nPearson r={pearson:.3g}, Spearman r={spearman:.3g}, n={x.size}")
     ax.text(
         0.02,
         0.02,
@@ -1259,20 +1270,25 @@ def _plot_c2_plife_plus_branching(output_root: Path, figures: Path) -> dict[str,
         ha="left",
         va="bottom",
         fontsize=9,
-        color="#555555",
+        color="#333333",
+        bbox={"facecolor": "white", "edgecolor": "#cccccc", "alpha": 0.92, "pad": 3},
     )
     ax.grid(color="#dddddd", linewidth=0.7, alpha=0.75)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
+    ax.legend(title="Delta-H stratum", frameon=False, loc="best")
     out = figures / "c2_plife_plus_branching_sensitivity.png"
     _save(fig, out)
     out_corr = figures / "c2_plife_plus_delta_h_branching_correlation.png"
     _save(fig, out_corr)
+    out_clean = figures / "c2_plife_plus_clip_chamfer_association_clean.png"
+    _save(fig, out_clean)
     plt.close(fig)
-    log_event(f"C2 PLife++ plots wrote {out} and {out_corr}", component="visualization")
+    log_event(f"C2 PLife++ plots wrote {out}, {out_corr}, and {out_clean}", component="visualization")
     return {
         "c2_plife_plus_branching_sensitivity": str(out),
         "c2_plife_plus_delta_h_branching_correlation": str(out_corr),
+        "c2_plife_plus_clip_chamfer_association_clean": str(out_clean),
     }
 
 

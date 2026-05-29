@@ -301,11 +301,13 @@ c2:
     output_dir: analysis/results/paper_suite/c2_plife_plus_branching
     branch_root: analysis/results/paper_suite/c2_plife_plus_branching/branches
     max_trajectories: 9
+    selection_mode: tau_mean_ranked_high_low
     n_high: 5
     n_mid: 5
     n_low: 5
     branches_per_time: 3
     horizon_steps: 1000
+    min_branch_step: 0
     refractory_steps: 250
     future_sample_every_steps: 25
     branching_metric: clip_chamfer
@@ -587,11 +589,13 @@ smoke:
       output_dir: analysis/results/paper_suite_smoke/c2_plife_plus_branching
       branch_root: analysis/results/paper_suite_smoke/c2_plife_plus_branching/branches
       max_trajectories: 1
+      selection_mode: tau_mean_ranked_high_low
       n_high: 1
       n_mid: 1
       n_low: 1
       branches_per_time: 2
       horizon_steps: 16
+      min_branch_step: 0
       refractory_steps: 0
       future_sample_every_steps: 4
       branching_metric: clip_chamfer

@@ -198,7 +198,7 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=args.dry_run,
         )
         log_event("starting PLife++ C2 branch metrics", component="runner")
-        _c2_plife_plus_metrics(args.config, smoke=args.smoke, force=True)
+        _c2_plife_plus_metrics(args.config, smoke=args.smoke, force=False)
     if args.layer in {"visualization", "all"}:
         log_event("starting visualization layer", component="runner")
         _visualization(args.config, args.task, smoke=args.smoke, force=args.force)

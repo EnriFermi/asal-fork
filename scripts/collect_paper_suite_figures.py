@@ -37,6 +37,7 @@ EXPECTED_MAIN_FIGURES = (
     "figures/c2_delta_h_branching_correlation_clip_chamfer.png",
     "figures/c2_plife_plus_branching_sensitivity.png",
     "figures/c2_plife_plus_delta_h_branching_correlation.png",
+    "figures/c2_plife_plus_clip_chamfer_association_clean.png",
     "figures/c5_flow_lenia_frustration_contrast.png",
     "figures/c5_flow_lenia_embedding_vs_mspd.png",
     "figures/c1_plife_plus_paired_contrast.png",

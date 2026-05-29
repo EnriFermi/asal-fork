@@ -25,7 +25,15 @@ import numpy as np
 from omegaconf import OmegaConf
 
 from clip_deltah_msc_metric import make_metric_loss_fn
-from paper_suite_common import ensure_dir, load_config, log_event, resolve_path, to_plain, write_csv, write_json
+from paper_suite_common import command_to_str, ensure_dir, load_config, log_event, read_csv, resolve_path, to_plain, write_csv, write_json
+from paper_suite_c2_branching import (
+    _as_float_list,
+    _is_delta_h_sweep_mode,
+    _is_ranked_high_low_mode,
+    _select_delta_h_points,
+    _select_ranked_high_low_points,
+)
+from paper_suite_metric_cache import sha256_text, stable_json
 from paper_suite_plife_c1_lagrangian import (
     _apply_section_base_overrides,
     _flatten_base_config,
@@ -50,17 +58,31 @@ METRICS_MANIFEST_COLUMNS = [
     "message",
     "metrics_path",
     "n_points",
+    "sample_every_steps",
+    "trajectory_start_steps",
+    "trajectory_end_steps",
 ]
+
+PLIFE_BRANCH_PLAN_VERSION = "c2_plife_branch_plan_v2_flow_style"
 
 BRANCH_PLAN_COLUMNS = [
     "point_id",
+    "pair_id",
     "traj_id",
     "trial_idx",
     "optimized_run_idx",
     "condition",
     "window_idx",
     "step",
+    "requested_step",
+    "step_snap_delta",
     "delta_h",
+    "delta_h_energy",
+    "target_quantile",
+    "delta_h_quantile",
+    "delta_h_quantile_rank",
+    "selection_mode",
+    "selection_method",
     "metrics_path",
     "lagrangian_path",
     "params_path",
@@ -68,13 +90,22 @@ BRANCH_PLAN_COLUMNS = [
     "sample_every_steps",
     "trajectory_start_steps",
     "trajectory_end_steps",
-    "branches_per_time",
     "horizon_steps",
+    "branch_id",
+    "branch_seed",
+    "branch_dir",
+    "branch_output_path",
+    "perturb_x_std",
+    "perturb_v_std",
+    "perturb_c_std",
+    "status",
+    "command",
 ]
 
 BRANCHING_SCORE_COLUMNS = [
     "traj_id",
     "point_id",
+    "pair_id",
     "condition",
     "step",
     "delta_h",
@@ -260,6 +291,147 @@ def _window_centers(info: dict[str, np.ndarray], metric_cfg: dict[str, Any], tra
     starts = np.asarray(info.get("window_start_steps", np.arange(np.asarray(info["delta_h_map"]).shape[1])), dtype=np.float64).reshape(-1)
     window = float(metric_cfg.get("window_size_steps", metric_cfg.get("window_size_frames", 0.0)) or 0.0)
     return float(traj_start) + starts + 0.5 * window
+
+
+def _metric_timing_aliases(info: dict[str, np.ndarray], metric_cfg: dict[str, Any], lag: dict[str, Any]) -> dict[str, np.ndarray]:
+    delta_h_map = np.asarray(info["delta_h_map"])
+    sample_every = int(metric_cfg.get("sample_every_steps", lag.get("sample_every", 1)) or lag.get("sample_every", 1) or 1)
+    sample_steps = np.asarray(lag.get("sample_steps", []), dtype=np.int64).reshape(-1)
+    if sample_steps.size:
+        step_offset = int(sample_steps[0])
+    else:
+        step_offset = int(lag.get("start", 0)) + sample_every
+    base_step = max(0, step_offset - sample_every)
+    starts_rel = np.asarray(info.get("window_start_steps", np.arange(delta_h_map.shape[1])), dtype=np.int64).reshape(-1)
+    window_start_steps = starts_rel + int(base_step)
+    window_size_steps = int(metric_cfg.get("window_size_steps", int(metric_cfg.get("window_size_frames", 1)) * sample_every))
+    window_end_steps = window_start_steps + int(window_size_steps)
+    window_center_steps = window_start_steps + int(window_size_steps // 2)
+    tau_steps = np.asarray(info.get("tau_steps", metric_cfg.get("tau_steps_list", np.arange(delta_h_map.shape[0]))), dtype=np.int64).reshape(-1)
+    selected_idx = int(np.asarray(info.get("tau_selected_idx", info.get("delta_h_selected_tau_idx", np.asarray(0)))).reshape(-1)[0])
+    selected_tau = int(tau_steps[selected_idx]) if 0 <= selected_idx < tau_steps.size else int(tau_steps[0]) if tau_steps.size else 0
+    return {
+        "delta_h_tau_steps": tau_steps.astype(np.int32),
+        "delta_h_tau_frames": np.asarray(info.get("tau_frames", np.maximum(1, np.round(tau_steps / max(1, sample_every))).astype(np.int32)), dtype=np.int32),
+        "delta_h_selected_tau_idx": np.asarray(selected_idx, dtype=np.int32),
+        "delta_h_selected_tau_steps": np.asarray(selected_tau, dtype=np.int32),
+        "delta_h_window_start_steps": window_start_steps.astype(np.int64),
+        "delta_h_window_end_steps": window_end_steps.astype(np.int64),
+        "delta_h_window_center_steps": window_center_steps.astype(np.int64),
+        "delta_h_window_size_steps": np.asarray(window_size_steps, dtype=np.int32),
+        "delta_h_sample_every_steps": np.asarray(sample_every, dtype=np.int32),
+    }
+
+
+def _npz_scalar(data: np.lib.npyio.NpzFile, key: str, default: Any = None) -> Any:
+    if key not in data.files:
+        return default
+    try:
+        return np.asarray(data[key]).reshape(-1)[0].item()
+    except Exception:
+        return default
+
+
+def _npz_json(data: np.lib.npyio.NpzFile, key: str) -> dict[str, Any]:
+    raw = _npz_scalar(data, key, None)
+    if raw is None:
+        return {}
+    try:
+        return json.loads(str(raw))
+    except Exception:
+        return {}
+
+
+def _load_plife_delta_h(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    with np.load(path, allow_pickle=False) as data:
+        if "delta_h_best" in data.files:
+            dh = np.asarray(data["delta_h_best"], dtype=np.float64).reshape(-1)
+        elif "delta_h_map" in data.files:
+            dh_map = np.asarray(data["delta_h_map"], dtype=np.float64)
+            selected = int(_npz_scalar(data, "delta_h_selected_tau_idx", _npz_scalar(data, "tau_selected_idx", 0)) or 0)
+            dh = np.asarray(dh_map[selected], dtype=np.float64).reshape(-1)
+        else:
+            raise ValueError(f"{path} has neither delta_h_best nor delta_h_map.")
+        if "delta_h_window_center_steps" in data.files:
+            centers = np.asarray(data["delta_h_window_center_steps"], dtype=np.float64).reshape(-1)
+        else:
+            starts = np.asarray(data["window_start_steps"] if "window_start_steps" in data.files else np.arange(dh.size), dtype=np.float64).reshape(-1)
+            metric_cfg = _npz_json(data, "metric_config_json")
+            sample_every = int(_npz_scalar(data, "sample_every_steps", metric_cfg.get("sample_every_steps", 1)) or 1)
+            traj_start = int(_npz_scalar(data, "trajectory_start_steps", 0) or 0)
+            window_size = int(metric_cfg.get("window_size_steps", int(metric_cfg.get("window_size_frames", 1)) * sample_every))
+            centers = traj_start + starts + int(window_size // 2)
+    n = min(int(dh.size), int(centers.size))
+    if n == 0:
+        raise ValueError(f"{path} has an empty Delta-H series.")
+    return centers[:n], dh[:n]
+
+
+def _load_plife_delta_h_energy(
+    path: Path,
+    *,
+    min_remaining_steps: int | None = None,
+    min_remaining_samples: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    with np.load(path, allow_pickle=False) as data:
+        if "delta_h_map" not in data.files:
+            centers, dh = _load_plife_delta_h(path)
+            return centers, dh, {
+                "selection_energy_source": "delta_h_best_fallback",
+                "admissible_tau_count": 1,
+                "admissible_tau_steps": "",
+            }
+        dh_map = np.asarray(data["delta_h_map"], dtype=np.float64)
+        if dh_map.ndim != 2:
+            raise ValueError(f"{path} delta_h_map must be 2D, got {dh_map.shape}.")
+        tau_steps = np.asarray(
+            data["delta_h_tau_steps"] if "delta_h_tau_steps" in data.files else data["tau_steps"] if "tau_steps" in data.files else np.arange(dh_map.shape[0]),
+            dtype=np.float64,
+        ).reshape(-1)
+        if dh_map.shape[0] != tau_steps.size and dh_map.shape[1] == tau_steps.size:
+            dh_map = dh_map.T
+        if dh_map.shape[0] != tau_steps.size:
+            raise ValueError(f"{path} delta_h_map shape {dh_map.shape} is incompatible with tau grid size {tau_steps.size}.")
+        if "delta_h_window_center_steps" in data.files:
+            centers = np.asarray(data["delta_h_window_center_steps"], dtype=np.float64).reshape(-1)
+        else:
+            centers, _dh = _load_plife_delta_h(path)
+        metric_cfg = _npz_json(data, "metric_config_json")
+        sample_every = int(_npz_scalar(data, "delta_h_sample_every_steps", metric_cfg.get("sample_every_steps", 1)) or 1)
+        window_size_steps = _npz_scalar(data, "delta_h_window_size_steps", None)
+        if window_size_steps is None:
+            window_size_steps = int(metric_cfg.get("window_size_frames", 1)) * max(1, sample_every)
+        window_size_steps = int(window_size_steps)
+        if min_remaining_steps is not None:
+            min_gap_steps = int(min_remaining_steps)
+        elif min_remaining_samples is not None:
+            min_gap_steps = int(min_remaining_samples) * max(1, sample_every)
+        else:
+            min_gap_steps = int(metric_cfg.get("m_min", 4)) * max(1, sample_every)
+        admissible = np.isfinite(tau_steps) & (tau_steps < float(window_size_steps)) & (
+            (float(window_size_steps) - tau_steps) >= float(min_gap_steps)
+        )
+        if not np.any(admissible):
+            raise ValueError(
+                f"{path} has no admissible tau for branching energy: "
+                f"window_size_steps={window_size_steps}, min_remaining_steps={min_gap_steps}, tau_steps={tau_steps.tolist()}."
+            )
+        processed = _processed_delta_h(dh_map, metric_cfg)
+        energy = np.nanmean(processed[admissible], axis=0)
+        n = min(int(centers.size), int(energy.size))
+        meta = {
+            "selection_energy_source": "mean_tau_phi_delta_h_map",
+            "selection_preprocess_mode": str(metric_cfg.get("preprocess_mode", "clip")),
+            "selection_delta_h_floor": float(metric_cfg.get("delta_h_floor", 0.0) or 0.0),
+            "selection_window_size_steps": int(window_size_steps),
+            "selection_sample_every_steps": int(sample_every),
+            "selection_min_remaining_steps": int(min_gap_steps),
+            "admissible_tau_count": int(np.sum(admissible)),
+            "admissible_tau_steps": ",".join(str(int(round(x))) for x in tau_steps[admissible]),
+        }
+    if n == 0:
+        raise ValueError(f"{path} produced an empty branching energy profile.")
+    return centers[:n], energy[:n], meta
 
 
 def _pick_condition_indices(values: np.ndarray, centers: np.ndarray, *, n_high: int, n_mid: int, n_low: int, refractory: int) -> list[tuple[str, int]]:
@@ -490,161 +662,77 @@ def _branch_output_path(branch_root: Path, row: dict[str, Any], rep: int) -> Pat
     return branch_root / traj / f"point_{int(row['point_id']):04d}" / f"branch_{int(rep):03d}.npz"
 
 
-def metrics(config_path: str | Path, *, smoke: bool = False, force: bool = False) -> dict[str, Any]:
-    cfg, _ = load_config(config_path, smoke=smoke)
-    output_root = _output_root(cfg)
-    out_dir = _out_dir(cfg, output_root)
-    c2_cfg = _plife_c2_cfg(cfg)
-    log_event(
-        f"PLife++ C2 metrics start smoke={smoke} force={force} output={out_dir}",
-        component="c2-plife",
-    )
-    enabled = bool(_get(c2_cfg, "enabled", True))
-    if not enabled:
-        summary = {"status": "disabled"}
-        write_json(out_dir / "c2_plife_plus_metrics_summary.json", summary)
-        log_event("PLife++ C2 metrics disabled by config", component="c2-plife")
-        return summary
-    root = _trajectory_root(cfg, smoke=smoke)
-    required = bool(_get(c2_cfg, "required", False))
-    if root is None or not root.exists():
-        if required:
-            raise FileNotFoundError(f"PLife++ C2 trajectory root not found: {root}")
-        summary = {"status": "skipped", "reason": f"missing trajectory root {root}"}
-        write_json(out_dir / "c2_plife_plus_metrics_summary.json", summary)
-        log_event(f"PLife++ C2 metrics skipped: {summary['reason']}", component="c2-plife")
-        return summary
+def _branch_output_npz_from_row(branch_root: Path, row: dict[str, Any]) -> Path:
+    raw = str(row.get("branch_output_path", "")).strip()
+    if raw:
+        return Path(raw)
+    branch_dir_raw = str(row.get("branch_dir", "")).strip()
+    if branch_dir_raw:
+        branch_dir = Path(branch_dir_raw)
+        if branch_dir.suffix == ".npz":
+            return branch_dir
+        return branch_dir / "branch_output.npz"
+    rep = int(float(row.get("branch_id", row.get("branch_rep", 0)) or 0))
+    return _branch_output_path(branch_root, row, rep)
 
-    items = _iter_trajectory_items(root)
-    max_trajectories = int(_get(c2_cfg, "max_trajectories", _get(_get(cfg.get("c2", {}), "branching", {}), "max_trajectories", 9)))
-    items = items[:max(0, max_trajectories)]
-    log_event(
-        f"PLife++ C2 metrics discovered n_optimized={len(items)} max_trajectories={max_trajectories} root={root}",
-        component="c2-plife",
-    )
-    if not items:
-        summary = {"status": "skipped", "reason": f"no optimized PLife++ trajectories under {root}"}
-        write_json(out_dir / "c2_plife_plus_metrics_summary.json", summary)
-        log_event(f"PLife++ C2 metrics skipped: {summary['reason']}", component="c2-plife")
-        return summary
 
-    metrics_dir = ensure_dir(out_dir / "metrics")
-    branch_root = _branch_root(cfg, output_root)
-    metric_raw = _metric_cfg_raw(cfg)
-    branch_cfg = _get(cfg.get("c2", {}), "branching", {})
-    n_high = int(_get(c2_cfg, "n_high", _get(branch_cfg, "n_high", 5)))
-    n_mid = int(_get(c2_cfg, "n_mid", _get(branch_cfg, "n_mid", 5)))
-    n_low = int(_get(c2_cfg, "n_low", _get(branch_cfg, "n_low", 5)))
-    refractory = int(_get(c2_cfg, "refractory_steps", _get(branch_cfg, "refractory_steps", 0)))
-    branches_per_time = int(_get(c2_cfg, "branches_per_time", _get(branch_cfg, "branches_per_time", 3)))
-    horizon_steps = int(_get(c2_cfg, "horizon_steps", _get(branch_cfg, "horizon_steps", 1000)))
-    domain = float(_get(c2_cfg, "domain_size", 1.0))
-    metric_mode = _branching_metric_mode(_get(c2_cfg, "branching_metric", "clip_chamfer"))
-    clip_foundation_model = str(_get(c2_cfg, "clip_foundation_model", _get(branch_cfg, "clip_foundation_model", "clip")))
-    clip_cache_raw = _get(c2_cfg, "clip_embedding_cache_dir", None)
-    clip_cache_dir = ensure_dir(resolve_path(clip_cache_raw) if clip_cache_raw else out_dir / "clip_embedding_cache")
-    clip_max_frames = int(_get(c2_cfg, "clip_max_future_frames", _get(branch_cfg, "future_max_frames", 32)))
-    clip_fm = None
-    log_event(
-        "PLife++ C2 metrics config "
-        f"metric={metric_mode} branch_root={branch_root} n_high={n_high} n_mid={n_mid} n_low={n_low} "
-        f"branches_per_time={branches_per_time} horizon_steps={horizon_steps} refractory_steps={refractory} "
-        f"clip_max_frames={clip_max_frames}",
-        component="c2-plife",
-    )
+def _branch_plan_meta_current(plan_path: Path) -> tuple[bool, str]:
+    if not plan_path.exists():
+        return False, f"missing branch plan {plan_path}"
+    meta_path = plan_path.with_name("branch_plan_meta.json")
+    if not meta_path.exists():
+        return False, f"missing branch plan metadata {meta_path}"
+    try:
+        rows = read_csv(plan_path)
+        with meta_path.open("r") as f:
+            meta = json.load(f)
+    except Exception as exc:
+        return False, f"cannot read branch plan metadata: {type(exc).__name__}: {exc}"
+    if str(meta.get("branch_plan_version", "")) != PLIFE_BRANCH_PLAN_VERSION:
+        return False, f"stale branch plan version {meta.get('branch_plan_version')!r}; expected {PLIFE_BRANCH_PLAN_VERSION}"
+    current_hash = sha256_text(stable_json(rows))
+    if str(meta.get("branch_plan_rows_hash", "")) != current_hash:
+        return False, "branch_plan.csv no longer matches branch_plan_meta.json"
+    metrics_hash = _metrics_manifest_identity_hash(plan_path.parent)
+    if metrics_hash and str(meta.get("metrics_manifest_identity_hash", "")) != metrics_hash:
+        return False, "branch_plan.csv was built from stale PLife++ C2 metrics_manifest/metrics files"
+    return True, "ok"
 
-    manifest_rows: list[dict[str, Any]] = []
-    plan_rows: list[dict[str, Any]] = []
-    point_id = 0
-    for item_idx, item in enumerate(items, start=1):
-        lag_path = Path(item["lagrangian_path"])
-        if _progress_now(item_idx, len(items)):
-            log_event(
-                f"PLife++ C2 metric item {item_idx}/{len(items)} traj={item['traj_id']} lagrangian={lag_path}",
-                component="c2-plife",
-            )
-        if not lag_path.exists():
-            log_event(
-                f"PLife++ C2 metric item missing lagrangian traj={item['traj_id']} path={lag_path}",
-                component="c2-plife",
-            )
-            manifest_rows.append({**item, "status": "missing_lagrangian", "message": str(lag_path)})
-            continue
-        lag = _load_lagrangian(lag_path)
-        metric_cfg = _metric_config_from_lagrangian(lag_path, metric_raw)
-        metrics_path = metrics_dir / f"{item['traj_id']}_metrics.npz"
-        if metrics_path.exists() and not force:
-            if _progress_now(item_idx, len(items)):
-                log_event(f"PLife++ C2 metric cache hit traj={item['traj_id']} metrics={metrics_path}", component="c2-plife")
-            with np.load(metrics_path, allow_pickle=False) as data:
-                info = {key: np.asarray(data[key]) for key in data.files}
-        else:
-            log_event(
-                f"PLife++ C2 metric compute traj={item['traj_id']} T={lag['xy'].shape[0]} N={lag['xy'].shape[1]} "
-                f"sample_every={lag['sample_every']} range={lag['start']}..{lag['end']} metrics={metrics_path}",
-                component="c2-plife",
-            )
-            metric_eval = jax.jit(make_metric_loss_fn(metric_cfg, include_maps=True))
-            info = _score_maps(metric_eval, int(item["metric_seed"]), np.asarray(lag["xy"], dtype=np.float32))
-            np.savez_compressed(
-                metrics_path,
-                **info,
-                metric_config_json=np.asarray(json.dumps(to_plain(metric_cfg), sort_keys=True)),
-                lagrangian_path=np.asarray(str(lag_path)),
-                params_path=np.asarray(str(item["params_path"])),
-                trajectory_start_steps=np.asarray(int(lag["start"]), dtype=np.int32),
-                trajectory_end_steps=np.asarray(int(lag["end"]), dtype=np.int32),
-                sample_every_steps=np.asarray(int(lag["sample_every"]), dtype=np.int32),
-            )
-        if "delta_h_map" not in info:
-            log_event(f"PLife++ C2 metric item has no delta_h_map traj={item['traj_id']} metrics={metrics_path}", component="c2-plife")
-            manifest_rows.append({**item, "status": "missing_delta_h_map", "metrics_path": str(metrics_path)})
-            continue
-        delta_h_map = np.asarray(info["delta_h_map"], dtype=np.float64)
-        processed = _processed_delta_h(delta_h_map, metric_cfg)
-        energy = np.nanmean(processed, axis=0)
-        centers = _window_centers(info, metric_cfg, int(lag["start"]))
-        n = min(energy.size, centers.size)
-        picks = _pick_condition_indices(energy[:n], centers[:n], n_high=n_high, n_mid=n_mid, n_low=n_low, refractory=refractory)
-        energy_min = float(np.nanmin(energy[:n])) if n > 0 else float("nan")
-        energy_max = float(np.nanmax(energy[:n])) if n > 0 else float("nan")
-        log_event(
-            f"PLife++ C2 selected points traj={item['traj_id']} n_windows={n} n_tau={delta_h_map.shape[0]} "
-            f"n_points={len(picks)} delta_h_range={energy_min:.6g}..{energy_max:.6g}",
-            component="c2-plife",
-        )
-        for condition, idx in picks:
-            plan_rows.append(
-                {
-                    "point_id": int(point_id),
-                    "traj_id": str(item["traj_id"]),
-                    "trial_idx": int(item["trial_idx"]),
-                    "optimized_run_idx": int(item["optimized_run_idx"]),
-                    "condition": condition,
-                    "window_idx": int(idx),
-                    "step": int(round(float(centers[idx]))),
-                    "delta_h": float(energy[idx]),
-                    "metrics_path": str(metrics_path),
-                    "lagrangian_path": str(lag_path),
-                    "params_path": str(item["params_path"]),
-                    "seed_x": int(item["seed_x"]),
-                    "sample_every_steps": int(lag["sample_every"]),
-                    "trajectory_start_steps": int(lag["start"]),
-                    "trajectory_end_steps": int(lag["end"]),
-                    "branches_per_time": int(branches_per_time),
-                    "horizon_steps": int(horizon_steps),
-                }
-            )
-            point_id += 1
-        manifest_rows.append({**item, "status": "ok", "metrics_path": str(metrics_path), "n_points": len(picks)})
 
-    write_csv(out_dir / "metrics_manifest.csv", manifest_rows, fieldnames=METRICS_MANIFEST_COLUMNS)
-    write_csv(out_dir / "branch_plan.csv", plan_rows, fieldnames=BRANCH_PLAN_COLUMNS)
-    log_event(
-        f"PLife++ C2 wrote branch plan n_plan={len(plan_rows)} manifest={out_dir / 'metrics_manifest.csv'} plan={out_dir / 'branch_plan.csv'}",
-        component="c2-plife",
-    )
+def _metrics_manifest_identity_hash(out_dir: Path) -> str:
+    manifest_path = out_dir / "metrics_manifest.csv"
+    if not manifest_path.exists():
+        return ""
+    records: list[dict[str, Any]] = []
+    for row in read_csv(manifest_path):
+        path = Path(str(row.get("metrics_path", "")))
+        rec: dict[str, Any] = {
+            "traj_id": row.get("traj_id", ""),
+            "status": row.get("status", ""),
+            "metrics_path": str(path),
+        }
+        if path.exists():
+            stat = path.stat()
+            rec["size"] = int(stat.st_size)
+            rec["mtime_ns"] = int(stat.st_mtime_ns)
+        records.append(rec)
+    return sha256_text(stable_json(records))
 
+
+def _score_branch_plan(
+    *,
+    plan_rows: list[dict[str, Any]],
+    branch_root: Path,
+    out_dir: Path,
+    c2_cfg: Any,
+    branch_cfg: Any,
+    metric_mode: str,
+    clip_foundation_model: str,
+    clip_cache_dir: Path,
+    clip_max_frames: int,
+    domain: float,
+    force: bool,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     score_rows: list[dict[str, Any]] = []
     max_particles = int(_get(c2_cfg, "divergence_max_particles", 128))
     expected_branch_outputs = 0
@@ -652,19 +740,25 @@ def metrics(config_path: str | Path, *, smoke: bool = False, force: bool = False
     missing_min_branch_points = 0
     invalid_score_points = 0
     missing_rgb_outputs = 0
-    for point_idx, row in enumerate(plan_rows, start=1):
-        branch_paths = []
-        for rep in range(int(row["branches_per_time"])):
+    clip_fm = None
+    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for row in plan_rows:
+        key = (str(row.get("traj_id", "")), str(row.get("point_id", row.get("pair_id", ""))), str(row.get("condition", "sampled")))
+        groups.setdefault(key, []).append(row)
+
+    for point_idx, ((traj_id, point_id, condition), rows) in enumerate(sorted(groups.items()), start=1):
+        branch_paths: list[Path] = []
+        for row in rows:
             expected_branch_outputs += 1
-            path = _branch_output_path(branch_root, row, rep)
+            path = _branch_output_npz_from_row(branch_root, row)
             if not path.exists():
                 continue
             existing_branch_outputs += 1
             branch_paths.append(path)
-        if _progress_now(point_idx, len(plan_rows), every=10):
+        if _progress_now(point_idx, len(groups), every=10):
             log_event(
-                f"PLife++ C2 score point {point_idx}/{len(plan_rows)} point={row['point_id']} "
-                f"traj={row['traj_id']} condition={row['condition']} existing_branches={len(branch_paths)}/{row['branches_per_time']}",
+                f"PLife++ C2 score point {point_idx}/{len(groups)} point={point_id} "
+                f"traj={traj_id} condition={condition} existing_branches={len(branch_paths)}/{len(rows)}",
                 component="c2-plife",
             )
         if len(branch_paths) < 2:
@@ -709,31 +803,34 @@ def metrics(config_path: str | Path, *, smoke: bool = False, force: bool = False
         if not np.isfinite(score):
             invalid_score_points += 1
             continue
+        used = branch_paths
+        first = rows[0]
+        step_vals = [float(row.get("step", "nan")) for row in rows]
+        dh_vals = [float(row.get("delta_h", "nan")) for row in rows]
         score_row = {
-            "traj_id": row["traj_id"],
-            "point_id": int(row["point_id"]),
-            "condition": row["condition"],
-            "step": int(row["step"]),
-            "delta_h": float(row["delta_h"]),
+            "traj_id": traj_id,
+            "point_id": int(float(point_id)),
+            "pair_id": int(float(first.get("pair_id", point_id) or point_id)),
+            "condition": condition,
+            "step": float(np.nanmedian(step_vals)),
+            "delta_h": float(np.nanmedian(dh_vals)),
             "branching_score": float(score),
             "branching_metric": str(detail.get("metric", metric_mode)),
-            "n_branches": int(detail.get("n_branches", len(branch_paths))),
+            "n_branches": int(detail.get("n_branches", len(used))),
             "n_branch_pairs": int(detail.get("n_pairs", 0)),
         }
         for key, value in detail.items():
             if key not in score_row:
                 score_row[str(key)] = value
         score_rows.append(score_row)
+
     metric_name = "future_clip_chamfer_cosine" if metric_mode == "clip_chamfer" else "future_position_chamfer"
     corr = _correlation_summary(score_rows, metric_name=metric_name)
     write_csv(out_dir / "branching_scores.csv", score_rows, fieldnames=BRANCHING_SCORE_COLUMNS)
     write_csv(out_dir / "branching_delta_h_correlation.csv", [corr])
-    summary = {
-        "status": "ok",
-        "trajectory_root": str(root),
-        "branch_root": str(branch_root),
-        "n_metric_items": len(manifest_rows),
-        "n_plan_points": len(plan_rows),
+    score_summary = {
+        "n_plan_rows": len(plan_rows),
+        "n_plan_points": len(groups),
         "n_scores": len(score_rows),
         "n_expected_branch_outputs": int(expected_branch_outputs),
         "n_existing_branch_outputs": int(existing_branch_outputs),
@@ -743,13 +840,182 @@ def metrics(config_path: str | Path, *, smoke: bool = False, force: bool = False
         "branching_metric_mode": metric_mode,
         "correlation": corr,
     }
+    return score_rows, score_summary
+
+
+def metrics(config_path: str | Path, *, smoke: bool = False, force: bool = False) -> dict[str, Any]:
+    cfg, _ = load_config(config_path, smoke=smoke)
+    output_root = _output_root(cfg)
+    out_dir = _out_dir(cfg, output_root)
+    c2_cfg = _plife_c2_cfg(cfg)
+    log_event(
+        f"PLife++ C2 metrics start smoke={smoke} force={force} output={out_dir}",
+        component="c2-plife",
+    )
+    enabled = bool(_get(c2_cfg, "enabled", True))
+    if not enabled:
+        summary = {"status": "disabled"}
+        write_json(out_dir / "c2_plife_plus_metrics_summary.json", summary)
+        log_event("PLife++ C2 metrics disabled by config", component="c2-plife")
+        return summary
+    root = _trajectory_root(cfg, smoke=smoke)
+    required = bool(_get(c2_cfg, "required", False))
+    if root is None or not root.exists():
+        if required:
+            raise FileNotFoundError(f"PLife++ C2 trajectory root not found: {root}")
+        summary = {"status": "skipped", "reason": f"missing trajectory root {root}"}
+        write_json(out_dir / "c2_plife_plus_metrics_summary.json", summary)
+        log_event(f"PLife++ C2 metrics skipped: {summary['reason']}", component="c2-plife")
+        return summary
+
+    items = _iter_trajectory_items(root)
+    max_trajectories = int(_get(c2_cfg, "max_trajectories", _get(_get(cfg.get("c2", {}), "branching", {}), "max_trajectories", 9)))
+    items = items[:max(0, max_trajectories)]
+    log_event(
+        f"PLife++ C2 metrics discovered n_optimized={len(items)} max_trajectories={max_trajectories} root={root}",
+        component="c2-plife",
+    )
+    if not items:
+        summary = {"status": "skipped", "reason": f"no optimized PLife++ trajectories under {root}"}
+        write_json(out_dir / "c2_plife_plus_metrics_summary.json", summary)
+        log_event(f"PLife++ C2 metrics skipped: {summary['reason']}", component="c2-plife")
+        return summary
+
+    metrics_dir = ensure_dir(out_dir / "metrics")
+    branch_root = _branch_root(cfg, output_root)
+    metric_raw = _metric_cfg_raw(cfg)
+    branch_cfg = _get(cfg.get("c2", {}), "branching", {})
+    domain = float(_get(c2_cfg, "domain_size", 1.0))
+    metric_mode = _branching_metric_mode(_get(c2_cfg, "branching_metric", "clip_chamfer"))
+    clip_foundation_model = str(_get(c2_cfg, "clip_foundation_model", _get(branch_cfg, "clip_foundation_model", "clip")))
+    clip_cache_raw = _get(c2_cfg, "clip_embedding_cache_dir", None)
+    clip_cache_dir = ensure_dir(resolve_path(clip_cache_raw) if clip_cache_raw else out_dir / "clip_embedding_cache")
+    clip_max_frames = int(_get(c2_cfg, "clip_max_future_frames", _get(branch_cfg, "future_max_frames", 32)))
+    log_event(
+        "PLife++ C2 metrics config "
+        f"metric={metric_mode} branch_root={branch_root} clip_max_frames={clip_max_frames}",
+        component="c2-plife",
+    )
+
+    manifest_rows: list[dict[str, Any]] = []
+    for item_idx, item in enumerate(items, start=1):
+        lag_path = Path(item["lagrangian_path"])
+        if _progress_now(item_idx, len(items)):
+            log_event(
+                f"PLife++ C2 metric item {item_idx}/{len(items)} traj={item['traj_id']} lagrangian={lag_path}",
+                component="c2-plife",
+            )
+        if not lag_path.exists():
+            log_event(
+                f"PLife++ C2 metric item missing lagrangian traj={item['traj_id']} path={lag_path}",
+                component="c2-plife",
+            )
+            manifest_rows.append({**item, "status": "missing_lagrangian", "message": str(lag_path)})
+            continue
+        lag = _load_lagrangian(lag_path)
+        metric_cfg = _metric_config_from_lagrangian(lag_path, metric_raw)
+        metrics_path = metrics_dir / f"{item['traj_id']}_metrics.npz"
+        if metrics_path.exists() and not force:
+            if _progress_now(item_idx, len(items)):
+                log_event(f"PLife++ C2 metric cache hit traj={item['traj_id']} metrics={metrics_path}", component="c2-plife")
+            with np.load(metrics_path, allow_pickle=False) as data:
+                info = {key: np.asarray(data[key]) for key in data.files}
+        else:
+            log_event(
+                f"PLife++ C2 metric compute traj={item['traj_id']} T={lag['xy'].shape[0]} N={lag['xy'].shape[1]} "
+                f"sample_every={lag['sample_every']} range={lag['start']}..{lag['end']} metrics={metrics_path}",
+                component="c2-plife",
+            )
+            metric_eval = jax.jit(make_metric_loss_fn(metric_cfg, include_maps=True))
+            info = _score_maps(metric_eval, int(item["metric_seed"]), np.asarray(lag["xy"], dtype=np.float32))
+            timing_aliases = _metric_timing_aliases(info, metric_cfg, lag)
+            np.savez_compressed(
+                metrics_path,
+                **info,
+                **timing_aliases,
+                metric_config_json=np.asarray(json.dumps(to_plain(metric_cfg), sort_keys=True)),
+                lagrangian_path=np.asarray(str(lag_path)),
+                params_path=np.asarray(str(item["params_path"])),
+                trajectory_start_steps=np.asarray(int(lag["start"]), dtype=np.int32),
+                trajectory_end_steps=np.asarray(int(lag["end"]), dtype=np.int32),
+                sample_every_steps=np.asarray(int(lag["sample_every"]), dtype=np.int32),
+            )
+        if "delta_h_map" not in info:
+            log_event(f"PLife++ C2 metric item has no delta_h_map traj={item['traj_id']} metrics={metrics_path}", component="c2-plife")
+            manifest_rows.append({**item, "status": "missing_delta_h_map", "metrics_path": str(metrics_path)})
+            continue
+        n_windows = int(np.asarray(info["delta_h_map"]).shape[1]) if np.asarray(info["delta_h_map"]).ndim == 2 else 0
+        manifest_rows.append(
+            {
+                **item,
+                "status": "ok",
+                "metrics_path": str(metrics_path),
+                "n_points": n_windows,
+                "sample_every_steps": int(lag["sample_every"]),
+                "trajectory_start_steps": int(lag["start"]),
+                "trajectory_end_steps": int(lag["end"]),
+            }
+        )
+
+    write_csv(out_dir / "metrics_manifest.csv", manifest_rows, fieldnames=METRICS_MANIFEST_COLUMNS)
+    log_event(
+        f"PLife++ C2 wrote metrics manifest n_items={len(manifest_rows)} manifest={out_dir / 'metrics_manifest.csv'}",
+        component="c2-plife",
+    )
+
+    plan_path = out_dir / "branch_plan.csv"
+    plan_ok, plan_reason = _branch_plan_meta_current(plan_path)
+    if plan_ok:
+        plan_rows = read_csv(plan_path)
+        score_rows, score_summary = _score_branch_plan(
+            plan_rows=plan_rows,
+            branch_root=branch_root,
+            out_dir=out_dir,
+            c2_cfg=c2_cfg,
+            branch_cfg=branch_cfg,
+            metric_mode=metric_mode,
+            clip_foundation_model=clip_foundation_model,
+            clip_cache_dir=clip_cache_dir,
+            clip_max_frames=clip_max_frames,
+            domain=domain,
+            force=force,
+        )
+    else:
+        score_rows = []
+        metric_name = "future_clip_chamfer_cosine" if metric_mode == "clip_chamfer" else "future_position_chamfer"
+        corr = _correlation_summary(score_rows, metric_name=metric_name)
+        write_csv(out_dir / "branching_scores.csv", score_rows, fieldnames=BRANCHING_SCORE_COLUMNS)
+        write_csv(out_dir / "branching_delta_h_correlation.csv", [corr])
+        score_summary = {
+            "n_plan_rows": 0,
+            "n_plan_points": 0,
+            "n_scores": 0,
+            "n_expected_branch_outputs": 0,
+            "n_existing_branch_outputs": 0,
+            "n_points_with_fewer_than_two_branches": 0,
+            "n_points_with_invalid_score": 0,
+            "n_existing_branch_outputs_missing_rgb_future": 0,
+            "branching_metric_mode": metric_mode,
+            "correlation": corr,
+            "score_skip_reason": plan_reason,
+        }
+        log_event(f"PLife++ C2 metrics branch scoring skipped: {plan_reason}", component="c2-plife")
+    summary = {
+        "status": "ok",
+        "trajectory_root": str(root),
+        "branch_root": str(branch_root),
+        "n_metric_items": len(manifest_rows),
+        **score_summary,
+    }
     write_json(out_dir / "c2_plife_plus_metrics_summary.json", summary)
     log_event(
         "PLife++ C2 metrics done "
-        f"n_plan={len(plan_rows)} n_scores={len(score_rows)} "
-        f"branch_outputs={existing_branch_outputs}/{expected_branch_outputs} "
-        f"points_lt2_branches={missing_min_branch_points} invalid_scores={invalid_score_points} "
-        f"missing_rgb={missing_rgb_outputs} summary={out_dir / 'c2_plife_plus_metrics_summary.json'}",
+        f"n_plan_rows={summary['n_plan_rows']} n_plan_points={summary['n_plan_points']} n_scores={len(score_rows)} "
+        f"branch_outputs={summary['n_existing_branch_outputs']}/{summary['n_expected_branch_outputs']} "
+        f"points_lt2_branches={summary['n_points_with_fewer_than_two_branches']} "
+        f"invalid_scores={summary['n_points_with_invalid_score']} "
+        f"missing_rgb={summary['n_existing_branch_outputs_missing_rgb_future']} "
+        f"summary={out_dir / 'c2_plife_plus_metrics_summary.json'}",
         component="c2-plife",
     )
     return summary
@@ -855,6 +1121,253 @@ def _simulate_one_branch(
     return out
 
 
+def _safe_path_id(value: Any) -> str:
+    text = str(value)
+    out = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in text)
+    return out or "traj"
+
+
+def _nearest_window_idx(centers: np.ndarray, step: int) -> int:
+    c = np.asarray(centers, dtype=np.float64).reshape(-1)
+    if c.size == 0:
+        return 0
+    return int(np.argmin(np.abs(c - float(step))))
+
+
+def _int_or(value: Any, default: int) -> int:
+    try:
+        x = float(value)
+        if not np.isfinite(x):
+            return int(default)
+        return int(x)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _write_branch_plan_with_meta(out_dir: Path, rows: list[dict[str, Any]], *, matching: str, config_summary: dict[str, Any]) -> Path:
+    plan_path = out_dir / "branch_plan.csv"
+    write_csv(plan_path, rows, fieldnames=BRANCH_PLAN_COLUMNS)
+    csv_rows = read_csv(plan_path)
+    meta = {
+        "branch_plan_version": PLIFE_BRANCH_PLAN_VERSION,
+        "branch_plan_rows_hash": sha256_text(stable_json(csv_rows)),
+        "metrics_manifest_identity_hash": _metrics_manifest_identity_hash(out_dir),
+        "matching": matching,
+        "branching_config": config_summary,
+    }
+    write_json(out_dir / "branch_plan_meta.json", meta)
+    return plan_path
+
+
+def _build_branch_plan_rows(cfg: Any, output_root: Path, out_dir: Path, branch_root: Path) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
+    c2_cfg = _plife_c2_cfg(cfg)
+    branch_cfg = _get(cfg.get("c2", {}), "branching", {})
+    manifest_path = out_dir / "metrics_manifest.csv"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"missing PLife++ C2 metrics manifest {manifest_path}; run PLife++ C2 metrics first")
+    manifest_rows = [row for row in read_csv(manifest_path) if str(row.get("status", "")) == "ok"]
+    selection_mode = str(_get(c2_cfg, "selection_mode", _get(branch_cfg, "selection_mode", "tau_mean_ranked_high_low")))
+    n_high = int(_get(c2_cfg, "n_high", _get(branch_cfg, "n_high", 5)))
+    n_mid = int(_get(c2_cfg, "n_mid", _get(branch_cfg, "n_mid", 5)))
+    n_low = int(_get(c2_cfg, "n_low", _get(branch_cfg, "n_low", 5)))
+    m_pairs = int(_get(c2_cfg, "m_pairs", _get(branch_cfg, "m_pairs", 5)))
+    selection_seed = int(_get(c2_cfg, "selection_seed", _get(branch_cfg, "selection_seed", 12345)))
+    n_points_per_trajectory = int(_get(c2_cfg, "n_points_per_trajectory", _get(branch_cfg, "n_points_per_trajectory", max(1, 2 * m_pairs))))
+    point_quantiles = _as_float_list(_get(c2_cfg, "point_quantiles", _get(branch_cfg, "point_quantiles", None)))
+    point_quantile_min = float(_get(c2_cfg, "point_quantile_min", _get(branch_cfg, "point_quantile_min", 0.05)))
+    point_quantile_max = float(_get(c2_cfg, "point_quantile_max", _get(branch_cfg, "point_quantile_max", 0.95)))
+    high_quantile = float(_get(c2_cfg, "high_quantile", _get(branch_cfg, "high_quantile", 0.8)))
+    low_quantile = float(_get(c2_cfg, "low_quantile", _get(branch_cfg, "low_quantile", 0.2)))
+    mid_quantile_low = float(_get(c2_cfg, "mid_quantile_low", _get(branch_cfg, "mid_quantile_low", 0.4)))
+    mid_quantile_high = float(_get(c2_cfg, "mid_quantile_high", _get(branch_cfg, "mid_quantile_high", 0.6)))
+    refractory_steps = int(_get(c2_cfg, "refractory_steps", _get(branch_cfg, "refractory_steps", 0)))
+    min_branch_step = int(_get(c2_cfg, "min_branch_step", _get(c2_cfg, "selection_min_step", 0)))
+    horizon_steps = int(_get(c2_cfg, "horizon_steps", _get(branch_cfg, "horizon_steps", 1000)))
+    branches_per_time = int(_get(c2_cfg, "branches_per_time", _get(branch_cfg, "branches_per_time", 3)))
+    energy_min_remaining_steps_raw = _get(c2_cfg, "energy_min_remaining_steps", _get(branch_cfg, "energy_min_remaining_steps", None))
+    energy_min_remaining_samples_raw = _get(c2_cfg, "energy_min_samples", _get(branch_cfg, "energy_min_samples", None))
+    energy_min_remaining_steps = None if energy_min_remaining_steps_raw is None else int(energy_min_remaining_steps_raw)
+    energy_min_remaining_samples = None if energy_min_remaining_samples_raw is None else int(energy_min_remaining_samples_raw)
+    perturb_cfg = _get(c2_cfg, "perturb", {})
+    perturb_x_std = float(_get(perturb_cfg, "x_std", 0.003))
+    perturb_v_std = float(_get(perturb_cfg, "v_std", 0.0))
+    perturb_c_std = float(_get(perturb_cfg, "c_std", 0.01))
+
+    config_summary = {
+        "selection_mode": selection_mode,
+        "selection_seed": selection_seed,
+        "n_high": n_high,
+        "n_mid": n_mid,
+        "n_low": n_low,
+        "m_pairs": m_pairs,
+        "n_points_per_trajectory": n_points_per_trajectory,
+        "point_quantiles": point_quantiles,
+        "point_quantile_min": point_quantile_min,
+        "point_quantile_max": point_quantile_max,
+        "high_quantile": high_quantile,
+        "mid_quantile_low": mid_quantile_low,
+        "mid_quantile_high": mid_quantile_high,
+        "low_quantile": low_quantile,
+        "refractory_steps": refractory_steps,
+        "min_branch_step": min_branch_step,
+        "horizon_steps": horizon_steps,
+        "branches_per_time": branches_per_time,
+        "energy_min_remaining_steps": energy_min_remaining_steps,
+        "energy_min_samples": energy_min_remaining_samples,
+        "perturb_x_std": perturb_x_std,
+        "perturb_v_std": perturb_v_std,
+        "perturb_c_std": perturb_c_std,
+    }
+
+    ranked: list[tuple[float, int, dict[str, str], np.ndarray, np.ndarray, dict[str, Any]]] = []
+    for item_idx, row in enumerate(manifest_rows):
+        metrics_path = Path(str(row.get("metrics_path", "")))
+        if not metrics_path.exists():
+            continue
+        if _is_ranked_high_low_mode(selection_mode):
+            centers, energy, selection_meta = _load_plife_delta_h_energy(
+                metrics_path,
+                min_remaining_steps=energy_min_remaining_steps,
+                min_remaining_samples=energy_min_remaining_samples,
+            )
+            rank_score = float(np.nanmean(energy))
+        else:
+            centers, energy = _load_plife_delta_h(metrics_path)
+            selection_meta = {}
+            rank_score = float(np.nanmax(energy))
+        ranked.append((rank_score, item_idx, row, centers, energy, selection_meta))
+    ranked.sort(key=lambda x: -x[0])
+    max_trajectories = int(_get(c2_cfg, "max_trajectories", _get(branch_cfg, "max_trajectories", len(ranked))))
+    ranked = ranked[: max(0, max_trajectories)]
+    rows: list[dict[str, Any]] = []
+    global_point_id = 0
+    matching_used = "none"
+
+    log_event(
+        f"PLife++ C2 branch planning n_metric_items={len(ranked)} selection_mode={selection_mode} "
+        f"n_high={n_high} n_mid={n_mid} n_low={n_low} branches_per_time={branches_per_time}",
+        component="c2-plife",
+    )
+    for traj_order, (_rank, _item_idx, item, centers, energy, selection_meta) in enumerate(ranked):
+        traj_id = str(item.get("traj_id", Path(str(item.get("metrics_path", ""))).stem))
+        trajectory_end_raw = item.get("trajectory_end_steps", "")
+        trajectory_end = _int_or(trajectory_end_raw, -1)
+        trajectory_end = None if trajectory_end < 0 else trajectory_end
+        if _is_ranked_high_low_mode(selection_mode):
+            points, select_summary = _select_ranked_high_low_points(
+                centers=centers,
+                energy=energy,
+                covariates={},
+                n_high=n_high,
+                n_low=n_low,
+                n_mid=n_mid,
+                q_high=high_quantile,
+                q_low=low_quantile,
+                q_mid_low=mid_quantile_low,
+                q_mid_high=mid_quantile_high,
+                horizon_steps=horizon_steps,
+                trajectory_end_step=trajectory_end,
+                seed=selection_seed + 10007 * traj_order,
+                min_step=min_branch_step,
+                energy_meta=selection_meta,
+            )
+            log_event(
+                f"PLife++ C2 branch planning traj={traj_id} selected_high={select_summary.get('n_high_selected', 0)} "
+                f"selected_mid={select_summary.get('n_mid_selected', 0)} selected_low={select_summary.get('n_low_selected', 0)}",
+                component="c2-plife",
+            )
+            matching = "mean_tau_phi_delta_h_quantile_rank_sampling_without_replacement"
+            matching_used = matching
+        elif _is_delta_h_sweep_mode(selection_mode):
+            points = _select_delta_h_points(
+                centers=centers,
+                dh=energy,
+                covariates={},
+                n_points=n_points_per_trajectory,
+                refractory_steps=refractory_steps,
+                quantiles=point_quantiles or None,
+                quantile_min=point_quantile_min,
+                quantile_max=point_quantile_max,
+                min_step=min_branch_step,
+            )
+            matching = "delta_h_quantile_sweep"
+            matching_used = matching
+            log_event(f"PLife++ C2 branch planning traj={traj_id} selected_points={len(points)}", component="c2-plife")
+        else:
+            points = _select_delta_h_points(
+                centers=centers,
+                dh=energy,
+                covariates={},
+                n_points=max(1, n_high + n_mid + n_low),
+                refractory_steps=refractory_steps,
+                quantile_min=point_quantile_min,
+                quantile_max=point_quantile_max,
+                min_step=min_branch_step,
+            )
+            matching = "delta_h_quantile_sweep_fallback"
+            matching_used = matching
+            log_event(f"PLife++ C2 branch planning fallback traj={traj_id} selected_points={len(points)}", component="c2-plife")
+
+        for point in points:
+            local_point_id = int(point.get("point_id", global_point_id))
+            condition = str(point.get("condition", "sampled"))
+            step = int(point.get("step", point.get("window_center_step", 0)))
+            window_idx = int(point.get("window_index", _nearest_window_idx(centers, step)))
+            delta_h = float(point.get("delta_h", point.get("delta_h_energy", np.nan)))
+            pair_id = int(point.get("pair_id", local_point_id))
+            try:
+                target_q_value = float(point.get("target_quantile", 0.5))
+            except (TypeError, ValueError):
+                target_q_value = float("nan")
+            q_tag = int(round(1000.0 * target_q_value)) if np.isfinite(target_q_value) else global_point_id
+            point_dir = branch_root / _safe_path_id(traj_id) / f"point_{global_point_id:04d}_{condition}_q_{q_tag:04d}_step_{step}"
+            for branch_id in range(branches_per_time):
+                condition_offset = {"high": 0, "mid": 3967, "low": 7919, "sampled": 12347}.get(condition, 12347)
+                branch_seed = int(selection_seed + 1000003 * traj_order + 1009 * global_point_id + 131 * branch_id + condition_offset)
+                branch_dir = point_dir / f"branch_{branch_id:02d}"
+                branch_output = branch_dir / "branch_output.npz"
+                rows.append(
+                    {
+                        "point_id": int(global_point_id),
+                        "pair_id": int(pair_id),
+                        "traj_id": traj_id,
+                        "trial_idx": _int_or(item.get("trial_idx", -1), -1),
+                        "optimized_run_idx": _int_or(item.get("optimized_run_idx", -1), -1),
+                        "condition": condition,
+                        "window_idx": int(window_idx),
+                        "step": int(step),
+                        "requested_step": int(step),
+                        "step_snap_delta": 0,
+                        "delta_h": float(delta_h),
+                        "delta_h_energy": float(point.get("delta_h_energy", delta_h)),
+                        "target_quantile": point.get("target_quantile", ""),
+                        "delta_h_quantile": point.get("delta_h_quantile", ""),
+                        "delta_h_quantile_rank": point.get("delta_h_quantile_rank", ""),
+                        "selection_mode": selection_mode,
+                        "selection_method": point.get("selection_method", matching),
+                        "metrics_path": str(item.get("metrics_path", "")),
+                        "lagrangian_path": str(item.get("lagrangian_path", "")),
+                        "params_path": str(item.get("params_path", "")),
+                        "seed_x": _int_or(item.get("seed_x", -1), -1),
+                        "sample_every_steps": _int_or(item.get("sample_every_steps", 1), 1),
+                        "trajectory_start_steps": _int_or(item.get("trajectory_start_steps", 0), 0),
+                        "trajectory_end_steps": _int_or(item.get("trajectory_end_steps", 0), 0),
+                        "horizon_steps": int(horizon_steps),
+                        "branch_id": int(branch_id),
+                        "branch_seed": int(branch_seed),
+                        "branch_dir": str(branch_dir),
+                        "branch_output_path": str(branch_output),
+                        "perturb_x_std": float(perturb_x_std),
+                        "perturb_v_std": float(perturb_v_std),
+                        "perturb_c_std": float(perturb_c_std),
+                        "status": "planned",
+                        "command": "",
+                    }
+                )
+            global_point_id += 1
+    return rows, matching_used, config_summary
+
+
 def simulation(
     config_path: str | Path,
     *,
@@ -874,52 +1387,101 @@ def simulation(
     if not bool(_get(c2_cfg, "enabled", True)):
         log_event("PLife++ C2 simulation disabled by config", component="c2-plife")
         return {"status": "disabled"}
+    branch_root = _branch_root(cfg, output_root)
     plan_path = out_dir / "branch_plan.csv"
-    if not plan_path.exists():
-        summary = {"status": "skipped", "reason": f"missing branch plan {plan_path}; run C2 PLife++ metrics first"}
+    plan_ok, plan_reason = _branch_plan_meta_current(plan_path)
+    if force or not plan_ok:
+        try:
+            rows, matching, config_summary = _build_branch_plan_rows(cfg, output_root, out_dir, branch_root)
+        except FileNotFoundError as exc:
+            summary = {"status": "skipped", "reason": str(exc), "branch_plan": str(plan_path)}
+            write_json(out_dir / "c2_plife_plus_simulation_summary.json", summary)
+            log_event(f"PLife++ C2 simulation skipped: {summary['reason']}", component="c2-plife")
+            return summary
+        log_event(
+            f"PLife++ C2 simulation rebuilt branch plan reason={plan_reason} n_plan_rows={len(rows)}",
+            component="c2-plife",
+        )
+    else:
+        rows = read_csv(plan_path)
+        try:
+            with (out_dir / "branch_plan_meta.json").open("r") as f:
+                meta = json.load(f)
+        except Exception:
+            meta = {}
+        matching = str(meta.get("matching", "unknown"))
+        config_summary = dict(meta.get("branching_config", {}))
+        log_event(f"PLife++ C2 simulation using current branch plan n_plan_rows={len(rows)}", component="c2-plife")
+
+    if not rows:
+        _write_branch_plan_with_meta(out_dir, rows, matching=matching, config_summary=config_summary)
+        summary = {"status": "skipped", "reason": "empty branch plan", "branch_plan": str(plan_path)}
         write_json(out_dir / "c2_plife_plus_simulation_summary.json", summary)
         log_event(f"PLife++ C2 simulation skipped: {summary['reason']}", component="c2-plife")
         return summary
-    if not allow_heavy:
-        summary = {"status": "skipped_heavy", "reason": "PLife++ C2 branch simulation requires --allow-heavy", "branch_plan": str(plan_path)}
-        write_json(out_dir / "c2_plife_plus_simulation_summary.json", summary)
-        log_event(f"PLife++ C2 simulation skipped heavy: plan={plan_path}", component="c2-plife")
-        return summary
-    rows = []
-    with plan_path.open("r", newline="") as f:
-        import csv
 
-        rows = list(csv.DictReader(f))
-    if not rows:
-        summary = {"status": "skipped", "reason": "empty branch plan", "branch_plan": str(plan_path)}
-        write_json(out_dir / "c2_plife_plus_simulation_summary.json", summary)
-        log_event("PLife++ C2 simulation skipped: empty branch plan", component="c2-plife")
-        return summary
-    if dry_run:
-        summary = {"status": "dry_run", "n_plan_points": len(rows)}
-        write_json(out_dir / "c2_plife_plus_simulation_summary.json", summary)
-        log_event(f"PLife++ C2 simulation dry-run n_plan_points={len(rows)}", component="c2-plife")
-        return summary
-
-    branch_root = _branch_root(cfg, output_root)
-    log_event(f"PLife++ C2 building substrate branch_root={branch_root}", component="c2-plife")
-    substrate = _build_substrate(cfg, smoke=smoke)
-    perturb_cfg = _get(c2_cfg, "perturb", {})
-    perturb = {
-        "x_std": float(_get(perturb_cfg, "x_std", 0.003)),
-        "v_std": float(_get(perturb_cfg, "v_std", 0.0)),
-        "c_std": float(_get(perturb_cfg, "c_std", 0.01)),
-    }
     future_sample_every = int(_get(c2_cfg, "future_sample_every_steps", _get(c2_cfg, "sample_every_steps", 25)))
     metric_mode = _branching_metric_mode(_get(c2_cfg, "branching_metric", "clip_chamfer"))
     render_img_size = int(_get(c2_cfg, "render_img_size", 128)) if metric_mode == "clip_chamfer" else 0
-    total_expected = 0
-    for row in rows:
-        total_expected += int(float(row.get("branches_per_time", _get(c2_cfg, "branches_per_time", 3))))
+    total_expected = len(rows)
+
+    def _mark_without_running(status: str) -> dict[str, Any]:
+        existing = 0
+        for row in rows:
+            out = _branch_output_npz_from_row(branch_root, row)
+            if out.exists():
+                row["status"] = "exists"
+                existing += 1
+            else:
+                row["status"] = status
+            row["branch_output_path"] = str(out)
+            row["command"] = command_to_str(
+                [
+                    "internal_plife_branch",
+                    str(row.get("params_path", "")),
+                    "--step",
+                    str(row.get("step", "")),
+                    "--horizon",
+                    str(row.get("horizon_steps", "")),
+                    "--branch-seed",
+                    str(row.get("branch_seed", "")),
+                ]
+            )
+        _write_branch_plan_with_meta(out_dir, rows, matching=matching, config_summary=config_summary)
+        return {
+            "n_existing": existing,
+            "n_expected_branch_outputs": total_expected,
+        }
+
+    if not allow_heavy:
+        counts = _mark_without_running("skipped_heavy")
+        summary = {
+            "status": "skipped_heavy",
+            "reason": "PLife++ C2 branch simulation requires --allow-heavy",
+            "branch_plan": str(plan_path),
+            "n_plan_rows": len(rows),
+            **counts,
+        }
+        write_json(out_dir / "c2_plife_plus_simulation_summary.json", summary)
+        log_event(
+            f"PLife++ C2 simulation skipped heavy n_plan_rows={len(rows)} existing={counts['n_existing']}/{total_expected} plan={plan_path}",
+            component="c2-plife",
+        )
+        return summary
+
+    if dry_run:
+        counts = _mark_without_running("dry_run")
+        summary = {"status": "dry_run", "n_plan_rows": len(rows), "branch_plan": str(plan_path), **counts}
+        write_json(out_dir / "c2_plife_plus_simulation_summary.json", summary)
+        log_event(f"PLife++ C2 simulation dry-run n_plan_rows={len(rows)}", component="c2-plife")
+        return summary
+
+    log_event(f"PLife++ C2 building substrate branch_root={branch_root}", component="c2-plife")
+    substrate = _build_substrate(cfg, smoke=smoke)
     log_event(
         "PLife++ C2 simulation config "
-        f"n_plan={len(rows)} expected_branch_outputs={total_expected} metric={metric_mode} "
-        f"future_sample_every={future_sample_every} render_img_size={render_img_size} perturb={perturb}",
+        f"n_plan_rows={len(rows)} expected_branch_outputs={total_expected} metric={metric_mode} "
+        f"future_sample_every={future_sample_every} render_img_size={render_img_size}",
         component="c2-plife",
     )
     done = 0
@@ -927,64 +1489,86 @@ def simulation(
     existing = 0
     skipped = 0
     errors = []
-    for point_idx, row in enumerate(rows, start=1):
+    for branch_idx, row in enumerate(rows, start=1):
         params_path = Path(str(row["params_path"]))
-        seed = int(float(row.get("seed_x", -1)))
+        seed = _int_or(row.get("seed_x", -1), -1)
+        out = _branch_output_npz_from_row(branch_root, row)
+        row["branch_output_path"] = str(out)
+        row["command"] = command_to_str(
+            [
+                "internal_plife_branch",
+                str(params_path),
+                "--step",
+                str(row.get("step", "")),
+                "--horizon",
+                str(row.get("horizon_steps", "")),
+                "--branch-seed",
+                str(row.get("branch_seed", "")),
+            ]
+        )
         if seed < 0 or not params_path.exists():
             skipped += 1
             errors.append(f"point={row.get('point_id')} missing seed/params")
+            row["status"] = "skipped_missing_params"
             log_event(
-                f"PLife++ C2 simulation skip point {point_idx}/{len(rows)} point={row.get('point_id')} "
+                f"PLife++ C2 simulation skip branch {branch_idx}/{len(rows)} point={row.get('point_id')} "
                 f"seed={seed} params={params_path}",
                 component="c2-plife",
             )
             continue
         params = np.load(params_path, allow_pickle=True)
-        branches = int(float(row.get("branches_per_time", _get(c2_cfg, "branches_per_time", 3))))
-        if _progress_now(point_idx, len(rows), every=5):
+        if _progress_now(branch_idx, len(rows), every=10):
             log_event(
-                f"PLife++ C2 simulation point {point_idx}/{len(rows)} point={row.get('point_id')} "
-                f"traj={row.get('traj_id')} condition={row.get('condition')} step={row.get('step')} branches={branches}",
+                f"PLife++ C2 simulation branch {branch_idx}/{len(rows)} point={row.get('point_id')} branch={row.get('branch_id')} "
+                f"traj={row.get('traj_id')} condition={row.get('condition')} step={row.get('step')}",
                 component="c2-plife",
             )
-        for rep in range(branches):
-            out = _branch_output_path(branch_root, row, rep)
-            if out.exists() and not force:
-                done += 1
-                existing += 1
-                continue
-            ensure_dir(out.parent)
-            branch_payload = _simulate_one_branch(
-                substrate=substrate,
-                params=params,
-                seed=seed,
-                branch_step=int(float(row["step"])),
-                rep_seed=int(10_000_000 + 1009 * int(float(row["point_id"])) + rep),
-                horizon_steps=int(float(row["horizon_steps"])),
-                sample_every=future_sample_every,
-                perturb=perturb,
-                render_img_size=render_img_size,
-            )
-            if written == 0:
-                shape_text = ", ".join(f"{key}={tuple(value.shape)}" for key, value in branch_payload.items())
-                log_event(f"PLife++ C2 first branch payload shapes {shape_text}", component="c2-plife")
-            np.savez_compressed(
-                out,
-                **{key: np.asarray(value, dtype=np.float32) for key, value in branch_payload.items()},
-                point_id=np.asarray(int(float(row["point_id"])), dtype=np.int32),
-                branch_rep=np.asarray(rep, dtype=np.int32),
-                step=np.asarray(int(float(row["step"])), dtype=np.int32),
-                future_sample_every_steps=np.asarray(future_sample_every, dtype=np.int32),
-                branching_metric=np.asarray(metric_mode),
-                render_img_size=np.asarray(int(render_img_size), dtype=np.int32),
-            )
+        if out.exists() and not force:
             done += 1
-            written += 1
-            if written == 1 or written % 25 == 0 or done == total_expected:
-                log_event(
-                    f"PLife++ C2 branch outputs progress done={done}/{total_expected} written={written} existing={existing} last={out}",
-                    component="c2-plife",
-                )
+            existing += 1
+            row["status"] = "exists"
+            continue
+        ensure_dir(out.parent)
+        perturb = {
+            "x_std": float(row.get("perturb_x_std", _get(_get(c2_cfg, "perturb", {}), "x_std", 0.003))),
+            "v_std": float(row.get("perturb_v_std", _get(_get(c2_cfg, "perturb", {}), "v_std", 0.0))),
+            "c_std": float(row.get("perturb_c_std", _get(_get(c2_cfg, "perturb", {}), "c_std", 0.01))),
+        }
+        branch_payload = _simulate_one_branch(
+            substrate=substrate,
+            params=params,
+            seed=seed,
+            branch_step=_int_or(row["step"], 0),
+            rep_seed=_int_or(row.get("branch_seed", -1), 10_000_000 + 1009 * _int_or(row.get("point_id", 0), 0) + _int_or(row.get("branch_id", 0), 0)),
+            horizon_steps=_int_or(row["horizon_steps"], 0),
+            sample_every=future_sample_every,
+            perturb=perturb,
+            render_img_size=render_img_size,
+        )
+        if written == 0:
+            shape_text = ", ".join(f"{key}={tuple(value.shape)}" for key, value in branch_payload.items())
+            log_event(f"PLife++ C2 first branch payload shapes {shape_text}", component="c2-plife")
+        np.savez_compressed(
+            out,
+            **{key: np.asarray(value, dtype=np.float32) for key, value in branch_payload.items()},
+            point_id=np.asarray(_int_or(row["point_id"], -1), dtype=np.int32),
+            branch_id=np.asarray(_int_or(row.get("branch_id", 0), 0), dtype=np.int32),
+            branch_seed=np.asarray(_int_or(row.get("branch_seed", -1), -1), dtype=np.int64),
+            step=np.asarray(_int_or(row["step"], 0), dtype=np.int32),
+            horizon_steps=np.asarray(_int_or(row["horizon_steps"], 0), dtype=np.int32),
+            future_sample_every_steps=np.asarray(future_sample_every, dtype=np.int32),
+            branching_metric=np.asarray(metric_mode),
+            render_img_size=np.asarray(int(render_img_size), dtype=np.int32),
+        )
+        row["status"] = "exists" if out.exists() else "missing"
+        done += 1
+        written += 1
+        if written == 1 or written % 25 == 0 or done == total_expected:
+            log_event(
+                f"PLife++ C2 branch outputs progress done={done}/{total_expected} written={written} existing={existing} last={out}",
+                component="c2-plife",
+            )
+    _write_branch_plan_with_meta(out_dir, rows, matching=matching, config_summary=config_summary)
     summary = {
         "status": "ok",
         "n_written_or_existing": done,
@@ -994,6 +1578,7 @@ def simulation(
         "n_skipped_points": skipped,
         "errors": errors[:20],
         "branch_root": str(branch_root),
+        "branch_plan": str(plan_path),
     }
     write_json(out_dir / "c2_plife_plus_simulation_summary.json", summary)
     log_event(
@@ -1002,6 +1587,31 @@ def simulation(
         component="c2-plife",
     )
     return summary
+
+
+def visualization(config_path: str | Path, *, smoke: bool = False, force: bool = False) -> dict[str, Any]:
+    log_event(f"PLife++ C2 visualization start smoke={smoke} force={force}", component="c2-plife")
+    from paper_suite_visualize import run as run_visualization
+
+    result = run_visualization(config_path, task="c2", smoke=smoke, force=force)
+    figure_paths = result.get("figure_paths", {})
+    plife_figures = {
+        key: value
+        for key, value in figure_paths.items()
+        if str(key).startswith("c2_plife_plus")
+    }
+    log_event(f"PLife++ C2 visualization done n_plife_figures={len(plife_figures)}", component="c2-plife")
+    return {"status": "ok", "n_plife_figures": len(plife_figures), "figure_paths": plife_figures, "visualization": result}
+
+
+def _normalize_layer(layer: str) -> str:
+    value = str(layer).strip().lower().replace("-", "_")
+    aliases = {
+        "viz": "visualization",
+        "visualisation": "visualization",
+        "vizualisation": "visualization",
+    }
+    return aliases.get(value, value)
 
 
 def run(
@@ -1013,20 +1623,30 @@ def run(
     allow_heavy: bool = False,
     dry_run: bool = False,
 ) -> dict[str, Any]:
+    layer = _normalize_layer(layer)
     if layer == "metrics":
         return metrics(config_path, smoke=smoke, force=force)
     if layer == "simulation":
         return simulation(config_path, smoke=smoke, force=force, allow_heavy=allow_heavy, dry_run=dry_run)
+    if layer == "visualization":
+        return visualization(config_path, smoke=smoke, force=force)
+    if layer != "all":
+        raise ValueError(f"Unknown PLife++ C2 layer {layer!r}; use simulation, metrics, visualization, or all.")
     first = metrics(config_path, smoke=smoke, force=force)
     sim = simulation(config_path, smoke=smoke, force=force, allow_heavy=allow_heavy, dry_run=dry_run)
-    second = metrics(config_path, smoke=smoke, force=True)
-    return {"metrics_before": first, "simulation": sim, "metrics_after": second}
+    second = metrics(config_path, smoke=smoke, force=False)
+    vis = visualization(config_path, smoke=smoke, force=force)
+    return {"metrics_before": first, "simulation": sim, "metrics_after": second, "visualization": vis}
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="PLife++ C2 Delta-H branch sensitivity layer.")
     parser.add_argument("config")
-    parser.add_argument("--layer", choices=["simulation", "metrics", "all"], default="all")
+    parser.add_argument(
+        "--layer",
+        choices=["simulation", "metrics", "visualization", "visualisation", "vizualisation", "viz", "all"],
+        default="all",
+    )
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--allow-heavy", action="store_true")
