@@ -121,6 +121,19 @@ def _c2_plife_plus_metrics(config: str, *, smoke: bool, force: bool = False) -> 
     _call("paper_suite_c2_plife_plus.py", config, *args)
 
 
+def _plife_noise_sweep(config: str, *, smoke: bool, force: bool, allow_heavy: bool, dry_run: bool) -> None:
+    args = []
+    if smoke:
+        args.append("--smoke")
+    if force:
+        args.append("--force")
+    if allow_heavy:
+        args.append("--allow-heavy")
+    if dry_run:
+        args.append("--dry-run")
+    _call("c2_plife_perturbation_strength_sweep.py", config, *args)
+
+
 def _visualization(config: str, task: str, *, smoke: bool, force: bool) -> None:
     if task == "nnopt_apf":
         log_event("visualization skipped for nnopt_apf task", component="runner")
@@ -168,7 +181,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="One-button MSPD paper experiment suite.")
     parser.add_argument("config", help="experiments/paper_suite/config.yaml")
     parser.add_argument("--layer", choices=["simulation", "metrics", "visualization", "all"], default="all")
-    parser.add_argument("--task", choices=["all", "synthetic", "c1", "c2", "c4", "c5", "c6", "nnopt_apf", "plife_videos"], default="all")
+    parser.add_argument(
+        "--task",
+        choices=["all", "synthetic", "c1", "c2", "c4", "c5", "c6", "nnopt_apf", "plife_videos", "plife_noise_sweep"],
+        default="all",
+    )
     parser.add_argument("--smoke", action="store_true", help="Use small CPU smoke settings and generated tiny posthoc fixtures.")
     parser.add_argument("--force", action="store_true", help="Recompute outputs even when present.")
     parser.add_argument("--allow-heavy", action="store_true", help="Allow configured heavy real simulation commands.")
@@ -177,6 +194,20 @@ def main(argv: list[str] | None = None) -> int:
 
     master_log = init_suite_logging(args.config, smoke=args.smoke, layer=args.layer, task=args.task)
     log_event(f"master log: {master_log}", component="runner")
+    if args.task == "plife_noise_sweep":
+        if args.layer in {"simulation", "all"}:
+            log_event("starting PLife++ C2 perturbation strength sweep", component="runner")
+            _plife_noise_sweep(
+                args.config,
+                smoke=args.smoke,
+                force=args.force,
+                allow_heavy=args.allow_heavy,
+                dry_run=args.dry_run,
+            )
+        else:
+            log_event(f"PLife++ noise sweep has no standalone {args.layer} layer", component="runner")
+        log_event("paper suite finished", component="runner")
+        return 0
     if args.layer in {"simulation", "all"} and args.task != "plife_videos":
         log_event("starting simulation layer", component="runner")
         _simulation(args.config, args.task, smoke=args.smoke, force=args.force, allow_heavy=args.allow_heavy, dry_run=args.dry_run)
