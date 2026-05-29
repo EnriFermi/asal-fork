@@ -1292,6 +1292,198 @@ def _plot_c2_plife_plus_branching(output_root: Path, figures: Path) -> dict[str,
     }
 
 
+def _npz_scalar(data: np.lib.npyio.NpzFile, key: str, default: Any = None) -> Any:
+    if key not in data.files:
+        return default
+    try:
+        return np.asarray(data[key]).reshape(-1)[0].item()
+    except Exception:
+        return default
+
+
+def _metric_config_from_npz(data: np.lib.npyio.NpzFile) -> dict[str, Any]:
+    raw = _npz_scalar(data, "metric_config_json", None)
+    if raw is None:
+        return {}
+    try:
+        return json.loads(str(raw))
+    except Exception:
+        return {}
+
+
+def _processed_delta_h_for_plot(delta_h_map: np.ndarray, metric_cfg: dict[str, Any]) -> np.ndarray:
+    x = np.asarray(delta_h_map, dtype=np.float64)
+    mode = str(metric_cfg.get("preprocess_mode", "clip")).strip().lower()
+    if mode == "clip":
+        out = np.maximum(x, 0.0)
+    elif mode == "shift":
+        out = x - np.nanmin(x, axis=1, keepdims=True)
+    elif mode == "none":
+        out = x.copy()
+    else:
+        out = np.maximum(x, 0.0)
+    floor = float(metric_cfg.get("delta_h_floor", 0.0) or 0.0)
+    if floor > 0.0:
+        out = np.where(out >= floor, out, 0.0)
+    return out
+
+
+def _load_plife_heatmap(metrics_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    try:
+        with np.load(metrics_path, allow_pickle=False) as data:
+            if "delta_h_map" not in data.files:
+                return None
+            metric_cfg = _metric_config_from_npz(data)
+            z = _processed_delta_h_for_plot(np.asarray(data["delta_h_map"], dtype=np.float64), metric_cfg)
+            tau = np.asarray(
+                data["delta_h_tau_steps"] if "delta_h_tau_steps" in data.files else data["tau_steps"] if "tau_steps" in data.files else np.arange(z.shape[0]),
+                dtype=np.float64,
+            ).reshape(-1)
+            if z.ndim != 2:
+                return None
+            if z.shape[0] != tau.size and z.shape[1] == tau.size:
+                z = z.T
+            if z.shape[0] != tau.size:
+                tau = np.arange(z.shape[0], dtype=np.float64)
+            if "delta_h_window_center_steps" in data.files:
+                centers = np.asarray(data["delta_h_window_center_steps"], dtype=np.float64).reshape(-1)
+            else:
+                starts = np.asarray(data["window_start_steps"] if "window_start_steps" in data.files else np.arange(z.shape[1]), dtype=np.float64).reshape(-1)
+                sample_every = int(_npz_scalar(data, "sample_every_steps", metric_cfg.get("sample_every_steps", 1)) or 1)
+                window = int(metric_cfg.get("window_size_steps", int(metric_cfg.get("window_size_frames", 1)) * max(1, sample_every)))
+                traj_start = int(_npz_scalar(data, "trajectory_start_steps", 0) or 0)
+                centers = traj_start + starts + int(window // 2)
+            n = min(int(z.shape[1]), int(centers.size))
+            if n <= 0:
+                return None
+            return centers[:n], tau, z[:, :n]
+    except Exception:
+        return None
+
+
+def _axis_limits_from_centers(values: np.ndarray) -> tuple[float, float]:
+    x = np.asarray(values, dtype=np.float64).reshape(-1)
+    if x.size == 0:
+        return -0.5, 0.5
+    if x.size == 1:
+        return float(x[0] - 0.5), float(x[0] + 0.5)
+    step = float(np.nanmedian(np.diff(np.sort(x))))
+    if not np.isfinite(step) or step <= 0.0:
+        step = 1.0
+    return float(np.nanmin(x) - 0.5 * step), float(np.nanmax(x) + 0.5 * step)
+
+
+def _plot_c2_plife_plus_branch_selection_heatmaps(output_root: Path, figures: Path) -> dict[str, str]:
+    c2_dir = output_root / "c2_plife_plus_branching"
+    plan_path = c2_dir / "branch_plan.csv"
+    if not plan_path.exists() or plan_path.stat().st_size <= 1:
+        _record_skip("c2_plife_plus_branch_selection_heatmaps", f"missing branch plan {plan_path}")
+        return {}
+    try:
+        plan = pd.read_csv(plan_path)
+    except pd.errors.EmptyDataError:
+        _record_skip("c2_plife_plus_branch_selection_heatmaps", f"empty branch plan {plan_path}")
+        return {}
+    if plan.empty or not {"traj_id", "metrics_path", "step", "condition"}.issubset(plan.columns):
+        _record_skip("c2_plife_plus_branch_selection_heatmaps", f"branch plan lacks required columns in {plan_path}")
+        return {}
+
+    point_cols = [col for col in ["traj_id", "point_id", "condition", "step", "delta_h", "metrics_path"] if col in plan.columns]
+    points = plan[point_cols].drop_duplicates()
+    metrics_paths = []
+    seen: set[str] = set()
+    for raw in points["metrics_path"].astype(str):
+        if raw and raw not in seen:
+            seen.add(raw)
+            metrics_paths.append(Path(raw))
+    max_panels = min(6, len(metrics_paths))
+    items: list[tuple[Path, np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]] = []
+    heatmaps: list[np.ndarray] = []
+    for metrics_path in metrics_paths[:max_panels]:
+        loaded = _load_plife_heatmap(metrics_path)
+        if loaded is None:
+            continue
+        centers, tau, z = loaded
+        sub = points[points["metrics_path"].astype(str) == str(metrics_path)].copy()
+        if sub.empty:
+            continue
+        items.append((metrics_path, centers, tau, z, sub))
+        heatmaps.append(z)
+    if not items:
+        _record_skip("c2_plife_plus_branch_selection_heatmaps", f"no usable metric heatmaps referenced by {plan_path}")
+        return {}
+
+    finite_vals = np.concatenate([arr[np.isfinite(arr)].reshape(-1) for arr in heatmaps if np.isfinite(arr).any()])
+    vmax = float(np.nanpercentile(finite_vals, 98.0)) if finite_vals.size else 1.0
+    if not np.isfinite(vmax) or vmax <= 0.0:
+        vmax = 1.0
+
+    plt = _ensure_matplotlib()
+    n = len(items)
+    n_cols = min(2, n)
+    n_rows = int(np.ceil(n / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(7.0 * n_cols, 3.9 * n_rows), squeeze=False, constrained_layout=True)
+    palette = {"low": "#4c78a8", "mid": "#f58518", "high": "#d62728", "sampled": "#6f4e9b"}
+    marker_for = {"low": "^", "mid": "o", "high": "v", "sampled": "D"}
+    last_im = None
+    for idx, (metrics_path, centers, tau, z, sub) in enumerate(items):
+        ax = axes[idx // n_cols][idx % n_cols]
+        x0, x1 = _axis_limits_from_centers(centers)
+        y0, y1 = _axis_limits_from_centers(tau)
+        last_im = ax.imshow(
+            z,
+            aspect="auto",
+            origin="lower",
+            interpolation="nearest",
+            extent=[x0, x1, y0, y1],
+            cmap="viridis",
+            vmin=0.0,
+            vmax=vmax,
+        )
+        tau_min = float(np.nanmin(tau)) if tau.size else 0.0
+        tau_max = float(np.nanmax(tau)) if tau.size else 1.0
+        tau_mid = 0.5 * (tau_min + tau_max)
+        y_for = {"low": tau_min, "mid": tau_mid, "high": tau_max, "sampled": tau_mid}
+        for row in sub.itertuples(index=False):
+            condition = str(getattr(row, "condition", "sampled"))
+            step = float(getattr(row, "step"))
+            color = palette.get(condition, palette["sampled"])
+            marker = marker_for.get(condition, "o")
+            y = y_for.get(condition, tau_mid)
+            ax.axvline(step, color=color, linewidth=1.25, alpha=0.85)
+            ax.scatter(
+                [step],
+                [y],
+                marker=marker,
+                s=60,
+                color=color,
+                edgecolor="black",
+                linewidth=0.45,
+                zorder=5,
+                label=condition,
+            )
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            uniq: dict[str, Any] = {}
+            for h, label in zip(handles, labels, strict=False):
+                uniq.setdefault(label, h)
+            ax.legend(uniq.values(), uniq.keys(), title="selected", frameon=False, loc="upper right", fontsize=8, title_fontsize=8)
+        ax.set_title(metrics_path.stem.replace("_metrics", ""), fontsize=10)
+        ax.set_xlabel("window center step")
+        ax.set_ylabel("tau steps")
+        ax.grid(False)
+    for idx in range(len(items), n_rows * n_cols):
+        axes[idx // n_cols][idx % n_cols].axis("off")
+    if last_im is not None:
+        fig.colorbar(last_im, ax=[axes[i // n_cols][i % n_cols] for i in range(len(items))], shrink=0.86, pad=0.015, label="phi(Delta-H)")
+    fig.suptitle("PLife++ C2 branch selection over Delta-H heatmaps", fontsize=13)
+    out = figures / "c2_plife_plus_branch_selection_heatmaps.png"
+    _save(fig, out)
+    plt.close(fig)
+    log_event(f"C2 PLife++ branch selection heatmaps wrote {out}", component="visualization")
+    return {"c2_plife_plus_branch_selection_heatmaps": str(out)}
+
+
 def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, force: bool = False) -> dict[str, Any]:
     _VISUALIZATION_SKIPS.clear()
     cfg, _ = load_config(config_path, smoke=smoke)
@@ -1309,6 +1501,7 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
         paths.update(_plot_c2_branching(output_root, figures))
         paths.update(_plot_c2_clip_chamfer_association_clean(output_root, figures))
         paths.update(_plot_c2_plife_plus_branching(output_root, figures))
+        paths.update(_plot_c2_plife_plus_branch_selection_heatmaps(output_root, figures))
     if task in {"all", "c1", "c5", "c6"}:
         for dataset, _ds in dataset_items(cfg):
             ds_dir = output_root / dataset
