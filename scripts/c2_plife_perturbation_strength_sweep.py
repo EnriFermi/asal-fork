@@ -162,6 +162,27 @@ def _resize_nearest(frame: np.ndarray, panel_size: int) -> np.ndarray:
     return np.asarray(frame[yy][:, xx], dtype=np.uint8)
 
 
+def _color_strip(c_future: np.ndarray, frame_idx: int, *, width: int, height: int) -> np.ndarray:
+    c = np.asarray(c_future, dtype=np.float32)
+    if c.ndim != 3 or c.shape[-1] < 3 or c.shape[1] <= 0:
+        return np.zeros((0, int(width), 3), dtype=np.uint8)
+    t = int(np.clip(frame_idx, 0, c.shape[0] - 1))
+    rgb = np.clip((c[t, :, :3] + 1.0) * 0.5, 0.0, 1.0)
+    cols = np.linspace(0, rgb.shape[0] - 1, max(1, int(width))).round().astype(np.int64)
+    strip = (rgb[cols][None, :, :] * 255.0).astype(np.uint8)
+    return np.repeat(strip, max(1, int(height)), axis=0)
+
+
+def _append_color_strip(frame: np.ndarray, arrays: dict[str, np.ndarray], frame_idx: int, *, enabled: bool, height: int) -> np.ndarray:
+    out = np.asarray(frame, dtype=np.uint8)
+    if not enabled or "c_future" not in arrays or int(height) <= 0:
+        return out
+    strip = _color_strip(arrays["c_future"], frame_idx, width=out.shape[1], height=int(height))
+    if strip.size == 0:
+        return out
+    return np.concatenate([out, strip], axis=0)
+
+
 def _load_video_frames(
     path: Path,
     *,
@@ -170,28 +191,69 @@ def _load_video_frames(
     radius: int,
     trail_steps: int,
     domain_size: float,
+    debug_color_strip: bool,
+    color_strip_height: int,
 ) -> list[np.ndarray]:
     arrays = _load_branch_arrays(path)
     if "rgb_future" in arrays:
         frames = _rgb_uint8(arrays["rgb_future"])
         idx = _frame_indices(frames.shape[0], max_frames)
-        return [_resize_nearest(frames[int(i)], panel_size) for i in idx]
+        return [
+            _append_color_strip(
+                _resize_nearest(frames[int(i)], panel_size),
+                arrays,
+                int(i),
+                enabled=debug_color_strip,
+                height=color_strip_height,
+            )
+            for i in idx
+        ]
     if "xy_future" in arrays:
         xy = np.asarray(arrays["xy_future"], dtype=np.float32)
         idx = _frame_indices(xy.shape[0], max_frames)
         return [
-            _xy_frame(
-                xy,
+            _append_color_strip(
+                _xy_frame(
+                    xy,
+                    int(i),
+                    img_size=int(panel_size),
+                    radius=int(radius),
+                    trail_steps=int(trail_steps),
+                    domain_size=float(domain_size),
+                    wrap=True,
+                ),
+                arrays,
                 int(i),
-                img_size=int(panel_size),
-                radius=int(radius),
-                trail_steps=int(trail_steps),
-                domain_size=float(domain_size),
-                wrap=True,
+                enabled=debug_color_strip,
+                height=color_strip_height,
             )
             for i in idx
         ]
     raise ValueError(f"No rgb_future or xy_future in {path}")
+
+
+def _write_frame_list_video(
+    frames: list[np.ndarray],
+    output: Path,
+    *,
+    fps: float,
+    codec: str,
+    force: bool,
+) -> dict[str, Any]:
+    if output.exists() and not force:
+        return {"status": "exists", "video_path": str(output), "n_frames": 0}
+    if not frames:
+        return {"status": "skipped_empty", "video_path": str(output), "n_frames": 0}
+    ensure_dir(output.parent)
+    writer, cv2 = _open_video_writer(output, fps=fps, codec=codec, frame_shape=frames[0].shape)
+    written = 0
+    try:
+        for frame in frames:
+            writer.write(cv2.cvtColor(np.asarray(frame, dtype=np.uint8), cv2.COLOR_RGB2BGR))
+            written += 1
+    finally:
+        writer.release()
+    return {"status": "written", "video_path": str(output), "n_frames": int(written)}
 
 
 def _grid_canvas(frames: list[np.ndarray], labels: list[str], *, n_cols: int):
@@ -226,6 +288,8 @@ def _write_grid_video(
     radius: int,
     trail_steps: int,
     domain_size: float,
+    debug_color_strip: bool,
+    color_strip_height: int,
     force: bool,
 ) -> dict[str, Any]:
     if output.exists() and not force:
@@ -239,6 +303,8 @@ def _write_grid_video(
             radius=radius,
             trail_steps=trail_steps,
             domain_size=domain_size,
+            debug_color_strip=debug_color_strip,
+            color_strip_height=color_strip_height,
         )
         if frames:
             series.append((frames, label))
@@ -393,6 +459,239 @@ def _color_debug_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return summary
 
 
+def _boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    return text in {"1", "true", "yes", "y", "on"}
+
+
+def _subsample_vectors(arr: np.ndarray, max_items: int) -> np.ndarray:
+    x = np.asarray(arr, dtype=np.float32)
+    if x.ndim != 2:
+        return x.reshape((0, 0))
+    n = int(x.shape[0])
+    if n <= int(max_items) or int(max_items) <= 0:
+        return x
+    idx = np.linspace(0, n - 1, int(max_items)).round().astype(np.int64)
+    return x[np.unique(idx)]
+
+
+def _vector_chamfer(a: np.ndarray, b: np.ndarray, *, max_items: int) -> float:
+    aa = _subsample_vectors(np.asarray(a, dtype=np.float32), max_items=max_items)
+    bb = _subsample_vectors(np.asarray(b, dtype=np.float32), max_items=max_items)
+    if aa.size == 0 or bb.size == 0:
+        return float("nan")
+    d = aa[:, None, :] - bb[None, :, :]
+    dist = np.sqrt(np.sum(d * d, axis=-1))
+    return float(0.5 * (np.mean(np.min(dist, axis=1)) + np.mean(np.min(dist, axis=0))))
+
+
+def _identity_l2(a: np.ndarray, b: np.ndarray) -> float:
+    aa = np.asarray(a, dtype=np.float32)
+    bb = np.asarray(b, dtype=np.float32)
+    n = min(int(aa.shape[0]), int(bb.shape[0]))
+    if n <= 0:
+        return float("nan")
+    return float(np.mean(np.sqrt(np.sum((aa[:n] - bb[:n]) ** 2, axis=-1))))
+
+
+def _elapsed_steps(frame_idx: int, sample_every: int, *, has_initial_frame: bool) -> int:
+    if has_initial_frame:
+        return int(frame_idx) * max(1, int(sample_every))
+    return (int(frame_idx) + 1) * max(1, int(sample_every))
+
+
+def _write_color_relaxation_plot(timeseries_rows: list[dict[str, Any]], output_path: Path, *, metric_key: str) -> str | None:
+    if not timeseries_rows:
+        return None
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+
+    point_ids = sorted({_int_or(row.get("sweep_point_id", -1), -1) for row in timeseries_rows})
+    point_ids = [pid for pid in point_ids if pid >= 0]
+    if not point_ids:
+        return None
+    n_cols = min(3, len(point_ids))
+    n_rows = int(math.ceil(len(point_ids) / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5.2 * n_cols, 3.6 * n_rows), squeeze=False)
+    cmap = plt.get_cmap("viridis")
+    strengths = sorted({_float_or(row.get("strength"), float("nan")) for row in timeseries_rows if np.isfinite(_float_or(row.get("strength"), float("nan")))})
+    denom = max(1, len(strengths) - 1)
+    color_by_strength = {strength: cmap(i / denom) for i, strength in enumerate(strengths)}
+
+    for ax in axes.ravel():
+        ax.axis("off")
+    for ax, point_id in zip(axes.ravel(), point_ids):
+        ax.axis("on")
+        rows = [row for row in timeseries_rows if _int_or(row.get("sweep_point_id", -1), -1) == point_id]
+        groups: dict[tuple[float, int], list[dict[str, Any]]] = {}
+        for row in rows:
+            strength = _float_or(row.get("strength"), float("nan"))
+            rep = _int_or(row.get("rep_id", 0), 0)
+            if np.isfinite(strength):
+                groups.setdefault((strength, rep), []).append(row)
+        for (strength, rep), group in sorted(groups.items(), key=lambda item: (item[0][0], item[0][1])):
+            group = sorted(group, key=lambda row: _int_or(row.get("elapsed_steps", 0), 0))
+            x = np.asarray([_int_or(row.get("elapsed_steps", 0), 0) for row in group], dtype=np.float64)
+            y = np.asarray([_float_or(row.get(metric_key), float("nan")) for row in group], dtype=np.float64)
+            finite = np.isfinite(x) & np.isfinite(y)
+            if not np.any(finite):
+                continue
+            style = "--" if abs(strength) <= 1e-12 else "-"
+            ax.plot(x[finite], y[finite], style, lw=2.0, color=color_by_strength[strength], label=f"s={strength:g} r={rep}")
+        ax.set_title(f"point {point_id}")
+        ax.set_xlabel("steps after branch")
+        ax.set_ylabel(metric_key)
+        ax.grid(True, alpha=0.25)
+        ax.legend(fontsize=8, ncol=2)
+    fig.tight_layout()
+    ensure_dir(output_path.parent)
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+    return str(output_path)
+
+
+def _write_color_relaxation_outputs(
+    rows: list[dict[str, Any]],
+    *,
+    out_root: Path,
+    max_particles: int,
+    force_plot: bool,
+) -> dict[str, Any]:
+    baseline_paths: dict[tuple[int, int], Path] = {}
+    for row in rows:
+        if str(row.get("status")) in {"written", "exists"} and abs(_float_or(row.get("strength"), float("nan"))) <= 1e-12:
+            baseline_paths[(_int_or(row.get("sweep_point_id", -1), -1), _int_or(row.get("rep_id", 0), 0))] = Path(str(row["output_path"]))
+
+    cache: dict[Path, dict[str, np.ndarray]] = {}
+
+    def load(path: Path) -> dict[str, np.ndarray]:
+        if path not in cache:
+            cache[path] = _load_branch_arrays(path)
+        return cache[path]
+
+    ts_rows: list[dict[str, Any]] = []
+    summary_rows: list[dict[str, Any]] = []
+    for row in rows:
+        if str(row.get("status")) not in {"written", "exists"}:
+            continue
+        path = Path(str(row.get("output_path", "")))
+        if not path.exists():
+            continue
+        arrays = load(path)
+        if "c_future" not in arrays:
+            continue
+        c = np.asarray(arrays["c_future"], dtype=np.float32)
+        if c.ndim != 3 or c.shape[0] < 2:
+            continue
+        has_initial = _boolish(row.get("pre_perturb_initial_frame", False))
+        if not has_initial:
+            continue
+        pre = c[0]
+        baseline_c = None
+        baseline_path = baseline_paths.get((_int_or(row.get("sweep_point_id", -1), -1), _int_or(row.get("rep_id", 0), 0)))
+        if baseline_path is not None and baseline_path.exists():
+            base_arrays = load(baseline_path)
+            if "c_future" in base_arrays:
+                baseline_c = np.asarray(base_arrays["c_future"], dtype=np.float32)
+        sample_every = _int_or(row.get("future_sample_every_steps", 1), 1)
+        for frame_idx in range(int(c.shape[0])):
+            cur = c[frame_idx]
+            rgb_cur = np.clip((cur[:, :3] + 1.0) * 0.5, 0.0, 1.0)
+            rgb_pre = np.clip((pre[:, :3] + 1.0) * 0.5, 0.0, 1.0)
+            rec = {
+                "sweep_point_id": row.get("sweep_point_id", ""),
+                "traj_id": row.get("traj_id", ""),
+                "condition": row.get("condition", ""),
+                "step": row.get("step", ""),
+                "strength": row.get("strength", ""),
+                "rep_id": row.get("rep_id", ""),
+                "frame_idx": int(frame_idx),
+                "elapsed_steps": _elapsed_steps(frame_idx, sample_every, has_initial_frame=has_initial),
+                "c_chamfer_to_pre": _vector_chamfer(cur, pre, max_items=max_particles),
+                "c_rgb_chamfer_to_pre": _vector_chamfer(rgb_cur, rgb_pre, max_items=max_particles),
+                "c_identity_l2_to_pre": _identity_l2(cur, pre),
+                "c_rgb_identity_l2_to_pre": _identity_l2(rgb_cur, rgb_pre),
+                "output_path": str(path),
+            }
+            if baseline_c is not None and frame_idx < int(baseline_c.shape[0]):
+                base = baseline_c[frame_idx]
+                rgb_base = np.clip((base[:, :3] + 1.0) * 0.5, 0.0, 1.0)
+                rec.update(
+                    {
+                        "c_chamfer_to_baseline_same_frame": _vector_chamfer(cur, base, max_items=max_particles),
+                        "c_rgb_chamfer_to_baseline_same_frame": _vector_chamfer(rgb_cur, rgb_base, max_items=max_particles),
+                        "c_identity_l2_to_baseline_same_frame": _identity_l2(cur, base),
+                        "c_rgb_identity_l2_to_baseline_same_frame": _identity_l2(rgb_cur, rgb_base),
+                    }
+                )
+            ts_rows.append(rec)
+
+    groups: dict[tuple[int, float, int], list[dict[str, Any]]] = {}
+    for rec in ts_rows:
+        point_id = _int_or(rec.get("sweep_point_id", -1), -1)
+        strength = _float_or(rec.get("strength"), float("nan"))
+        rep = _int_or(rec.get("rep_id", 0), 0)
+        if point_id >= 0 and np.isfinite(strength):
+            groups.setdefault((point_id, strength, rep), []).append(rec)
+    for (point_id, strength, rep), group in sorted(groups.items()):
+        group = sorted(group, key=lambda rec: _int_or(rec.get("elapsed_steps", 0), 0))
+        post = [rec for rec in group if _int_or(rec.get("frame_idx", 0), 0) > 0]
+        for metric_key in ("c_rgb_chamfer_to_pre", "c_chamfer_to_pre", "c_rgb_chamfer_to_baseline_same_frame"):
+            vals = np.asarray([_float_or(rec.get(metric_key), float("nan")) for rec in post], dtype=np.float64)
+            steps = np.asarray([_int_or(rec.get("elapsed_steps", 0), 0) for rec in post], dtype=np.int64)
+            finite = np.isfinite(vals)
+            if not np.any(finite):
+                continue
+            vals_f = vals[finite]
+            steps_f = steps[finite]
+            first = float(vals_f[0])
+            final = float(vals_f[-1])
+            min_idx = int(np.argmin(vals_f))
+            half_step = ""
+            if first > 0:
+                below = np.flatnonzero(vals_f <= 0.5 * first)
+                if below.size:
+                    half_step = int(steps_f[int(below[0])])
+            summary_rows.append(
+                {
+                    "sweep_point_id": int(point_id),
+                    "strength": float(strength),
+                    "rep_id": int(rep),
+                    "metric": metric_key,
+                    "first_post": first,
+                    "final": final,
+                    "min": float(vals_f[min_idx]),
+                    "min_elapsed_steps": int(steps_f[min_idx]),
+                    "final_over_first": float(final / first) if first > 0 else "",
+                    "half_relax_elapsed_steps": half_step,
+                    "n_post_frames": int(vals_f.size),
+                }
+            )
+
+    ts_path = out_root / "plife_color_relaxation_timeseries.csv"
+    summary_path = out_root / "plife_color_relaxation_summary.csv"
+    write_csv(ts_path, ts_rows)
+    write_csv(summary_path, summary_rows)
+    plot_path = None
+    if force_plot and ts_rows:
+        plot_path = _write_color_relaxation_plot(
+            ts_rows,
+            out_root / "plife_color_relaxation.png",
+            metric_key="c_rgb_chamfer_to_pre",
+        )
+    return {
+        "color_relaxation_timeseries": str(ts_path),
+        "color_relaxation_summary": str(summary_path),
+        "color_relaxation_plot": plot_path or "",
+        "n_color_relaxation_rows": len(ts_rows),
+        "n_color_relaxation_summary_rows": len(summary_rows),
+    }
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     cfg, _ = load_config(args.config, smoke=bool(args.smoke))
     output_root = _output_root(cfg)
@@ -434,6 +733,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     max_video_frames = int(args.max_video_frames if args.max_video_frames is not None else _get(sweep_cfg, "max_video_frames", 128))
     radius = int(args.radius if args.radius is not None else _get(sweep_cfg, "radius", 3))
     trail_steps = int(args.trail_steps if args.trail_steps is not None else _get(sweep_cfg, "trail_steps", 6))
+    debug_color_strip = bool(_get(sweep_cfg, "debug_color_strip", True)) and not bool(args.no_debug_color_strip)
+    color_strip_height = int(args.color_strip_height if args.color_strip_height is not None else _get(sweep_cfg, "color_strip_height", 24))
     max_particles = int(_get(c2_cfg, "divergence_max_particles", 128))
     perturb_cfg = _get(c2_cfg, "perturb", {})
     base_x_std = float(args.base_x_std if args.base_x_std is not None else _get(sweep_cfg, "base_x_std", _get(perturb_cfg, "x_std", 0.003)))
@@ -449,6 +750,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     log_event(
         f"PLife++ perturbation sweep base noise x_std={base_x_std:g} v_std={base_v_std:g} c_std={base_c_std:g} "
         f"domain={domain:g} max_particles={max_particles} include_pre_perturb_initial_frame={include_initial_frame}",
+        component="c2-plife-sweep",
+    )
+    log_event(
+        f"PLife++ perturbation sweep video debug_color_strip={debug_color_strip} color_strip_height={color_strip_height}",
         component="c2-plife-sweep",
     )
     for point_idx, point in enumerate(points):
@@ -668,6 +973,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             f"rgb_max={_float_or(row.get('rgb_max_abs_vs_baseline'), float('nan')):.6g}",
             component="c2-plife-sweep",
         )
+    log_event("PLife++ perturbation sweep writing color relaxation timeseries", component="c2-plife-sweep")
+    color_relaxation_summary = _write_color_relaxation_outputs(
+        rows,
+        out_root=out_root,
+        max_particles=max_particles,
+        force_plot=not bool(args.skip_color_relaxation_plot),
+    )
+    log_event(f"PLife++ perturbation sweep color relaxation outputs {color_relaxation_summary}", component="c2-plife-sweep")
 
     video_rows = 0
     if not args.dry_run and not args.skip_videos:
@@ -680,7 +993,25 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 continue
             arrays = _load_branch_arrays(output_path)
             try:
-                if "rgb_future" in arrays:
+                if debug_color_strip:
+                    frames = _load_video_frames(
+                        output_path,
+                        panel_size=panel_size,
+                        max_frames=max_video_frames,
+                        radius=radius,
+                        trail_steps=trail_steps,
+                        domain_size=float(domain),
+                        debug_color_strip=debug_color_strip,
+                        color_strip_height=color_strip_height,
+                    )
+                    result = _write_frame_list_video(
+                        frames,
+                        Path(str(row["video_path"])),
+                        fps=video_fps,
+                        codec=codec,
+                        force=bool(args.force),
+                    )
+                elif "rgb_future" in arrays:
                     result = _write_rgb_video(
                         arrays["rgb_future"],
                         Path(str(row["video_path"])),
@@ -758,6 +1089,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     radius=radius,
                     trail_steps=trail_steps,
                     domain_size=float(domain),
+                    debug_color_strip=debug_color_strip,
+                    color_strip_height=color_strip_height,
                     force=bool(args.force),
                 )
                 if result.get("status") in {"written", "exists"}:
@@ -806,8 +1139,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "video_fps": float(video_fps),
         "panel_size": int(panel_size),
         "max_video_frames": int(max_video_frames),
+        "debug_color_strip": bool(debug_color_strip),
+        "color_strip_height": int(color_strip_height),
         **div_summary,
         **color_summary,
+        **color_relaxation_summary,
         "errors": errors[:20],
     }
     write_json(out_root / "plife_perturbation_strength_sweep_summary.json", summary)
@@ -851,6 +1187,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-video-frames", type=int, default=None)
     parser.add_argument("--radius", type=int, default=None)
     parser.add_argument("--trail-steps", type=int, default=None)
+    parser.add_argument("--no-debug-color-strip", action="store_true", help="Do not append c[:, :3] particle color strips to rendered sweep videos.")
+    parser.add_argument("--color-strip-height", type=int, default=None)
+    parser.add_argument("--skip-color-relaxation-plot", action="store_true")
     args = parser.parse_args(argv)
     print(run(args))
     return 0

@@ -331,6 +331,8 @@ c2:
       strengths: [0, 0.1, 1, 3, 10]
       reps_per_strength: 1
       include_pre_perturb_initial_frame: true
+      debug_color_strip: true
+      color_strip_height: 24
       video_fps: 12
       panel_size: 192
       max_video_frames: 128
@@ -624,6 +626,8 @@ smoke:
         strengths: [0, 1]
         reps_per_strength: 1
         include_pre_perturb_initial_frame: true
+        debug_color_strip: true
+        color_strip_height: 16
         horizon_steps: 16
         future_sample_every_steps: 4
         render_img_size: 64
