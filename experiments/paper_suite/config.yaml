@@ -324,6 +324,15 @@ c2:
       x_std: 0.003
       v_std: 0.0
       c_std: 0.01
+    perturbation_strength_sweep:
+      output_dir: analysis/results/paper_suite/c2_plife_plus_perturbation_strength_sweep
+      conditions: [high]
+      n_points: 3
+      strengths: [0, 0.1, 1, 3, 10]
+      reps_per_strength: 1
+      video_fps: 12
+      panel_size: 192
+      max_video_frames: 128
 
 c4:
   enabled: true
@@ -607,3 +616,14 @@ smoke:
         x_std: 0.01
         v_std: 0.0
         c_std: 0.01
+      perturbation_strength_sweep:
+        output_dir: analysis/results/paper_suite_smoke/c2_plife_plus_perturbation_strength_sweep
+        conditions: [high]
+        n_points: 1
+        strengths: [0, 1]
+        reps_per_strength: 1
+        horizon_steps: 16
+        future_sample_every_steps: 4
+        render_img_size: 64
+        panel_size: 96
+        max_video_frames: 16
