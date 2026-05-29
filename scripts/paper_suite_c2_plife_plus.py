@@ -1072,6 +1072,7 @@ def _simulate_one_branch(
     sample_every: int,
     perturb: dict[str, float],
     render_img_size: int,
+    include_initial_frame: bool = False,
 ) -> dict[str, np.ndarray]:
     params_j = jnp.asarray(params, dtype=jnp.float32)
     init_rng, init_key = jax.random.split(jax.random.PRNGKey(int(seed)), 2)
@@ -1085,8 +1086,19 @@ def _simulate_one_branch(
         rng, state = advance(n)(rng, state, params_j)
         remaining -= n
 
-    prng = np.random.default_rng(int(rep_seed))
     state_np = {key: np.asarray(value) for key, value in state.items()}
+    x_frames = []
+    c_frames = []
+    rgb_frames = []
+    if include_initial_frame:
+        x_frames.append(np.asarray(state_np["x"], dtype=np.float32))
+        if "c" in state_np:
+            c_frames.append(np.asarray(state_np["c"], dtype=np.float32))
+        if render_img_size > 0:
+            rgb = substrate.render_state(state, params_j, img_size=int(render_img_size))
+            rgb_frames.append(np.asarray(jax.device_get(rgb), dtype=np.float32))
+
+    prng = np.random.default_rng(int(rep_seed))
     if float(perturb.get("x_std", 0.0)) > 0.0 and "x" in state_np:
         state_np["x"] = (state_np["x"] + prng.normal(0.0, float(perturb["x_std"]), size=state_np["x"].shape)) % 1.0
     if float(perturb.get("v_std", 0.0)) > 0.0 and "v" in state_np:
@@ -1096,9 +1108,6 @@ def _simulate_one_branch(
         state_np["c"] = c / np.maximum(np.linalg.norm(c, axis=-1, keepdims=True), 1e-12)
     state = {key: jnp.asarray(value, dtype=jnp.float32) for key, value in state_np.items()}
 
-    x_frames = []
-    c_frames = []
-    rgb_frames = []
     remaining = int(horizon_steps)
     sample_every = max(1, int(sample_every))
     while remaining > 0:

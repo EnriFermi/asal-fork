@@ -99,6 +99,7 @@ def _ensure_branch_plan(config_path: str | Path, *, smoke: bool, cfg: Any, outpu
         plan_ok, plan_reason = _branch_plan_meta_current(plan_path)
     if not plan_ok:
         raise FileNotFoundError(f"PLife++ C2 branch_plan is not ready: {plan_reason}")
+    log_event(f"PLife++ perturbation sweep using branch plan {plan_path}", component="c2-plife-sweep")
     return plan_path
 
 
@@ -276,21 +277,29 @@ def _compute_divergences(rows: list[dict[str, Any]], *, domain: float, max_parti
             base = load(baseline)
             cur = load(output)
             if "xy_future" in base and "xy_future" in cur:
+                cur_xy = np.asarray(cur["xy_future"])
+                base_xy = np.asarray(base["xy_future"])
+                if bool(row.get("pre_perturb_initial_frame", False)) and cur_xy.shape[0] > 1 and base_xy.shape[0] > 1:
+                    cur_xy = cur_xy[1:]
+                    base_xy = base_xy[1:]
                 row["xy_chamfer_mean_vs_baseline"] = _future_chamfer(
-                    cur["xy_future"],
-                    base["xy_future"],
+                    cur_xy,
+                    base_xy,
                     domain=float(domain),
                     max_particles=int(max_particles),
                 )
                 row["xy_chamfer_final_vs_baseline"] = _future_chamfer(
-                    cur["xy_future"][-1:],
-                    base["xy_future"][-1:],
+                    cur_xy[-1:],
+                    base_xy[-1:],
                     domain=float(domain),
                     max_particles=int(max_particles),
                 )
             if "rgb_future" in base and "rgb_future" in cur:
                 a = np.asarray(cur["rgb_future"], dtype=np.float32)
                 b = np.asarray(base["rgb_future"], dtype=np.float32)
+                if bool(row.get("pre_perturb_initial_frame", False)) and a.shape[0] > 1 and b.shape[0] > 1:
+                    a = a[1:]
+                    b = b[1:]
                 n = min(int(a.shape[0]), int(b.shape[0]))
                 row["rgb_mse_mean_vs_baseline"] = float(np.mean((a[:n] - b[:n]) ** 2)) if n > 0 else float("nan")
             row["baseline_output_path"] = str(baseline)
@@ -298,6 +307,19 @@ def _compute_divergences(rows: list[dict[str, Any]], *, domain: float, max_parti
         except Exception as exc:
             row["divergence_status"] = "error"
             row["divergence_message"] = f"{type(exc).__name__}: {exc}"
+
+
+def _divergence_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    vals = np.asarray([_float_or(row.get("xy_chamfer_mean_vs_baseline", "nan")) for row in rows], dtype=np.float64)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return {"n_xy_divergence": 0}
+    return {
+        "n_xy_divergence": int(vals.size),
+        "xy_chamfer_mean_min": float(np.min(vals)),
+        "xy_chamfer_mean_median": float(np.median(vals)),
+        "xy_chamfer_mean_max": float(np.max(vals)),
+    }
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -315,6 +337,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         force_plan=bool(args.force_plan),
     )
     plan_rows = read_csv(plan_path)
+    log_event(f"PLife++ perturbation sweep loaded branch plan rows={len(plan_rows)}", component="c2-plife-sweep")
     conditions = _parse_conditions(args.conditions if args.conditions is not None else _get(sweep_cfg, "conditions", ["high"]))
     n_points = int(args.n_points if args.n_points is not None else _get(sweep_cfg, "n_points", 3))
     points = _select_points(plan_rows, conditions=conditions, n_points=n_points)
@@ -333,6 +356,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     render_img_size = int(args.render_img_size if args.render_img_size is not None else _get(sweep_cfg, "render_img_size", _get(c2_cfg, "render_img_size", 128)))
     domain = float(args.domain_size if args.domain_size is not None else _get(sweep_cfg, "domain_size", _get(c2_cfg, "domain_size", 1.0)))
+    include_initial_frame = bool(_get(sweep_cfg, "include_pre_perturb_initial_frame", True)) and not bool(args.no_initial_frame)
     video_fps = float(args.video_fps if args.video_fps is not None else _get(sweep_cfg, "video_fps", 12.0))
     codec = str(args.codec if args.codec is not None else _get(sweep_cfg, "codec", "mp4v"))
     panel_size = int(args.panel_size if args.panel_size is not None else _get(sweep_cfg, "panel_size", 192))
@@ -351,12 +375,31 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         f"horizon={horizon_steps} sample_every={future_sample_every} render_img_size={render_img_size} output={out_root}",
         component="c2-plife-sweep",
     )
+    log_event(
+        f"PLife++ perturbation sweep base noise x_std={base_x_std:g} v_std={base_v_std:g} c_std={base_c_std:g} "
+        f"domain={domain:g} max_particles={max_particles} include_pre_perturb_initial_frame={include_initial_frame}",
+        component="c2-plife-sweep",
+    )
+    for point_idx, point in enumerate(points):
+        log_event(
+            "PLife++ perturbation sweep selected point "
+            f"{point_idx + 1}/{len(points)} source_point={point.get('point_id')} traj={point.get('traj_id')} "
+            f"condition={point.get('condition')} step={point.get('step')} "
+            f"delta_h={_float_or(point.get('delta_h'), float('nan')):.6g} "
+            f"delta_h_energy={_float_or(point.get('delta_h_energy'), float('nan')):.6g}",
+            component="c2-plife-sweep",
+        )
 
     rows: list[dict[str, Any]] = []
     if args.allow_heavy and not args.dry_run:
+        log_event("PLife++ perturbation sweep building PLife++ substrate for branch resumes", component="c2-plife-sweep")
         substrate = _build_substrate(cfg, smoke=bool(args.smoke))
     else:
         substrate = None
+        log_event(
+            f"PLife++ perturbation sweep not running substrate allow_heavy={bool(args.allow_heavy)} dry_run={bool(args.dry_run)}",
+            component="c2-plife-sweep",
+        )
 
     params_cache: dict[Path, np.ndarray] = {}
     written = 0
@@ -369,7 +412,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         point_dir = out_root / f"point_{point_idx:03d}_{traj_tag}_src_{_int_or(point.get('point_id', point_idx), point_idx):04d}_step_{_int_or(point.get('step', 0), 0)}"
         params_path = Path(str(point.get("params_path", "")))
         seed_x = _int_or(point.get("seed_x", -1), -1)
+        log_event(
+            f"PLife++ perturbation sweep point {point_idx + 1}/{len(points)} output={point_dir} "
+            f"params={params_path} seed_x={seed_x}",
+            component="c2-plife-sweep",
+        )
         for strength_idx, strength in enumerate(strengths):
+            log_event(
+                f"PLife++ perturbation sweep point {point_idx + 1}/{len(points)} strength={float(strength):g} "
+                f"noise=x:{base_x_std * float(strength):g} v:{base_v_std * float(strength):g} c:{base_c_std * float(strength):g} "
+                f"reps={max(1, reps_per_strength)}",
+                component="c2-plife-sweep",
+            )
             strength_tag = _safe_tag(strength)
             for rep_id in range(max(1, reps_per_strength)):
                 branch_seed = int(args.seed_base) + 100_003 * point_idx + 1009 * rep_id
@@ -401,6 +455,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "branch_seed": int(branch_seed),
                     "horizon_steps": int(horizon_steps),
                     "future_sample_every_steps": int(future_sample_every),
+                    "pre_perturb_initial_frame": bool(include_initial_frame),
                     "params_path": str(params_path),
                     "metrics_path": point.get("metrics_path", ""),
                     "output_path": str(output_path),
@@ -424,15 +479,30 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 if output_path.exists() and not args.force:
                     row["status"] = "exists"
                     existing += 1
+                    log_event(
+                        f"PLife++ perturbation sweep exists point={point_idx} strength={float(strength):g} "
+                        f"rep={rep_id} output={output_path}",
+                        component="c2-plife-sweep",
+                    )
                     rows.append(row)
                     continue
                 if not args.allow_heavy:
                     row["status"] = "skipped_heavy"
                     skipped += 1
+                    log_event(
+                        f"PLife++ perturbation sweep planned/skipped-heavy point={point_idx} strength={float(strength):g} "
+                        f"rep={rep_id} output={output_path}",
+                        component="c2-plife-sweep",
+                    )
                     rows.append(row)
                     continue
                 if args.dry_run:
                     row["status"] = "dry_run"
+                    log_event(
+                        f"PLife++ perturbation sweep dry-run point={point_idx} strength={float(strength):g} "
+                        f"rep={rep_id} command={row['command']}",
+                        component="c2-plife-sweep",
+                    )
                     rows.append(row)
                     continue
                 if seed_x < 0 or not params_path.exists():
@@ -440,6 +510,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     row["message"] = f"seed_x={seed_x} params_exists={params_path.exists()}"
                     skipped += 1
                     errors.append(f"point={point_idx} missing seed/params")
+                    log_event(
+                        f"PLife++ perturbation sweep skipped missing params point={point_idx} seed={seed_x} params={params_path}",
+                        component="c2-plife-sweep",
+                    )
                     rows.append(row)
                     continue
                 try:
@@ -461,6 +535,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         sample_every=future_sample_every,
                         perturb={"x_std": row["x_std"], "v_std": row["v_std"], "c_std": row["c_std"]},
                         render_img_size=render_img_size,
+                        include_initial_frame=include_initial_frame,
                     )
                     ensure_dir(output_path.parent)
                     np.savez_compressed(
@@ -477,19 +552,34 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         step=np.asarray(int(row["step"]), dtype=np.int32),
                         horizon_steps=np.asarray(horizon_steps, dtype=np.int32),
                         future_sample_every_steps=np.asarray(future_sample_every, dtype=np.int32),
+                        pre_perturb_initial_frame=np.asarray(bool(include_initial_frame)),
                     )
                     row["status"] = "written"
                     written += 1
+                    log_event(
+                        f"PLife++ perturbation sweep wrote branch point={point_idx} strength={float(strength):g} "
+                        f"rep={rep_id} output={output_path}",
+                        component="c2-plife-sweep",
+                    )
                 except Exception as exc:
                     row["status"] = "error"
                     row["message"] = f"{type(exc).__name__}: {exc}"
                     errors.append(f"point={point_idx} strength={strength:g} rep={rep_id}: {type(exc).__name__}: {exc}")
+                    log_event(
+                        f"PLife++ perturbation sweep error point={point_idx} strength={float(strength):g} "
+                        f"rep={rep_id}: {type(exc).__name__}: {exc}",
+                        component="c2-plife-sweep",
+                    )
                 rows.append(row)
 
+    log_event("PLife++ perturbation sweep computing divergence against strength=0 baselines", component="c2-plife-sweep")
     _compute_divergences(rows, domain=domain, max_particles=max_particles)
+    div_summary = _divergence_summary(rows)
+    log_event(f"PLife++ perturbation sweep divergence summary {div_summary}", component="c2-plife-sweep")
 
     video_rows = 0
     if not args.dry_run and not args.skip_videos:
+        log_event("PLife++ perturbation sweep rendering individual videos", component="c2-plife-sweep")
         for row in rows:
             if str(row.get("status")) not in {"written", "exists"}:
                 continue
@@ -529,12 +619,28 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 row["video_n_frames"] = result.get("n_frames", "")
                 if result.get("status") in {"written", "exists"}:
                     video_rows += 1
+                log_event(
+                    f"PLife++ perturbation sweep video {row['video_status']} point={row['sweep_point_id']} "
+                    f"strength={float(row['strength']):g} rep={row['rep_id']} path={row['video_path']}",
+                    component="c2-plife-sweep",
+                )
             except Exception as exc:
                 row["video_status"] = "error"
                 row["video_message"] = f"{type(exc).__name__}: {exc}"
+                log_event(
+                    f"PLife++ perturbation sweep video error point={row['sweep_point_id']} "
+                    f"strength={float(row['strength']):g} rep={row['rep_id']}: {type(exc).__name__}: {exc}",
+                    component="c2-plife-sweep",
+                )
+    else:
+        log_event(
+            f"PLife++ perturbation sweep skipping individual videos dry_run={bool(args.dry_run)} skip_videos={bool(args.skip_videos)}",
+            component="c2-plife-sweep",
+        )
 
     grid_videos: list[str] = []
     if not args.dry_run and not args.skip_grid_videos:
+        log_event("PLife++ perturbation sweep rendering per-point strength grid videos", component="c2-plife-sweep")
         grid_cols = int(args.grid_cols if args.grid_cols is not None else _get(sweep_cfg, "grid_cols", len(strengths)))
         for point_idx in range(len(points)):
             items_with_strength: list[tuple[float, Path, str]] = []
@@ -564,8 +670,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 if result.get("status") in {"written", "exists"}:
                     grid_videos.append(str(grid_path))
+                log_event(
+                    f"PLife++ perturbation sweep grid video {result.get('status')} point={point_idx} path={grid_path}",
+                    component="c2-plife-sweep",
+                )
             except Exception as exc:
                 errors.append(f"grid point={point_idx}: {type(exc).__name__}: {exc}")
+                log_event(
+                    f"PLife++ perturbation sweep grid video error point={point_idx}: {type(exc).__name__}: {exc}",
+                    component="c2-plife-sweep",
+                )
+    else:
+        log_event(
+            f"PLife++ perturbation sweep skipping grid videos dry_run={bool(args.dry_run)} skip_grid_videos={bool(args.skip_grid_videos)}",
+            component="c2-plife-sweep",
+        )
 
     plan_out = out_root / "plife_perturbation_strength_sweep_plan.csv"
     write_csv(plan_out, rows)
@@ -588,12 +707,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "reps_per_strength": int(reps_per_strength),
         "horizon_steps": int(horizon_steps),
         "future_sample_every_steps": int(future_sample_every),
+        "include_pre_perturb_initial_frame": bool(include_initial_frame),
         "base_x_std": float(base_x_std),
         "base_v_std": float(base_v_std),
         "base_c_std": float(base_c_std),
         "video_fps": float(video_fps),
         "panel_size": int(panel_size),
         "max_video_frames": int(max_video_frames),
+        **div_summary,
         "errors": errors[:20],
     }
     write_json(out_root / "plife_perturbation_strength_sweep_summary.json", summary)
@@ -620,6 +741,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base-x-std", type=float, default=None)
     parser.add_argument("--base-v-std", type=float, default=None)
     parser.add_argument("--base-c-std", type=float, default=None)
+    parser.add_argument("--no-initial-frame", action="store_true", help="Do not prepend the shared pre-perturb branch frame to sweep videos.")
     parser.add_argument("--seed-base", type=int, default=9_300_003)
     parser.add_argument("--vary-rng-with-strength", action="store_true")
     parser.add_argument("--force-plan", action="store_true")
