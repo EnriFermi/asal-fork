@@ -230,25 +230,99 @@ def _finite_records(rows: list[dict[str, str]], trajectory_col: str, energy_col:
     return out
 
 
+PER_TRAJECTORY_FIELDNAMES = [
+    "trajectory_id",
+    "n_branch_states",
+    "status",
+    "valid",
+    "spearman_rho",
+    "pearson_r",
+    "energy_mean",
+    "energy_std",
+    "divergence_mean",
+    "divergence_std",
+]
+
+
+def _write_outputs(
+    *,
+    input_path: Path,
+    out_csv: Path,
+    out_json: Path,
+    rows: list[dict[str, Any]],
+    summary: dict[str, Any],
+) -> None:
+    ensure_dir(out_csv.parent)
+    ensure_dir(out_json.parent)
+    write_csv(out_csv, rows, fieldnames=PER_TRAJECTORY_FIELDNAMES)
+    write_json(out_json, _json_clean({**summary, "outputs": {"per_trajectory_csv": str(out_csv), "summary_json": str(out_json)}}))
+
+
 def analyze(args: argparse.Namespace) -> dict[str, Any]:
     input_path = resolve_path(args.input)
     if input_path is None or not input_path.exists():
         raise FileNotFoundError(f"Missing input CSV: {args.input}")
     rows, headers = _read_csv(input_path)
-    if not rows:
-        raise ValueError(f"Input CSV has no rows: {input_path}")
+    if not headers:
+        raise ValueError(f"Input CSV has no header: {input_path}")
 
     trajectory_col = _resolve_column(headers, args.trajectory_col, TRAJECTORY_CANDIDATES, "trajectory id")
     energy_col = _resolve_column(headers, args.energy_col, ENERGY_CANDIDATES, "Delta-H energy")
     divergence_col = _resolve_column(headers, args.divergence_col, DIVERGENCE_CANDIDATES, "future divergence")
     time_col = _resolve_column(headers, args.time_col, TIME_CANDIDATES, "branch time", required=False)
     assert trajectory_col is not None and energy_col is not None and divergence_col is not None
+    out_csv = resolve_path(args.out_csv)
+    out_json = resolve_path(args.out_json)
+    if out_csv is None or out_json is None:
+        raise ValueError("--out-csv and --out-json are required")
 
     log_event(
         f"C2 within-trajectory association input={input_path} trajectory_col={trajectory_col} "
         f"energy_col={energy_col} divergence_col={divergence_col} time_col={time_col}",
         component="c2-within",
     )
+    if not rows:
+        summary = {
+            "status": "no_rows",
+            "reason": "input CSV has a header but no branch-state rows; C2 branch metrics likely produced n_scores=0",
+            "input": str(input_path),
+            "columns": {
+                "trajectory": trajectory_col,
+                "time": time_col or "",
+                "energy": energy_col,
+                "divergence": divergence_col,
+            },
+            "sample_sizes": {
+                "n_input_rows": 0,
+                "n_finite_rows": 0,
+                "n_total_trajectories": 0,
+                "n_valid_trajectories": 0,
+                "n_dropped_trajectories": 0,
+                "n_retained_branch_states": 0,
+            },
+            "pooled_raw": {"n": 0, "pearson_r": float("nan"), "spearman_r": float("nan")},
+            "within_trajectory_zscored": {"n": 0, "pearson_r": float("nan"), "spearman_r": float("nan")},
+            "within_trajectory_spearman_permutation_null": {
+                "n_permutations": int(max(0, int(args.n_permutations))),
+                "p_value_positive": float("nan"),
+                "null_mean": float("nan"),
+                "null_std": float("nan"),
+            },
+            "per_trajectory_spearman_summary": {
+                "n_valid": 0,
+                "mean": float("nan"),
+                "median": float("nan"),
+                "std": float("nan"),
+                "min": float("nan"),
+                "max": float("nan"),
+            },
+        }
+        _write_outputs(input_path=input_path, out_csv=out_csv, out_json=out_json, rows=[], summary=summary)
+        log_event(
+            f"C2 within-trajectory association no rows in input; wrote empty outputs out_json={out_json} out_csv={out_csv}",
+            component="c2-within",
+        )
+        return summary
 
     finite_records = _finite_records(rows, trajectory_col, energy_col, divergence_col, time_col)
     groups: dict[str, list[dict[str, Any]]] = {}
@@ -331,30 +405,8 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
         seed=int(args.seed),
     )
 
-    out_csv = resolve_path(args.out_csv)
-    out_json = resolve_path(args.out_json)
-    if out_csv is None or out_json is None:
-        raise ValueError("--out-csv and --out-json are required")
-    ensure_dir(out_csv.parent)
-    ensure_dir(out_json.parent)
-    write_csv(
-        out_csv,
-        per_traj_rows,
-        fieldnames=[
-            "trajectory_id",
-            "n_branch_states",
-            "status",
-            "valid",
-            "spearman_rho",
-            "pearson_r",
-            "energy_mean",
-            "energy_std",
-            "divergence_mean",
-            "divergence_std",
-        ],
-    )
-
     summary = {
+        "status": "ok" if retained_records else "no_valid_trajectories",
         "input": str(input_path),
         "columns": {
             "trajectory": trajectory_col,
@@ -381,12 +433,8 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
             "min": float(np.min(valid_rhos)) if valid_rhos.size else float("nan"),
             "max": float(np.max(valid_rhos)) if valid_rhos.size else float("nan"),
         },
-        "outputs": {
-            "per_trajectory_csv": str(out_csv),
-            "summary_json": str(out_json),
-        },
     }
-    write_json(out_json, _json_clean(summary))
+    _write_outputs(input_path=input_path, out_csv=out_csv, out_json=out_json, rows=per_traj_rows, summary=summary)
     log_event(
         f"C2 within-trajectory association done valid_trajectories={summary['sample_sizes']['n_valid_trajectories']} "
         f"retained_states={summary['sample_sizes']['n_retained_branch_states']} "

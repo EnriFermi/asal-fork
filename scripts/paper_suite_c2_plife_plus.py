@@ -662,18 +662,39 @@ def _branch_output_path(branch_root: Path, row: dict[str, Any], rep: int) -> Pat
     return branch_root / traj / f"point_{int(row['point_id']):04d}" / f"branch_{int(rep):03d}.npz"
 
 
-def _branch_output_npz_from_row(branch_root: Path, row: dict[str, Any]) -> Path:
+def _legacy_branch_output_without_perturb_tag(path: Path) -> Path | None:
+    parts = list(path.parts)
+    for idx, part in enumerate(parts):
+        text = str(part)
+        if text.startswith("h_") and "_x_" in text and "_v_" in text and "_c_" in text:
+            return Path(*parts[:idx], *parts[idx + 1 :])
+    return None
+
+
+def _branch_output_npz_from_row(branch_root: Path, row: dict[str, Any], *, legacy_fallback: bool = False) -> Path:
     raw = str(row.get("branch_output_path", "")).strip()
     if raw:
-        return Path(raw)
+        path = Path(raw)
+        if legacy_fallback and not path.exists():
+            legacy = _legacy_branch_output_without_perturb_tag(path)
+            if legacy is not None and legacy.exists():
+                return legacy
+        return path
     branch_dir_raw = str(row.get("branch_dir", "")).strip()
     if branch_dir_raw:
         branch_dir = Path(branch_dir_raw)
         if branch_dir.suffix == ".npz":
-            return branch_dir
-        return branch_dir / "branch_output.npz"
+            path = branch_dir
+        else:
+            path = branch_dir / "branch_output.npz"
+        if legacy_fallback and not path.exists():
+            legacy = _legacy_branch_output_without_perturb_tag(path)
+            if legacy is not None and legacy.exists():
+                return legacy
+        return path
     rep = int(float(row.get("branch_id", row.get("branch_rep", 0)) or 0))
-    return _branch_output_path(branch_root, row, rep)
+    path = _branch_output_path(branch_root, row, rep)
+    return path
 
 
 def _branch_plan_meta_current(plan_path: Path, *, expected_config_summary: dict[str, Any] | None = None) -> tuple[bool, str]:
@@ -741,10 +762,12 @@ def _score_branch_plan(
     max_particles = int(_get(c2_cfg, "divergence_max_particles", 128))
     expected_branch_outputs = 0
     existing_branch_outputs = 0
+    legacy_branch_outputs = 0
     missing_min_branch_points = 0
     invalid_score_points = 0
     missing_rgb_outputs = 0
     clip_fm = None
+    diagnostics: list[dict[str, Any]] = []
     groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for row in plan_rows:
         key = (str(row.get("traj_id", "")), str(row.get("point_id", row.get("pair_id", ""))), str(row.get("condition", "sampled")))
@@ -752,12 +775,19 @@ def _score_branch_plan(
 
     for point_idx, ((traj_id, point_id, condition), rows) in enumerate(sorted(groups.items()), start=1):
         branch_paths: list[Path] = []
+        missing_paths: list[str] = []
+        legacy_paths: list[str] = []
         for row in rows:
             expected_branch_outputs += 1
-            path = _branch_output_npz_from_row(branch_root, row)
+            primary_path = _branch_output_npz_from_row(branch_root, row)
+            path = _branch_output_npz_from_row(branch_root, row, legacy_fallback=True)
             if not path.exists():
+                missing_paths.append(str(primary_path))
                 continue
             existing_branch_outputs += 1
+            if path != primary_path:
+                legacy_branch_outputs += 1
+                legacy_paths.append(str(path))
             branch_paths.append(path)
         if _progress_now(point_idx, len(groups), every=10):
             log_event(
@@ -767,15 +797,33 @@ def _score_branch_plan(
             )
         if len(branch_paths) < 2:
             missing_min_branch_points += 1
+            diagnostics.append(
+                {
+                    "traj_id": traj_id,
+                    "point_id": point_id,
+                    "condition": condition,
+                    "score_status": "fewer_than_two_branch_outputs",
+                    "n_expected_branches": len(rows),
+                    "n_existing_branches": len(branch_paths),
+                    "n_legacy_branch_outputs": len(legacy_paths),
+                    "n_missing_branches": len(missing_paths),
+                    "missing_branch_output_paths": " | ".join(missing_paths[:8]),
+                    "legacy_branch_output_paths": " | ".join(legacy_paths[:8]),
+                    "branching_metric_mode": metric_mode,
+                }
+            )
             continue
         if metric_mode == "clip_chamfer":
+            point_missing_rgb = 0
             for path in branch_paths:
                 try:
                     with np.load(path, allow_pickle=False) as data:
                         if "rgb_future" not in data.files:
                             missing_rgb_outputs += 1
+                            point_missing_rgb += 1
                 except Exception:
                     missing_rgb_outputs += 1
+                    point_missing_rgb += 1
             if clip_fm is None:
                 import foundation_models
 
@@ -804,8 +852,25 @@ def _score_branch_plan(
             vals = [v for v in vals if np.isfinite(v)]
             score = float(np.mean(vals)) if vals else float("nan")
             detail = {"metric": "future_position_chamfer", "n_branches": len(branches), "n_pairs": len(vals)}
+            point_missing_rgb = 0
         if not np.isfinite(score):
             invalid_score_points += 1
+            diagnostics.append(
+                {
+                    "traj_id": traj_id,
+                    "point_id": point_id,
+                    "condition": condition,
+                    "score_status": "invalid_score",
+                    "n_expected_branches": len(rows),
+                    "n_existing_branches": len(branch_paths),
+                    "n_legacy_branch_outputs": len(legacy_paths),
+                    "n_missing_branches": len(missing_paths),
+                    "n_missing_rgb_future": int(point_missing_rgb),
+                    "missing_branch_output_paths": " | ".join(missing_paths[:8]),
+                    "legacy_branch_output_paths": " | ".join(legacy_paths[:8]),
+                    "branching_metric_mode": metric_mode,
+                }
+            )
             continue
         used = branch_paths
         first = rows[0]
@@ -827,10 +892,28 @@ def _score_branch_plan(
             if key not in score_row:
                 score_row[str(key)] = value
         score_rows.append(score_row)
+        diagnostics.append(
+            {
+                "traj_id": traj_id,
+                "point_id": point_id,
+                "condition": condition,
+                "score_status": "ok",
+                "n_expected_branches": len(rows),
+                "n_existing_branches": len(branch_paths),
+                "n_legacy_branch_outputs": len(legacy_paths),
+                "n_missing_branches": len(missing_paths),
+                "n_missing_rgb_future": int(point_missing_rgb),
+                "missing_branch_output_paths": " | ".join(missing_paths[:8]),
+                "legacy_branch_output_paths": " | ".join(legacy_paths[:8]),
+                "branching_metric_mode": metric_mode,
+                "branching_score": float(score),
+            }
+        )
 
     metric_name = "future_clip_chamfer_cosine" if metric_mode == "clip_chamfer" else "future_position_chamfer"
     corr = _correlation_summary(score_rows, metric_name=metric_name)
     write_csv(out_dir / "branching_scores.csv", score_rows, fieldnames=BRANCHING_SCORE_COLUMNS)
+    write_csv(out_dir / "branching_score_diagnostics.csv", diagnostics)
     write_csv(out_dir / "branching_delta_h_correlation.csv", [corr])
     score_summary = {
         "n_plan_rows": len(plan_rows),
@@ -838,6 +921,7 @@ def _score_branch_plan(
         "n_scores": len(score_rows),
         "n_expected_branch_outputs": int(expected_branch_outputs),
         "n_existing_branch_outputs": int(existing_branch_outputs),
+        "n_legacy_branch_outputs": int(legacy_branch_outputs),
         "n_points_with_fewer_than_two_branches": int(missing_min_branch_points),
         "n_points_with_invalid_score": int(invalid_score_points),
         "n_existing_branch_outputs_missing_rgb_future": int(missing_rgb_outputs),
@@ -989,6 +1073,7 @@ def metrics(config_path: str | Path, *, smoke: bool = False, force: bool = False
         metric_name = "future_clip_chamfer_cosine" if metric_mode == "clip_chamfer" else "future_position_chamfer"
         corr = _correlation_summary(score_rows, metric_name=metric_name)
         write_csv(out_dir / "branching_scores.csv", score_rows, fieldnames=BRANCHING_SCORE_COLUMNS)
+        write_csv(out_dir / "branching_score_diagnostics.csv", [])
         write_csv(out_dir / "branching_delta_h_correlation.csv", [corr])
         score_summary = {
             "n_plan_rows": 0,
@@ -996,6 +1081,7 @@ def metrics(config_path: str | Path, *, smoke: bool = False, force: bool = False
             "n_scores": 0,
             "n_expected_branch_outputs": 0,
             "n_existing_branch_outputs": 0,
+            "n_legacy_branch_outputs": 0,
             "n_points_with_fewer_than_two_branches": 0,
             "n_points_with_invalid_score": 0,
             "n_existing_branch_outputs_missing_rgb_future": 0,
@@ -1009,13 +1095,26 @@ def metrics(config_path: str | Path, *, smoke: bool = False, force: bool = False
         "trajectory_root": str(root),
         "branch_root": str(branch_root),
         "n_metric_items": len(manifest_rows),
+        "branching_score_diagnostics": str(out_dir / "branching_score_diagnostics.csv"),
         **score_summary,
     }
     write_json(out_dir / "c2_plife_plus_metrics_summary.json", summary)
+    if len(score_rows) == 0 and int(summary.get("n_plan_rows", 0)) > 0:
+        log_event(
+            "PLife++ C2 metrics produced no branch scores; inspect "
+            f"{out_dir / 'branching_score_diagnostics.csv'} "
+            f"branch_outputs={summary['n_existing_branch_outputs']}/{summary['n_expected_branch_outputs']} "
+            f"legacy_branch_outputs={summary.get('n_legacy_branch_outputs', 0)} "
+            f"points_lt2_branches={summary['n_points_with_fewer_than_two_branches']} "
+            f"invalid_scores={summary['n_points_with_invalid_score']} "
+            f"missing_rgb={summary['n_existing_branch_outputs_missing_rgb_future']}",
+            component="c2-plife",
+        )
     log_event(
         "PLife++ C2 metrics done "
         f"n_plan_rows={summary['n_plan_rows']} n_plan_points={summary['n_plan_points']} n_scores={len(score_rows)} "
         f"branch_outputs={summary['n_existing_branch_outputs']}/{summary['n_expected_branch_outputs']} "
+        f"legacy_branch_outputs={summary.get('n_legacy_branch_outputs', 0)} "
         f"points_lt2_branches={summary['n_points_with_fewer_than_two_branches']} "
         f"invalid_scores={summary['n_points_with_invalid_score']} "
         f"missing_rgb={summary['n_existing_branch_outputs_missing_rgb_future']} "
