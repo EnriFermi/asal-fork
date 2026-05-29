@@ -120,7 +120,21 @@ def _select_points(plan_rows: list[dict[str, str]], *, conditions: set[str], n_p
 
 def _load_branch_arrays(path: Path) -> dict[str, np.ndarray]:
     with np.load(path, allow_pickle=False) as data:
-        return {key: np.asarray(data[key]) for key in data.files if key in {"xy_future", "rgb_future", "c_future"}}
+        return {
+            key: np.asarray(data[key])
+            for key in data.files
+            if key
+            in {
+                "xy_future",
+                "rgb_future",
+                "c_future",
+                "strength",
+                "x_std",
+                "v_std",
+                "c_std",
+                "pre_perturb_initial_frame",
+            }
+        }
 
 
 def _rgb_uint8(frames: np.ndarray) -> np.ndarray:
@@ -276,6 +290,13 @@ def _compute_divergences(rows: list[dict[str, Any]], *, domain: float, max_parti
         try:
             base = load(baseline)
             cur = load(output)
+            for key in ("strength", "x_std", "v_std", "c_std"):
+                if key in cur:
+                    saved = float(np.asarray(cur[key]).reshape(-1)[0])
+                    row[f"saved_{key}"] = saved
+                    planned = _float_or(row.get(key), float("nan"))
+                    if np.isfinite(planned):
+                        row[f"{key}_saved_minus_planned"] = float(saved - planned)
             if "xy_future" in base and "xy_future" in cur:
                 cur_xy = np.asarray(cur["xy_future"])
                 base_xy = np.asarray(base["xy_future"])
@@ -301,7 +322,31 @@ def _compute_divergences(rows: list[dict[str, Any]], *, domain: float, max_parti
                     a = a[1:]
                     b = b[1:]
                 n = min(int(a.shape[0]), int(b.shape[0]))
-                row["rgb_mse_mean_vs_baseline"] = float(np.mean((a[:n] - b[:n]) ** 2)) if n > 0 else float("nan")
+                if n > 0:
+                    diff = a[:n] - b[:n]
+                    row["rgb_mse_mean_vs_baseline"] = float(np.mean(diff**2))
+                    row["rgb_mean_abs_vs_baseline"] = float(np.mean(np.abs(diff)))
+                    row["rgb_max_abs_vs_baseline"] = float(np.max(np.abs(diff)))
+                else:
+                    row["rgb_mse_mean_vs_baseline"] = float("nan")
+            if "c_future" in base and "c_future" in cur:
+                c_cur = np.asarray(cur["c_future"], dtype=np.float32)
+                c_base = np.asarray(base["c_future"], dtype=np.float32)
+                if bool(row.get("pre_perturb_initial_frame", False)) and c_cur.shape[0] > 1 and c_base.shape[0] > 1:
+                    c_cur = c_cur[1:]
+                    c_base = c_base[1:]
+                n = min(int(c_cur.shape[0]), int(c_base.shape[0]))
+                if n > 0:
+                    c_delta = c_cur[:n] - c_base[:n]
+                    c3_delta = c_cur[:n, :, :3] - c_base[:n, :, :3]
+                    c3 = c_cur[:n, :, :3]
+                    row["c_mean_abs_vs_baseline"] = float(np.mean(np.abs(c_delta)))
+                    row["c_max_abs_vs_baseline"] = float(np.max(np.abs(c_delta)))
+                    row["c_first3_mean_abs_vs_baseline"] = float(np.mean(np.abs(c3_delta)))
+                    row["c_first3_max_abs_vs_baseline"] = float(np.max(np.abs(c3_delta)))
+                    row["c_first3_min"] = float(np.min(c3))
+                    row["c_first3_max"] = float(np.max(c3))
+                    row["c_first3_std"] = float(np.std(c3))
             row["baseline_output_path"] = str(baseline)
             row["divergence_status"] = "ok"
         except Exception as exc:
@@ -320,6 +365,32 @@ def _divergence_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "xy_chamfer_mean_median": float(np.median(vals)),
         "xy_chamfer_mean_max": float(np.max(vals)),
     }
+
+
+def _color_debug_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    c_vals = np.asarray([_float_or(row.get("c_first3_mean_abs_vs_baseline", "nan")) for row in rows], dtype=np.float64)
+    c_vals = c_vals[np.isfinite(c_vals)]
+    rgb_vals = np.asarray([_float_or(row.get("rgb_mean_abs_vs_baseline", "nan")) for row in rows], dtype=np.float64)
+    rgb_vals = rgb_vals[np.isfinite(rgb_vals)]
+    summary: dict[str, Any] = {
+        "n_c_first3_debug": int(c_vals.size),
+        "n_rgb_debug": int(rgb_vals.size),
+    }
+    if c_vals.size:
+        summary.update(
+            {
+                "c_first3_mean_abs_max": float(np.max(c_vals)),
+                "c_first3_mean_abs_median": float(np.median(c_vals)),
+            }
+        )
+    if rgb_vals.size:
+        summary.update(
+            {
+                "rgb_mean_abs_max": float(np.max(rgb_vals)),
+                "rgb_mean_abs_median": float(np.median(rgb_vals)),
+            }
+        )
+    return summary
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -418,18 +489,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             component="c2-plife-sweep",
         )
         for strength_idx, strength in enumerate(strengths):
+            actual_x_std = float(base_x_std * float(strength))
+            actual_v_std = float(base_v_std * float(strength))
+            actual_c_std = float(base_c_std * float(strength))
             log_event(
                 f"PLife++ perturbation sweep point {point_idx + 1}/{len(points)} strength={float(strength):g} "
-                f"noise=x:{base_x_std * float(strength):g} v:{base_v_std * float(strength):g} c:{base_c_std * float(strength):g} "
+                f"noise=x:{actual_x_std:g} v:{actual_v_std:g} c:{actual_c_std:g} "
                 f"reps={max(1, reps_per_strength)}",
                 component="c2-plife-sweep",
             )
             strength_tag = _safe_tag(strength)
+            noise_tag = _safe_path_id(f"s_{float(strength):.6g}_x_{actual_x_std:.6g}_v_{actual_v_std:.6g}_c_{actual_c_std:.6g}")
             for rep_id in range(max(1, reps_per_strength)):
                 branch_seed = int(args.seed_base) + 100_003 * point_idx + 1009 * rep_id
                 if args.vary_rng_with_strength:
                     branch_seed += 131 * strength_idx
-                output_path = point_dir / f"strength_{strength_tag}" / f"rep_{rep_id:03d}" / "branch_output.npz"
+                output_path = point_dir / f"strength_{noise_tag}" / f"rep_{rep_id:03d}" / "branch_output.npz"
                 video_path = output_path.with_name("video.mp4")
                 row = {
                     "sweep_point_id": int(point_idx),
@@ -448,9 +523,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "strength": float(strength),
                     "strength_tag": strength_tag,
                     "rep_id": int(rep_id),
-                    "x_std": float(base_x_std * float(strength)),
-                    "v_std": float(base_v_std * float(strength)),
-                    "c_std": float(base_c_std * float(strength)),
+                    "x_std": actual_x_std,
+                    "v_std": actual_v_std,
+                    "c_std": actual_c_std,
                     "seed_x": int(seed_x),
                     "branch_seed": int(branch_seed),
                     "horizon_steps": int(horizon_steps),
@@ -575,7 +650,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     log_event("PLife++ perturbation sweep computing divergence against strength=0 baselines", component="c2-plife-sweep")
     _compute_divergences(rows, domain=domain, max_particles=max_particles)
     div_summary = _divergence_summary(rows)
+    color_summary = _color_debug_summary(rows)
     log_event(f"PLife++ perturbation sweep divergence summary {div_summary}", component="c2-plife-sweep")
+    log_event(f"PLife++ perturbation sweep color debug summary {color_summary}", component="c2-plife-sweep")
+    for row in rows:
+        if str(row.get("status")) not in {"written", "exists"}:
+            continue
+        log_event(
+            "PLife++ perturbation sweep color debug "
+            f"point={row.get('sweep_point_id')} strength={_float_or(row.get('strength'), float('nan')):g} "
+            f"status={row.get('status')} planned_c_std={_float_or(row.get('c_std'), float('nan')):g} "
+            f"saved_c_std={_float_or(row.get('saved_c_std'), float('nan')):g} "
+            f"c3_abs={_float_or(row.get('c_first3_mean_abs_vs_baseline'), float('nan')):.6g} "
+            f"c3_range=[{_float_or(row.get('c_first3_min'), float('nan')):.6g},{_float_or(row.get('c_first3_max'), float('nan')):.6g}] "
+            f"c3_std={_float_or(row.get('c_first3_std'), float('nan')):.6g} "
+            f"rgb_abs={_float_or(row.get('rgb_mean_abs_vs_baseline'), float('nan')):.6g} "
+            f"rgb_max={_float_or(row.get('rgb_max_abs_vs_baseline'), float('nan')):.6g}",
+            component="c2-plife-sweep",
+        )
 
     video_rows = 0
     if not args.dry_run and not args.skip_videos:
@@ -715,6 +807,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "panel_size": int(panel_size),
         "max_video_frames": int(max_video_frames),
         **div_summary,
+        **color_summary,
         "errors": errors[:20],
     }
     write_json(out_root / "plife_perturbation_strength_sweep_summary.json", summary)
