@@ -65,6 +65,10 @@ def _safe_path_id(value: Any) -> str:
     return out.strip("_") or "traj"
 
 
+def _legacy_strength_output_path(point_dir: Path, strength: float, rep_id: int) -> Path:
+    return point_dir / f"strength_{_safe_tag(strength)}" / f"rep_{int(rep_id):03d}" / "branch_output.npz"
+
+
 def _float_or(value: Any, default: float = float("nan")) -> float:
     try:
         x = float(value)
@@ -940,6 +944,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 if args.vary_rng_with_strength:
                     branch_seed += 131 * strength_idx
                 output_path = point_dir / f"strength_{noise_tag}" / f"rep_{rep_id:03d}" / "branch_output.npz"
+                legacy_output_path = _legacy_strength_output_path(point_dir, float(strength), rep_id)
                 video_path = output_path.with_name("video.mp4")
                 row = {
                     "sweep_point_id": int(point_idx),
@@ -969,6 +974,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "params_path": str(params_path),
                     "metrics_path": point.get("metrics_path", ""),
                     "output_path": str(output_path),
+                    "legacy_output_path": str(legacy_output_path),
                     "video_path": str(video_path),
                     "status": "planned",
                     "command": command_to_str(
@@ -986,12 +992,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         ]
                     ),
                 }
+                if not output_path.exists() and legacy_output_path.exists() and not args.force:
+                    output_path = legacy_output_path
+                    video_path = output_path.with_name("video.mp4")
+                    row["output_path"] = str(output_path)
+                    row["video_path"] = str(video_path)
+                    row["used_legacy_output_path"] = True
                 if output_path.exists() and not args.force:
                     row["status"] = "exists"
                     existing += 1
                     log_event(
                         f"PLife++ perturbation sweep exists point={point_idx} strength={float(strength):g} "
-                        f"rep={rep_id} output={output_path}",
+                        f"rep={rep_id} output={output_path} legacy={bool(row.get('used_legacy_output_path', False))}",
                         component="c2-plife-sweep",
                     )
                     rows.append(row)
