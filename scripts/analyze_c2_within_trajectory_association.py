@@ -110,6 +110,15 @@ def _sample_std(x: np.ndarray) -> float:
     return float(np.std(arr, ddof=1)) if arr.size > 1 else float("nan")
 
 
+def _checked_corr(value: float, *, name: str) -> float:
+    x = float(value)
+    if not math.isfinite(x):
+        return x
+    if abs(x) > 1.0 + 1e-9:
+        raise RuntimeError(f"Internal error: {name}={x} is outside [-1, 1]. This is not a valid correlation.")
+    return float(np.clip(x, -1.0, 1.0))
+
+
 def _pearson(x: np.ndarray, y: np.ndarray) -> float:
     xx = np.asarray(x, dtype=np.float64)
     yy = np.asarray(y, dtype=np.float64)
@@ -120,7 +129,7 @@ def _pearson(x: np.ndarray, y: np.ndarray) -> float:
         return float("nan")
     if float(np.std(xx)) <= 1e-12 or float(np.std(yy)) <= 1e-12:
         return float("nan")
-    return float(np.corrcoef(xx, yy)[0, 1])
+    return _checked_corr(float(np.corrcoef(xx, yy)[0, 1]), name="pearson_r")
 
 
 def _rankdata_average(x: np.ndarray) -> np.ndarray:
@@ -150,7 +159,7 @@ def _spearman(x: np.ndarray, y: np.ndarray) -> float:
         return float("nan")
     if float(np.std(xx)) <= 1e-12 or float(np.std(yy)) <= 1e-12:
         return float("nan")
-    return _pearson(_rankdata_average(xx), _rankdata_average(yy))
+    return _checked_corr(_pearson(_rankdata_average(xx), _rankdata_average(yy)), name="spearman_r")
 
 
 def _corr_summary(x: np.ndarray, y: np.ndarray) -> dict[str, Any]:
