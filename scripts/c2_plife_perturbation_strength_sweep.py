@@ -232,6 +232,67 @@ def _load_video_frames(
     raise ValueError(f"No rgb_future or xy_future in {path}")
 
 
+def _load_frames_at_indices(
+    path: Path,
+    indices: list[int],
+    *,
+    panel_size: int,
+    radius: int,
+    trail_steps: int,
+    domain_size: float,
+    debug_color_strip: bool,
+    color_strip_height: int,
+) -> list[tuple[int, np.ndarray]]:
+    arrays = _load_branch_arrays(path)
+    if "rgb_future" in arrays:
+        frames = _rgb_uint8(arrays["rgb_future"])
+        out: list[tuple[int, np.ndarray]] = []
+        for idx in indices:
+            i = int(idx)
+            if 0 <= i < int(frames.shape[0]):
+                out.append(
+                    (
+                        i,
+                        _append_color_strip(
+                            _resize_nearest(frames[i], panel_size),
+                            arrays,
+                            i,
+                            enabled=debug_color_strip,
+                            height=color_strip_height,
+                        ),
+                    )
+                )
+        return out
+    if "xy_future" in arrays:
+        xy = np.asarray(arrays["xy_future"], dtype=np.float32)
+        out = []
+        for idx in indices:
+            i = int(idx)
+            if 0 <= i < int(xy.shape[0]):
+                out.append(
+                    (
+                        i,
+                        _append_color_strip(
+                            _xy_frame(
+                                xy,
+                                i,
+                                img_size=int(panel_size),
+                                radius=int(radius),
+                                trail_steps=int(trail_steps),
+                                domain_size=float(domain_size),
+                                wrap=True,
+                            ),
+                            arrays,
+                            i,
+                            enabled=debug_color_strip,
+                            height=color_strip_height,
+                        ),
+                    )
+                )
+        return out
+    raise ValueError(f"No rgb_future or xy_future in {path}")
+
+
 def _write_frame_list_video(
     frames: list[np.ndarray],
     output: Path,
@@ -256,6 +317,18 @@ def _write_frame_list_video(
     return {"status": "written", "video_path": str(output), "n_frames": int(written)}
 
 
+def _write_image(output: Path, frame: np.ndarray, *, force: bool) -> dict[str, Any]:
+    if output.exists() and not force:
+        return {"status": "exists", "image_path": str(output)}
+    import cv2  # type: ignore
+
+    ensure_dir(output.parent)
+    ok = cv2.imwrite(str(output), cv2.cvtColor(np.asarray(frame, dtype=np.uint8), cv2.COLOR_RGB2BGR))
+    if not ok:
+        raise RuntimeError(f"Could not write image {output}")
+    return {"status": "written", "image_path": str(output)}
+
+
 def _grid_canvas(frames: list[np.ndarray], labels: list[str], *, n_cols: int):
     import cv2  # type: ignore
 
@@ -274,6 +347,57 @@ def _grid_canvas(frames: list[np.ndarray], labels: list[str], *, n_cols: int):
         cv2.putText(canvas, labels[idx], (x0 + 6, y0 + 17), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (20, 20, 20), 1, cv2.LINE_AA)
         canvas[y0 + label_h : y0 + label_h + h, x0 : x0 + w] = frame
     return canvas
+
+
+def _frame_label(frame_idx: int, sample_every: int, *, has_initial_frame: bool) -> str:
+    if has_initial_frame and int(frame_idx) == 0:
+        return "pre"
+    if has_initial_frame:
+        return f"+{int(frame_idx) * max(1, int(sample_every))}"
+    return f"+{(int(frame_idx) + 1) * max(1, int(sample_every))}"
+
+
+def _write_first_frame_montage(
+    *,
+    output: Path,
+    items: list[tuple[float, int, Path]],
+    frame_count: int,
+    panel_size: int,
+    radius: int,
+    trail_steps: int,
+    domain_size: float,
+    sample_every: int,
+    has_initial_frame: bool,
+    debug_color_strip: bool,
+    color_strip_height: int,
+    force: bool,
+) -> dict[str, Any]:
+    if output.exists() and not force:
+        return {"status": "exists", "image_path": str(output), "n_tiles": 0}
+    n_frames = max(1, int(frame_count))
+    frame_indices = list(range(n_frames))
+    frames: list[np.ndarray] = []
+    labels: list[str] = []
+    for strength, rep_id, path in sorted(items, key=lambda item: (item[0], item[1], str(item[2]))):
+        selected = _load_frames_at_indices(
+            path,
+            frame_indices,
+            panel_size=panel_size,
+            radius=radius,
+            trail_steps=trail_steps,
+            domain_size=domain_size,
+            debug_color_strip=debug_color_strip,
+            color_strip_height=color_strip_height,
+        )
+        for frame_idx, frame in selected:
+            frames.append(frame)
+            labels.append(f"s={strength:g} r={rep_id} {_frame_label(frame_idx, sample_every, has_initial_frame=has_initial_frame)}")
+    if not frames:
+        return {"status": "skipped_empty", "image_path": str(output), "n_tiles": 0}
+    canvas = _grid_canvas(frames, labels, n_cols=n_frames)
+    result = _write_image(output, canvas, force=force)
+    result["n_tiles"] = int(len(frames))
+    return result
 
 
 def _write_grid_video(
@@ -731,10 +855,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     codec = str(args.codec if args.codec is not None else _get(sweep_cfg, "codec", "mp4v"))
     panel_size = int(args.panel_size if args.panel_size is not None else _get(sweep_cfg, "panel_size", 192))
     max_video_frames = int(args.max_video_frames if args.max_video_frames is not None else _get(sweep_cfg, "max_video_frames", 128))
+    first_frame_count = int(args.first_frame_count if args.first_frame_count is not None else _get(sweep_cfg, "first_frame_count", 4))
     radius = int(args.radius if args.radius is not None else _get(sweep_cfg, "radius", 3))
     trail_steps = int(args.trail_steps if args.trail_steps is not None else _get(sweep_cfg, "trail_steps", 6))
     debug_color_strip = bool(_get(sweep_cfg, "debug_color_strip", True)) and not bool(args.no_debug_color_strip)
     color_strip_height = int(args.color_strip_height if args.color_strip_height is not None else _get(sweep_cfg, "color_strip_height", 24))
+    render_force = bool(args.force_render or args.force)
     max_particles = int(_get(c2_cfg, "divergence_max_particles", 128))
     perturb_cfg = _get(c2_cfg, "perturb", {})
     base_x_std = float(args.base_x_std if args.base_x_std is not None else _get(sweep_cfg, "base_x_std", _get(perturb_cfg, "x_std", 0.003)))
@@ -754,6 +880,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     log_event(
         f"PLife++ perturbation sweep video debug_color_strip={debug_color_strip} color_strip_height={color_strip_height}",
+        component="c2-plife-sweep",
+    )
+    log_event(
+        f"PLife++ perturbation sweep first-frame montages frame_count={first_frame_count}",
         component="c2-plife-sweep",
     )
     for point_idx, point in enumerate(points):
@@ -1009,7 +1139,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         Path(str(row["video_path"])),
                         fps=video_fps,
                         codec=codec,
-                        force=bool(args.force),
+                        force=render_force,
                     )
                 elif "rgb_future" in arrays:
                     result = _write_rgb_video(
@@ -1019,7 +1149,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         codec=codec,
                         macro_block_size=1,
                         max_frames=max_video_frames,
-                        force=bool(args.force),
+                        force=render_force,
                     )
                 elif "xy_future" in arrays:
                     result = _write_xy_video(
@@ -1034,7 +1164,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         max_frames=max_video_frames,
                         domain_size=float(domain),
                         wrap=True,
-                        force=bool(args.force),
+                        force=render_force,
                     )
                 else:
                     result = {"status": "skipped_missing_frames", "video_path": row["video_path"], "n_frames": 0}
@@ -1091,7 +1221,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     domain_size=float(domain),
                     debug_color_strip=debug_color_strip,
                     color_strip_height=color_strip_height,
-                    force=bool(args.force),
+                    force=render_force,
                 )
                 if result.get("status") in {"written", "exists"}:
                     grid_videos.append(str(grid_path))
@@ -1111,12 +1241,62 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             component="c2-plife-sweep",
         )
 
+    first_frame_montages: list[str] = []
+    if not args.dry_run and not args.skip_first_frame_montages:
+        log_event("PLife++ perturbation sweep rendering first-frame perturbation montages", component="c2-plife-sweep")
+        for point_idx in range(len(points)):
+            items_with_strength: list[tuple[float, int, Path]] = []
+            for row in rows:
+                if int(row["sweep_point_id"]) != point_idx or str(row.get("status")) not in {"written", "exists"}:
+                    continue
+                path = Path(str(row["output_path"]))
+                if path.exists():
+                    items_with_strength.append((float(row["strength"]), int(row["rep_id"]), path))
+            if not items_with_strength:
+                continue
+            montage_path = out_root / f"point_{point_idx:03d}_first_frames.png"
+            try:
+                result = _write_first_frame_montage(
+                    output=montage_path,
+                    items=items_with_strength,
+                    frame_count=first_frame_count,
+                    panel_size=panel_size,
+                    radius=radius,
+                    trail_steps=trail_steps,
+                    domain_size=float(domain),
+                    sample_every=future_sample_every,
+                    has_initial_frame=include_initial_frame,
+                    debug_color_strip=debug_color_strip,
+                    color_strip_height=color_strip_height,
+                    force=render_force,
+                )
+                if result.get("status") in {"written", "exists"}:
+                    first_frame_montages.append(str(montage_path))
+                log_event(
+                    f"PLife++ perturbation sweep first-frame montage {result.get('status')} "
+                    f"point={point_idx} tiles={result.get('n_tiles')} path={montage_path}",
+                    component="c2-plife-sweep",
+                )
+            except Exception as exc:
+                errors.append(f"first-frame montage point={point_idx}: {type(exc).__name__}: {exc}")
+                log_event(
+                    f"PLife++ perturbation sweep first-frame montage error point={point_idx}: {type(exc).__name__}: {exc}",
+                    component="c2-plife-sweep",
+                )
+    else:
+        log_event(
+            "PLife++ perturbation sweep skipping first-frame montages "
+            f"dry_run={bool(args.dry_run)} skip_first_frame_montages={bool(args.skip_first_frame_montages)}",
+            component="c2-plife-sweep",
+        )
+
     plan_out = out_root / "plife_perturbation_strength_sweep_plan.csv"
     write_csv(plan_out, rows)
     summary = {
         "status": "ok",
         "allow_heavy": bool(args.allow_heavy),
         "dry_run": bool(args.dry_run),
+        "force_render": bool(args.force_render),
         "branch_plan": str(plan_path),
         "output_root": str(out_root),
         "plan": str(plan_out),
@@ -1127,6 +1307,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "n_skipped": int(skipped),
         "n_videos": int(video_rows),
         "grid_videos": grid_videos,
+        "first_frame_montages": first_frame_montages,
+        "n_first_frame_montages": int(len(first_frame_montages)),
         "conditions": sorted(conditions),
         "strengths": strengths,
         "reps_per_strength": int(reps_per_strength),
@@ -1139,6 +1321,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "video_fps": float(video_fps),
         "panel_size": int(panel_size),
         "max_video_frames": int(max_video_frames),
+        "first_frame_count": int(first_frame_count),
         "debug_color_strip": bool(debug_color_strip),
         "color_strip_height": int(color_strip_height),
         **div_summary,
@@ -1149,7 +1332,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     write_json(out_root / "plife_perturbation_strength_sweep_summary.json", summary)
     log_event(
         f"PLife++ perturbation sweep done rows={len(rows)} written={written} existing={existing} "
-        f"videos={video_rows} grids={len(grid_videos)} summary={out_root / 'plife_perturbation_strength_sweep_summary.json'}",
+        f"videos={video_rows} grids={len(grid_videos)} first_frame_montages={len(first_frame_montages)} "
+        f"summary={out_root / 'plife_perturbation_strength_sweep_summary.json'}",
         component="c2-plife-sweep",
     )
     return summary
@@ -1177,6 +1361,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--allow-heavy", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--force-render", action="store_true", help="Overwrite rendered PNG/MP4 files without forcing branch resimulation.")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--skip-videos", action="store_true")
     parser.add_argument("--skip-grid-videos", action="store_true")
@@ -1185,6 +1370,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--panel-size", type=int, default=None)
     parser.add_argument("--grid-cols", type=int, default=None)
     parser.add_argument("--max-video-frames", type=int, default=None)
+    parser.add_argument("--first-frame-count", type=int, default=None, help="Number of initial saved frames to show in perturbation montage PNGs.")
+    parser.add_argument("--skip-first-frame-montages", action="store_true")
     parser.add_argument("--radius", type=int, default=None)
     parser.add_argument("--trail-steps", type=int, default=None)
     parser.add_argument("--no-debug-color-strip", action="store_true", help="Do not append c[:, :3] particle color strips to rendered sweep videos.")

@@ -336,6 +336,7 @@ c2:
       video_fps: 12
       panel_size: 192
       max_video_frames: 128
+      first_frame_count: 4
 
 c4:
   enabled: true
@@ -633,3 +634,4 @@ smoke:
         render_img_size: 64
         panel_size: 96
         max_video_frames: 16
+        first_frame_count: 4
