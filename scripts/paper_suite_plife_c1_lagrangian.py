@@ -454,6 +454,11 @@ def _write_trial_artifacts(
         trajectory_window_steps=np.asarray(late_end - late_start, dtype=np.int32),
         metric_window_size_steps=np.asarray(int(base_cfg.metric.metric_window_size_steps), dtype=np.int32),
         metric_window_step_steps=np.asarray(int(base_cfg.metric.metric_window_step_steps), dtype=np.int32),
+        metric_tau_mode=np.asarray(str(_get(base_cfg.metric, "metric_tau_mode", "fixed"))),
+        metric_tau_grid_steps=np.asarray(
+            [int(x) for x in (_get(base_cfg.metric, "metric_tau_grid_steps", []) or [])],
+            dtype=np.int32,
+        ),
         metric_tau_steps=np.asarray(int(base_cfg.metric.metric_tau_steps), dtype=np.int32),
         params_path=str(paths["params"].relative_to(output_root)),
     )
@@ -613,6 +618,8 @@ def run(
         base_cfg.metric.sample_every_steps = 1
         base_cfg.metric.metric_window_size_steps = 8
         base_cfg.metric.metric_window_step_steps = 4
+        base_cfg.metric.metric_tau_mode = "max_grid"
+        base_cfg.metric.metric_tau_grid_steps = [1, 2, 3]
         base_cfg.metric.metric_tau_steps = 2
     rollout_flat = _flatten_base_config(base_cfg)
 

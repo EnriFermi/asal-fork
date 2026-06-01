@@ -126,8 +126,8 @@ datasets:
       expected_trajectory_start_steps: 4000
       expected_trajectory_end_steps: 24000
       metric:
-        metric_tau_mode: fixed
-        metric_tau_grid_steps: null
+        metric_tau_mode: max_grid
+        metric_tau_grid_steps: [5, 10, 15, 20, 25, 30, 35]
         metric_tau_steps: 25
         metric_window_size_steps: 100
         metric_window_step_steps: 50
@@ -413,7 +413,8 @@ simulation:
     late_window_start_steps: 4000
     late_window_end_steps: 24000
     sample_every_steps: 1
-    metric_tau_mode: fixed
+    metric_tau_mode: max_grid
+    metric_tau_grid_steps: [5, 10, 15, 20, 25, 30, 35]
     metric_tau_steps: 25
     metric_window_size_steps: 100
     metric_window_step_steps: 50

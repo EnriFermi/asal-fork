@@ -361,6 +361,38 @@ def _frame_label(frame_idx: int, sample_every: int, *, has_initial_frame: bool) 
     return f"+{(int(frame_idx) + 1) * max(1, int(sample_every))}"
 
 
+def _strength_from_dir_name(name: str) -> float:
+    text = str(name)
+    if text.startswith("strength_"):
+        text = text[len("strength_") :]
+    if text.startswith("s_"):
+        text = text[2:].split("_", 1)[0]
+    text = text.replace("m", "-").replace("p", ".")
+    return _float_or(text, float("nan"))
+
+
+def _rep_from_dir_name(name: str) -> int:
+    text = str(name)
+    if text.startswith("rep_"):
+        text = text[len("rep_") :]
+    return _int_or(text, 0)
+
+
+def _discover_existing_first_frame_items(out_root: Path) -> dict[Path, list[tuple[float, int, Path]]]:
+    groups: dict[Path, list[tuple[float, int, Path]]] = {}
+    for path in sorted(Path(out_root).glob("point_*/strength_*/rep_*/branch_output.npz")):
+        try:
+            point_dir = path.parents[2]
+            strength = _strength_from_dir_name(path.parents[1].name)
+            rep_id = _rep_from_dir_name(path.parents[0].name)
+            if not np.isfinite(strength):
+                strength = float(len(groups.get(point_dir, [])))
+            groups.setdefault(point_dir, []).append((float(strength), int(rep_id), path))
+        except Exception:
+            continue
+    return groups
+
+
 def _write_first_frame_montage(
     *,
     output: Path,
@@ -585,6 +617,14 @@ def _color_debug_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
             }
         )
     return summary
+
+
+def _status_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        status = str(row.get("status", ""))
+        counts[status] = counts.get(status, 0) + 1
+    return counts
 
 
 def _boolish(value: Any) -> bool:
@@ -870,6 +910,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     base_x_std = float(args.base_x_std if args.base_x_std is not None else _get(sweep_cfg, "base_x_std", _get(perturb_cfg, "x_std", 0.003)))
     base_v_std = float(args.base_v_std if args.base_v_std is not None else _get(sweep_cfg, "base_v_std", _get(perturb_cfg, "v_std", 0.0)))
     base_c_std = float(args.base_c_std if args.base_c_std is not None else _get(sweep_cfg, "base_c_std", _get(perturb_cfg, "c_std", 0.01)))
+    force_branch_outputs = bool(args.force and args.allow_heavy and not args.dry_run)
+    if args.force and not force_branch_outputs:
+        log_event(
+            "PLife++ perturbation sweep --force will only force render/posthoc outputs because "
+            "--allow-heavy is not active; existing branch_output.npz files remain reusable",
+            component="c2-plife-sweep",
+        )
 
     log_event(
         "PLife++ perturbation sweep start "
@@ -992,13 +1039,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         ]
                     ),
                 }
-                if not output_path.exists() and legacy_output_path.exists() and not args.force:
+                if not output_path.exists() and legacy_output_path.exists() and not force_branch_outputs:
                     output_path = legacy_output_path
                     video_path = output_path.with_name("video.mp4")
                     row["output_path"] = str(output_path)
                     row["video_path"] = str(video_path)
                     row["used_legacy_output_path"] = True
-                if output_path.exists() and not args.force:
+                if output_path.exists() and not force_branch_outputs:
                     row["status"] = "exists"
                     existing += 1
                     log_event(
@@ -1254,6 +1301,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     first_frame_montages: list[str] = []
+    first_frame_candidate_outputs = 0
+    first_frame_rendered_dirs: set[Path] = set()
     if not args.dry_run and not args.skip_first_frame_montages:
         log_event("PLife++ perturbation sweep rendering first-frame perturbation montages", component="c2-plife-sweep")
         for point_idx in range(len(points)):
@@ -1264,7 +1313,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 path = Path(str(row["output_path"]))
                 if path.exists():
                     items_with_strength.append((float(row["strength"]), int(row["rep_id"]), path))
+                    first_frame_candidate_outputs += 1
             if not items_with_strength:
+                statuses: dict[str, int] = {}
+                for row in rows:
+                    if int(row["sweep_point_id"]) == point_idx:
+                        status = str(row.get("status", ""))
+                        statuses[status] = statuses.get(status, 0) + 1
+                log_event(
+                    f"PLife++ perturbation sweep first-frame montage skipped point={point_idx} "
+                    f"candidate_outputs=0 row_statuses={statuses}",
+                    component="c2-plife-sweep",
+                )
                 continue
             montage_path = out_root / f"point_{point_idx:03d}_first_frames.png"
             try:
@@ -1284,6 +1344,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 if result.get("status") in {"written", "exists"}:
                     first_frame_montages.append(str(montage_path))
+                    first_frame_rendered_dirs.update(path.parents[2] for _strength, _rep_id, path in items_with_strength)
                 log_event(
                     f"PLife++ perturbation sweep first-frame montage {result.get('status')} "
                     f"point={point_idx} tiles={result.get('n_tiles')} path={montage_path}",
@@ -1295,10 +1356,61 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     f"PLife++ perturbation sweep first-frame montage error point={point_idx}: {type(exc).__name__}: {exc}",
                     component="c2-plife-sweep",
                 )
+        discovered = _discover_existing_first_frame_items(out_root)
+        log_event(
+            f"PLife++ perturbation sweep discovered existing first-frame groups={len(discovered)} "
+            f"branch_outputs={sum(len(items) for items in discovered.values())}",
+            component="c2-plife-sweep",
+        )
+        for point_dir, items_with_strength in sorted(discovered.items(), key=lambda item: item[0].name):
+            if point_dir in first_frame_rendered_dirs:
+                continue
+            first_frame_candidate_outputs += len(items_with_strength)
+            montage_path = out_root / f"{point_dir.name}_first_frames.png"
+            try:
+                result = _write_first_frame_montage(
+                    output=montage_path,
+                    items=items_with_strength,
+                    frame_count=first_frame_count,
+                    panel_size=panel_size,
+                    radius=radius,
+                    trail_steps=trail_steps,
+                    domain_size=float(domain),
+                    sample_every=future_sample_every,
+                    has_initial_frame=include_initial_frame,
+                    debug_color_strip=debug_color_strip,
+                    color_strip_height=color_strip_height,
+                    force=render_force,
+                )
+                if result.get("status") in {"written", "exists"}:
+                    first_frame_montages.append(str(montage_path))
+                    first_frame_rendered_dirs.add(point_dir)
+                log_event(
+                    f"PLife++ perturbation sweep first-frame discovered montage {result.get('status')} "
+                    f"point_dir={point_dir.name} tiles={result.get('n_tiles')} path={montage_path}",
+                    component="c2-plife-sweep",
+                )
+            except Exception as exc:
+                errors.append(f"first-frame discovered montage point_dir={point_dir.name}: {type(exc).__name__}: {exc}")
+                log_event(
+                    f"PLife++ perturbation sweep first-frame discovered montage error "
+                    f"point_dir={point_dir.name}: {type(exc).__name__}: {exc}",
+                    component="c2-plife-sweep",
+                )
     else:
         log_event(
             "PLife++ perturbation sweep skipping first-frame montages "
             f"dry_run={bool(args.dry_run)} skip_first_frame_montages={bool(args.skip_first_frame_montages)}",
+            component="c2-plife-sweep",
+        )
+    if not args.dry_run and not args.skip_first_frame_montages and not first_frame_montages:
+        statuses: dict[str, int] = {}
+        for row in rows:
+            status = str(row.get("status", ""))
+            statuses[status] = statuses.get(status, 0) + 1
+        log_event(
+            "PLife++ perturbation sweep first-frame montage none written "
+            f"candidate_outputs={first_frame_candidate_outputs} row_statuses={statuses} output_root={out_root}",
             component="c2-plife-sweep",
         )
 
@@ -1321,6 +1433,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "grid_videos": grid_videos,
         "first_frame_montages": first_frame_montages,
         "n_first_frame_montages": int(len(first_frame_montages)),
+        "n_first_frame_candidate_outputs": int(first_frame_candidate_outputs),
         "conditions": sorted(conditions),
         "strengths": strengths,
         "reps_per_strength": int(reps_per_strength),
