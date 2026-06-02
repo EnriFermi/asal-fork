@@ -23,6 +23,34 @@ def _maybe_list(x: Any) -> list[Any] | None:
     return None
 
 
+def _normalize_metric_objective(value: Any) -> str | None:
+    if value is None:
+        return None
+    name = str(value).strip().lower().replace("-", "_")
+    if name in {"", "none", "custom", "manual"}:
+        return None
+    aliases = {
+        "legacy": "legacy_msc_t",
+        "legacy_msc": "legacy_msc_t",
+        "legacy_msc_t": "legacy_msc_t",
+        "old_msc": "legacy_msc_t",
+        "old_msc_t": "legacy_msc_t",
+        "msc": "legacy_msc_t",
+        "msc_t": "legacy_msc_t",
+        "overlap": "legacy_msc_t",
+        "mspd": "mspd",
+        "new_mspd": "mspd",
+        "paper_mspd": "mspd",
+        "c1_mspd": "mspd",
+    }
+    if name not in aliases:
+        raise ValueError(
+            "metric_objective must be one of 'legacy_msc_t', 'mspd', or 'custom', "
+            f"got {value!r}."
+        )
+    return aliases[name]
+
+
 def _resolve_frames(
     *,
     frames: Any,
@@ -170,6 +198,7 @@ def _resolve_scales(
 
 
 def resolve_metric_config(args: Any) -> dict[str, Any]:
+    metric_objective = _normalize_metric_objective(getattr(args, "metric_objective", None))
     rollout_steps = int(args.rollout_steps)
     sample_every_raw = getattr(args, "sample_every_steps", None)
     time_sampling_raw = getattr(args, "time_sampling", None)
@@ -329,8 +358,12 @@ def resolve_metric_config(args: Any) -> dict[str, Any]:
     delta_h_floor = float(getattr(args, "metric_delta_h_floor", 0.0) or 0.0)
     if delta_h_floor < 0.0:
         raise ValueError(f"metric_delta_h_floor must be >= 0, got {delta_h_floor}.")
+    if metric_objective == "mspd":
+        msc_floor_default = 0.01
+    else:
+        msc_floor_default = delta_h_floor
     msc_floor_raw = getattr(args, "metric_msc_floor", None)
-    msc_floor = float(delta_h_floor if msc_floor_raw is None else msc_floor_raw)
+    msc_floor = float(msc_floor_default if msc_floor_raw is None else msc_floor_raw)
     if msc_floor < 0.0:
         raise ValueError(f"metric_msc_floor must be >= 0, got {msc_floor}.")
 
@@ -340,13 +373,23 @@ def resolve_metric_config(args: Any) -> dict[str, Any]:
         weights_raw=getattr(args, "metric_scale_weights", None),
     )
     scale_weight_sum = float(sum(float(w) for _r, w in pairs))
-    msc_normalize_by_weight_sum = bool(getattr(args, "metric_msc_normalize_by_weight_sum", False))
+    if metric_objective == "mspd":
+        msc_normalize_by_weight_sum = True
+    elif metric_objective == "legacy_msc_t":
+        msc_normalize_by_weight_sum = False
+    else:
+        msc_normalize_by_weight_sum = bool(getattr(args, "metric_msc_normalize_by_weight_sum", False))
     if pairs and msc_normalize_by_weight_sum and scale_weight_sum <= 0.0:
         raise ValueError(
             "Sum of metric_scale_weights over valid scale pairs must be positive "
             f"for normalized MSC, got {scale_weight_sum}."
         )
-    msc_term = str(getattr(args, "metric_msc_term", "overlap")).strip().lower()
+    if metric_objective == "mspd":
+        msc_term = "floor_reconstruction_error"
+    elif metric_objective == "legacy_msc_t":
+        msc_term = "overlap"
+    else:
+        msc_term = str(getattr(args, "metric_msc_term", "overlap")).strip().lower()
     if msc_term in {"floor_reconstruction_error", "reconstruction_error", "mse"}:
         msc_term = "floor_reconstruction_error"
     elif msc_term in {"overlap", "legacy_overlap"}:
@@ -356,6 +399,12 @@ def resolve_metric_config(args: Any) -> dict[str, Any]:
             "metric_msc_term must be one of 'overlap' or "
             f"'floor_reconstruction_error', got {msc_term!r}."
         )
+    if metric_objective in {"legacy_msc_t", "mspd"}:
+        alpha = 0.0
+        beta = 1.0
+    else:
+        alpha = float(getattr(args, "metric_alpha", 1.0))
+        beta = float(getattr(args, "metric_beta", 1.0))
 
     periodic_raw = getattr(args, "metric_periodic", False)
     domain_y_raw = getattr(args, "metric_domain_y", 0.0)
@@ -397,8 +446,9 @@ def resolve_metric_config(args: Any) -> dict[str, Any]:
         scale_weight_sum=scale_weight_sum,
         scale_normalization="sum_weight_r" if msc_normalize_by_weight_sum else "none",
         msc_term=msc_term,
-        alpha=float(getattr(args, "metric_alpha", 1.0)),
-        beta=float(getattr(args, "metric_beta", 1.0)),
+        alpha=alpha,
+        beta=beta,
+        objective="custom" if metric_objective is None else metric_objective,
         eps=float(getattr(args, "metric_eps", 1e-12)),
         dirs_seed=int(getattr(args, "metric_dirs_seed", 123)),
         periodic=bool(periodic_raw) if periodic_raw is not None else False,
@@ -449,6 +499,7 @@ def metric_summary(cfg: dict[str, Any]) -> dict[str, Any]:
         scale_weight_sum=float(cfg.get("scale_weight_sum", sum(float(w) for _, w in cfg["scale_pairs"]))),
         scale_normalization=str(cfg.get("scale_normalization", "none")),
         msc_term=str(cfg.get("msc_term", "overlap")),
+        objective=str(cfg.get("objective", "custom")),
         alpha=float(cfg["alpha"]),
         beta=float(cfg["beta"]),
     )

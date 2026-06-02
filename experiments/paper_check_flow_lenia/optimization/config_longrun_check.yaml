@@ -102,11 +102,17 @@ metric:
   metric_lagrangian_diffusion_scale: 1.0
 
   # MSC_t settings
+  # Objective preset:
+  #   legacy_msc_t keeps the old overlap-style MSC_t optimization metric.
+  #   mspd switches optimization to the paper MSPD discrepancy:
+  #        floor_reconstruction_error + normalized scale weights + msc_floor=0.01.
+  #   custom/omitted keeps the low-level metric_msc_* fields exactly as specified.
+  metric_objective: legacy_msc_t
   metric_preprocess_mode: clip   # clip | shift | none
   metric_scales: null            # auto dyadic if null
   metric_scale_weights: null     # default all 1.0 if null
 
-  # Final scalar objective: loss = -(alpha * A + beta * MSC_t)
+  # Used only with metric_objective: custom/omitted; presets force pure metric score.
   metric_alpha: 0.0
   metric_beta: 1.0
   metric_eps: 1.0e-12
