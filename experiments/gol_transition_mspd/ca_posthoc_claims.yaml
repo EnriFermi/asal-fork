@@ -1,0 +1,60 @@
+# Posthoc C1/C2/C5 checks for transition-law MSPD cellular automata runs.
+# This is downstream-only: it reads an existing optimization/rule-sweep output
+# directory and does not rerun the GA or all-rule sweep.
+
+# Set a concrete finished run for reproducibility, or keep null to use the most
+# recently modified completed directory under results_root. A completed directory
+# must contain best_rule_result.npz or best_result.npz plus its run config.
+input_dir: null
+results_root: analysis/results/gol_transition_mspd
+
+# Default: <input_dir>/posthoc_claims
+output_dir: null
+
+# all | c1 | c2 | c5
+task: all
+
+# null means reuse backend from the saved GoL MSPD run. For GPU/CUDA, set jax.
+backend: jax
+seed: 0
+
+c1:
+  # For rule-sweep, optimized candidates are top-K rules by transition-law MSPD.
+  # Strict mode selects top-K using the completed sweep, then re-evaluates top-K
+  # and random controls on fresh Bernoulli holdout boards that were not in the
+  # sweep. This is the paper-facing C1 for CA.
+  eval_mode: fresh_holdout
+  optimized_top_k: 1
+  random_controls: 32
+  holdout_n_initial_boards: 32
+  # source = reuse the sweep's initialization law:
+  # fixed initial_density if the sweep was fixed-p, or p~Uniform(low, high)
+  # if the sweep used initial_density_range.
+  holdout_density_mode: source
+  holdout_density: null
+  holdout_density_range: null
+  # null means reuse ExperimentConfig.eval_batch_size from the saved run.
+  eval_batch_size: null
+
+c2:
+  # Samples windows across the saved Delta-H distribution, branches from those
+  # states with small bit flips, and correlates Delta-H with future Hamming divergence.
+  branch_windows: 24
+  branches_per_window: 4
+  horizon: 64
+  perturb_fraction: 0.01
+
+c5:
+  # CA version of the paper-suite frustration/history assay:
+  # control_a: global rollout from seed_x.
+  # control_b: global rollout from independent seed_x1.
+  # walls: same seed_x as control_a, but warmup is run in isolated spatial blocks;
+  #        blocks are then merged and the normal toroidal CA runs to the late window.
+  # Primary score is Delta-H trace distance:
+  # D(control, walls) - D(control_a, control_b).
+  random_controls: 32
+  n_trials: 4
+  warmup_steps: null
+  late_window_start_steps: null
+  late_window_end_steps: null
+  wall_grid_split: 2

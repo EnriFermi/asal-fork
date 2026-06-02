@@ -1,6 +1,12 @@
 import os
 import argparse
 import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "scripts")):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 import evosax
 import jax
@@ -10,6 +16,33 @@ from omegaconf import OmegaConf
 import substrates
 import simulate_save_apf
 import util
+
+
+def _replace_state_fields(state, **updates):
+    if hasattr(state, "replace"):
+        return state.replace(**updates)
+    if hasattr(state, "_replace"):
+        return state._replace(**updates)
+    for key, value in updates.items():
+        setattr(state, key, value)
+    return state
+
+
+def _initialize_strategy_with_mean(strategy, rng_init, es_params, init_mean):
+    try:
+        return strategy.initialize(rng_init, es_params, init_mean=init_mean)
+    except TypeError:
+        state = strategy.initialize(rng_init, es_params)
+        updates = {}
+        if hasattr(state, "mean"):
+            updates["mean"] = init_mean
+        if hasattr(state, "best_member"):
+            updates["best_member"] = init_mean
+        if not updates:
+            raise RuntimeError(
+                "Could not set a custom optimizer initialization mean on this evosax strategy/state."
+            )
+        return _replace_state_fields(state, **updates)
 
 
 def _project_root() -> str:
@@ -88,7 +121,7 @@ def _build_run_cfg(cfg, run_idx: int, n_runs: int):
 
     init_mode = str(run_cfg.random_best.get("init_mode", "substrate_default")).strip().lower()
     cma_pop_size = _as_int(run_cfg.random_best.get("cma_pop_size", 1), 1)
-    if init_mode == "sep_cma_es_ask" and cma_pop_size < 1:
+    if init_mode in {"sep_cma_es_ask", "sep_cma_es_ask_substrate_default"} and cma_pop_size < 1:
         raise ValueError(f"random_best.cma_pop_size must be >= 1, got {cma_pop_size}.")
 
     if n_runs == 1:
@@ -105,7 +138,7 @@ def _build_run_cfg(cfg, run_idx: int, n_runs: int):
     sim_seed = sim_seed_start + run_idx
     lagrangian_seed = lagrangian_seed_start + run_idx
 
-    if init_mode == "sep_cma_es_ask":
+    if init_mode in {"sep_cma_es_ask", "sep_cma_es_ask_substrate_default"}:
         pop_round = run_idx // cma_pop_size
         member_idx = run_idx % cma_pop_size
         param_seed = param_seed_start + pop_round
@@ -142,6 +175,7 @@ def _sample_params_sep_cma_es_ask(
     sigma_init: float,
     pop_size: int,
     member_idx: int,
+    mean_init_mode: str = "strategy_default",
 ):
     if pop_size < 1:
         raise ValueError(f"cma_pop_size must be >= 1, got {pop_size}.")
@@ -157,8 +191,19 @@ def _sample_params_sep_cma_es_ask(
         sigma_init=sigma_init,
     )
     es_params = strategy.default_params
-    rng, rng_init, rng_ask = jax.random.split(rng, 3)
-    es_state = strategy.initialize(rng_init, es_params)
+    mean_init_mode = str(mean_init_mode).strip().lower().replace("-", "_")
+    if mean_init_mode not in {"strategy_default", "substrate_default"}:
+        raise ValueError(
+            "mean_init_mode must be 'strategy_default' or 'substrate_default', "
+            f"got {mean_init_mode!r}."
+        )
+    if mean_init_mode == "substrate_default":
+        rng, rng_mean, rng_init, rng_ask = jax.random.split(rng, 4)
+        init_mean = substrate.default_params(rng_mean)
+        es_state = _initialize_strategy_with_mean(strategy, rng_init, es_params, init_mean)
+    else:
+        rng, rng_init, rng_ask = jax.random.split(rng, 3)
+        es_state = strategy.initialize(rng_init, es_params)
     params_pop, _ = strategy.ask(rng_ask, es_state, es_params)
     return params_pop[member_idx]
 
@@ -171,13 +216,10 @@ def main(cfg, args):
     fitness = float(getattr(args, "fitness", 0.0))
     init_mode = str(getattr(args, "init_mode", "substrate_default")).strip().lower()
 
-    if args.substrate == "lenia_flow":
-        substrate = substrates.create_substrate(
-            args.substrate,
-            **util.flow_lenia_kwargs_from_args(args),
-        )
-    else:
-        substrate = substrates.create_substrate(args.substrate)
+    substrate = substrates.create_substrate(
+        args.substrate,
+        **util.substrate_kwargs_from_args(args),
+    )
     substrate = substrates.FlattenSubstrateParameters(substrate)
 
     if init_mode == "substrate_default":
@@ -194,11 +236,27 @@ def main(cfg, args):
             sigma_init=float(sigma_init_raw),
             pop_size=int(getattr(args, "cma_pop_size", 1)),
             member_idx=int(getattr(args, "cma_member_idx", 0)),
+            mean_init_mode="strategy_default",
+        )
+    elif init_mode == "sep_cma_es_ask_substrate_default":
+        sigma_init_raw = getattr(args, "cma_sigma_init", None)
+        if sigma_init_raw is None:
+            raise ValueError(
+                "random_best.init_mode='sep_cma_es_ask_substrate_default' requires "
+                "random_best.cma_sigma_init."
+            )
+        params = _sample_params_sep_cma_es_ask(
+            substrate,
+            seed=seed,
+            sigma_init=float(sigma_init_raw),
+            pop_size=int(getattr(args, "cma_pop_size", 1)),
+            member_idx=int(getattr(args, "cma_member_idx", 0)),
+            mean_init_mode="substrate_default",
         )
     else:
         raise ValueError(
             f"Unknown random_best.init_mode={init_mode!r}. "
-            "Use 'substrate_default' or 'sep_cma_es_ask'."
+            "Use 'substrate_default', 'sep_cma_es_ask', or 'sep_cma_es_ask_substrate_default'."
         )
 
     params_np = np.asarray(params)

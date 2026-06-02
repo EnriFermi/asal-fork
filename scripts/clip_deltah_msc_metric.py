@@ -23,6 +23,34 @@ def _maybe_list(x: Any) -> list[Any] | None:
     return None
 
 
+def _normalize_metric_objective(value: Any) -> str | None:
+    if value is None:
+        return None
+    name = str(value).strip().lower().replace("-", "_")
+    if name in {"", "none", "custom", "manual"}:
+        return None
+    aliases = {
+        "legacy": "legacy_msc_t",
+        "legacy_msc": "legacy_msc_t",
+        "legacy_msc_t": "legacy_msc_t",
+        "old_msc": "legacy_msc_t",
+        "old_msc_t": "legacy_msc_t",
+        "msc": "legacy_msc_t",
+        "msc_t": "legacy_msc_t",
+        "overlap": "legacy_msc_t",
+        "mspd": "mspd",
+        "new_mspd": "mspd",
+        "paper_mspd": "mspd",
+        "c1_mspd": "mspd",
+    }
+    if name not in aliases:
+        raise ValueError(
+            "metric_objective must be one of 'legacy_msc_t', 'mspd', or 'custom', "
+            f"got {value!r}."
+        )
+    return aliases[name]
+
+
 def _resolve_frames(
     *,
     frames: Any,
@@ -170,6 +198,7 @@ def _resolve_scales(
 
 
 def resolve_metric_config(args: Any) -> dict[str, Any]:
+    metric_objective = _normalize_metric_objective(getattr(args, "metric_objective", None))
     rollout_steps = int(args.rollout_steps)
     sample_every_raw = getattr(args, "sample_every_steps", None)
     time_sampling_raw = getattr(args, "time_sampling", None)
@@ -326,12 +355,56 @@ def resolve_metric_config(args: Any) -> dict[str, Any]:
         raise ValueError(
             f"metric_preprocess_mode must be one of ['clip','shift','none'], got {mode!r}."
         )
+    delta_h_floor = float(getattr(args, "metric_delta_h_floor", 0.0) or 0.0)
+    if delta_h_floor < 0.0:
+        raise ValueError(f"metric_delta_h_floor must be >= 0, got {delta_h_floor}.")
+    if metric_objective == "mspd":
+        msc_floor_default = 0.01
+    else:
+        msc_floor_default = delta_h_floor
+    msc_floor_raw = getattr(args, "metric_msc_floor", None)
+    msc_floor = float(msc_floor_default if msc_floor_raw is None else msc_floor_raw)
+    if msc_floor < 0.0:
+        raise ValueError(f"metric_msc_floor must be >= 0, got {msc_floor}.")
 
     scales, weight_map, pairs = _resolve_scales(
         W=W,
         scales_raw=getattr(args, "metric_scales", None),
         weights_raw=getattr(args, "metric_scale_weights", None),
     )
+    scale_weight_sum = float(sum(float(w) for _r, w in pairs))
+    if metric_objective == "mspd":
+        msc_normalize_by_weight_sum = True
+    elif metric_objective == "legacy_msc_t":
+        msc_normalize_by_weight_sum = False
+    else:
+        msc_normalize_by_weight_sum = bool(getattr(args, "metric_msc_normalize_by_weight_sum", False))
+    if pairs and msc_normalize_by_weight_sum and scale_weight_sum <= 0.0:
+        raise ValueError(
+            "Sum of metric_scale_weights over valid scale pairs must be positive "
+            f"for normalized MSC, got {scale_weight_sum}."
+        )
+    if metric_objective == "mspd":
+        msc_term = "floor_reconstruction_error"
+    elif metric_objective == "legacy_msc_t":
+        msc_term = "overlap"
+    else:
+        msc_term = str(getattr(args, "metric_msc_term", "overlap")).strip().lower()
+    if msc_term in {"floor_reconstruction_error", "reconstruction_error", "mse"}:
+        msc_term = "floor_reconstruction_error"
+    elif msc_term in {"overlap", "legacy_overlap"}:
+        msc_term = "overlap"
+    else:
+        raise ValueError(
+            "metric_msc_term must be one of 'overlap' or "
+            f"'floor_reconstruction_error', got {msc_term!r}."
+        )
+    if metric_objective in {"legacy_msc_t", "mspd"}:
+        alpha = 0.0
+        beta = 1.0
+    else:
+        alpha = float(getattr(args, "metric_alpha", 1.0))
+        beta = float(getattr(args, "metric_beta", 1.0))
 
     periodic_raw = getattr(args, "metric_periodic", False)
     domain_y_raw = getattr(args, "metric_domain_y", 0.0)
@@ -365,11 +438,17 @@ def resolve_metric_config(args: Any) -> dict[str, Any]:
         null_reps=null_reps,
         particle_samples=particle_samples,
         preprocess_mode=mode,
+        delta_h_floor=delta_h_floor,
+        msc_floor=msc_floor,
         scales=scales,
         scale_weights={int(k): float(v) for k, v in weight_map.items()},
         scale_pairs=pairs,
-        alpha=float(getattr(args, "metric_alpha", 1.0)),
-        beta=float(getattr(args, "metric_beta", 1.0)),
+        scale_weight_sum=scale_weight_sum,
+        scale_normalization="sum_weight_r" if msc_normalize_by_weight_sum else "none",
+        msc_term=msc_term,
+        alpha=alpha,
+        beta=beta,
+        objective="custom" if metric_objective is None else metric_objective,
         eps=float(getattr(args, "metric_eps", 1e-12)),
         dirs_seed=int(getattr(args, "metric_dirs_seed", 123)),
         periodic=bool(periodic_raw) if periodic_raw is not None else False,
@@ -409,11 +488,18 @@ def metric_summary(cfg: dict[str, Any]) -> dict[str, Any]:
         null_reps=int(cfg["null_reps"]),
         particle_samples=int(cfg["particle_samples"]),
         periodic=bool(cfg["periodic"]),
+        positions_unwrapped=bool(cfg.get("positions_unwrapped", False)),
         domain_y=float(cfg["domain_y"]),
         domain_x=float(cfg["domain_x"]),
         preprocess_mode=str(cfg["preprocess_mode"]),
+        delta_h_floor=float(cfg.get("delta_h_floor", 0.0)),
+        msc_floor=float(cfg.get("msc_floor", cfg.get("delta_h_floor", 0.0))),
         scales=list(cfg["scales"]),
         scale_pairs=[(int(r), float(w)) for r, w in cfg["scale_pairs"]],
+        scale_weight_sum=float(cfg.get("scale_weight_sum", sum(float(w) for _, w in cfg["scale_pairs"]))),
+        scale_normalization=str(cfg.get("scale_normalization", "none")),
+        msc_term=str(cfg.get("msc_term", "overlap")),
+        objective=str(cfg.get("objective", "custom")),
         alpha=float(cfg["alpha"]),
         beta=float(cfg["beta"]),
     )
@@ -429,7 +515,7 @@ def _mean_pairwise_l1(sig: jnp.ndarray) -> jnp.ndarray:
     return jnp.sum(d * mask) / jnp.maximum(denom, jnp.array(1.0, dtype=sig.dtype))
 
 
-def make_metric_loss_fn(cfg: dict[str, Any]):
+def make_metric_loss_fn(cfg: dict[str, Any], *, include_maps: bool = False):
     starts = jnp.asarray(cfg["starts"], dtype=jnp.int32)
     W = int(cfg["W"])
     win = int(cfg["window_size_frames"])
@@ -450,12 +536,18 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
     null_reps = int(cfg["null_reps"])
     particle_samples = int(cfg["particle_samples"])
     mode = str(cfg["preprocess_mode"])
+    delta_h_floor = float(cfg.get("delta_h_floor", 0.0))
+    msc_floor = float(cfg.get("msc_floor", delta_h_floor))
     scale_pairs = [(int(r), float(w)) for r, w in cfg["scale_pairs"]]
+    scale_weight_sum = float(cfg.get("scale_weight_sum", sum(float(w) for _r, w in scale_pairs)))
+    scale_normalization = str(cfg.get("scale_normalization", "none"))
+    msc_term = str(cfg.get("msc_term", "overlap"))
     alpha = float(cfg["alpha"])
     beta = float(cfg["beta"])
     eps = float(cfg["eps"])
     dirs_seed = int(cfg["dirs_seed"])
     periodic = bool(cfg["periodic"])
+    positions_unwrapped = bool(cfg.get("positions_unwrapped", False))
     domain_y = float(cfg["domain_y"])
     domain_x = float(cfg["domain_x"])
     sample_stride_steps = float(cfg["sample_stride_steps"])
@@ -463,10 +555,15 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
 
     def _preprocess(h: jnp.ndarray) -> jnp.ndarray:
         if mode == "clip":
-            return jnp.maximum(h, 0.0)
-        if mode == "shift":
-            return h - jnp.min(h)
-        return h
+            out = jnp.maximum(h, 0.0)
+        elif mode == "shift":
+            out = h - jnp.min(h)
+        else:
+            out = h
+        if delta_h_floor > 0.0:
+            floor = jnp.asarray(delta_h_floor, dtype=out.dtype)
+            out = jnp.where(out >= floor, out, jnp.zeros_like(out))
+        return out
 
     def _signature_from_increments(v_s: jnp.ndarray, dirs: jnp.ndarray) -> jnp.ndarray:
         # v_s: (m_count, S, 2)
@@ -476,7 +573,7 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
         return sig
 
     def _delta_periodic(dx: jnp.ndarray) -> jnp.ndarray:
-        if periodic:
+        if periodic and not positions_unwrapped:
             if domain_y > 0:
                 dy = (dx[..., 0] + 0.5 * domain_y) % domain_y - 0.5 * domain_y
                 dx = dx.at[..., 0].set(dy)
@@ -518,12 +615,16 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
 
         X0 = X_w[k_idx][:, p_idx, :]
         X1 = X_w[k_idx + tau][:, p_idx, :]
+        X_sample = X_w[:, p_idx, :]
         dx = _delta_periodic(X1 - X0)
         dt = jnp.maximum(
             jnp.asarray(float(tau) * sample_stride_steps, dtype=xy_seq.dtype),
             jnp.asarray(1e-12, dtype=xy_seq.dtype),
         )
         v_s = dx / dt  # (m_count, S, 2)
+        dx_norm = jnp.linalg.norm(dx, axis=-1)
+        speed_norm = jnp.linalg.norm(v_s, axis=-1)
+        pos_flat = X_sample.reshape((-1, 2))
 
         dirs = jax.random.normal(dir_key, (n_proj, 2), dtype=xy_seq.dtype)
         dirs = dirs / jnp.maximum(jnp.linalg.norm(dirs, axis=1, keepdims=True), 1e-12)
@@ -546,12 +647,35 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
             h0 = jax.vmap(_one_null)(null_keys)
             h_null = jnp.median(h0)
 
-        return h_real - h_null
+        h_delta = h_real - h_null
+        return dict(
+            delta_h=h_delta,
+            h_real=h_real,
+            h_null=h_null,
+            dx_norm_mean=jnp.mean(dx_norm),
+            dx_norm_std=jnp.std(dx_norm),
+            dx_norm_max=jnp.max(dx_norm),
+            speed_norm_mean=jnp.mean(speed_norm),
+            speed_norm_std=jnp.std(speed_norm),
+            speed_norm_max=jnp.max(speed_norm),
+            speed_component_std_mean=jnp.mean(jnp.std(v_s.reshape((-1, 2)), axis=0)),
+            position_std_mean=jnp.mean(jnp.std(pos_flat, axis=0)),
+            position_range_mean=jnp.mean(jnp.max(pos_flat, axis=0) - jnp.min(pos_flat, axis=0)),
+        )
 
-    def _score_from_h(h: jnp.ndarray, dtype: jnp.dtype) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    def _score_from_h(
+        h: jnp.ndarray,
+        dtype: jnp.dtype,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         h_pos = _preprocess(h)
         amp = jnp.mean(h_pos)
         msc = jnp.array(0.0, dtype=dtype)
+        if scale_normalization == "sum_weight_r":
+            weight_denom = jnp.asarray(scale_weight_sum, dtype=dtype) + jnp.asarray(eps, dtype=dtype)
+        else:
+            weight_denom = jnp.asarray(1.0, dtype=dtype)
+        msc_raw_terms = []
+        msc_weighted_terms = []
         for r, wr in scale_pairs:
             U_r = W // r
             U_2r = W // (2 * r)
@@ -562,27 +686,59 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
             U_cmp = min(U_r, 2 * U_2r)
             g_r_cmp = g_r[:U_cmp]
             up = jnp.repeat(g_2r, 2)[:U_cmp]
-            overlap = jnp.sum(g_r_cmp * up)
-            power = jnp.sum(g_r_cmp * g_r_cmp)
-            d_r = 1.0 - overlap / (power + eps)
-            msc = msc + (wr * d_r)
+            if msc_term == "floor_reconstruction_error":
+                numerator = jnp.mean((g_r_cmp - up) ** 2)
+                denominator = jnp.mean(g_r_cmp * g_r_cmp) + jnp.asarray(msc_floor * msc_floor, dtype=dtype) + eps
+                d_r = numerator / denominator
+            else:
+                overlap = jnp.sum(g_r_cmp * up)
+                power = jnp.sum(g_r_cmp * g_r_cmp)
+                d_r = jnp.where(
+                    power > eps,
+                    1.0 - overlap / (power + eps),
+                    jnp.array(0.0, dtype=dtype),
+                )
+            weighted = (wr * d_r) / weight_denom
+            msc = msc + weighted
+            msc_raw_terms.append(d_r)
+            msc_weighted_terms.append(weighted)
+        if msc_raw_terms:
+            msc_raw_by_scale = jnp.stack(msc_raw_terms, axis=0)
+            msc_by_scale = jnp.stack(msc_weighted_terms, axis=0)
+        else:
+            msc_raw_by_scale = jnp.zeros((0,), dtype=dtype)
+            msc_by_scale = jnp.zeros((0,), dtype=dtype)
         score = alpha * amp + beta * msc
-        return score, amp, msc
+        return score, amp, msc, h_pos, msc_raw_by_scale, msc_by_scale
 
     def metric_loss_fn(rng_metric: jax.Array, xy_seq: jnp.ndarray, tau_selector: jax.Array | None = None):
         tau_count = len(tau_frames_list)
         keys_tau = jax.random.split(rng_metric, tau_count)
 
         h_list = []
+        h_real_list = []
+        h_null_list = []
+        dx_norm_mean_list = []
+        dx_norm_std_list = []
+        dx_norm_max_list = []
+        speed_norm_mean_list = []
+        speed_norm_std_list = []
+        speed_norm_max_list = []
+        speed_component_std_mean_list = []
+        position_std_mean_list = []
+        position_range_mean_list = []
+        h_processed_list = []
         score_list = []
         amp_list = []
         msc_list = []
+        msc_raw_by_scale_list = []
+        msc_by_scale_list = []
         for i in range(tau_count):
             tau = int(tau_frames_list[i])
             tseg = int(tseg_list[i])
             m_count = int(m_count_list[i])
             keys_w = jax.random.split(keys_tau[i], W)
-            h = jax.vmap(
+            window_diag = jax.vmap(
                 lambda s, k: _delta_h_window(
                     xy_seq,
                     s,
@@ -592,16 +748,45 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
                     m_count=m_count,
                 )
             )(starts, keys_w)
-            score, amp, msc = _score_from_h(h, xy_seq.dtype)
+            h = window_diag["delta_h"]
+            score, amp, msc, h_processed, msc_raw_by_scale, msc_by_scale = _score_from_h(h, xy_seq.dtype)
             h_list.append(h)
+            h_real_list.append(window_diag["h_real"])
+            h_null_list.append(window_diag["h_null"])
+            dx_norm_mean_list.append(window_diag["dx_norm_mean"])
+            dx_norm_std_list.append(window_diag["dx_norm_std"])
+            dx_norm_max_list.append(window_diag["dx_norm_max"])
+            speed_norm_mean_list.append(window_diag["speed_norm_mean"])
+            speed_norm_std_list.append(window_diag["speed_norm_std"])
+            speed_norm_max_list.append(window_diag["speed_norm_max"])
+            speed_component_std_mean_list.append(window_diag["speed_component_std_mean"])
+            position_std_mean_list.append(window_diag["position_std_mean"])
+            position_range_mean_list.append(window_diag["position_range_mean"])
+            h_processed_list.append(h_processed)
             score_list.append(score)
             amp_list.append(amp)
             msc_list.append(msc)
+            msc_raw_by_scale_list.append(msc_raw_by_scale)
+            msc_by_scale_list.append(msc_by_scale)
 
         h_all = jnp.stack(h_list, axis=0)  # (Ktau, W)
+        h_processed_all = jnp.stack(h_processed_list, axis=0)
+        h_real_all = jnp.stack(h_real_list, axis=0)
+        h_null_all = jnp.stack(h_null_list, axis=0)
+        dx_norm_mean_all = jnp.stack(dx_norm_mean_list, axis=0)
+        dx_norm_std_all = jnp.stack(dx_norm_std_list, axis=0)
+        dx_norm_max_all = jnp.stack(dx_norm_max_list, axis=0)
+        speed_norm_mean_all = jnp.stack(speed_norm_mean_list, axis=0)
+        speed_norm_std_all = jnp.stack(speed_norm_std_list, axis=0)
+        speed_norm_max_all = jnp.stack(speed_norm_max_list, axis=0)
+        speed_component_std_mean_all = jnp.stack(speed_component_std_mean_list, axis=0)
+        position_std_mean_all = jnp.stack(position_std_mean_list, axis=0)
+        position_range_mean_all = jnp.stack(position_range_mean_list, axis=0)
         score_all = jnp.stack(score_list, axis=0)  # (Ktau,)
         amp_all = jnp.stack(amp_list, axis=0)
         msc_all = jnp.stack(msc_list, axis=0)
+        msc_raw_by_scale_all = jnp.stack(msc_raw_by_scale_list, axis=0)
+        msc_by_scale_all = jnp.stack(msc_by_scale_list, axis=0)
 
         if tau_mode == "max_grid":
             best_idx = jnp.argmax(score_all)
@@ -613,7 +798,21 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
         score = score_all[best_idx]
         amp = amp_all[best_idx]
         msc = msc_all[best_idx]
+        msc_raw_by_scale_best = msc_raw_by_scale_all[best_idx]
+        msc_by_scale_best = msc_by_scale_all[best_idx]
         h_best = h_all[best_idx]
+        h_processed_best = h_processed_all[best_idx]
+        h_real_best = h_real_all[best_idx]
+        h_null_best = h_null_all[best_idx]
+        dx_norm_mean_best = dx_norm_mean_all[best_idx]
+        dx_norm_std_best = dx_norm_std_all[best_idx]
+        dx_norm_max_best = dx_norm_max_all[best_idx]
+        speed_norm_mean_best = speed_norm_mean_all[best_idx]
+        speed_norm_std_best = speed_norm_std_all[best_idx]
+        speed_norm_max_best = speed_norm_max_all[best_idx]
+        speed_component_std_mean_best = speed_component_std_mean_all[best_idx]
+        position_std_mean_best = position_std_mean_all[best_idx]
+        position_range_mean_best = position_range_mean_all[best_idx]
 
         tau_frames_arr = jnp.asarray(tau_frames_list, dtype=jnp.int32)
         tau_steps_arr = jnp.asarray(tau_steps_list, dtype=jnp.int32)
@@ -627,7 +826,7 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
         tau_selected_idx = best_idx.astype(xy_seq.dtype)
 
         loss = -score
-        return loss, dict(
+        info = dict(
             score=score,
             amp=amp,
             msc=msc,
@@ -635,6 +834,40 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
             delta_h_std=jnp.std(h_best),
             delta_h_min=jnp.min(h_best),
             delta_h_max=jnp.max(h_best),
+            delta_h_abs_mean=jnp.mean(jnp.abs(h_best)),
+            delta_h_positive_frac=jnp.mean((h_best > 0.0).astype(xy_seq.dtype)),
+            delta_h_processed_mean=jnp.mean(h_processed_best),
+            delta_h_processed_std=jnp.std(h_processed_best),
+            delta_h_processed_min=jnp.min(h_processed_best),
+            delta_h_processed_max=jnp.max(h_processed_best),
+            delta_h_processed_positive_frac=jnp.mean((h_processed_best > 0.0).astype(xy_seq.dtype)),
+            h_real_mean=jnp.mean(h_real_best),
+            h_real_std=jnp.std(h_real_best),
+            h_real_min=jnp.min(h_real_best),
+            h_real_max=jnp.max(h_real_best),
+            h_null_mean=jnp.mean(h_null_best),
+            h_null_std=jnp.std(h_null_best),
+            h_null_min=jnp.min(h_null_best),
+            h_null_max=jnp.max(h_null_best),
+            h_real_minus_null_mean=jnp.mean(h_real_best - h_null_best),
+            h_real_over_null_mean=jnp.mean(h_real_best / jnp.maximum(jnp.abs(h_null_best), eps)),
+            h_delta_over_real_mean=jnp.mean(h_best / jnp.maximum(jnp.abs(h_real_best), eps)),
+            dx_norm_mean=jnp.mean(dx_norm_mean_best),
+            dx_norm_std_mean=jnp.mean(dx_norm_std_best),
+            dx_norm_max=jnp.max(dx_norm_max_best),
+            speed_norm_mean=jnp.mean(speed_norm_mean_best),
+            speed_norm_std_mean=jnp.mean(speed_norm_std_best),
+            speed_norm_max=jnp.max(speed_norm_max_best),
+            speed_component_std_mean=jnp.mean(speed_component_std_mean_best),
+            position_std_mean=jnp.mean(position_std_mean_best),
+            position_range_mean=jnp.mean(position_range_mean_best),
+            delta_h_tau_mean=jnp.mean(h_all),
+            delta_h_tau_abs_mean=jnp.mean(jnp.abs(h_all)),
+            delta_h_processed_tau_mean=jnp.mean(h_processed_all),
+            h_real_tau_mean=jnp.mean(h_real_all),
+            h_null_tau_mean=jnp.mean(h_null_all),
+            dx_norm_tau_mean=jnp.mean(dx_norm_mean_all),
+            speed_norm_tau_mean=jnp.mean(speed_norm_mean_all),
             tau_selected_idx=tau_selected_idx,
             tau_best_frames=tau_best_frames.astype(xy_seq.dtype),
             tau_best_steps=tau_best_steps.astype(xy_seq.dtype),
@@ -649,5 +882,28 @@ def make_metric_loss_fn(cfg: dict[str, Any]):
             amp_tau_min=jnp.min(amp_all),
             amp_tau_mean=jnp.mean(amp_all),
         )
+        if include_maps:
+            info.update(
+                delta_h_map=h_all,
+                delta_h_best=h_best,
+                delta_h_processed_map=h_processed_all,
+                delta_h_processed_best=h_processed_best,
+                score_by_tau=score_all,
+                amp_by_tau=amp_all,
+                msc_by_tau=msc_all,
+                msc_scale_r=jnp.asarray([int(r) for r, _wr in scale_pairs], dtype=jnp.int32),
+                msc_scale_weight=jnp.asarray([float(wr) for _r, wr in scale_pairs], dtype=xy_seq.dtype),
+                msc_scale_weight_sum=jnp.asarray(scale_weight_sum, dtype=xy_seq.dtype),
+                msc_normalized_by_scale_weight_sum=jnp.asarray(scale_normalization == "sum_weight_r", dtype=xy_seq.dtype),
+                msc_raw_by_scale_by_tau=msc_raw_by_scale_all,
+                msc_by_scale_by_tau=msc_by_scale_all,
+                msc_raw_by_scale_best=msc_raw_by_scale_best,
+                msc_by_scale_best=msc_by_scale_best,
+                tau_frames=tau_frames_arr,
+                tau_steps=tau_steps_arr,
+                window_start_frames=starts.astype(jnp.int32),
+                window_start_steps=(starts * int(cfg["sample_stride_steps"])).astype(jnp.int32),
+            )
+        return loss, info
 
     return metric_loss_fn

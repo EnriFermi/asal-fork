@@ -50,7 +50,8 @@ It makes a decision to turn left or right based on the neighbors' positions and 
 class Boids():
     def __init__(self, n_boids=64, n_nbrs=16, visual_range=0.1, speed=0.5,
                  controller='network',
-                 dt=0.01, bird_render_size=0.02, bird_render_sharpness=20, space_size=1., red_boid=True):
+                 dt=0.01, bird_render_size=0.02, bird_render_sharpness=20, space_size=1., red_boid=True,
+                 border='torus'):
         self.n_boids = n_boids
         self.n_nbrs = n_nbrs
         self.visual_range = visual_range
@@ -61,10 +62,34 @@ class Boids():
         self.bird_render_sharpness = bird_render_sharpness
         self.space_size = space_size
         self.red_boid = red_boid
+        self.border = border
 
         self.net = BoidNetwork()
 
         assert controller=='network', 'only network controller supported for now'
+        assert border in ('torus', 'wall'), "border must be 'torus' or 'wall'"
+
+    def _apply_boundary(self, x, v):
+        if self.border == 'torus':
+            return x % self.space_size, v
+
+        hit_lo = x < 0.0
+        hit_hi = x > self.space_size
+        x = jnp.where(hit_lo, -x, x)
+        x = jnp.where(hit_hi, 2.0 * self.space_size - x, x)
+        v = jnp.where(hit_lo | hit_hi, -v, v)
+        x = jnp.clip(x, 0.0, self.space_size)
+        return x, v
+
+    def _pairwise_delta(self, x_src, x_tgt):
+        r = x_tgt - x_src
+        if self.border == 'torus':
+            r = jax.lax.select(
+                r > self.space_size / 2.0,
+                r - self.space_size,
+                jax.lax.select(r < -self.space_size / 2.0, r + self.space_size, r),
+            )
+        return r
 
     def default_params(self, rng):
         if self.controller == 'network':
@@ -124,16 +149,14 @@ class Boids():
         v = v + dv * self.dt
         v = v / jnp.linalg.norm(v, axis=-1, keepdims=True)
         x = x + self.speed * v * self.dt
-        x = x%self.space_size # circular boundary
+        x, v = self._apply_boundary(x, v)
         return dict(x=x, v=v)
 
     def _step_state_simple(self, rng, state, params):
         x, v = state['x'], state['v'] # n_boids, 2
 
         # shape: src boids, tgt boids
-        r = x[None, :, :] - x[:, None, :] # src, tgt, 2
-        # r = jax.lax.select(r>0.5, r-1, jax.lax.select(r<-0.5, r+1, r))  # circular boundary
-        r = jax.lax.select(r>self.space_size/2., r-self.space_size, jax.lax.select(r<-self.space_size/2, r+self.space_size, r))  # circular boundary
+        r = self._pairwise_delta(x[:, None, :], x[None, :, :]) # src, tgt, 2
         d = jnp.linalg.norm(r, axis=-1) # src, tgt
         nbr_mask = (d<self.nbr_dist) * (1-jnp.eye(self.n_boids)) # src, tgt
         n_nbrs = nbr_mask.sum(axis=-1) # src
@@ -157,7 +180,7 @@ class Boids():
         # v = jnp.where(speed > self.max_speed, v/speed*self.max_speed, v)
         v = v/speed * self.max_speed
         x = x + v * self.dt
-        x = x%1. # circular boundary
+        x, v = self._apply_boundary(x, v)
         return dict(x=x, v=v)
     
     def step_state(self, rng, state, params):

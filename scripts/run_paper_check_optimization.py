@@ -4,6 +4,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "scripts")):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
 from omegaconf import OmegaConf
 
 from paper_check_common import (
@@ -18,6 +23,40 @@ from paper_check_common import (
 )
 
 
+def _entrypoint_command(stage_cfg, repo: Path, resolved_config_path: Path) -> list[str]:
+    raw = stage_cfg.get("entrypoint", stage_cfg.get("objective", "msc"))
+    name = str(raw).strip().lower().replace("-", "_")
+    aliases = {
+        "msc": "msc",
+        "main_opt_msc": "msc",
+        "delta_h": "msc",
+        "deltah": "msc",
+        "clip": "clip_oe",
+        "clip_oe": "clip_oe",
+        "oe": "clip_oe",
+        "oe_loss": "clip_oe",
+        "main_opt": "clip_oe",
+        "asal": "clip_oe",
+    }
+    if name not in aliases:
+        raise ValueError(
+            "Unknown optimization.entrypoint/objective "
+            f"{raw!r}. Use 'msc' or 'clip_oe'."
+        )
+    entrypoint = aliases[name]
+    if entrypoint == "msc":
+        return [
+            sys.executable,
+            str(repo / "scripts" / "main_opt_msc.py"),
+            str(resolved_config_path),
+        ]
+    return [
+        sys.executable,
+        str(repo / "scripts" / "run_main_opt_from_yaml.py"),
+        str(resolved_config_path),
+    ]
+
+
 def _build_run_config(paper_cfg, config_path: Path, run_idx: int):
     stage_cfg = paper_cfg.get("optimization", {})
     base_cfg, _ = load_stage_base_config(stage_cfg, config_path.parent)
@@ -29,7 +68,7 @@ def _build_run_config(paper_cfg, config_path: Path, run_idx: int):
     paper_section = paper_cfg.get("paper_check", {})
     run_seed = int(paper_section.get("optimization_seed_base", 0)) + int(run_idx)
 
-    save_root_rel = Path(str(stage_cfg.get("save_root", "experiments/paper_check/checkpoints/optimization")))
+    save_root_rel = Path(str(stage_cfg.get("save_root", "experiments/paper_check_flow_lenia/checkpoints/optimization")))
     run_save_dir_rel = save_root_rel / f"run_{int(run_idx):03d}"
     run_save_dir_abs = resolve_path(run_save_dir_rel, repo_root())
     ensure_dir(run_save_dir_abs)
@@ -41,6 +80,9 @@ def _build_run_config(paper_cfg, config_path: Path, run_idx: int):
     wandb_project = paper_cfg.get("meta", {}).get("wandb_project", None)
     if wandb_project is not None:
         base_cfg.logging.wandb_project = str(wandb_project)
+    wandb_mode = paper_cfg.get("meta", {}).get("wandb_mode", None)
+    if wandb_mode is not None:
+        base_cfg.logging.wandb_mode = str(wandb_mode)
 
     save_every = stage_cfg.get("save_every", None)
     if save_every is not None:
@@ -67,15 +109,16 @@ def main() -> int:
     )
 
     repo = repo_root()
-    script_path = repo / "scripts" / "main_opt_msc.py"
+    stage_cfg = paper_cfg.get("optimization", {})
     for run_idx in assigned:
         _, resolved_config_path = _build_run_config(paper_cfg, config_path, run_idx)
+        cmd = _entrypoint_command(stage_cfg, repo, resolved_config_path)
         print(
             f"[paper_check/optimization] starting run_idx={run_idx} "
-            f"config={resolved_config_path}"
+            f"config={resolved_config_path} command={' '.join(cmd)}"
         )
         subprocess.run(
-            [sys.executable, str(script_path), str(resolved_config_path)],
+            cmd,
             cwd=str(repo),
             check=True,
         )

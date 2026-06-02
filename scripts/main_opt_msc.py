@@ -2,6 +2,12 @@ import os
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "scripts")):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 import evosax
 import jax
@@ -62,6 +68,85 @@ def _to_jax_tree(tree):
     return jax.tree.map(lambda x: jnp.asarray(x), tree)
 
 
+def _canonicalize_params_init(name):
+    if name is None:
+        return "strategy_default"
+    normalized = str(name).strip().lower().replace("-", "_")
+    aliases = {
+        "strategy_default": "strategy_default",
+        "optimizer_default": "strategy_default",
+        "default": "strategy_default",
+        "substrate_default": "substrate_default",
+        "default_params": "substrate_default",
+        "smart": "substrate_default",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            f"Unknown params_init {name!r}. Use 'strategy_default' or 'substrate_default'."
+        )
+    return aliases[normalized]
+
+
+def _replace_state_fields(state, **updates):
+    if hasattr(state, "replace"):
+        return state.replace(**updates)
+    if hasattr(state, "_replace"):
+        return state._replace(**updates)
+    for key, value in updates.items():
+        setattr(state, key, value)
+    return state
+
+
+def _initialize_strategy_with_mean(strategy, rng_init, es_params, init_mean):
+    try:
+        return strategy.initialize(rng_init, es_params, init_mean=init_mean)
+    except TypeError:
+        state = strategy.initialize(rng_init, es_params)
+        updates = {}
+        if hasattr(state, "mean"):
+            updates["mean"] = jnp.asarray(init_mean)
+        if hasattr(state, "best_member"):
+            updates["best_member"] = jnp.asarray(init_mean)
+        if not updates:
+            raise RuntimeError(
+                "Could not set a custom optimizer initialization mean on this evosax strategy/state."
+            )
+        return _replace_state_fields(state, **updates)
+
+
+def _build_candidate_init_mean(
+    *,
+    substrate,
+    rng_mean,
+    optimize_tau: bool,
+) -> jax.Array:
+    init_mean = jnp.asarray(substrate.default_params(rng_mean), dtype=jnp.float32)
+    if not optimize_tau:
+        return init_mean
+    # raw tau latent = 0 -> sigmoid(0)=0.5, i.e. the middle of the tau grid
+    tau0 = jnp.zeros((1,), dtype=init_mean.dtype)
+    return jnp.concatenate((init_mean, tau0), axis=0)
+
+
+def _unwrap_sampled_xy_jax(
+    xy_seq: jax.Array,
+    *,
+    domain_y: float,
+    domain_x: float,
+) -> jax.Array:
+    if xy_seq.shape[0] <= 1:
+        return xy_seq
+    dxy = xy_seq[1:] - xy_seq[:-1]
+    if domain_y > 0:
+        dy = (dxy[..., 0] + 0.5 * domain_y) % domain_y - 0.5 * domain_y
+        dxy = dxy.at[..., 0].set(dy)
+    if domain_x > 0:
+        dx = (dxy[..., 1] + 0.5 * domain_x) % domain_x - 0.5 * domain_x
+        dxy = dxy.at[..., 1].set(dx)
+    increments = jnp.cumsum(dxy, axis=0)
+    return jnp.concatenate((xy_seq[:1], xy_seq[:1] + increments), axis=0)
+
+
 def _load_resume_state(save_dir):
     if save_dir is None:
         return None
@@ -81,6 +166,7 @@ def _save_resume_state(
     candidate_dims,
     substrate_param_dims,
     optimize_tau,
+    params_init,
     data,
     best_params_traj,
     best_tau_traj,
@@ -99,6 +185,7 @@ def _save_resume_state(
         candidate_dims=int(candidate_dims),
         substrate_param_dims=int(substrate_param_dims),
         optimize_tau=bool(optimize_tau),
+        params_init=str(params_init),
         rng=np.array(rng),
         es_state=_to_numpy_tree(es_state),
         data=[] if len(data) == 0 else _to_numpy_tree(data),
@@ -120,6 +207,7 @@ def _restore_resume_state(
     candidate_dims,
     substrate_param_dims,
     optimize_tau,
+    params_init,
 ):
     if checkpoint is None:
         return None
@@ -143,6 +231,11 @@ def _restore_resume_state(
     if ckpt_optimize_tau != bool(optimize_tau):
         raise ValueError(
             f"Resume checkpoint optimize_tau mismatch: checkpoint={ckpt_optimize_tau}, current={bool(optimize_tau)}."
+        )
+    ckpt_params_init = str(checkpoint.get("params_init", "strategy_default"))
+    if ckpt_params_init != str(params_init):
+        raise ValueError(
+            f"Resume checkpoint params_init mismatch: checkpoint={ckpt_params_init!r}, current={params_init!r}."
         )
     return dict(
         next_iter=int(checkpoint.get("next_iter", 0)),
@@ -204,6 +297,129 @@ def _init_lagrangian_points_jax(
     return pts.astype(jnp.float32)
 
 
+def _normalize_metric_trajectory_source(source_raw) -> str:
+    normalized = str(source_raw).strip().lower().replace("-", "_")
+    aliases = {
+        "auto": "auto",
+        "lagrangian": "lagrangian",
+        "state_x": "state_x",
+        "state": "state_x",
+        "state_array": "state_x",
+        "state_positions": "state_x",
+        "direct": "state_x",
+        "positions": "state_x",
+        "position": "state_x",
+        "direct_x": "state_x",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            "metric_trajectory_source must be one of "
+            "['auto', 'lagrangian', 'state_x'], "
+            f"got {source_raw!r}."
+        )
+    return aliases[normalized]
+
+
+def _extract_state_positions(state) -> jax.Array:
+    if isinstance(state, dict):
+        if "x" not in state:
+            raise ValueError(
+                "metric_trajectory_source='state_x' requires a state dict containing key 'x' "
+                "or a state array with shape (..., 2)."
+            )
+        return state["x"]
+    arr = jnp.asarray(state)
+    if arr.ndim < 2 or int(arr.shape[-1]) != 2:
+        raise ValueError(
+            "metric_trajectory_source='state_x' requires a state dict containing key 'x' "
+            "or a state array with shape (..., 2)."
+        )
+    return arr
+
+
+def _state_has_color_vectors(state) -> bool:
+    if not isinstance(state, dict) or "c" not in state:
+        return False
+    c = jnp.asarray(state["c"])
+    return c.ndim == 2 and int(c.shape[0]) > 0 and int(c.shape[1]) > 0
+
+
+def _color_diversity_stats(c: jax.Array) -> dict[str, jax.Array]:
+    c = jnp.asarray(c, dtype=jnp.float32)
+    n = int(c.shape[0])
+    d = int(c.shape[1])
+    eps = jnp.asarray(1e-8, dtype=c.dtype)
+
+    c_mean = jnp.mean(c, axis=0)
+    centered = c - c_mean
+    dim_var = jnp.mean(centered * centered, axis=0)
+    diversity = jnp.sum(dim_var)
+    pairwise_sqdist = jnp.where(
+        n > 1,
+        (2.0 * float(n) / float(max(n - 1, 1))) * diversity,
+        jnp.asarray(0.0, dtype=c.dtype),
+    )
+
+    labels = jnp.argmax(c, axis=-1)
+    counts = jnp.bincount(labels, length=d).astype(c.dtype)
+    probs = counts / jnp.maximum(jnp.sum(counts), eps)
+    entropy = -jnp.sum(jnp.where(probs > 0.0, probs * jnp.log(probs + eps), 0.0))
+    entropy_norm = entropy / jnp.maximum(jnp.log(jnp.asarray(float(d), dtype=c.dtype)), eps)
+
+    norms = jnp.linalg.norm(c, axis=-1)
+    if d >= 3:
+        rgb = jnp.clip((c[:, :3] + 1.0) * 0.5, 0.0, 1.0)
+        rgb_std_mean = jnp.mean(jnp.std(rgb, axis=0))
+        rgb_range_mean = jnp.mean(jnp.max(rgb, axis=0) - jnp.min(rgb, axis=0))
+    else:
+        rgb_std_mean = jnp.asarray(0.0, dtype=c.dtype)
+        rgb_range_mean = jnp.asarray(0.0, dtype=c.dtype)
+
+    return {
+        "color_diversity": diversity,
+        "color_pairwise_sqdist": pairwise_sqdist,
+        "color_dim_entropy": entropy,
+        "color_dim_entropy_norm": entropy_norm,
+        "color_norm_mean": jnp.mean(norms),
+        "color_norm_std": jnp.std(norms),
+        "color_rgb_std_mean": rgb_std_mean,
+        "color_rgb_range_mean": rgb_range_mean,
+    }
+
+
+def _infer_metric_trajectory_source(args, substrate) -> tuple[str, dict | None]:
+    requested = _normalize_metric_trajectory_source(getattr(args, "metric_trajectory_source", "auto"))
+    sample_info = None
+    if requested == "lagrangian":
+        return requested, sample_info
+    if requested == "state_x":
+        params0 = substrate.default_params(jax.random.PRNGKey(0))
+        state0 = substrate.init_state(jax.random.PRNGKey(1), params0)
+        xy0 = _extract_state_positions(state0)
+        sample_info = dict(tracked_entities=int(xy0.shape[0]))
+        return requested, sample_info
+
+    if hasattr(substrate, "RT"):
+        return "lagrangian", sample_info
+
+    params0 = substrate.default_params(jax.random.PRNGKey(0))
+    state0 = substrate.init_state(jax.random.PRNGKey(1), params0)
+    if hasattr(substrate, "RT"):
+        return "lagrangian", sample_info
+    try:
+        xy0 = _extract_state_positions(state0)
+    except ValueError:
+        xy0 = None
+    if xy0 is not None:
+        sample_info = dict(tracked_entities=int(xy0.shape[0]))
+        return "state_x", sample_info
+
+    raise ValueError(
+        "Could not infer metric trajectory source automatically. "
+        "Set metric_trajectory_source explicitly to 'lagrangian' or 'state_x'."
+    )
+
+
 def load_config():
     if len(sys.argv) < 2:
         raise SystemExit("Usage: python scripts/main_opt_msc.py <config.yaml>")
@@ -223,15 +439,16 @@ def load_config():
 
 def main(cfg, args):
     wandb_project = str(getattr(args, "wandb_project", "asal"))
-    run = wandb.init(project=wandb_project, config=OmegaConf.to_container(cfg, resolve=True))
+    wandb_mode = getattr(args, "wandb_mode", None)
+    wandb_kwargs = dict(project=wandb_project, config=OmegaConf.to_container(cfg, resolve=True))
+    if wandb_mode is not None:
+        wandb_kwargs["mode"] = str(wandb_mode)
+    run = wandb.init(**wandb_kwargs)
     try:
-        if args.substrate == "lenia_flow":
-            base_substrate = substrates.create_substrate(
-                args.substrate,
-                **util.flow_lenia_kwargs_from_args(args),
-            )
-        else:
-            base_substrate = substrates.create_substrate(args.substrate)
+        base_substrate = substrates.create_substrate(
+            args.substrate,
+            **util.substrate_kwargs_from_args(args),
+        )
         if hasattr(base_substrate, "debug_return_F"):
             base_substrate.debug_return_F = True
         substrate = substrates.FlattenSubstrateParameters(base_substrate)
@@ -239,15 +456,33 @@ def main(cfg, args):
         if args.rollout_steps is None:
             args.rollout_steps = substrate.rollout_steps
 
-        # Auto-fill periodic settings for lagrangian displacement unwrapping.
+        # Auto-fill periodic settings for trajectory displacement unwrapping.
+        metric_space_defaults = util.metric_periodic_space_defaults(base_substrate)
         if (not hasattr(args, "metric_periodic")) or (getattr(args, "metric_periodic", None) is None):
-            args.metric_periodic = str(getattr(substrate, "border", "wall")) == "torus"
+            args.metric_periodic = bool(metric_space_defaults["periodic"])
         if (not hasattr(args, "metric_domain_y")) or (getattr(args, "metric_domain_y", None) is None):
-            args.metric_domain_y = float(getattr(getattr(substrate, "cfg", None), "X", getattr(substrate, "grid_size", 0)))
+            args.metric_domain_y = float(metric_space_defaults["domain_y"])
         if (not hasattr(args, "metric_domain_x")) or (getattr(args, "metric_domain_x", None) is None):
-            args.metric_domain_x = float(getattr(getattr(substrate, "cfg", None), "Y", getattr(substrate, "grid_size", 0)))
+            args.metric_domain_x = float(metric_space_defaults["domain_x"])
+
+        params_init = _canonicalize_params_init(getattr(args, "params_init", "strategy_default"))
+        run.summary["optimizer/params_init"] = params_init
+        trajectory_source, trajectory_sample_info = _infer_metric_trajectory_source(args, substrate)
+        run.summary["metric_cfg/trajectory_source"] = str(trajectory_source)
+        if trajectory_sample_info is not None:
+            for k, v in trajectory_sample_info.items():
+                run.summary[f"metric_cfg/{k}"] = v
+        state_x_unwrap = bool(getattr(args, "metric_unwrap_state_x", True))
 
         metric_cfg = resolve_metric_config(args)
+        optimize_tau = str(metric_cfg.get("tau_mode", "fixed")) == "trainable_grid"
+        tau_extra_dims = 1 if optimize_tau else 0
+        positions_unwrapped = bool(
+            trajectory_source == "state_x"
+            and bool(metric_space_defaults["periodic"])
+            and state_x_unwrap
+        )
+        metric_cfg["positions_unwrapped"] = positions_unwrapped
         metric_info = metric_summary(metric_cfg)
         print("Resolved metric config:", metric_info)
         for k, v in metric_info.items():
@@ -256,8 +491,6 @@ def main(cfg, args):
             else:
                 run.summary[f"metric_cfg/{k}"] = v
         metric_loss_fn = make_metric_loss_fn(metric_cfg)
-        optimize_tau = str(metric_cfg.get("tau_mode", "fixed")) == "trainable_grid"
-        tau_extra_dims = 1 if optimize_tau else 0
         run.summary["metric_cfg/trainable_tau"] = bool(optimize_tau)
         if optimize_tau:
             run.summary["metric_cfg/tau_grid_steps"] = str(metric_cfg.get("tau_steps_list", []))
@@ -265,6 +498,15 @@ def main(cfg, args):
         chunk_steps = int(metric_cfg["sample_every_steps"])
         time_sampling = int(metric_cfg["time_sampling"])
         substrate_param_dims = int(substrate.n_params)
+        log_color_diversity_requested = bool(getattr(args, "log_color_diversity", True))
+        color_probe_params = substrate.default_params(jax.random.PRNGKey(17))
+        color_probe_state = substrate.init_state(jax.random.PRNGKey(18), color_probe_params)
+        log_color_diversity = bool(log_color_diversity_requested and _state_has_color_vectors(color_probe_state))
+        run.summary["color_logging/enabled"] = bool(log_color_diversity)
+        run.summary["color_logging/requested"] = bool(log_color_diversity_requested)
+        if log_color_diversity:
+            run.summary["color_logging/n_elements"] = int(color_probe_state["c"].shape[0])
+            run.summary["color_logging/n_color_dims"] = int(color_probe_state["c"].shape[1])
 
         def split_candidate_params(params_full):
             params_sub = params_full[:substrate_param_dims]
@@ -348,67 +590,113 @@ def main(cfg, args):
         else:
             run.summary["clip_logging/enabled"] = False
 
-        lag_n_particles = int(getattr(args, "metric_lagrangian_n_particles", 256))
-        lag_init_mode = str(getattr(args, "metric_lagrangian_init_mode", "mass"))
-        lag_flow_channel = int(getattr(args, "metric_lagrangian_flow_channel", -1))
-        lag_flow_reduce = str(getattr(args, "metric_lagrangian_flow_reduce", "mass_weighted"))
-        lag_channel_mode = str(getattr(args, "metric_lagrangian_channel_mode", "mix"))
-        lag_noise_model = str(getattr(args, "metric_lagrangian_noise_model", "none"))
-        lag_diffusion_scale = float(getattr(args, "metric_lagrangian_diffusion_scale", 1.0))
+        if trajectory_source == "lagrangian":
+            lag_n_particles = int(getattr(args, "metric_lagrangian_n_particles", 256))
+            lag_init_mode = str(getattr(args, "metric_lagrangian_init_mode", "mass"))
+            lag_flow_channel = int(getattr(args, "metric_lagrangian_flow_channel", -1))
+            lag_flow_reduce = str(getattr(args, "metric_lagrangian_flow_reduce", "mass_weighted"))
+            lag_channel_mode = str(getattr(args, "metric_lagrangian_channel_mode", "mix"))
+            lag_noise_model = str(getattr(args, "metric_lagrangian_noise_model", "none"))
+            lag_diffusion_scale = float(getattr(args, "metric_lagrangian_diffusion_scale", 1.0))
+            run.summary["metric_cfg/lagrangian_n_particles"] = int(lag_n_particles)
 
-        def rollout_lagrangian_xy(rng, params):
-            k_state, k_pts, k_ch, k_scan = jax.random.split(rng, 4)
-            s0 = substrate.init_state(k_state, params)
-            if "F" not in s0:
-                raise ValueError(
-                    "State does not contain flow field F. "
-                    "For FlowLenia set debug_return_F=true before optimization."
+            def rollout_metric_xy_and_aux(rng, params):
+                k_state, k_pts, k_ch, k_scan = jax.random.split(rng, 4)
+                s0 = substrate.init_state(k_state, params)
+                if "F" not in s0:
+                    raise ValueError(
+                        "State does not contain flow field F. "
+                        "For FlowLenia set debug_return_F=true before optimization."
+                    )
+                if not hasattr(substrate, "RT"):
+                    raise ValueError("Substrate does not provide RT for lagrangian advection.")
+
+                rt = substrate.RT
+                pts0 = _init_lagrangian_points_jax(
+                    s0["A"],
+                    n_particles=lag_n_particles,
+                    init_mode=lag_init_mode,
+                    border=str(getattr(rt, "border", "wall")),
+                    sigma=float(getattr(rt, "sigma", 0.0)),
+                    key=k_pts,
                 )
-            if not hasattr(substrate, "RT"):
-                raise ValueError("Substrate does not provide RT for lagrangian advection.")
+                if lag_channel_mode in ("fixed", "resample"):
+                    ch0 = rt.sample_point_channels(pts0, s0["A"], k_ch)
+                else:
+                    ch0 = jnp.zeros((lag_n_particles,), dtype=jnp.int32)
 
-            rt = substrate.RT
-            pts0 = _init_lagrangian_points_jax(
-                s0["A"],
-                n_particles=lag_n_particles,
-                init_mode=lag_init_mode,
-                border=str(getattr(rt, "border", "wall")),
-                sigma=float(getattr(rt, "sigma", 0.0)),
-                key=k_pts,
-            )
-            if lag_channel_mode in ("fixed", "resample"):
-                ch0 = rt.sample_point_channels(pts0, s0["A"], k_ch)
-            else:
-                ch0 = jnp.zeros((lag_n_particles,), dtype=jnp.int32)
+                def step_fn(state, key_step):
+                    st, pts, ch = state
+                    st = substrate.step_state(key_step, st, params)
+                    lag_key = jax.random.fold_in(key_step, jnp.uint32(0x4C4147))
+                    pts, ch = rt.advect_particles(
+                        points=pts,
+                        F=st["F"],
+                        A=st["A"],
+                        channel=lag_flow_channel,
+                        reduce=lag_flow_reduce,
+                        point_channels=ch,
+                        channel_mode=lag_channel_mode,
+                        key=lag_key,
+                        noise_model=lag_noise_model,
+                        diffusion_scale=lag_diffusion_scale,
+                    )
+                    return (st, pts, ch), None
 
-            def step_fn(state, key_step):
-                st, pts, ch = state
-                st = substrate.step_state(key_step, st, params)
-                lag_key = jax.random.fold_in(key_step, jnp.uint32(0x4C4147))
-                pts, ch = rt.advect_particles(
-                    points=pts,
-                    F=st["F"],
-                    A=st["A"],
-                    channel=lag_flow_channel,
-                    reduce=lag_flow_reduce,
-                    point_channels=ch,
-                    channel_mode=lag_channel_mode,
-                    key=lag_key,
-                    noise_model=lag_noise_model,
-                    diffusion_scale=lag_diffusion_scale,
+                def chunk_fn(state, key_chunk):
+                    state_next, _ = jax.lax.scan(step_fn, state, split(key_chunk, chunk_steps))
+                    return state_next, state_next[1]
+
+                (_, _, _), xy_seq = jax.lax.scan(
+                    chunk_fn,
+                    (s0, pts0, ch0),
+                    split(k_scan, time_sampling),
                 )
-                return (st, pts, ch), None
+                return xy_seq, {}  # (time_sampling, N_particles, 2)
+        elif trajectory_source == "state_x":
+            def rollout_metric_xy_and_aux(rng, params):
+                k_state, k_scan = jax.random.split(rng, 2)
+                s0 = substrate.init_state(k_state, params)
+                _extract_state_positions(s0)
 
-            def chunk_fn(state, key_chunk):
-                state_next, _ = jax.lax.scan(step_fn, state, split(key_chunk, chunk_steps))
-                return state_next, state_next[1]
+                def step_fn(state, key_step):
+                    state_next = substrate.step_state(key_step, state, params)
+                    return state_next, None
 
-            (_, _, _), xy_seq = jax.lax.scan(
-                chunk_fn,
-                (s0, pts0, ch0),
-                split(k_scan, time_sampling),
-            )
-            return xy_seq  # (time_sampling, N_particles, 2)
+                if log_color_diversity:
+                    def chunk_fn(state, key_chunk):
+                        state_next, _ = jax.lax.scan(step_fn, state, split(key_chunk, chunk_steps))
+                        return state_next, (
+                            _extract_state_positions(state_next),
+                            _color_diversity_stats(state_next["c"]),
+                        )
+
+                    _, (xy_seq, color_seq) = jax.lax.scan(
+                        chunk_fn,
+                        s0,
+                        split(k_scan, time_sampling),
+                    )
+                    color_aux = jax.tree.map(lambda x: jnp.mean(x, axis=0), color_seq)
+                else:
+                    def chunk_fn(state, key_chunk):
+                        state_next, _ = jax.lax.scan(step_fn, state, split(key_chunk, chunk_steps))
+                        return state_next, _extract_state_positions(state_next)
+
+                    _, xy_seq = jax.lax.scan(
+                        chunk_fn,
+                        s0,
+                        split(k_scan, time_sampling),
+                    )
+                    color_aux = {}
+                if positions_unwrapped:
+                    xy_seq = _unwrap_sampled_xy_jax(
+                        xy_seq,
+                        domain_y=float(metric_space_defaults["domain_y"]),
+                        domain_x=float(metric_space_defaults["domain_x"]),
+                    )
+                return xy_seq, color_aux
+        else:
+            raise ValueError(f"Unhandled metric trajectory source {trajectory_source!r}.")
 
         def calc_loss(rng, params_full):
             params, tau_selector = split_candidate_params(params_full)
@@ -416,11 +704,13 @@ def main(cfg, args):
                 rng_roll, rng_metric, rng_clip = split(rng, 3)
             else:
                 rng_roll, rng_metric = split(rng)
-            xy_seq = rollout_lagrangian_xy(rng_roll, params)
+            xy_seq, aux_dict = rollout_metric_xy_and_aux(rng_roll, params)
             if optimize_tau:
                 msc_loss, msc_dict = metric_loss_fn(rng_metric, xy_seq, tau_selector=tau_selector)
             else:
                 msc_loss, msc_dict = metric_loss_fn(rng_metric, xy_seq)
+            if aux_dict:
+                msc_dict = dict(msc_dict, **aux_dict)
             if not log_clip_evolution:
                 return msc_loss, msc_dict
             clip_out = rollout_clip(rng_clip, params)
@@ -483,6 +773,7 @@ def main(cfg, args):
                     candidate_dims=candidate_dims,
                     substrate_param_dims=substrate_param_dims,
                     optimize_tau=optimize_tau,
+                    params_init=params_init,
                 )
                 start_iter = restored["next_iter"]
                 rng = restored["rng"]
@@ -498,8 +789,19 @@ def main(cfg, args):
                 resumed = True
                 print(f"Resuming optimization from iter {start_iter} using {args.save_dir}/resume_state.pkl")
         if not resumed:
-            rng, _rng = split(rng)
-            es_state = strategy.initialize(_rng, es_params)
+            if params_init == "strategy_default":
+                rng, _rng = split(rng)
+                es_state = strategy.initialize(_rng, es_params)
+            elif params_init == "substrate_default":
+                rng, rng_mean, rng_init = jax.random.split(rng, 3)
+                init_mean = _build_candidate_init_mean(
+                    substrate=substrate,
+                    rng_mean=rng_mean,
+                    optimize_tau=optimize_tau,
+                )
+                es_state = _initialize_strategy_with_mean(strategy, rng_init, es_params, init_mean)
+            else:
+                raise ValueError(f"Unhandled params_init {params_init!r}.")
 
         run.summary["resume/enabled"] = bool(resume_enabled)
         run.summary["resume/loaded"] = bool(resumed)
@@ -711,6 +1013,7 @@ def main(cfg, args):
                     candidate_dims=candidate_dims,
                     substrate_param_dims=substrate_param_dims,
                     optimize_tau=optimize_tau,
+                    params_init=params_init,
                     data=data,
                     best_params_traj=best_params_traj,
                     best_tau_traj=best_tau_traj,

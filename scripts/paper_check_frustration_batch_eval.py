@@ -7,6 +7,11 @@ from types import SimpleNamespace
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "scripts")):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -139,6 +144,174 @@ def _build_batched_lagrangian_chunk_stepper(
         return jax.vmap(single, in_axes=(0, 0, 0))(chunk_keys_batch, lag_carry_batch, params_batch)
 
     return step
+
+
+def _extract_positions_from_state(state):
+    if isinstance(state, dict):
+        if "x" not in state:
+            raise ValueError("Explicit-position paper check expects state dict key 'x' or an array state.")
+        return state["x"]
+    arr = jnp.asarray(state)
+    if arr.ndim < 2 or int(arr.shape[-1]) != 2:
+        raise ValueError("Explicit-position paper check expects state array shape (..., 2).")
+    return arr
+
+
+def _replace_positions_in_state(state, xy):
+    if isinstance(state, dict):
+        out = dict(state)
+        out["x"] = xy
+        return out
+    return xy
+
+
+def _build_generic_batch_embedder(*, substrate, fm, clip_img_size: int):
+    embed_batch = _build_image_embedder(fm)
+
+    @jax.jit
+    def embed_global_batch(state_batch, params_batch):
+        imgs = jax.vmap(
+            lambda st, pr: substrate.render_state(st, pr, img_size=clip_img_size),
+            in_axes=(0, 0),
+        )(state_batch, params_batch)
+        return embed_batch(imgs)
+
+    return embed_global_batch
+
+
+def _metric_space_from_args(args, substrate) -> dict[str, float | bool]:
+    defaults = util.metric_periodic_space_defaults(substrate)
+    periodic = getattr(args, "metric_periodic", None)
+    domain_y = getattr(args, "metric_domain_y", None)
+    domain_x = getattr(args, "metric_domain_x", None)
+    return dict(
+        periodic=bool(defaults["periodic"] if periodic is None else periodic),
+        domain_y=float(defaults["domain_y"] if domain_y is None else domain_y),
+        domain_x=float(defaults["domain_x"] if domain_x is None else domain_x),
+    )
+
+
+def _position_domain_for_perturbation(args, substrate, xy):
+    space = _metric_space_from_args(args, substrate)
+    y_min_cfg = getattr(args, "perturbation_domain_min_y", None)
+    x_min_cfg = getattr(args, "perturbation_domain_min_x", None)
+    y_size_cfg = getattr(args, "perturbation_domain_y", None)
+    x_size_cfg = getattr(args, "perturbation_domain_x", None)
+
+    if y_min_cfg is not None and x_min_cfg is not None and y_size_cfg is not None and x_size_cfg is not None:
+        lo = jnp.asarray([float(y_min_cfg), float(x_min_cfg)], dtype=xy.dtype)
+        span = jnp.asarray([float(y_size_cfg), float(x_size_cfg)], dtype=xy.dtype)
+        return lo, jnp.maximum(span, jnp.asarray(1e-6, dtype=xy.dtype)), bool(space["periodic"])
+
+    if float(space["domain_y"]) > 0.0 and float(space["domain_x"]) > 0.0:
+        lo = jnp.zeros((2,), dtype=xy.dtype)
+        span = jnp.asarray([float(space["domain_y"]), float(space["domain_x"])], dtype=xy.dtype)
+        return lo, span, bool(space["periodic"])
+
+    padding = float(getattr(args, "perturbation_domain_padding", 0.05))
+    xy_min = jnp.min(xy, axis=0)
+    xy_max = jnp.max(xy, axis=0)
+    raw_span = jnp.maximum(xy_max - xy_min, jnp.asarray(1e-6, dtype=xy.dtype))
+    pad = raw_span * padding
+    return xy_min - pad, raw_span + 2.0 * pad, False
+
+
+def _normalize_state_perturbation(kind: str) -> str:
+    normalized = str(kind).strip().lower().replace("-", "_")
+    aliases = {
+        "none": "none",
+        "off": "none",
+        "cell_shuffle": "cell_shuffle",
+        "grid_shuffle": "cell_shuffle",
+        "spatial_shuffle": "cell_shuffle",
+        "position_permute": "position_permute",
+        "permute_positions": "position_permute",
+        "permute": "position_permute",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            "protocol.perturbation_kind must be one of "
+            "['cell_shuffle', 'position_permute', 'none'], "
+            f"got {kind!r}."
+        )
+    return aliases[normalized]
+
+
+def _apply_position_perturbation(state, key, *, args, substrate):
+    kind = _normalize_state_perturbation(getattr(args, "perturbation_kind", "cell_shuffle"))
+    if kind == "none":
+        return state
+
+    xy = _extract_positions_from_state(state)
+    n = int(xy.shape[0])
+    if n < 1:
+        return state
+
+    key_perm, key_jitter = jax.random.split(key)
+    strength = float(getattr(args, "perturbation_strength", 1.0))
+    strength = max(0.0, min(1.0, strength))
+
+    if kind == "position_permute":
+        perm = jax.random.permutation(key_perm, n)
+        target = xy[perm]
+    else:
+        grid_split = int(getattr(args, "perturbation_grid_split", getattr(args, "grid_split", 2)))
+        if grid_split < 1:
+            raise ValueError(f"perturbation_grid_split must be >= 1, got {grid_split}.")
+        n_cells = int(grid_split * grid_split)
+        lo, span, periodic = _position_domain_for_perturbation(args, substrate, xy)
+        one = jnp.asarray(1.0, dtype=xy.dtype)
+        norm = (xy - lo) / span
+        norm = jnp.clip(norm, 0.0, jnp.nextafter(one, jnp.asarray(0.0, dtype=xy.dtype)))
+        scaled = norm * float(grid_split)
+        cell = jnp.floor(scaled).astype(jnp.int32)
+        frac = scaled - cell.astype(xy.dtype)
+        flat = cell[:, 0] * grid_split + cell[:, 1]
+        cell_perm = jax.random.permutation(key_perm, n_cells)
+        target_flat = cell_perm[flat]
+        target_cell = jnp.stack((target_flat // grid_split, target_flat % grid_split), axis=-1)
+        target_norm = (target_cell.astype(xy.dtype) + frac) / float(grid_split)
+        target = lo + target_norm * span
+        jitter_scale = float(getattr(args, "perturbation_jitter", 0.0))
+        if jitter_scale > 0.0:
+            jitter = jax.random.normal(key_jitter, xy.shape, dtype=xy.dtype)
+            target = target + jitter * (span / float(grid_split)) * jitter_scale
+        if periodic:
+            target = lo + jnp.mod(target - lo, span)
+        else:
+            target = jnp.clip(target, lo, lo + span)
+
+    xy_new = xy + strength * (target - xy)
+    out = _replace_positions_in_state(state, xy_new)
+
+    if isinstance(out, dict) and "v" in out:
+        velocity_mode = str(getattr(args, "perturbation_velocity_mode", "keep")).strip().lower()
+        if velocity_mode in {"random", "randomize", "randomized"}:
+            v = jax.random.normal(key_jitter, out["v"].shape, dtype=out["v"].dtype)
+            v = v / jnp.maximum(jnp.linalg.norm(v, axis=-1, keepdims=True), 1e-12)
+            out["v"] = v
+        elif velocity_mode in {"keep", "none"}:
+            pass
+        else:
+            raise ValueError(
+                "protocol.perturbation_velocity_mode must be one of ['keep', 'randomize'], "
+                f"got {velocity_mode!r}."
+            )
+
+    return out
+
+
+def _unwrap_sampled_xy_np(xy_seq: np.ndarray, *, domain_y: float, domain_x: float) -> np.ndarray:
+    xy = np.asarray(xy_seq, dtype=np.float32)
+    if xy.shape[0] <= 1:
+        return xy
+    dxy = xy[1:] - xy[:-1]
+    if domain_y > 0:
+        dxy[..., 0] = (dxy[..., 0] + 0.5 * domain_y) % domain_y - 0.5 * domain_y
+    if domain_x > 0:
+        dxy[..., 1] = (dxy[..., 1] + 0.5 * domain_x) % domain_x - 0.5 * domain_x
+    increments = np.cumsum(dxy, axis=0)
+    return np.concatenate((xy[:1], xy[:1] + increments), axis=0)
 
 
 def _build_batch_embedders(
@@ -302,6 +475,8 @@ def _save_lane_checkpoint(lane: dict) -> None:
         rng=state["rng"],
         full_steps=state["full_steps"],
         late_steps=state["late_steps"],
+        z_late_steps=state.get("z_late_steps", state["late_steps"]),
+        xy_late_steps=state.get("xy_late_steps", state["late_steps"]),
         z_full=state["z_full"],
         z_full_blocks=state["z_full_blocks"],
         z_late=state["z_late"],
@@ -315,6 +490,8 @@ def _lane_output(lane: dict) -> dict[str, np.ndarray]:
     return {
         "full_steps": np.asarray(state["full_steps"], dtype=np.int32),
         "late_steps": np.asarray(state["late_steps"], dtype=np.int32),
+        "z_late_steps": np.asarray(state.get("z_late_steps", state["late_steps"]), dtype=np.int32),
+        "xy_late_steps": np.asarray(state.get("xy_late_steps", state["late_steps"]), dtype=np.int32),
         "z_full": _stack_or_empty(state["z_full"], dtype=np.float32),
         "z_full_blocks": _stack_or_empty(state["z_full_blocks"], dtype=np.float32),
         "z_late": _stack_or_empty(state["z_late"], dtype=np.float32),
@@ -384,8 +561,10 @@ def _append_late_all(lanes: list[dict], group_indices: list[int], *, z_host: np.
         state = lanes[lane_idx]["state"]
         state["late_steps"].append(int(state["current_step"]))
         if z_host is not None:
+            state.setdefault("z_late_steps", []).append(int(state["current_step"]))
             state["z_late"].append(np.asarray(z_host[local_idx], dtype=np.float32))
         if xy_host is not None:
+            state.setdefault("xy_late_steps", []).append(int(state["current_step"]))
             state["xy_late"].append(np.asarray(xy_host[local_idx], dtype=np.float32))
 
 
@@ -394,6 +573,140 @@ def _maybe_save_group(lanes: list[dict], group_indices: list[int], *, checkpoint
         step = int(lanes[lane_idx]["state"]["current_step"])
         if step >= int(total_steps) or step % int(checkpoint_every_steps) == 0:
             _save_lane_checkpoint(lanes[lane_idx])
+
+
+def _load_or_init_generic_lane(
+    lane: dict,
+    *,
+    resume: bool,
+    substrate,
+):
+    state = _load_run_checkpoint(lane["checkpoint_path"]) if resume else None
+    if state is None:
+        rng = jax.random.PRNGKey(int(lane["run_seed"]))
+        rng, init_key = jax.random.split(rng)
+        state = dict(
+            mode="global",
+            current_step=0,
+            rng=rng,
+            global_state=substrate.init_state(init_key, lane["params"]),
+            full_steps=[],
+            late_steps=[],
+            z_late_steps=[],
+            xy_late_steps=[],
+            z_full=[],
+            z_full_blocks=[],
+            z_late=[],
+            xy_late=[],
+        )
+        if bool(lane.get("apply_perturbation", False)) and int(lane.get("warmup_steps", 0)) == 0:
+            state["global_state"] = _apply_position_perturbation(
+                state["global_state"],
+                jax.random.fold_in(rng, jnp.uint32(0x50545242)),
+                args=lane["args"],
+                substrate=substrate,
+            )
+    lane["state"] = state
+
+
+def _run_generic_global_lanes(
+    *,
+    lanes: list[dict],
+    total_steps: int,
+    warmup_steps: int,
+    late_start: int,
+    late_end: int,
+    base_chunk_steps: int,
+    clip_sample_every_steps: int,
+    checkpoint_every_steps: int,
+    full_embedding_sample_every_steps: int,
+    enable_clip: bool,
+    enable_msc: bool,
+    batched_state_chunk_stepper,
+    embed_global_batch,
+    substrate,
+):
+    if not lanes:
+        return
+
+    while True:
+        active_groups = _group_active_lanes(lanes, total_steps=total_steps)
+        if not active_groups:
+            break
+
+        for group_indices in active_groups:
+            mode = str(lanes[group_indices[0]]["state"]["mode"])
+            if mode != "global":
+                raise ValueError(f"Generic explicit-position lanes only support mode='global', got {mode!r}.")
+            current_step = int(lanes[group_indices[0]]["state"]["current_step"])
+            params_batch = jnp.stack([lanes[idx]["params"] for idx in group_indices], axis=0)
+            rng_batch = jnp.stack([lanes[idx]["state"]["rng"] for idx in group_indices], axis=0)
+            rng_next, chunk_keys = _split_rng_batch(rng_batch)
+            next_step = int(current_step + base_chunk_steps)
+
+            global_batch = _stack_trees([lanes[idx]["state"]["global_state"] for idx in group_indices])
+            step_keys_batch = _make_step_keys_batch(chunk_keys, base_chunk_steps)
+            global_batch = batched_state_chunk_stepper(step_keys_batch, global_batch, params_batch)
+            global_states = _unstack_tree(global_batch)
+
+            for local_idx, lane_idx in enumerate(group_indices):
+                lane = lanes[lane_idx]
+                if (
+                    bool(lane.get("apply_perturbation", False))
+                    and current_step < int(warmup_steps) <= next_step
+                ):
+                    global_states[local_idx] = _apply_position_perturbation(
+                        global_states[local_idx],
+                        jax.random.fold_in(chunk_keys[local_idx], jnp.uint32(0x50545242)),
+                        args=lane["args"],
+                        substrate=substrate,
+                    )
+
+            global_batch = _stack_trees(global_states)
+            xy_host = None
+            in_late_window = bool(int(late_start) < next_step <= int(late_end))
+            need_late_xy = bool(enable_msc and in_late_window)
+            need_late_z = bool(
+                enable_clip
+                and in_late_window
+                and ((next_step - int(late_start)) % int(clip_sample_every_steps) == 0)
+            )
+            need_full = bool(enable_clip and next_step % int(full_embedding_sample_every_steps) == 0)
+            if need_late_xy:
+                xy_host = np.asarray(jax.device_get(_extract_positions_from_state(global_batch)), dtype=np.float32)
+
+            if enable_clip and (need_late_z or need_full):
+                z_all_host = np.asarray(jax.device_get(embed_global_batch(global_batch, params_batch)), dtype=np.float32)
+            else:
+                z_all_host = None
+
+            for local_idx, lane_idx in enumerate(group_indices):
+                lane = lanes[lane_idx]
+                state = lane["state"]
+                state["rng"] = rng_next[local_idx]
+                state["current_step"] = next_step
+                state["global_state"] = global_states[local_idx]
+                state["mode"] = "global"
+
+                if need_late_z or need_late_xy:
+                    state["late_steps"].append(next_step)
+                    if need_late_z:
+                        state.setdefault("z_late_steps", []).append(next_step)
+                        state["z_late"].append(np.asarray(z_all_host[local_idx], dtype=np.float32))
+                    if need_late_xy:
+                        state.setdefault("xy_late_steps", []).append(next_step)
+                        state["xy_late"].append(np.asarray(xy_host[local_idx], dtype=np.float32))
+
+                if need_full and lane["full_embeddings_enabled"]:
+                    state["full_steps"].append(next_step)
+                    state["z_full"].append(np.asarray(z_all_host[local_idx], dtype=np.float32))
+
+            _maybe_save_group(
+                lanes,
+                group_indices,
+                checkpoint_every_steps=checkpoint_every_steps,
+                total_steps=total_steps,
+            )
 
 
 def _run_control_lanes(
@@ -478,6 +791,7 @@ def _run_control_lanes(
                         state["mode"] = "global"
                         if z_all_host is not None:
                             state["late_steps"].append(next_step)
+                            state.setdefault("z_late_steps", []).append(next_step)
                             state["z_late"].append(np.asarray(z_all_host[local_idx], dtype=np.float32))
                         if need_full and lane["full_embeddings_enabled"] and z_all_host is not None:
                             state["full_steps"].append(next_step)
@@ -518,8 +832,10 @@ def _run_control_lanes(
                     state["current_step"] = next_step
                     if z_all_host is not None:
                         state["late_steps"].append(next_step)
+                        state.setdefault("z_late_steps", []).append(next_step)
                         state["z_late"].append(np.asarray(z_all_host[local_idx], dtype=np.float32))
                     if xy_host is not None:
+                        state.setdefault("xy_late_steps", []).append(next_step)
                         state["xy_late"].append(np.asarray(xy_host[local_idx], dtype=np.float32))
                     if need_full and lane["full_embeddings_enabled"] and z_all_host is not None:
                         state["full_steps"].append(next_step)
@@ -688,6 +1004,7 @@ def _run_walls_lanes(
                         state["mode"] = "global"
                         if need_late:
                             state["late_steps"].append(next_step)
+                            state.setdefault("z_late_steps", []).append(next_step)
                             state["z_late"].append(np.asarray(z_all_host[local_idx], dtype=np.float32))
 
             elif mode == "lag":
@@ -719,7 +1036,9 @@ def _run_walls_lanes(
                     state["current_step"] = next_step
                     if need_late:
                         state["late_steps"].append(next_step)
+                        state.setdefault("z_late_steps", []).append(next_step)
                         state["z_late"].append(np.asarray(z_all_host[local_idx], dtype=np.float32))
+                        state.setdefault("xy_late_steps", []).append(next_step)
                         state["xy_late"].append(np.asarray(xy_host[local_idx], dtype=np.float32))
                     if need_full:
                         state["full_steps"].append(next_step)
@@ -779,6 +1098,7 @@ def _finalize_trial(
         "warmup_steps": int(getattr(args, "warmup_steps")),
         "total_steps": int(getattr(args, "total_steps")),
         "clip_time_sampling": int(run_outputs["control_a"]["z_late"].shape[0]) if enable_clip else None,
+        "clip_sample_every_steps": int(getattr(args, "clip_sample_every_steps", getattr(args, "sample_every_steps", 0))) if enable_clip else None,
         "distance_metric": distance_metric if enable_clip else None,
         "foundation_model": None if not enable_clip else str(getattr(args, "foundation_model", "clip")),
     }
@@ -787,6 +1107,11 @@ def _finalize_trial(
         z_control_a = run_outputs["control_a"]["z_late"]
         z_control_b = run_outputs["control_b"]["z_late"]
         z_walls = run_outputs["walls"]["z_late"]
+        if min(z_control_a.shape[0], z_control_b.shape[0], z_walls.shape[0]) < 1:
+            raise ValueError(
+                "No late CLIP samples were collected. Decrease evaluation.clip_sample_every_steps "
+                "or enlarge the late window."
+            )
         baseline_distance, baseline_per_t = _sequence_distance(z_control_a, z_control_b, distance_metric)
         walls_a_distance, walls_a_per_t = _sequence_distance(z_control_a, z_walls, distance_metric)
         walls_b_distance, walls_b_per_t = _sequence_distance(z_control_b, z_walls, distance_metric)
@@ -818,7 +1143,8 @@ def _finalize_trial(
             baseline_per_t=baseline_per_t,
             walls_ctrl_a_per_t=walls_a_per_t,
             walls_ctrl_b_per_t=walls_b_per_t,
-            late_sample_steps=np.asarray(run_outputs["control_a"]["late_steps"], dtype=np.int32),
+            late_sample_steps=np.asarray(run_outputs["control_a"]["z_late_steps"], dtype=np.int32),
+            z_late_sample_steps=np.asarray(run_outputs["control_a"]["z_late_steps"], dtype=np.int32),
             z_control_a_full=run_outputs["control_a"]["z_full"],
             z_control_a_full_steps=np.asarray(run_outputs["control_a"]["full_steps"], dtype=np.int32),
             z_walls_full=run_outputs["walls"]["z_full"],
@@ -882,7 +1208,8 @@ def _finalize_trial(
             xy_control_a=xy_control_a,
             xy_control_b=xy_control_b,
             xy_walls=xy_walls,
-            sample_offsets_steps=np.asarray(run_outputs["control_a"]["late_steps"], dtype=np.int32) - int(late_start),
+            sample_offsets_steps=np.asarray(run_outputs["control_a"]["xy_late_steps"], dtype=np.int32) - int(late_start),
+            xy_late_sample_steps=np.asarray(run_outputs["control_a"]["xy_late_steps"], dtype=np.int32),
             sample_every_steps=np.asarray(int(metric_cfg["sample_every_steps"]), dtype=np.int32),
             trajectory_start_steps=np.asarray(int(late_start), dtype=np.int32),
             trajectory_end_steps=np.asarray(int(late_end), dtype=np.int32),
@@ -900,6 +1227,195 @@ def _finalize_trial(
 
     _write_json(trial_paths["trial_row_json"], row)
     return row, metric_info
+
+
+def _run_generic_state_perturbation_trials(
+    *,
+    trials: list[dict],
+    common_args,
+    root_save_dir: Path,
+    repo: Path,
+    run,
+    substrate,
+    enable_clip: bool,
+    enable_msc: bool,
+    total_steps: int,
+    warmup_steps: int,
+    late_start: int,
+    late_end: int,
+    base_chunk_steps: int,
+    clip_sample_every_steps: int,
+    checkpoint_every_steps: int,
+    full_embedding_sample_every_steps: int,
+):
+    params_list = []
+    for trial in trials:
+        params = _load_params(trial["args"], repo)
+        trial["params"] = params
+        trial["late_start"] = late_start
+        trial["late_end"] = late_end
+        _write_text(
+            trial["trial_paths"]["trial_artifact_dir"] / "resolved_config.yaml",
+            OmegaConf.to_yaml(trial["cfg"], resolve=True),
+        )
+        params_list.append(params)
+
+    batched_state_chunk_stepper = _build_batched_state_chunk_stepper(substrate, base_chunk_steps)
+
+    embed_global_batch = None
+    if enable_clip:
+        foundation_model = str(getattr(common_args, "foundation_model", "clip"))
+        fm = foundation_models.create_foundation_model(foundation_model)
+        embed_global_batch = _build_generic_batch_embedder(
+            substrate=substrate,
+            fm=fm,
+            clip_img_size=int(getattr(common_args, "clip_img_size", 224)),
+        )
+
+    metric_cfg = None
+    metric_info = None
+    metric_eval = None
+    positions_unwrapped = False
+    metric_space = _metric_space_from_args(common_args, substrate)
+    if enable_msc:
+        metric_node = OmegaConf.merge(trials[0]["cfg"].get("substrate", {}), trials[0]["cfg"].get("metric", {}))
+        metric_dict = OmegaConf.to_container(metric_node, resolve=True)
+        metric_args = SimpleNamespace(**metric_dict)
+        metric_args.rollout_steps = int(late_end - late_start)
+        if getattr(metric_args, "metric_periodic", None) is None:
+            metric_args.metric_periodic = bool(metric_space["periodic"])
+        if getattr(metric_args, "metric_domain_y", None) is None:
+            metric_args.metric_domain_y = float(metric_space["domain_y"])
+        if getattr(metric_args, "metric_domain_x", None) is None:
+            metric_args.metric_domain_x = float(metric_space["domain_x"])
+        metric_cfg = resolve_metric_config(metric_args)
+        if int(metric_cfg["sample_every_steps"]) != int(base_chunk_steps):
+            raise ValueError(
+                "paper_check generic frustration evaluation expects metric.sample_every_steps to define the base chunk size. "
+                f"Got metric.sample_every_steps={int(metric_cfg['sample_every_steps'])}, "
+                f"sample_every_steps={int(base_chunk_steps)}."
+            )
+        unwrap_state_x = bool(getattr(metric_args, "metric_unwrap_state_x", True))
+        positions_unwrapped = bool(metric_cfg["periodic"] and unwrap_state_x)
+        metric_cfg["positions_unwrapped"] = positions_unwrapped
+        metric_info = dict(metric_summary(metric_cfg))
+        metric_eval = jax.jit(make_metric_loss_fn(metric_cfg))
+
+        params0 = params_list[0]
+        state0 = substrate.init_state(jax.random.PRNGKey(0), params0)
+        xy0 = _extract_positions_from_state(state0)
+        run.summary["metric_cfg/trajectory_source"] = "state_x"
+        run.summary["metric_cfg/tracked_entities"] = int(xy0.shape[0])
+        run.summary["paper_check/frustration_protocol"] = "state_perturbation"
+
+    resume = bool(getattr(common_args, "resume", True))
+    lanes = []
+    for trial in trials:
+        params = trial["params"]
+        seed_x = int(getattr(trial["args"], "seed_x"))
+        seed_x1 = int(getattr(trial["args"], "seed_x1"))
+        control_a = {
+            "trial": trial,
+            "variant": "control_a",
+            "checkpoint_path": trial["trial_paths"]["trial_artifact_dir"] / "control_a_checkpoint.npz",
+            "run_seed": seed_x,
+            "params": params,
+            "wall_mode": False,
+            "full_embeddings_enabled": bool(enable_clip),
+            "block_embeddings_enabled": False,
+            "apply_perturbation": False,
+            "warmup_steps": int(warmup_steps),
+            "args": trial["args"],
+        }
+        control_b = {
+            "trial": trial,
+            "variant": "control_b",
+            "checkpoint_path": trial["trial_paths"]["trial_artifact_dir"] / "control_b_checkpoint.npz",
+            "run_seed": seed_x1,
+            "params": params,
+            "wall_mode": False,
+            "full_embeddings_enabled": bool(getattr(common_args, "log_full_embeddings_for_b", False) and enable_clip),
+            "block_embeddings_enabled": False,
+            "apply_perturbation": False,
+            "warmup_steps": int(warmup_steps),
+            "args": trial["args"],
+        }
+        walls = {
+            "trial": trial,
+            "variant": "walls",
+            "checkpoint_path": trial["trial_paths"]["trial_artifact_dir"] / "walls_checkpoint.npz",
+            "run_seed": seed_x,
+            "params": params,
+            "wall_mode": False,
+            "full_embeddings_enabled": bool(enable_clip),
+            "block_embeddings_enabled": False,
+            "apply_perturbation": True,
+            "warmup_steps": int(warmup_steps),
+            "args": trial["args"],
+        }
+        trial["control_a_lane"] = control_a
+        trial["control_b_lane"] = control_b
+        trial["walls_lane"] = walls
+        lanes.extend([control_a, control_b, walls])
+
+    for lane in lanes:
+        _load_or_init_generic_lane(lane, resume=resume, substrate=substrate)
+
+    _run_generic_global_lanes(
+        lanes=lanes,
+        total_steps=total_steps,
+        warmup_steps=warmup_steps,
+        late_start=late_start,
+        late_end=late_end,
+        base_chunk_steps=base_chunk_steps,
+        clip_sample_every_steps=clip_sample_every_steps,
+        checkpoint_every_steps=checkpoint_every_steps,
+        full_embedding_sample_every_steps=full_embedding_sample_every_steps,
+        enable_clip=enable_clip,
+        enable_msc=enable_msc,
+        batched_state_chunk_stepper=batched_state_chunk_stepper,
+        embed_global_batch=embed_global_batch,
+        substrate=substrate,
+    )
+
+    completed_rows = []
+    for trial in trials:
+        run_outputs = {
+            "control_a": _lane_output(trial["control_a_lane"]),
+            "control_b": _lane_output(trial["control_b_lane"]),
+            "walls": _lane_output(trial["walls_lane"]),
+        }
+        if enable_msc and positions_unwrapped:
+            for output in run_outputs.values():
+                output["xy_late"] = _unwrap_sampled_xy_np(
+                    output["xy_late"],
+                    domain_y=float(metric_cfg["domain_y"]),
+                    domain_x=float(metric_cfg["domain_x"]),
+                )
+        row, _ = _finalize_trial(
+            trial=trial,
+            run_outputs=run_outputs,
+            root_save_dir=root_save_dir,
+            enable_clip=enable_clip,
+            enable_msc=enable_msc,
+            distance_metric=str(getattr(common_args, "distance_metric", "cosine_mean")),
+            metric_cfg=metric_cfg,
+            metric_info=metric_info,
+            metric_eval=metric_eval,
+        )
+        row["frustration_protocol"] = "state_perturbation"
+        _write_json(trial["trial_paths"]["trial_row_json"], row)
+        completed_rows.append(row)
+        print(f"Completed trial {trial['trial_idx']:05d}")
+
+    for key, value in {
+        "paper_check/n_trials_completed_in_batch": int(len(completed_rows)),
+        "paper_check/batch_size": int(len(trials)),
+    }.items():
+        run.summary[key] = value
+    if metric_info is not None:
+        run.summary["paper_check/msc_metric_summary"] = str(metric_info)
+    return completed_rows
 
 
 def run_batch(job_config_paths: list[str | Path]) -> int:
@@ -935,6 +1451,7 @@ def run_batch(job_config_paths: list[str | Path]) -> int:
         base_chunk_steps = int(getattr(common_args, "sample_every_steps"))
         checkpoint_every_steps = int(getattr(common_args, "checkpoint_every_steps", base_chunk_steps))
         full_embedding_sample_every_steps = int(getattr(common_args, "full_embedding_sample_every_steps", base_chunk_steps))
+        clip_sample_every_steps = int(getattr(common_args, "clip_sample_every_steps", base_chunk_steps))
         _validate_divisibility(
             total_steps=total_steps,
             warmup_steps=warmup_steps,
@@ -944,6 +1461,41 @@ def run_batch(job_config_paths: list[str | Path]) -> int:
             checkpoint_every_steps=checkpoint_every_steps,
             full_embedding_sample_every_steps=full_embedding_sample_every_steps,
         )
+        if clip_sample_every_steps < 1:
+            raise ValueError("evaluation.clip_sample_every_steps must be >= 1.")
+        if clip_sample_every_steps % base_chunk_steps != 0:
+            raise ValueError(
+                "evaluation.clip_sample_every_steps must be divisible by "
+                f"metric.sample_every_steps={base_chunk_steps}, got {clip_sample_every_steps}."
+            )
+        if enable_clip and clip_sample_every_steps > int(late_end - late_start):
+            raise ValueError(
+                "evaluation.clip_sample_every_steps is larger than the late window; "
+                f"got clip_sample_every_steps={clip_sample_every_steps}, "
+                f"late_window_steps={int(late_end - late_start)}."
+            )
+
+        substrate = _create_substrate(common_args, enable_msc=enable_msc)
+        if str(common_args.substrate) != "lenia_flow":
+            _run_generic_state_perturbation_trials(
+                trials=trials,
+                common_args=common_args,
+                root_save_dir=root_save_dir,
+                repo=repo,
+                run=run,
+                substrate=substrate,
+                enable_clip=enable_clip,
+                enable_msc=enable_msc,
+                total_steps=total_steps,
+                warmup_steps=warmup_steps,
+                late_start=late_start,
+                late_end=late_end,
+                base_chunk_steps=base_chunk_steps,
+                clip_sample_every_steps=clip_sample_every_steps,
+                checkpoint_every_steps=checkpoint_every_steps,
+                full_embedding_sample_every_steps=full_embedding_sample_every_steps,
+            )
+            return 0
 
         split_n = int(getattr(common_args, "grid_split"))
         grid_size = int(getattr(common_args, "grid_size"))
@@ -952,10 +1504,6 @@ def run_batch(job_config_paths: list[str | Path]) -> int:
         block_size = grid_size // split_n
         pad = int(getattr(common_args, "wall_pad", int(common_args.dd)))
         block_sim_size = block_size + 2 * pad
-
-        substrate = _create_substrate(common_args, enable_msc=enable_msc)
-        if str(common_args.substrate) != "lenia_flow":
-            raise ValueError("paper_check frustration batch evaluation currently supports substrate='lenia_flow' only.")
 
         params_list = []
         for trial in trials:

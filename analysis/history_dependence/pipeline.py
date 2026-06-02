@@ -35,10 +35,10 @@ from .utils import resolve_config_path
 DEFAULT_CONFIG: dict[str, Any] = {
     "source": {
         "type": "history_dependence_eval",
-        "path": "experiments/frustration/checkpoints/history_dependence_opt1_best",
+        "path": "experiments/legacy/frustration/checkpoints/history_dependence_opt1_best",
     },
     "output": {
-        "dir": "experiments/frustration/checkpoints/history_dependence_opt1_best/offline_analysis",
+        "dir": "experiments/legacy/frustration/checkpoints/history_dependence_opt1_best/offline_analysis",
     },
     "embeddings": {
         "enabled": True,
@@ -61,8 +61,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "metric_particle_samples": 64,
         "metric_dirs_seed": 123,
         "metric_preprocess_mode": "clip",
+        "metric_delta_h_floor": 0.0,
+        "metric_msc_floor": 0.01,
+        "metric_msc_term": "floor_reconstruction_error",
+        "metric_msc_normalize_by_weight_sum": True,
         "metric_alpha": 0.0,
         "metric_beta": 1.0,
+        "metric_eps": 1e-12,
         "occupancy_bins": 64,
         "pairwise_map_metrics": ["l2", "mean_abs"],
         "fixed_tau_distribution_steps": 3000,

@@ -9,6 +9,11 @@ from types import SimpleNamespace
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "scripts")):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -99,6 +104,8 @@ def _make_trial_paths(root_dir: Path, trial_idx: int) -> dict[str, Path]:
 
 
 def _state_to_np_payload(prefix: str, state: dict[str, jax.Array]) -> dict[str, np.ndarray]:
+    if not isinstance(state, dict):
+        return {f"{prefix}__array": np.asarray(jax.device_get(state))}
     payload = {}
     for key, value in state.items():
         payload[f"{prefix}{key}"] = np.asarray(jax.device_get(value))
@@ -106,6 +113,9 @@ def _state_to_np_payload(prefix: str, state: dict[str, jax.Array]) -> dict[str, 
 
 
 def _state_from_npz(prefix: str, data) -> dict[str, jax.Array]:
+    array_key = f"{prefix}__array"
+    if array_key in data.files:
+        return jnp.asarray(np.asarray(data[array_key]))
     out = {}
     for key in data.files:
         if key.startswith(prefix):
@@ -129,11 +139,17 @@ def _load_run_checkpoint(path: Path):
             "rng": jnp.asarray(np.asarray(data["rng"], dtype=np.uint32)),
             "full_steps": np.asarray(data["full_steps"], dtype=np.int32).tolist() if "full_steps" in data.files else [],
             "late_steps": np.asarray(data["late_steps"], dtype=np.int32).tolist() if "late_steps" in data.files else [],
+            "z_late_steps": np.asarray(data["z_late_steps"], dtype=np.int32).tolist() if "z_late_steps" in data.files else [],
+            "xy_late_steps": np.asarray(data["xy_late_steps"], dtype=np.int32).tolist() if "xy_late_steps" in data.files else [],
             "z_full": [arr for arr in np.asarray(data["z_full"], dtype=np.float32)] if "z_full" in data.files else [],
             "z_full_blocks": [arr for arr in np.asarray(data["z_full_blocks"], dtype=np.float32)] if "z_full_blocks" in data.files else [],
             "z_late": [arr for arr in np.asarray(data["z_late"], dtype=np.float32)] if "z_late" in data.files else [],
             "xy_late": [arr for arr in np.asarray(data["xy_late"], dtype=np.float32)] if "xy_late" in data.files else [],
         }
+        if not ckpt["z_late_steps"] and ckpt["z_late"]:
+            ckpt["z_late_steps"] = list(ckpt["late_steps"])
+        if not ckpt["xy_late_steps"] and ckpt["xy_late"]:
+            ckpt["xy_late_steps"] = list(ckpt["late_steps"])
         if ckpt["mode"] == "block":
             ckpt["block_state"] = _state_from_npz("block__", data)
         elif ckpt["mode"] == "global":
@@ -160,16 +176,24 @@ def _save_run_checkpoint(
     z_full_blocks: list[np.ndarray],
     z_late: list[np.ndarray],
     xy_late: list[np.ndarray],
+    z_late_steps: list[int] | None = None,
+    xy_late_steps: list[int] | None = None,
     block_state: dict[str, jax.Array] | None = None,
     global_state: dict[str, jax.Array] | None = None,
     lag_carry=None,
 ) -> None:
+    if z_late_steps is None:
+        z_late_steps = late_steps
+    if xy_late_steps is None:
+        xy_late_steps = late_steps
     payload = {
         "mode": np.asarray(str(mode)),
         "current_step": np.asarray(int(current_step), dtype=np.int32),
         "rng": np.asarray(jax.device_get(rng), dtype=np.uint32),
         "full_steps": np.asarray(full_steps, dtype=np.int32),
         "late_steps": np.asarray(late_steps, dtype=np.int32),
+        "z_late_steps": np.asarray(z_late_steps, dtype=np.int32),
+        "xy_late_steps": np.asarray(xy_late_steps, dtype=np.int32),
         "z_full": _stack_or_empty(z_full, dtype=np.float32),
         "z_full_blocks": _stack_or_empty(z_full_blocks, dtype=np.float32),
         "z_late": _stack_or_empty(z_late, dtype=np.float32),
@@ -590,6 +614,13 @@ def _validate_divisibility(*, total_steps: int, warmup_steps: int, late_start: i
 
 
 def main(cfg, args):
+    if str(getattr(args, "substrate")) != "lenia_flow":
+        if len(sys.argv) < 2:
+            raise SystemExit("Usage: python scripts/paper_check_frustration_eval.py <resolved_job_config.yaml>")
+        from paper_check_frustration_batch_eval import run_batch
+
+        return run_batch([sys.argv[1]])
+
     project_root = _repo_root()
     root_save_dir = Path(project_root / str(getattr(args, "save_dir")))
     root_save_dir.mkdir(parents=True, exist_ok=True)

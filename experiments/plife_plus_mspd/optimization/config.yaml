@@ -1,0 +1,84 @@
+meta:
+  seed: 1
+  save_dir: experiments/opt_msc_plife_plus/checkpoints/longrun_check_fixed_oe
+  resume: true
+
+substrate:
+  substrate: plife_plus
+  rollout_steps: 1000
+  n_particles: 1000
+  n_colors: 6
+  n_dims: 2
+  x_dist_bins: 7
+  beta: 0.3
+  mass: 0.1
+  dt: 0.02
+  half_life: 0.04
+  rmax: 0.1
+  render_radius: 0.04
+  sharpness: 30.0
+  update_colors: true
+  world_size: 1.0
+  border: torus
+  neighbor_mode: dense
+  background_color: black
+
+
+evaluation:
+  sample_every_steps: 1
+  log_clip_evolution: true
+  foundation_model: clip
+  clip_time_sampling: 5
+  prompts: "a biological cell"
+  coef_prompt: 0.0
+  coef_softmax: 0.0
+  coef_oe: 1.0
+  coef_smooth: 0.0
+
+optimization:
+  params_init: substrate_default
+  bs: 1
+  pop_batch: 8
+  pop_size: 8
+  n_iters: 1000
+  sigma: 0.2
+
+logging:
+  wandb_project: asal
+  wandb_mode: online
+  log_color_diversity: true
+  pca_every: 0
+
+metric:
+  metric_trajectory_source: state_x
+  metric_unwrap_state_x: true
+  metric_tau_mode: trainable_grid
+  metric_tau_grid_steps: o
+
+  metric_window_size_steps: 100
+  metric_window_step_steps: 50
+  metric_tau_steps: 20
+  metric_range_start_steps: 0
+  metric_range_end_steps: 1000
+  metric_window_size_frames: null
+  metric_window_step_frames: null
+  metric_tau_frames: null
+  metric_tau_grid_frames: null
+
+  metric_m_samples: 48
+  metric_m_min: 4
+  metric_n_proj: 16
+  metric_null_reps: 6
+  metric_particle_samples: 64
+  metric_dirs_seed: 123
+  metric_periodic: null
+  metric_domain_y: null
+  metric_domain_x: null
+
+  metric_preprocess_mode: clip
+  metric_scales: null
+  metric_scale_weights: null
+
+  metric_alpha: 1.0
+  metric_beta: 1.0
+  metric_eps: 1.0e-3

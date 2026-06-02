@@ -1,0 +1,31 @@
+meta:
+  machine_idx: ${env:PAPER_MACHINE_IDX,0}
+  num_machines: ${env:PAPER_NUM_MACHINES,1}
+  wandb_project: asal
+  wandb_mode: online
+  output_root: experiments/paper_check_plife_plus/checkpoints
+
+paper_check:
+  num_optimizations: 1
+  num_random_baselines: 3
+  optimization_seed_base: 1001
+  random_param_seed_base: 200001
+  pair_seed_base: 400001
+  metric_seed_base: 800001
+
+optimization:
+  base_config: optimization/config_longrun_check.yaml
+  save_root: ${meta.output_root}/optimization
+  resume: true
+  save_every: 1
+  overrides: {}
+
+frustration_simulation:
+  base_config: frustration_simulation/config.yaml
+  save_root: ${meta.output_root}/frustration_simulation
+  resume: true
+  trial_batch_size: 4
+  checkpoint_every_steps: 5000
+  full_embedding_sample_every_steps: 1000
+  log_full_embeddings_for_b: false
+  overrides: {}

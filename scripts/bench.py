@@ -5,13 +5,19 @@ Run multiple tracking baselines on one video and collect overlays/JSON.
 import argparse
 import json
 import os
+import sys
+from pathlib import Path
 from typing import List, Optional, Tuple
 
-from baseline_btrack import run_btrack
-from baseline_trackmate import export_for_trackmate
-from baseline_trackpy import run_trackpy
-from baseline_ultrack import run_ultrack
-from run_flowlenia_classic_tracker import Config, run_pipeline, _parse_resize
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools.tracking.baseline_btrack import run_btrack
+from tools.tracking.baseline_trackmate import export_for_trackmate
+from tools.tracking.baseline_trackpy import run_trackpy
+from tools.tracking.baseline_ultrack import run_ultrack
+from tools.tracking.flowlenia_classic_tracker import Config, _parse_resize, run_pipeline
 
 
 def build_cfg(args) -> Config:
@@ -181,7 +187,7 @@ def main():
             # if user already produced tracks.csv (e.g., rerun), import and create overlays/json to match others
             csv_candidate = os.path.join(export_dir, "tracks.csv")
             if os.path.exists(csv_candidate):
-                from import_trackmate_csv import import_trackmate_csv
+                from tools.tracking.import_trackmate_csv import import_trackmate_csv
 
                 import_trackmate_csv(
                     csv_path=csv_candidate,
