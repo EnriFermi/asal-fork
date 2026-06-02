@@ -3,18 +3,18 @@ meta:
   num_machines: ${env:PAPER_NUM_MACHINES,1}
   wandb_project: asal
   wandb_mode: online
-  output_root: experiments/paper_check_flow_lenia/checkpoints
+  output_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1
 
 paper_check:
-  num_optimizations: 2        # R
+  num_optimizations: 9        # R
   num_random_baselines: 3     # M
-  optimization_seed_base: 1002
-  random_param_seed_base: 200002
-  pair_seed_base: 400002
-  metric_seed_base: 800002
+  optimization_seed_base: 1003
+  random_param_seed_base: 200003
+  pair_seed_base: 400003
+  metric_seed_base: 800003
 
 optimization:
-  base_config: optimization/config_longrun_check.yaml
+  base_config: optimization/config_longrun_check_fix.yaml
   save_root: ${meta.output_root}/optimization
   resume: true
   save_every: 1
