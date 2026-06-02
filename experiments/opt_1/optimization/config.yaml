@@ -1,6 +1,6 @@
 meta:
   seed: 1
-  save_dir: experiments/opt_1/checkpoints/clip_oe_run
+  save_dir: experiments/opt_1/checkpoints/lockheed-47
   resume: true
 
 substrate:
@@ -8,17 +8,17 @@ substrate:
   rollout_steps: 200000
   grid_size: 384
   C: 3
-  k: 135
-  kernel_components: 3
-  M: "15,15,15;15,15,15;15,15,15"
+  k: 36
+  kernel_components: 30
+  M: "4,4,4;4,4,4;4,4,4"
   dd: 5
   dt: 0.2
   sigma: 0.65
   border: wall
-  mix_rule: stoch
+  mix_rule: stoch_gene_wise
   base_seed: 0
   seed_patch_size: 20
-  seed_n_patches: 9
+  seed_n_patches: 16
   seed_mode: random_patches
   p_constant_per_patch: 1
   render_mode: Pcolor
@@ -26,7 +26,7 @@ substrate:
   clip2: .inf
   mutations: true
   mutation_sz: 40
-  mutation_p: 0.05
+  mutation_p: 0.2
   mutation_scale: 1.0
   optimize_mutation_scale: false
   volcano: false
@@ -70,10 +70,10 @@ optimization:
 
 logging:
   wandb_project: asal
-  save_every: 5
+  save_every: 1
   pca_every: 25
   pca_history: 100
-  full_video_interval: 0
-  full_video_rollout_steps: 4000
-  full_video_img_size: 140
+  # full_video_interval: 0
+  # full_video_rollout_steps: 4000
+  # full_video_img_size: 140
 
