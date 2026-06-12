@@ -306,7 +306,7 @@ c2:
     n_mid: 5
     n_low: 5
     branches_per_time: 3
-    horizon_steps: 1000
+    horizon_steps: 1500
     min_branch_step: 0
     refractory_steps: 250
     future_sample_every_steps: 25
@@ -322,8 +322,8 @@ c2:
     # state at sampled Delta-H windows.
     perturb:
       x_std: 0.003
-      v_std: 0.0
-      c_std: 0.01
+      v_std: 0.1
+      c_std: 1.0
     perturbation_strength_sweep:
       output_dir: analysis/results/paper_suite/c2_plife_plus_perturbation_strength_sweep
       conditions: [high]
