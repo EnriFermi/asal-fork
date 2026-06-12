@@ -122,6 +122,8 @@ def _parse_rewrite_prefix(raw: str | None) -> tuple[str, str] | None:
 def _select_score_row(
     rows: list[dict[str, str]],
     *,
+    plan_rows: list[dict[str, str]] | None = None,
+    min_branches: int = 1,
     min_delta_h_quantile: float,
     traj_id: str | None,
     pair_id: int | None,
@@ -150,6 +152,20 @@ def _select_score_row(
         candidates = [row for row in finite if _as_float(row.get("delta_h")) >= threshold]
         if candidates:
             finite = candidates
+
+    if plan_rows is not None and int(min_branches) > 1:
+        counts = [(len(_matching_plan_rows(plan_rows, row)), row) for row in finite]
+        enough = [row for count, row in counts if count >= int(min_branches)]
+        if not enough:
+            max_count = max((count for count, _row in counts), default=0)
+            raise RuntimeError(
+                f"No selected C2 score row has at least {int(min_branches)} branch rows; "
+                f"maximum available after filters is {max_count}. The branch plan was likely "
+                "generated with c2.branching.branches_per_time < 4. Re-run the C2 branching "
+                "simulation layer with c2.branching.branches_per_time=4, then recompute the "
+                "C2 branching metrics."
+            )
+        finite = enough
 
     return max(finite, key=lambda row: _as_float(row.get("branching_score")))
 
@@ -414,14 +430,16 @@ def main() -> int:
         meta_path = (_REPO_ROOT / meta_path).resolve()
 
     score_rows = _read_csv(scores_path)
+    plan_rows = _read_csv(plan_path)
     selected = _select_score_row(
         score_rows,
+        plan_rows=plan_rows,
+        min_branches=int(args.n_branches),
         min_delta_h_quantile=float(args.min_delta_h_quantile),
         traj_id=args.traj_id,
         pair_id=args.pair_id,
         condition=args.condition,
     )
-    plan_rows = _read_csv(plan_path)
     matching = _matching_plan_rows(plan_rows, selected)
     if len(matching) < 4:
         raise RuntimeError(
