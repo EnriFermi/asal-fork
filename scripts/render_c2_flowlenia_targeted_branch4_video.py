@@ -17,8 +17,10 @@ from omegaconf import OmegaConf
 
 from paper_suite_common import load_config, resolve_path, write_json
 from render_c2_flowlenia_branch_divergence_grid import (
+    _Mp4Writer,
     _as_float,
     _as_int,
+    _compose_grid,
     _default_output_root,
     _first_existing,
     _load_branch_frames,
@@ -26,6 +28,7 @@ from render_c2_flowlenia_branch_divergence_grid import (
     _matching_plan_rows,
     _parse_rewrite_prefix,
     _resolve_data_path,
+    _resize_nearest,
     _write_mp4,
 )
 
@@ -118,6 +121,7 @@ def _target_branch_rows(
     rewrite_prefix: tuple[str, str] | None,
     n_branches: int,
     horizon_steps: int | None,
+    snapshot_interval: int | None,
     perturb_a_std: float | None,
     perturb_p_std: float | None,
     perturb_lag_xy_std: float | None,
@@ -187,6 +191,7 @@ def _target_branch_rows(
                 "branch_id": int(branch_id),
                 "branch_seed": int(branch_seed),
                 "horizon_steps": int(horizon),
+                "snapshot_interval": "" if snapshot_interval is None else int(snapshot_interval),
                 "perturb_a_std": float(a_std),
                 "perturb_p_std": float(p_std),
                 "perturb_lagrangian_xy_std": float(lag_std),
@@ -214,6 +219,8 @@ def _jobs_from_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "perturb_lagrangian_xy_std": float(row["perturb_lagrangian_xy_std"]),
             }
         )
+        if row.get("snapshot_interval") not in (None, ""):
+            jobs[-1]["snapshot_interval"] = int(row["snapshot_interval"])
     return jobs
 
 
@@ -231,6 +238,218 @@ def _run_branch_jobs(jobs_path: Path, *, batch_size: int, force: bool, dry_run: 
     print(" ".join(cmd))
     if not dry_run:
         subprocess.run(cmd, cwd=str(_REPO_ROOT), check=True)
+
+
+def _frame_u8(frame: Any, *, panel_size: int | None) -> Any:
+    import numpy as np
+
+    out = np.asarray(frame)
+    if out.dtype != np.uint8:
+        out = (np.clip(out, 0.0, 1.0) * 255.0).astype(np.uint8)
+    if panel_size is not None:
+        out = _resize_nearest(out, int(panel_size))
+    return out
+
+
+def _render_state_grid(substrate: Any, state: Any, params: Any, *, panel_size: int | None, gap: int) -> Any:
+    import jax
+    import numpy as np
+
+    def render_one(st, pr):
+        return substrate.render_state(st, pr, img_size=int(panel_size or 256))
+
+    frames = jax.device_get(jax.vmap(render_one)(state, params))
+    panels = [_frame_u8(frames[i], panel_size=panel_size) for i in range(int(frames.shape[0]))]
+    if len(panels) != 4:
+        raise ValueError(f"Direct grid renderer expects exactly 4 panels, got {len(panels)}.")
+    return _compose_grid(panels, gap=int(gap))
+
+
+def _run_direct_video_jobs(
+    jobs: list[dict[str, Any]],
+    *,
+    output: Path,
+    metadata_path: Path,
+    selected: dict[str, str],
+    scores_path: Path,
+    plan_path: Path,
+    target_root: Path,
+    fps: float,
+    panel_size: int,
+    gap: int,
+    horizon_steps: int,
+    render_interval: int,
+    jit_microbatch: int | None,
+    max_frames: int,
+    loop_hold_frames: int,
+    force: bool,
+    no_prepend_source_frame: bool,
+) -> int:
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from tqdm import tqdm
+
+    from flowlenia_minibang_resume import _apply_resume_perturbation, _get, _reconstruct_state
+    from flowlenia_minibang_resume_batch import _make_batched_stepper, _prepare_job, _write_metadata
+    from flowlenia_minibang_simulate import _make_substrate
+
+    if len(jobs) != 4:
+        raise ValueError(f"Direct video mode expects exactly 4 jobs, got {len(jobs)}.")
+    if int(render_interval) < 1:
+        raise ValueError(f"--direct-render-interval must be >= 1, got {render_interval}.")
+    if int(horizon_steps) < 1:
+        raise ValueError(f"--horizon-steps must be >= 1, got {horizon_steps}.")
+
+    raw_jobs = [dict(job, additional_steps=int(horizon_steps)) for job in jobs]
+    prepared = [_prepare_job(raw, overwrite=bool(force)) for raw in raw_jobs]
+    group_keys = {job["group_key"] for job in prepared}
+    if len(group_keys) != 1:
+        raise ValueError("Selected direct-video jobs are not batch-compatible.")
+
+    first = prepared[0]
+    args = first["args"]
+    substrate = _make_substrate(args)
+    _ = substrate.seed_state(jax.random.PRNGKey(0), jnp.asarray(first["params"], dtype=jnp.float32))
+    rt = substrate.RT
+
+    common_state = _reconstruct_state(substrate, first["params"], first["snapshot"])
+    common_params = jnp.asarray(first["params"], dtype=jnp.float32)
+    common_frame = _frame_u8(
+        jax.device_get(substrate.render_state(common_state, common_params, img_size=int(panel_size))),
+        panel_size=int(panel_size),
+    )
+    common_grid = _compose_grid([common_frame, common_frame, common_frame, common_frame], gap=int(gap))
+
+    states = []
+    lag_xys = []
+    lag_chs = []
+    rngs = []
+    params = []
+    for job in prepared:
+        state = _reconstruct_state(substrate, job["params"], job["snapshot"])
+        lag_xy = jnp.asarray(np.asarray(job["snapshot"]["lagrangian_xy"], dtype=np.float32))
+        rng = jnp.asarray(np.asarray(job["snapshot"]["resume_batch_rng_key"], dtype=np.uint32))
+        state, lag_xy, rng = _apply_resume_perturbation(
+            state=state,
+            lag_xy=lag_xy,
+            rng=rng,
+            seed=int(job["raw"].get("branch_seed", -1)),
+            a_std=float(job["raw"].get("perturb_a_std", 0.0)),
+            p_std=float(job["raw"].get("perturb_p_std", 0.0)),
+            lag_xy_std=float(job["raw"].get("perturb_lagrangian_xy_std", 0.0)),
+            border=str(getattr(rt, "border", "wall")),
+            sigma=float(getattr(rt, "sigma", 0.0)),
+        )
+        states.append(state)
+        lag_xys.append(lag_xy)
+        lag_chs.append(jnp.asarray(np.asarray(job["snapshot"]["lagrangian_c"], dtype=np.int32)))
+        rngs.append(rng)
+        params.append(jnp.asarray(job["params"], dtype=jnp.float32))
+        _write_metadata(job)
+
+    state = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *states)
+    lag_xy = jnp.stack(lag_xys, axis=0)
+    lag_ch = jnp.stack(lag_chs, axis=0)
+    rng = jnp.stack(rngs, axis=0)
+    params_j = jnp.stack(params, axis=0)
+    original_batch_index = jnp.asarray([job["original_batch_index"] for job in prepared], dtype=jnp.int32)
+
+    lag_flow_channel = int(_get(args, "lagrangian_flow_channel", _get(args, "metric_lagrangian_flow_channel", -1)))
+    lag_flow_reduce = str(_get(args, "lagrangian_flow_reduce", _get(args, "metric_lagrangian_flow_reduce", "mass_weighted")))
+    lag_channel_mode = str(_get(args, "lagrangian_channel_mode", _get(args, "metric_lagrangian_channel_mode", "resample")))
+    lag_noise_model = str(_get(args, "lagrangian_noise_model", _get(args, "metric_lagrangian_noise_model", "rt_box")))
+    lag_diffusion_scale = float(_get(args, "lagrangian_diffusion_scale", _get(args, "metric_lagrangian_diffusion_scale", 1.0)))
+    stepper = _make_batched_stepper(
+        substrate=substrate,
+        rt=rt,
+        original_batch_size=int(first["original_batch_size"]),
+        lag_flow_channel=lag_flow_channel,
+        lag_flow_reduce=lag_flow_reduce,
+        lag_channel_mode=lag_channel_mode,
+        lag_noise_model=lag_noise_model,
+        lag_diffusion_scale=lag_diffusion_scale,
+    )
+
+    if jit_microbatch is None:
+        step_chunk = int(first["jit_microbatch"])
+    else:
+        step_chunk = int(jit_microbatch)
+    step_chunk = max(1, min(step_chunk, int(render_interval)))
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    writer = _Mp4Writer(output, fps=float(fps), first_frame=common_grid)
+    frame_rows: list[dict[str, Any]] = []
+    frames_written = 0
+
+    def append_grid(grid, rel_step: int) -> None:
+        nonlocal frames_written
+        if int(max_frames) > 0 and frames_written >= int(max_frames):
+            return
+        writer.append_data(grid)
+        frame_rows.append(
+            {
+                "frame_idx": int(frames_written),
+                "relative_step": int(rel_step),
+                "step": int(first["start_step"]) + int(rel_step),
+                "video_sec": float(frames_written) / float(fps),
+            }
+        )
+        frames_written += 1
+
+    try:
+        if not no_prepend_source_frame:
+            append_grid(common_grid, 0)
+        perturbed_grid = _render_state_grid(substrate, state, params_j, panel_size=int(panel_size), gap=int(gap))
+        append_grid(perturbed_grid, 0)
+
+        rel_done = 0
+        pbar = tqdm(total=int(horizon_steps) * len(prepared), desc=f"direct branch4 {horizon_steps} steps")
+        try:
+            while rel_done < int(horizon_steps):
+                target_rel = min(int(horizon_steps), ((rel_done // int(render_interval)) + 1) * int(render_interval))
+                while rel_done < target_rel:
+                    n = min(int(step_chunk), int(target_rel) - int(rel_done))
+                    split = jax.vmap(lambda key: jax.random.split(key, 2))(rng)
+                    rng = split[:, 0, :]
+                    subkey = split[:, 1, :]
+                    state, lag_xy, lag_ch = stepper(n)(state, lag_xy, lag_ch, subkey, params_j, original_batch_index)
+                    rel_done += int(n)
+                    pbar.update(int(n) * len(prepared))
+                grid = _render_state_grid(substrate, state, params_j, panel_size=int(panel_size), gap=int(gap))
+                append_grid(grid, rel_done)
+                if int(max_frames) > 0 and frames_written >= int(max_frames):
+                    break
+        finally:
+            pbar.close()
+
+        if loop_hold_frames > 0 and frame_rows:
+            final_grid = _render_state_grid(substrate, state, params_j, panel_size=int(panel_size), gap=int(gap))
+            for _ in range(int(loop_hold_frames)):
+                writer.append_data(final_grid)
+                frames_written += 1
+    finally:
+        writer.close()
+
+    write_json(
+        metadata_path,
+        {
+            "status": "ok",
+            "mode": "direct_video",
+            "output": str(output),
+            "frames_written": int(frames_written),
+            "frame_rows": frame_rows,
+            "render_interval": int(render_interval),
+            "horizon_steps": int(horizon_steps),
+            "jit_microbatch": int(step_chunk),
+            "selection_scores_path": str(scores_path),
+            "selection_branch_plan": str(plan_path),
+            "target_root": str(target_root),
+            "selected_score_row": selected,
+            "jobs": raw_jobs,
+        },
+    )
+    return int(frames_written)
 
 
 def main() -> int:
@@ -254,6 +473,12 @@ def main() -> int:
     ap.add_argument("--condition", default=None)
     ap.add_argument("--n-branches", type=int, default=4)
     ap.add_argument("--horizon-steps", type=int, default=None)
+    ap.add_argument(
+        "--snapshot-interval",
+        type=int,
+        default=None,
+        help="Override APF snapshot cadence for the freshly simulated branches.",
+    )
     ap.add_argument("--perturb-a-std", type=float, default=None)
     ap.add_argument("--perturb-p-std", type=float, default=None)
     ap.add_argument("--perturb-lagrangian-xy-std", type=float, default=None)
@@ -261,6 +486,23 @@ def main() -> int:
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--render-only", action="store_true")
+    ap.add_argument(
+        "--direct-video",
+        action="store_true",
+        help="Simulate the four selected branches and write the 2x2 mp4 directly without APF snapshot rendering.",
+    )
+    ap.add_argument(
+        "--direct-render-interval",
+        type=int,
+        default=100,
+        help="Simulation steps between frames in --direct-video mode.",
+    )
+    ap.add_argument(
+        "--direct-jit-microbatch",
+        type=int,
+        default=None,
+        help="Step chunk size for --direct-video mode; defaults to the source APF resume microbatch.",
+    )
     ap.add_argument("--max-frames", type=int, default=120)
     ap.add_argument("--snapshot-stride", type=int, default=1)
     ap.add_argument("--panel-size", type=int, default=256)
@@ -330,6 +572,7 @@ def main() -> int:
         rewrite_prefix=rewrite_prefix,
         n_branches=int(args.n_branches),
         horizon_steps=args.horizon_steps,
+        snapshot_interval=args.snapshot_interval,
         perturb_a_std=args.perturb_a_std,
         perturb_p_std=args.perturb_p_std,
         perturb_lag_xy_std=args.perturb_lagrangian_xy_std,
@@ -338,8 +581,55 @@ def main() -> int:
     jobs_path = target_root / "selected_branch4_jobs.json"
     write_json(jobs_path, {"jobs": jobs})
 
+    if args.direct_video and args.render_only:
+        raise ValueError("--direct-video cannot be combined with --render-only.")
+
     if not args.render_only:
-        _run_branch_jobs(jobs_path, batch_size=int(args.batch_size), force=bool(args.force), dry_run=bool(args.dry_run))
+        if args.direct_video:
+            if args.dry_run:
+                cmd = [
+                    sys.executable,
+                    "scripts/render_c2_flowlenia_targeted_branch4_video.py",
+                    "--config",
+                    str(args.config),
+                    "--direct-video",
+                    "--direct-render-interval",
+                    str(int(args.direct_render_interval)),
+                    "--horizon-steps",
+                    str(int(args.horizon_steps or selected_branch_rows[0]["horizon_steps"])),
+                ]
+                if args.force:
+                    cmd.append("--force")
+                print(" ".join(cmd))
+            else:
+                frames_written = _run_direct_video_jobs(
+                    jobs,
+                    output=out_path,
+                    metadata_path=meta_path,
+                    selected=selected,
+                    scores_path=scores_path,
+                    plan_path=plan_path,
+                    target_root=target_root,
+                    fps=float(args.fps),
+                    panel_size=int(args.panel_size),
+                    gap=int(args.gap),
+                    horizon_steps=int(args.horizon_steps or selected_branch_rows[0]["horizon_steps"]),
+                    render_interval=int(args.direct_render_interval),
+                    jit_microbatch=args.direct_jit_microbatch,
+                    max_frames=int(args.max_frames),
+                    loop_hold_frames=int(args.loop_hold_frames),
+                    force=bool(args.force),
+                    no_prepend_source_frame=bool(args.no_prepend_source_frame),
+                )
+                print(
+                    "Rendered direct targeted C2 branch4 video "
+                    f"traj={selected.get('traj_id')} pair={selected.get('pair_id')} "
+                    f"condition={selected.get('condition')} frames={frames_written} output={out_path}"
+                )
+                print(f"Metadata: {meta_path}")
+                return 0
+        else:
+            _run_branch_jobs(jobs_path, batch_size=int(args.batch_size), force=bool(args.force), dry_run=bool(args.dry_run))
     if args.dry_run:
         write_json(
             meta_path,
