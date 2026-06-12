@@ -1533,25 +1533,32 @@ def _read_csv_rows(path: Path) -> list[dict[str, Any]]:
 
 
 def _plot_c2_from_existing_tables(out: Path) -> dict[str, Any]:
-    scores_path = out / "c2_branching_scores.csv"
+    plot_dir = out
+    scores_path = plot_dir / "c2_branching_scores.csv"
     if not scores_path.exists():
-        scores_path = out / "c2_branching_window_scores.csv"
-    pair_path = out / "c2_branch_pair_scores.csv"
+        scores_path = plot_dir / "c2_branching_window_scores.csv"
+    if not scores_path.exists() and (out / "c2").is_dir():
+        plot_dir = out / "c2"
+        scores_path = plot_dir / "c2_branching_scores.csv"
+        if not scores_path.exists():
+            scores_path = plot_dir / "c2_branching_window_scores.csv"
+    pair_path = plot_dir / "c2_branch_pair_scores.csv"
     window_rows = _read_csv_rows(scores_path)
     pair_rows = _read_csv_rows(pair_path)
     if not window_rows:
         raise FileNotFoundError(f"No C2 scores found for plots-only mode: {scores_path}")
-    _plot_c2(out, window_rows, pair_rows)
+    _plot_c2(plot_dir, window_rows, pair_rows)
     return {
         "status": "ok",
         "plots_only": True,
+        "plot_dir": str(plot_dir),
         "scores": str(scores_path),
         "pair_scores": str(pair_path) if pair_path.exists() else "",
         "figures": [
-            str(out / "c2_ca_delta_h_branching_sensitivity.png"),
-            str(out / "c2_ca_delta_h_branching_sensitivity_ci.png"),
-            str(out / "ca_c2_delta_h_branching_paper.png"),
-            str(out / "ca_c2_delta_h_branching_paper_ci.png"),
+            str(plot_dir / "c2_ca_delta_h_branching_sensitivity.png"),
+            str(plot_dir / "c2_ca_delta_h_branching_sensitivity_ci.png"),
+            str(plot_dir / "ca_c2_delta_h_branching_paper.png"),
+            str(plot_dir / "ca_c2_delta_h_branching_paper_ci.png"),
         ],
     }
 
