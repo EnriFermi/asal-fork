@@ -46,6 +46,7 @@ DEFAULT_POSTHOC_CONFIG: dict[str, Any] = {
     "results_root": "analysis/results/gol_transition_mspd",
     "output_dir": None,
     "task": "all",
+    "plots_only": False,
     "backend": None,
     "seed": 0,
     "optimized_top_k": 1,
@@ -1435,9 +1436,9 @@ def _plot_c2(out: Path, window_rows: list[dict[str, Any]], pair_rows: list[dict[
         ax.plot(xs, coeff[0] * xs + coeff[1], color="#111827", linewidth=1.2)
     ax.set_xlabel("Delta-H")
     ax.set_ylabel("pairwise future Hamming divergence")
-    ax.set_title("C2 CA Delta-H vs perturbation sensitivity")
     fig.tight_layout()
     fig.savefig(out / "c2_ca_delta_h_branching_sensitivity.png")
+    fig.savefig(out / "ca_c2_delta_h_branching_paper.png")
     plt.close(fig)
 
     pair_rows = pair_rows or []
@@ -1454,10 +1455,8 @@ def _plot_c2(out: Path, window_rows: list[dict[str, Any]], pair_rows: list[dict[
         lows: list[float] = []
         highs: list[float] = []
         n_pairs: list[int] = []
-        values_for_rows: list[list[float]] = []
         for row in window_rows:
             vals = by_window.get(int(row["window_idx"]), [])
-            values_for_rows.append(vals)
             lo, hi = _bootstrap_mean_ci(vals)
             center = float(row[score_key])
             lows.append(center if not np.isfinite(lo) else lo)
@@ -1466,48 +1465,28 @@ def _plot_c2(out: Path, window_rows: list[dict[str, Any]], pair_rows: list[dict[
         lo_arr = np.asarray(lows, dtype=np.float64)
         hi_arr = np.asarray(highs, dtype=np.float64)
         yerr = np.vstack([np.maximum(0.0, y - lo_arr), np.maximum(0.0, hi_arr - y)])
-        fig, ax = plt.subplots(figsize=(6.2, 4.4), dpi=150)
+        fig, ax = plt.subplots(figsize=(5.6, 4.2), dpi=150)
         ax.errorbar(
             x,
             y,
             yerr=yerr,
             fmt="o",
-            markersize=4.5,
+            markersize=4.8,
             color="#7c3aed",
             ecolor="#7c3aed",
-            elinewidth=1.2,
-            capsize=3,
-            alpha=0.92,
-            label="window mean +/- bootstrap 95% CI",
+            elinewidth=1.0,
+            capsize=2,
+            alpha=0.82,
         )
         if x.size >= 2 and np.std(x) > 0.0:
             coeff = np.polyfit(x, y, deg=1)
             xs = np.linspace(float(np.min(x)), float(np.max(x)), 100)
             ax.plot(xs, coeff[0] * xs + coeff[1], color="#111827", linewidth=1.2)
-        span = max(float(np.ptp(x)), 1.0)
-        for xi, vals in zip(x, values_for_rows):
-            if not vals:
-                continue
-            offsets = np.linspace(-0.004, 0.004, len(vals)) * span
-            ax.scatter(np.full(len(vals), xi) + offsets, vals, s=12, color="#a78bfa", alpha=0.35, linewidth=0)
         ax.set_xlabel("Delta-H")
         ax.set_ylabel("pairwise future Hamming divergence")
-        ax.set_title("C2 CA Delta-H vs perturbation sensitivity\nwith branch-pair bootstrap intervals")
-        ax.text(
-            0.02,
-            0.02,
-            f"error bars use raw branch pairs per window; median n_pairs={np.median(n_pairs):.0f}",
-            transform=ax.transAxes,
-            ha="left",
-            va="bottom",
-            fontsize=8,
-            bbox={"facecolor": "white", "edgecolor": "#dddddd", "alpha": 0.92, "pad": 3},
-        )
-        ax.grid(color="#dddddd", linewidth=0.7, alpha=0.75)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
         fig.tight_layout()
         fig.savefig(out / "c2_ca_delta_h_branching_sensitivity_ci.png")
+        fig.savefig(out / "ca_c2_delta_h_branching_paper_ci.png")
         plt.close(fig)
 
     fig, ax1 = plt.subplots(figsize=(7.0, 3.4), dpi=150)
@@ -1546,6 +1525,37 @@ def _plot_c5(out: Path, run_rows: list[dict[str, Any]]) -> None:
     plt.close(fig)
 
 
+def _read_csv_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.exists() or path.stat().st_size <= 1:
+        return []
+    with path.open("r", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def _plot_c2_from_existing_tables(out: Path) -> dict[str, Any]:
+    scores_path = out / "c2_branching_scores.csv"
+    if not scores_path.exists():
+        scores_path = out / "c2_branching_window_scores.csv"
+    pair_path = out / "c2_branch_pair_scores.csv"
+    window_rows = _read_csv_rows(scores_path)
+    pair_rows = _read_csv_rows(pair_path)
+    if not window_rows:
+        raise FileNotFoundError(f"No C2 scores found for plots-only mode: {scores_path}")
+    _plot_c2(out, window_rows, pair_rows)
+    return {
+        "status": "ok",
+        "plots_only": True,
+        "scores": str(scores_path),
+        "pair_scores": str(pair_path) if pair_path.exists() else "",
+        "figures": [
+            str(out / "c2_ca_delta_h_branching_sensitivity.png"),
+            str(out / "c2_ca_delta_h_branching_sensitivity_ci.png"),
+            str(out / "ca_c2_delta_h_branching_paper.png"),
+            str(out / "ca_c2_delta_h_branching_paper_ci.png"),
+        ],
+    }
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1568,6 +1578,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=str, default=None, help="Default: <input-dir>/posthoc_claims.")
     parser.add_argument("--task", choices=["all", "c1", "c2", "c5"], default=None)
+    parser.add_argument("--plots-only", action="store_true", default=None, help="Only rebuild plots from existing posthoc CSV tables.")
     parser.add_argument("--backend", choices=["numpy", "jax"], default=None, help="Simulation backend for branch checks.")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--optimized-top-k", type=int, default=None)
@@ -1622,6 +1633,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "config": cfg,
         "available_completed_input_dirs": [str(path) for path in completed_dirs],
     }
+    if bool(cfg.get("plots_only", False)):
+        if cfg["task"] not in {"all", "c2"}:
+            raise ValueError("--plots-only currently supports task=all or task=c2 because only C2 has table-only plot rebuilds.")
+        summaries["c2"] = _plot_c2_from_existing_tables(output_dir)
+        write_json(output_dir / "ca_posthoc_claims_summary.json", summaries)
+        _log(f"CA MSPD posthoc plots-only done: {output_dir}")
+        print(json.dumps(summaries, indent=2, sort_keys=True))
+        return 0
     if cfg["task"] in {"all", "c1"}:
         _log(f"C1: optimized-vs-random MSPD contrast mode={cfg['c1_eval_mode']}")
         summaries["c1"] = run_c1(

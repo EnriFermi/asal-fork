@@ -1160,6 +1160,64 @@ def _plot_c2_branching_one(output_root: Path, figures: Path, *, suffix: str, lab
     contrasts = pd.read_csv(contrasts_path) if contrasts_path.exists() else pd.DataFrame()
     if scores.empty:
         return {}
+    if suffix == "_clip_chamfer" and {"delta_h", "branching_score"}.issubset(scores.columns):
+        rows: list[dict[str, Any]] = []
+        for _idx, row in scores.iterrows():
+            x = float(pd.to_numeric(pd.Series([row["delta_h"]]), errors="coerce").iloc[0])
+            y = float(pd.to_numeric(pd.Series([row["branching_score"]]), errors="coerce").iloc[0])
+            if not np.isfinite(x) or not np.isfinite(y):
+                continue
+            rows.append(
+                {
+                    "x": x,
+                    "y": y,
+                    "ci_low": y,
+                    "ci_high": y,
+                    "condition": str(row.get("condition", "sampled")).strip().lower(),
+                    "trajectory_id": _c2_trajectory_id(row),
+                    "n_pairs": _c2_int_or_zero(row.get("n_branch_pairs", 0)),
+                    "values": np.asarray([], dtype=np.float64),
+                }
+            )
+        if rows:
+            plt = _ensure_matplotlib()
+            style = {
+                "font.size": 11,
+                "axes.labelsize": 13,
+                "xtick.labelsize": 10,
+                "ytick.labelsize": 10,
+                "legend.fontsize": 10,
+                "legend.title_fontsize": 11,
+            }
+            with plt.rc_context(style):
+                fig, ax = plt.subplots(figsize=(5.8, 4.2), constrained_layout=True)
+                _draw_c2_pooled_paper_panel(ax, rows, ylabel="future divergence $B_b$", show_legend=True)
+                out = figures / "c2_branching_sensitivity_clip_chamfer.png"
+                out_corr = figures / "c2_delta_h_branching_correlation_clip_chamfer.png"
+                _save(fig, out)
+                _save(fig, out_corr)
+                plt.close(fig)
+
+                rhos = _c2_within_trajectory_rhos(rows)
+                combined = figures / "flow_c2_pooled_and_within_paper.png"
+                fig2, axes = plt.subplots(
+                    1,
+                    2,
+                    figsize=(10.8, 4.2),
+                    constrained_layout=True,
+                    gridspec_kw={"width_ratios": [1.45, 1.0]},
+                )
+                _draw_c2_pooled_paper_panel(axes[0], rows, ylabel="future divergence $B_b$", show_legend=True)
+                axes[0].text(-0.14, 1.04, "A", transform=axes[0].transAxes, fontsize=15, fontweight="bold", ha="left", va="bottom")
+                _draw_c2_within_paper_panel(axes[1], rhos)
+                axes[1].text(-0.14, 1.04, "B", transform=axes[1].transAxes, fontsize=15, fontweight="bold", ha="left", va="bottom")
+                _save(fig2, combined)
+                plt.close(fig2)
+            return {
+                "c2_branching_sensitivity_clip_chamfer": str(out),
+                "c2_delta_h_branching_correlation_clip_chamfer": str(out_corr),
+                "flow_c2_pooled_and_within_paper": str(combined),
+            }
     plt = _ensure_matplotlib()
     if contrasts.empty:
         fig, ax1 = plt.subplots(figsize=(5.2, 3.6))
@@ -1226,6 +1284,142 @@ def _plot_c2_branching_one(output_root: Path, figures: Path, *, suffix: str, lab
     }
 
 
+def _c2_trajectory_id(row: Any) -> str:
+    for col in ("traj_id", "source_trajectory_id", "trajectory_id", "source_traj_id", "run_id"):
+        try:
+            value = row.get(col, "")
+        except Exception:
+            value = ""
+        if str(value).strip():
+            return str(value)
+    return "trajectory"
+
+
+def _c2_int_or_zero(value: Any) -> int:
+    try:
+        parsed = float(value)
+    except Exception:
+        return 0
+    if not np.isfinite(parsed):
+        return 0
+    return int(parsed)
+
+
+def _draw_c2_pooled_paper_panel(ax: Any, rows: list[dict[str, Any]], *, ylabel: str, show_legend: bool) -> None:
+    x = np.asarray([row["x"] for row in rows], dtype=np.float64)
+    y = np.asarray([row["y"] for row in rows], dtype=np.float64)
+    palette = {"low": "#1f77b4", "mid": "#ff7f0e", "high": "#2ca02c", "sampled": "#8b5cf6"}
+    markers = {"low": "o", "mid": "s", "high": "^", "sampled": "o"}
+
+    for condition in ("low", "mid", "high", "sampled"):
+        cond_rows = [row for row in rows if row["condition"] == condition or (condition == "sampled" and row["condition"] not in palette)]
+        if not cond_rows:
+            continue
+        color = palette[condition]
+        marker = markers[condition]
+        xs = np.asarray([row["x"] for row in cond_rows], dtype=np.float64)
+        ys = np.asarray([row["y"] for row in cond_rows], dtype=np.float64)
+        lows = np.asarray([row["ci_low"] for row in cond_rows], dtype=np.float64)
+        highs = np.asarray([row["ci_high"] for row in cond_rows], dtype=np.float64)
+        yerr = np.vstack([np.maximum(0.0, ys - lows), np.maximum(0.0, highs - ys)])
+        ax.errorbar(
+            xs,
+            ys,
+            yerr=yerr,
+            fmt=marker,
+            linestyle="none",
+            markersize=5.2,
+            color=color,
+            markerfacecolor=color,
+            markeredgecolor=color,
+            ecolor=color,
+            elinewidth=0.9,
+            capsize=2.0,
+            alpha=0.72,
+            label=condition,
+        )
+
+    finite = np.isfinite(x) & np.isfinite(y)
+    x_f = x[finite]
+    y_f = y[finite]
+    if x_f.size >= 2 and float(np.nanstd(x_f)) > 1e-12:
+        coef = np.polyfit(x_f, y_f, deg=1)
+        x_grid = np.linspace(float(np.nanmin(x_f)), float(np.nanmax(x_f)), 160)
+        ax.plot(x_grid, coef[0] * x_grid + coef[1], color="#1f77b4", linewidth=1.5)
+
+    pearson = (
+        float(np.corrcoef(x_f, y_f)[0, 1])
+        if x_f.size >= 2 and float(np.nanstd(x_f)) > 1e-12 and float(np.nanstd(y_f)) > 1e-12
+        else float("nan")
+    )
+    spearman = _rank_correlation(x_f, y_f) if x_f.size >= 2 else float("nan")
+    ax.text(
+        0.03,
+        0.97,
+        f"n={x_f.size}, Pearson={pearson:.3f}\nSpearman={spearman:.3f}",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=10,
+    )
+    ax.set_xlabel("branch energy $E_b$")
+    ax.set_ylabel(ylabel)
+    if show_legend:
+        handles, labels = ax.get_legend_handles_labels()
+        keep = [(h, lab) for h, lab in zip(handles, labels, strict=True) if lab in {"low", "mid", "high"}]
+        if keep:
+            ax.legend([h for h, _lab in keep], [lab for _h, lab in keep], title="stratum", frameon=False, loc="lower right")
+    for spine in ax.spines.values():
+        spine.set_linewidth(0.9)
+
+
+def _c2_within_trajectory_rhos(rows: list[dict[str, Any]]) -> np.ndarray:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row.get("trajectory_id", "trajectory")), []).append(row)
+    rhos: list[float] = []
+    for group in grouped.values():
+        x = np.asarray([row["x"] for row in group], dtype=np.float64)
+        y = np.asarray([row["y"] for row in group], dtype=np.float64)
+        finite = np.isfinite(x) & np.isfinite(y)
+        x = x[finite]
+        y = y[finite]
+        if x.size < 3 or float(np.nanstd(x)) <= 1e-12 or float(np.nanstd(y)) <= 1e-12:
+            continue
+        rho = _rank_correlation(x, y)
+        if np.isfinite(rho):
+            rhos.append(float(rho))
+    return np.asarray(sorted(rhos), dtype=np.float64)
+
+
+def _draw_c2_within_paper_panel(ax: Any, rhos: np.ndarray) -> None:
+    rhos = np.asarray(rhos, dtype=np.float64)
+    rhos = rhos[np.isfinite(rhos)]
+    if rhos.size:
+        xs = np.arange(1, rhos.size + 1, dtype=np.int64)
+        ax.axhline(0.0, color="#1f77b4", linewidth=1.2)
+        ax.vlines(xs, 0.0, rhos, color="#1f77b4", linewidth=1.5)
+        ax.scatter(xs, rhos, s=42, color="#1f77b4", zorder=3)
+        ax.text(
+            0.04,
+            0.96,
+            f"{int(np.sum(rhos > 0))}/{rhos.size} positive\nmedian={float(np.nanmedian(rhos)):.3f}",
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=10,
+        )
+        ax.set_xlim(0.6, rhos.size + 0.4)
+        ax.set_xticks(xs)
+    else:
+        ax.axhline(0.0, color="#1f77b4", linewidth=1.2)
+        ax.text(0.04, 0.96, "no valid trajectories", transform=ax.transAxes, ha="left", va="top", fontsize=10)
+    ax.set_xlabel("source trajectory, sorted")
+    ax.set_ylabel(r"within-trajectory Spearman $\rho_i$")
+    for spine in ax.spines.values():
+        spine.set_linewidth(0.9)
+
+
 def _plot_c2_branching_ci_one(output_root: Path, figures: Path, *, suffix: str, label: str) -> dict[str, str]:
     scores_path = output_root / "c2_branching" / f"branching_scores{suffix}.csv"
     details_path = output_root / "c2_branching" / f"branching_pair_details{suffix}.csv"
@@ -1276,83 +1470,65 @@ def _plot_c2_branching_ci_one(output_root: Path, figures: Path, *, suffix: str, 
                 "y": y,
                 "ci_low": y if not np.isfinite(lo) else lo,
                 "ci_high": y if not np.isfinite(hi) else hi,
-                "condition": str(row.get("condition", "sampled")),
-                "n_pairs": int(vals.size) if vals.size else int(float(row.get("n_branch_pairs", 0) or 0)),
+                "condition": str(row.get("condition", "sampled")).strip().lower(),
+                "trajectory_id": _c2_trajectory_id(row),
+                "n_pairs": int(vals.size) if vals.size else _c2_int_or_zero(row.get("n_branch_pairs", 0)),
                 "values": vals,
             }
         )
     if not rows:
         return {}
 
-    x = np.asarray([row["x"] for row in rows], dtype=np.float64)
-    y = np.asarray([row["y"] for row in rows], dtype=np.float64)
-    lo = np.asarray([row["ci_low"] for row in rows], dtype=np.float64)
-    hi = np.asarray([row["ci_high"] for row in rows], dtype=np.float64)
-    yerr = np.vstack([np.maximum(0.0, y - lo), np.maximum(0.0, hi - y)])
-    palette = {"high": "#d62728", "mid": "#f58518", "low": "#4c78a8", "sampled": "#6f4e9b"}
-    colors = [palette.get(row["condition"], "#6f4e9b") for row in rows]
-    pearson = float(np.corrcoef(x, y)[0, 1]) if x.size >= 2 and float(np.nanstd(x)) > 1e-12 and float(np.nanstd(y)) > 1e-12 else float("nan")
-    spearman = _rank_correlation(x, y) if x.size >= 2 else float("nan")
-
     plt = _ensure_matplotlib()
-    fig, ax = plt.subplots(figsize=(7.0, 5.0), constrained_layout=True)
-    for row, color in zip(rows, colors):
-        ax.errorbar(
-            row["x"],
-            row["y"],
-            yerr=np.asarray([[max(0.0, row["y"] - row["ci_low"])], [max(0.0, row["ci_high"] - row["y"])]], dtype=np.float64),
-            fmt="o",
-            markersize=5,
-            color=color,
-            ecolor=color,
-            elinewidth=1.1,
-            capsize=3,
-            alpha=0.9,
-        )
-    span = max(float(np.ptp(x)), 1.0)
-    for row, color in zip(rows, colors):
-        vals = np.asarray(row["values"], dtype=np.float64)
-        vals = vals[np.isfinite(vals)]
-        if vals.size == 0:
-            continue
-        offsets = np.linspace(-0.0035, 0.0035, vals.size) * span
-        ax.scatter(np.full(vals.size, row["x"]) + offsets, vals, s=13, color=color, alpha=0.23, linewidth=0)
-    if x.size >= 2 and float(np.nanstd(x)) > 1e-12:
-        coef = np.polyfit(x, y, deg=1)
-        x_grid = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 160)
-        ax.plot(x_grid, coef[0] * x_grid + coef[1], color="#333333", linewidth=1.4)
-    ax.set_xlabel("Delta-H at branch time")
-    ax.set_ylabel("branch divergence")
-    ax.set_title(f"Delta-H vs future divergence with branch-pair CI\n{label}; Pearson r={pearson:.3g}, Spearman r={spearman:.3g}")
-    n_pairs = [int(row["n_pairs"]) for row in rows if int(row["n_pairs"]) > 0]
-    if n_pairs:
-        n_text = f"median n_pairs={np.median(n_pairs):.0f}"
-    else:
-        n_text = "CI from score table"
-    ax.text(
-        0.02,
-        0.02,
-        f"error bars: bootstrap 95% CI of point mean; {n_text}",
-        transform=ax.transAxes,
-        ha="left",
-        va="bottom",
-        fontsize=9,
-        bbox={"facecolor": "white", "edgecolor": "#cccccc", "alpha": 0.92, "pad": 3},
-    )
-    ax.grid(color="#dddddd", linewidth=0.7, alpha=0.75)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
     tag = suffix.lstrip("_")
     name_suffix = f"_{tag}" if tag else ""
-    out = figures / f"c2_delta_h_branching_correlation_ci{name_suffix}.png"
-    _save(fig, out)
-    alias = figures / f"c2_branching_sensitivity_ci{name_suffix}.png"
-    _save(fig, alias)
-    plt.close(fig)
     key_suffix = f"_{tag}" if tag else ""
+
+    style = {
+        "font.size": 11,
+        "axes.labelsize": 13,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+        "legend.fontsize": 10,
+        "legend.title_fontsize": 11,
+    }
+    with plt.rc_context(style):
+        fig, ax = plt.subplots(figsize=(5.8, 4.2), constrained_layout=True)
+        _draw_c2_pooled_paper_panel(ax, rows, ylabel="future divergence $B_b$", show_legend=True)
+        out = figures / f"c2_delta_h_branching_correlation_ci{name_suffix}.png"
+        _save(fig, out)
+        alias = figures / f"c2_branching_sensitivity_ci{name_suffix}.png"
+        _save(fig, alias)
+        plt.close(fig)
+
+        rhos = _c2_within_trajectory_rhos(rows)
+        combined = figures / f"c2_flow_lenia_pooled_and_within_ci{name_suffix}.png"
+        fig2, axes = plt.subplots(
+            1,
+            2,
+            figsize=(10.8, 4.2),
+            constrained_layout=True,
+            gridspec_kw={"width_ratios": [1.45, 1.0]},
+        )
+        _draw_c2_pooled_paper_panel(axes[0], rows, ylabel="future divergence $B_b$", show_legend=True)
+        axes[0].text(-0.14, 1.04, "A", transform=axes[0].transAxes, fontsize=15, fontweight="bold", ha="left", va="bottom")
+        _draw_c2_within_paper_panel(axes[1], rhos)
+        axes[1].text(-0.14, 1.04, "B", transform=axes[1].transAxes, fontsize=15, fontweight="bold", ha="left", va="bottom")
+        _save(fig2, combined)
+        outputs = {
+            f"c2_delta_h_branching_correlation_ci{key_suffix}": str(out),
+            f"c2_branching_sensitivity_ci{key_suffix}": str(alias),
+            f"c2_flow_lenia_pooled_and_within_ci{key_suffix}": str(combined),
+        }
+        if suffix == "_clip_chamfer":
+            paper_alias = figures / "flow_c2_pooled_and_within_paper_ci.png"
+            _save(fig2, paper_alias)
+            outputs["flow_c2_pooled_and_within_paper_ci"] = str(paper_alias)
+        plt.close(fig2)
     return {
         f"c2_delta_h_branching_correlation_ci{key_suffix}": str(out),
         f"c2_branching_sensitivity_ci{key_suffix}": str(alias),
+        **outputs,
     }
 
 
