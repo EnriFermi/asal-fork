@@ -1659,18 +1659,30 @@ def _pairwise_future_field_divergence(
     if len(fields) < 2:
         return float("nan"), {"metric": "future_apf_multiscale_l2", "n_branches": len(fields), "n_pairs": 0}
     pair_vals = []
+    pair_records: list[dict[str, Any]] = []
     key_vals: dict[str, list[float]] = {key: [] for key in weights}
     for i, j in combinations(range(len(fields)), 2):
         common = [key for key in weights if key in fields[i] and key in fields[j]]
         weighted = []
+        component_vals: dict[str, float] = {}
         for key in common:
             d = _field_l2(fields[i][key], fields[j][key], scales=scales)
             if np.isfinite(d):
                 key_vals[key].append(d)
+                component_vals[f"{key}_divergence"] = float(d)
                 weighted.append(float(weights[key]) * d)
         if weighted:
             denom = sum(float(weights[key]) for key in common)
-            pair_vals.append(float(sum(weighted) / max(denom, 1e-12)))
+            pair_score = float(sum(weighted) / max(denom, 1e-12))
+            pair_vals.append(pair_score)
+            pair_records.append(
+                {
+                    "branch_dir_i": str(used_dirs[i]),
+                    "branch_dir_j": str(used_dirs[j]),
+                    "pairwise_branching_score": pair_score,
+                    **component_vals,
+                }
+            )
     score = float(np.mean(pair_vals)) if pair_vals else float("nan")
     detail: dict[str, Any] = {
         "metric": "future_apf_multiscale_l2",
@@ -1683,6 +1695,7 @@ def _pairwise_future_field_divergence(
     for key, vals in key_vals.items():
         if vals:
             detail[f"{key}_divergence"] = float(np.mean(vals))
+    detail["_pair_records"] = pair_records
     return score, detail
 
 
@@ -1801,6 +1814,7 @@ def _pairwise_future_clip_chamfer_divergence(
 ) -> tuple[float, dict[str, Any]]:
     embeddings: list[np.ndarray] = []
     cache_paths: list[str] = []
+    used_dirs: list[Path] = []
     for branch_dir in branch_dirs:
         try:
             z, cache_path = _load_or_compute_branch_clip_embeddings(
@@ -1814,15 +1828,24 @@ def _pairwise_future_clip_chamfer_divergence(
             )
             embeddings.append(z)
             cache_paths.append(str(cache_path))
+            used_dirs.append(branch_dir)
         except Exception:
             continue
     if len(embeddings) < 2:
         return float("nan"), {"metric": "future_clip_chamfer_cosine", "n_branches": len(embeddings), "n_pairs": 0}
     pair_vals = []
+    pair_records: list[dict[str, Any]] = []
     for i, j in combinations(range(len(embeddings)), 2):
         d = _embedding_chamfer_cosine(embeddings[i], embeddings[j])
         if np.isfinite(d):
             pair_vals.append(float(d))
+            pair_records.append(
+                {
+                    "branch_dir_i": str(used_dirs[i]),
+                    "branch_dir_j": str(used_dirs[j]),
+                    "pairwise_branching_score": float(d),
+                }
+            )
     score = float(np.mean(pair_vals)) if pair_vals else float("nan")
     return score, {
         "metric": "future_clip_chamfer_cosine",
@@ -1831,6 +1854,7 @@ def _pairwise_future_clip_chamfer_divergence(
         "foundation_model": str(foundation_model),
         "max_future_frames": int(max_frames),
         "clip_embedding_cache_n": len(cache_paths),
+        "_pair_records": pair_records,
     }
 
 
@@ -1861,6 +1885,20 @@ def _pearson_corr(x: np.ndarray, y: np.ndarray) -> float:
     if sx <= 1e-12 or sy <= 1e-12:
         return float("nan")
     return float(np.corrcoef(xx, yy)[0, 1])
+
+
+def _bootstrap_mean_ci(values: list[float] | np.ndarray, *, n_boot: int = 2000, seed: int = 9173) -> tuple[float, float]:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float("nan"), float("nan")
+    if arr.size == 1:
+        value = float(arr[0])
+        return value, value
+    rng = np.random.default_rng(int(seed))
+    idx = rng.integers(0, arr.size, size=(int(n_boot), arr.size))
+    stats = np.mean(arr[idx], axis=1)
+    return float(np.nanpercentile(stats, 2.5)), float(np.nanpercentile(stats, 97.5))
 
 
 def _branching_correlation_summary(score_rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1943,6 +1981,7 @@ def metrics(
     log_event(f"C2 branching metrics loaded n_plan_rows={len(plan_rows)} n_groups={len(groups)}", component="c2-branch")
 
     score_rows: list[dict[str, Any]] = []
+    pair_detail_rows: list[dict[str, Any]] = []
     group_items = sorted(groups.items())
     for group_idx, ((traj_id, pair_id, condition), rows) in enumerate(group_items, start=1):
         if group_idx == 1 or group_idx == len(group_items) or group_idx % 5 == 0:
@@ -2001,25 +2040,51 @@ def metrics(
             continue
         if not used:
             used = rows
+        pair_records = list(detail.pop("_pair_records", []))
+        pair_values = [
+            float(record.get("pairwise_branching_score", "nan"))
+            for record in pair_records
+            if np.isfinite(float(record.get("pairwise_branching_score", "nan")))
+        ]
+        ci_low, ci_high = _bootstrap_mean_ci(pair_values)
         delta_h_vals = [float(row.get("delta_h", "nan")) for row in used]
         step_vals = [float(row.get("step", "nan")) for row in used]
+        delta_h_value = float(np.nanmedian(delta_h_vals))
+        step_value = float(np.nanmedian(step_vals))
         row_out = {
             "traj_id": traj_id,
             "pair_id": int(float(pair_id)),
             "condition": condition,
-            "step": float(np.nanmedian(step_vals)),
-            "delta_h": float(np.nanmedian(delta_h_vals)),
+            "step": step_value,
+            "delta_h": delta_h_value,
             "branching_score": float(score),
+            "branching_score_ci_low": ci_low,
+            "branching_score_ci_high": ci_high,
+            "branching_score_pair_median": float(np.nanmedian(pair_values)) if pair_values else float("nan"),
+            "branching_score_pair_std": float(np.nanstd(pair_values, ddof=1)) if len(pair_values) >= 2 else float("nan"),
             "branching_metric": metric_name,
             "used_debug_feature_fallback": bool(fallback_used),
             "n_branches": int(detail.get("n_branches", len(used))),
             "n_branch_pairs": int(detail.get("n_pairs", 0)),
         }
         for key, value in detail.items():
-            if key in row_out:
+            if key in row_out or str(key).startswith("_"):
                 continue
             row_out[str(key)] = value
         score_rows.append(row_out)
+        for pair_index, record in enumerate(pair_records):
+            pair_detail_rows.append(
+                {
+                    "traj_id": traj_id,
+                    "pair_id": int(float(pair_id)),
+                    "condition": condition,
+                    "step": step_value,
+                    "delta_h": delta_h_value,
+                    "branching_metric": metric_name,
+                    "pair_index": int(pair_index),
+                    **record,
+                }
+            )
 
     contrast_rows: list[dict[str, Any]] = []
     by_pair: dict[tuple[str, int], dict[str, dict[str, Any]]] = {}
@@ -2047,10 +2112,12 @@ def metrics(
 
     suffix = "" if metric_mode == "apf" else f"_{metric_mode}"
     scores_path = out_dir / f"branching_scores{suffix}.csv"
+    pair_details_path = out_dir / f"branching_pair_details{suffix}.csv"
     contrasts_path = out_dir / f"branching_pair_contrasts{suffix}.csv"
     correlation_path = out_dir / f"branching_delta_h_correlation{suffix}.csv"
     correlation_summary = _branching_correlation_summary(score_rows)
     write_csv(scores_path, score_rows)
+    write_csv(pair_details_path, pair_detail_rows)
     write_csv(contrasts_path, contrast_rows)
     write_csv(correlation_path, [correlation_summary])
     summary = {
@@ -2061,6 +2128,7 @@ def metrics(
         "branching_sign_test": sign_test_greater(row["delta_branching_score"] for row in contrast_rows),
         "branching_delta_h_correlation": correlation_summary,
         "scores": str(scores_path),
+        "pair_details": str(pair_details_path),
         "contrasts": str(contrasts_path),
         "correlation": str(correlation_path),
     }

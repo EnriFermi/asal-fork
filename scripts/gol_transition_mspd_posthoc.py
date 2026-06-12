@@ -821,6 +821,20 @@ def _simulate_branches(
     return simulate_lifelike_rule_batch(boards, rules, int(horizon), backend=backend)
 
 
+def _bootstrap_mean_ci(values: list[float] | np.ndarray, *, n_boot: int = 2000, seed: int = 8123) -> tuple[float, float]:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float("nan"), float("nan")
+    if arr.size == 1:
+        value = float(arr[0])
+        return value, value
+    rng = np.random.default_rng(int(seed))
+    idx = rng.integers(0, arr.size, size=(int(n_boot), arr.size))
+    stats = np.mean(arr[idx], axis=1)
+    return float(np.nanpercentile(stats, 2.5)), float(np.nanpercentile(stats, 97.5))
+
+
 def run_c2(
     loaded: LoadedCAResult,
     output_dir: Path,
@@ -914,6 +928,7 @@ def run_c2(
                     }
                 )
         pair_arr = np.asarray(pair_vals, dtype=np.float64)
+        ci_low, ci_high = _bootstrap_mean_ci(pair_arr)
         window_rows.append(
             {
                 "claim": "C2",
@@ -925,6 +940,10 @@ def run_c2(
                 "window_center_t": int(loaded.config.burn_in + int(window_idx) * int(loaded.config.window_step) + int(loaded.config.window_size) // 2),
                 "delta_h": float(loaded.best_delta_h[int(window_idx)]),
                 "branching_score": float(np.mean(pair_arr)) if pair_arr.size else float("nan"),
+                "branching_score_ci_low": ci_low,
+                "branching_score_ci_high": ci_high,
+                "branching_score_pair_median": float(np.nanmedian(pair_arr)) if pair_arr.size else float("nan"),
+                "branching_score_pair_std": float(np.nanstd(pair_arr, ddof=1)) if pair_arr.size >= 2 else float("nan"),
                 "branching_metric": "pairwise_future_hamming",
                 "mean_branch_vs_original_hamming": float(np.mean(original_vals)) if original_vals.size else float("nan"),
                 "std_branch_vs_original_hamming": float(np.std(original_vals, ddof=0)) if original_vals.size else float("nan"),
@@ -958,7 +977,7 @@ def run_c2(
     write_csv(out / "c2_branch_pair_scores.csv", pair_rows)
     write_csv(out / "c2_delta_h_correlation.csv", [corr])
     write_json(out / "c2_branching_metrics_summary.json", summary)
-    _plot_c2(out, window_rows)
+    _plot_c2(out, window_rows, pair_rows)
     return summary
 
 
@@ -1403,7 +1422,7 @@ def _plot_c1(out: Path, rule_level_rows: list[dict[str, Any]], contrast_rows: li
         plt.close(fig)
 
 
-def _plot_c2(out: Path, window_rows: list[dict[str, Any]]) -> None:
+def _plot_c2(out: Path, window_rows: list[dict[str, Any]], pair_rows: list[dict[str, Any]] | None = None) -> None:
     plt = _matplotlib()
     x = np.asarray([row["delta_h"] for row in window_rows], dtype=np.float64)
     score_key = "branching_score" if window_rows and "branching_score" in window_rows[0] else "mean_future_hamming"
@@ -1420,6 +1439,76 @@ def _plot_c2(out: Path, window_rows: list[dict[str, Any]]) -> None:
     fig.tight_layout()
     fig.savefig(out / "c2_ca_delta_h_branching_sensitivity.png")
     plt.close(fig)
+
+    pair_rows = pair_rows or []
+    by_window: dict[int, list[float]] = {}
+    for row in pair_rows:
+        try:
+            window_idx = int(row["window_idx"])
+            value = float(row.get("pairwise_future_hamming", "nan"))
+        except (TypeError, ValueError, KeyError):
+            continue
+        if np.isfinite(value):
+            by_window.setdefault(window_idx, []).append(value)
+    if by_window:
+        lows: list[float] = []
+        highs: list[float] = []
+        n_pairs: list[int] = []
+        values_for_rows: list[list[float]] = []
+        for row in window_rows:
+            vals = by_window.get(int(row["window_idx"]), [])
+            values_for_rows.append(vals)
+            lo, hi = _bootstrap_mean_ci(vals)
+            center = float(row[score_key])
+            lows.append(center if not np.isfinite(lo) else lo)
+            highs.append(center if not np.isfinite(hi) else hi)
+            n_pairs.append(len(vals))
+        lo_arr = np.asarray(lows, dtype=np.float64)
+        hi_arr = np.asarray(highs, dtype=np.float64)
+        yerr = np.vstack([np.maximum(0.0, y - lo_arr), np.maximum(0.0, hi_arr - y)])
+        fig, ax = plt.subplots(figsize=(6.2, 4.4), dpi=150)
+        ax.errorbar(
+            x,
+            y,
+            yerr=yerr,
+            fmt="o",
+            markersize=4.5,
+            color="#7c3aed",
+            ecolor="#7c3aed",
+            elinewidth=1.2,
+            capsize=3,
+            alpha=0.92,
+            label="window mean +/- bootstrap 95% CI",
+        )
+        if x.size >= 2 and np.std(x) > 0.0:
+            coeff = np.polyfit(x, y, deg=1)
+            xs = np.linspace(float(np.min(x)), float(np.max(x)), 100)
+            ax.plot(xs, coeff[0] * xs + coeff[1], color="#111827", linewidth=1.2)
+        span = max(float(np.ptp(x)), 1.0)
+        for xi, vals in zip(x, values_for_rows):
+            if not vals:
+                continue
+            offsets = np.linspace(-0.004, 0.004, len(vals)) * span
+            ax.scatter(np.full(len(vals), xi) + offsets, vals, s=12, color="#a78bfa", alpha=0.35, linewidth=0)
+        ax.set_xlabel("Delta-H")
+        ax.set_ylabel("pairwise future Hamming divergence")
+        ax.set_title("C2 CA Delta-H vs perturbation sensitivity\nwith branch-pair bootstrap intervals")
+        ax.text(
+            0.02,
+            0.02,
+            f"error bars use raw branch pairs per window; median n_pairs={np.median(n_pairs):.0f}",
+            transform=ax.transAxes,
+            ha="left",
+            va="bottom",
+            fontsize=8,
+            bbox={"facecolor": "white", "edgecolor": "#dddddd", "alpha": 0.92, "pad": 3},
+        )
+        ax.grid(color="#dddddd", linewidth=0.7, alpha=0.75)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        fig.tight_layout()
+        fig.savefig(out / "c2_ca_delta_h_branching_sensitivity_ci.png")
+        plt.close(fig)
 
     fig, ax1 = plt.subplots(figsize=(7.0, 3.4), dpi=150)
     ordered = sorted(window_rows, key=lambda row: int(row["window_idx"]))

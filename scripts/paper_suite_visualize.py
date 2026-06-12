@@ -87,6 +87,29 @@ def _median_or_nan(values: Any) -> float:
     return float(np.nanmedian(arr)) if arr.size else float("nan")
 
 
+def _bootstrap_ci(
+    values: Any,
+    *,
+    statistic: str = "mean",
+    n_boot: int = 2000,
+    seed: int = 91421,
+) -> tuple[float, float]:
+    arr = _finite_array(values)
+    if arr.size == 0:
+        return float("nan"), float("nan")
+    if arr.size == 1:
+        value = float(arr[0])
+        return value, value
+    rng = np.random.default_rng(int(seed))
+    idx = rng.integers(0, arr.size, size=(int(n_boot), arr.size))
+    samples = arr[idx]
+    if statistic == "median":
+        stats = np.nanmedian(samples, axis=1)
+    else:
+        stats = np.nanmean(samples, axis=1)
+    return float(np.nanpercentile(stats, 2.5)), float(np.nanpercentile(stats, 97.5))
+
+
 def _mad_or_eps(values: Any, eps: float = 1e-12) -> float:
     arr = _finite_array(values)
     if arr.size == 0:
@@ -215,6 +238,92 @@ def _plot_synthetic(output_root: Path, figures: Path) -> dict[str, str]:
         plt.close(fig)
         out_paths["synthetic_decomposition_grid"] = str(decomp)
     return out_paths
+
+
+def _plot_synthetic_tau_ci(output_root: Path, figures: Path) -> dict[str, str]:
+    tau = _synthetic_table(output_root, "tau_profiles")
+    if tau.empty or not {"family", "tau_steps", "score_by_tau"}.issubset(tau.columns):
+        return {}
+    families = [f for f in _FAMILY_ORDER if f in set(tau["family"].astype(str))]
+    if not families:
+        return {}
+    plt = _ensure_matplotlib()
+    n_cols = 4 if len(families) >= 4 else max(1, len(families))
+    n_rows = int(np.ceil(len(families) / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.2 * n_cols, 2.45 * n_rows), squeeze=False, constrained_layout=True)
+    for ax in axes.ravel()[len(families):]:
+        ax.axis("off")
+    for idx, family in enumerate(families):
+        ax = axes.ravel()[idx]
+        sub = tau[tau["family"].astype(str) == family].copy()
+        rows: list[dict[str, float]] = []
+        for tau_steps, group in sub.groupby("tau_steps", sort=True):
+            vals = pd.to_numeric(group["score_by_tau"], errors="coerce").to_numpy(dtype=np.float64)
+            vals = vals[np.isfinite(vals)]
+            if vals.size == 0:
+                continue
+            lo, hi = _bootstrap_ci(vals, statistic="median", seed=91000 + idx * 1009 + int(float(tau_steps)))
+            rows.append(
+                {
+                    "tau_steps": float(tau_steps),
+                    "median": float(np.nanmedian(vals)),
+                    "ci_low": lo,
+                    "ci_high": hi,
+                    "n": float(vals.size),
+                }
+            )
+        if not rows:
+            ax.axis("off")
+            continue
+        g = pd.DataFrame(rows).sort_values("tau_steps")
+        x = g["tau_steps"].to_numpy(dtype=np.float64)
+        y = g["median"].to_numpy(dtype=np.float64)
+        lo = g["ci_low"].to_numpy(dtype=np.float64)
+        hi = g["ci_high"].to_numpy(dtype=np.float64)
+        ax.plot(x, y, marker="o", color="#1f77b4", linewidth=1.4, markersize=4)
+        if np.any(np.isfinite(lo)) and np.any(np.isfinite(hi)):
+            ax.fill_between(x, lo, hi, color="#1f77b4", alpha=0.18, linewidth=0)
+            ax.errorbar(
+                x,
+                y,
+                yerr=np.vstack([np.maximum(0.0, y - lo), np.maximum(0.0, hi - y)]),
+                fmt="none",
+                ecolor="#1f77b4",
+                elinewidth=0.8,
+                capsize=2,
+                alpha=0.65,
+            )
+        ax.set_xscale("log")
+        _maybe_log_y(ax, np.concatenate([y, lo, hi]))
+        ax.set_title(family)
+        ax.set_xlabel("tau")
+        if idx % n_cols == 0:
+            ax.set_ylabel("MSPD score")
+        n_min = int(np.nanmin(g["n"].to_numpy(dtype=np.float64)))
+        n_max = int(np.nanmax(g["n"].to_numpy(dtype=np.float64)))
+        ax.text(
+            0.03,
+            0.97,
+            f"n={n_min}" if n_min == n_max else f"n={n_min}-{n_max}",
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=8,
+            bbox={"facecolor": "white", "edgecolor": "#dddddd", "alpha": 0.85, "pad": 2},
+        )
+        ax.grid(color="#dddddd", linewidth=0.6, alpha=0.7)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+    fig.suptitle("N0 MSPD by tau with bootstrap 95% intervals", fontsize=13)
+    out = figures / "synthetic_mspd_tau_ci.png"
+    _save(fig, out)
+    alias = figures / "synthetic_tau_mspd_confidence_intervals.png"
+    _save(fig, alias)
+    plt.close(fig)
+    return {
+        "synthetic_mspd_tau_ci": str(out),
+        "synthetic_tau_mspd_confidence_intervals": str(alias),
+    }
 
 
 def _plot_synthetic_summary_clean(output_root: Path, figures: Path) -> dict[str, str]:
@@ -1117,10 +1226,142 @@ def _plot_c2_branching_one(output_root: Path, figures: Path, *, suffix: str, lab
     }
 
 
+def _plot_c2_branching_ci_one(output_root: Path, figures: Path, *, suffix: str, label: str) -> dict[str, str]:
+    scores_path = output_root / "c2_branching" / f"branching_scores{suffix}.csv"
+    details_path = output_root / "c2_branching" / f"branching_pair_details{suffix}.csv"
+    if not scores_path.exists() or scores_path.stat().st_size <= 1:
+        return {}
+    scores = pd.read_csv(scores_path)
+    if scores.empty or not {"delta_h", "branching_score"}.issubset(scores.columns):
+        return {}
+    details = pd.read_csv(details_path) if details_path.exists() and details_path.stat().st_size > 1 else pd.DataFrame()
+    value_col = ""
+    for col in ("pairwise_branching_score", "pairwise_future_hamming", "branching_score"):
+        if col in details.columns:
+            value_col = col
+            break
+    if details.empty and not {"branching_score_ci_low", "branching_score_ci_high"}.issubset(scores.columns):
+        _record_skip(f"c2_branching_ci{suffix}", f"missing raw pair details {details_path}")
+        return {}
+
+    key_cols = [col for col in ("traj_id", "pair_id", "condition") if col in scores.columns and col in details.columns]
+    detail_groups: dict[tuple[Any, ...], np.ndarray] = {}
+    if not details.empty and value_col:
+        group_iter = details.groupby(key_cols, dropna=False) if key_cols else [((), details)]
+        for key, group in group_iter:
+            if not isinstance(key, tuple):
+                key = (key,)
+            vals = pd.to_numeric(group[value_col], errors="coerce").to_numpy(dtype=np.float64)
+            detail_groups[tuple(str(part) for part in key)] = vals[np.isfinite(vals)]
+
+    rows: list[dict[str, Any]] = []
+    for idx, row in scores.iterrows():
+        try:
+            x = float(row["delta_h"])
+            y = float(row["branching_score"])
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(x) or not np.isfinite(y):
+            continue
+        key = tuple(str(row[col]) for col in key_cols) if key_cols else ()
+        vals = detail_groups.get(key, np.asarray([], dtype=np.float64))
+        if vals.size:
+            lo, hi = _bootstrap_ci(vals, statistic="mean", seed=99173 + int(idx))
+        else:
+            lo = float(row.get("branching_score_ci_low", y))
+            hi = float(row.get("branching_score_ci_high", y))
+        rows.append(
+            {
+                "x": x,
+                "y": y,
+                "ci_low": y if not np.isfinite(lo) else lo,
+                "ci_high": y if not np.isfinite(hi) else hi,
+                "condition": str(row.get("condition", "sampled")),
+                "n_pairs": int(vals.size) if vals.size else int(float(row.get("n_branch_pairs", 0) or 0)),
+                "values": vals,
+            }
+        )
+    if not rows:
+        return {}
+
+    x = np.asarray([row["x"] for row in rows], dtype=np.float64)
+    y = np.asarray([row["y"] for row in rows], dtype=np.float64)
+    lo = np.asarray([row["ci_low"] for row in rows], dtype=np.float64)
+    hi = np.asarray([row["ci_high"] for row in rows], dtype=np.float64)
+    yerr = np.vstack([np.maximum(0.0, y - lo), np.maximum(0.0, hi - y)])
+    palette = {"high": "#d62728", "mid": "#f58518", "low": "#4c78a8", "sampled": "#6f4e9b"}
+    colors = [palette.get(row["condition"], "#6f4e9b") for row in rows]
+    pearson = float(np.corrcoef(x, y)[0, 1]) if x.size >= 2 and float(np.nanstd(x)) > 1e-12 and float(np.nanstd(y)) > 1e-12 else float("nan")
+    spearman = _rank_correlation(x, y) if x.size >= 2 else float("nan")
+
+    plt = _ensure_matplotlib()
+    fig, ax = plt.subplots(figsize=(7.0, 5.0), constrained_layout=True)
+    for row, color in zip(rows, colors):
+        ax.errorbar(
+            row["x"],
+            row["y"],
+            yerr=np.asarray([[max(0.0, row["y"] - row["ci_low"])], [max(0.0, row["ci_high"] - row["y"])]], dtype=np.float64),
+            fmt="o",
+            markersize=5,
+            color=color,
+            ecolor=color,
+            elinewidth=1.1,
+            capsize=3,
+            alpha=0.9,
+        )
+    span = max(float(np.ptp(x)), 1.0)
+    for row, color in zip(rows, colors):
+        vals = np.asarray(row["values"], dtype=np.float64)
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            continue
+        offsets = np.linspace(-0.0035, 0.0035, vals.size) * span
+        ax.scatter(np.full(vals.size, row["x"]) + offsets, vals, s=13, color=color, alpha=0.23, linewidth=0)
+    if x.size >= 2 and float(np.nanstd(x)) > 1e-12:
+        coef = np.polyfit(x, y, deg=1)
+        x_grid = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 160)
+        ax.plot(x_grid, coef[0] * x_grid + coef[1], color="#333333", linewidth=1.4)
+    ax.set_xlabel("Delta-H at branch time")
+    ax.set_ylabel("branch divergence")
+    ax.set_title(f"Delta-H vs future divergence with branch-pair CI\n{label}; Pearson r={pearson:.3g}, Spearman r={spearman:.3g}")
+    n_pairs = [int(row["n_pairs"]) for row in rows if int(row["n_pairs"]) > 0]
+    if n_pairs:
+        n_text = f"median n_pairs={np.median(n_pairs):.0f}"
+    else:
+        n_text = "CI from score table"
+    ax.text(
+        0.02,
+        0.02,
+        f"error bars: bootstrap 95% CI of point mean; {n_text}",
+        transform=ax.transAxes,
+        ha="left",
+        va="bottom",
+        fontsize=9,
+        bbox={"facecolor": "white", "edgecolor": "#cccccc", "alpha": 0.92, "pad": 3},
+    )
+    ax.grid(color="#dddddd", linewidth=0.7, alpha=0.75)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    tag = suffix.lstrip("_")
+    name_suffix = f"_{tag}" if tag else ""
+    out = figures / f"c2_delta_h_branching_correlation_ci{name_suffix}.png"
+    _save(fig, out)
+    alias = figures / f"c2_branching_sensitivity_ci{name_suffix}.png"
+    _save(fig, alias)
+    plt.close(fig)
+    key_suffix = f"_{tag}" if tag else ""
+    return {
+        f"c2_delta_h_branching_correlation_ci{key_suffix}": str(out),
+        f"c2_branching_sensitivity_ci{key_suffix}": str(alias),
+    }
+
+
 def _plot_c2_branching(output_root: Path, figures: Path) -> dict[str, str]:
     paths: dict[str, str] = {}
     paths.update(_plot_c2_branching_one(output_root, figures, suffix="", label="APF multiscale L2"))
+    paths.update(_plot_c2_branching_ci_one(output_root, figures, suffix="", label="APF multiscale L2"))
     paths.update(_plot_c2_branching_one(output_root, figures, suffix="_clip_chamfer", label="CLIP Chamfer"))
+    paths.update(_plot_c2_branching_ci_one(output_root, figures, suffix="_clip_chamfer", label="CLIP Chamfer"))
     return paths
 
 
@@ -1516,6 +1757,7 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
     log_event(f"visualization start task={task} smoke={smoke} force={force} figures={figures}", component="visualization")
     if task in {"all", "synthetic"}:
         paths.update(_plot_synthetic(output_root, figures))
+        paths.update(_plot_synthetic_tau_ci(output_root, figures))
         paths.update(_plot_synthetic_summary_clean(output_root, figures))
         paths.update(_plot_synthetic_delta_h_heatmaps_clean(output_root, figures))
         synthetic_result = visualize_synthetic(config_path, smoke=smoke, force=force)
