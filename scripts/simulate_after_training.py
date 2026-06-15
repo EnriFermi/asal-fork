@@ -244,7 +244,14 @@ def main(cfg, args):
     )
 
     # Streaming writer for 'video': compute frames in jitted microbatches and append
+    video_stride = int(getattr(args, "video_stride", getattr(args, "frame_stride", 1)))
+    if video_stride < 1:
+        raise ValueError(f"simulation.video_stride must be >= 1, got {video_stride}.")
+    out_dir = os.path.dirname(str(args.output))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     writer = imageio.get_writer(args.output, fps=args.fps, codec=args.codec, macro_block_size=args.macro_block_size)
+    frames_written = 0
     try:
         s = state0
         mass_total = []
@@ -252,7 +259,7 @@ def main(cfg, args):
         p_max_mean = []
         steps_done = 0
         with tqdm() as pbar:
-            print(args.batch_steps, args.max_steps)
+            print(args.batch_steps, args.max_steps, f"video_stride={video_stride}")
             while args.max_steps is None or steps_done < args.max_steps:
                 outer_b = args.batch_steps if args.max_steps is None else min(args.batch_steps, args.max_steps - steps_done)
                 remaining = outer_b
@@ -268,9 +275,12 @@ def main(cfg, args):
 
                     for i_frame in range(batch_u8.shape[0]):
                         frame_u8 = batch_u8[i_frame]
-                        writer.append_data(frame_u8)
+                        global_step = steps_done + i_frame + 1
+                        is_final_frame = args.max_steps is not None and global_step >= int(args.max_steps)
+                        if global_step % video_stride == 0 or is_final_frame:
+                            writer.append_data(frame_u8)
+                            frames_written += 1
 
-                        global_step = steps_done + i_frame
                         if track_mass:
                             mchs = batch_masses[i_frame]
                             for c in range(mass_channels_count):
@@ -315,7 +325,10 @@ def main(cfg, args):
         print("Interrupted by user; finalizing video...")
     finally:
         writer.close()
-        print(f"Saved simulation to {args.output} (best fitness: {np.array(best_fitness).item():.4f})")
+        print(
+            f"Saved simulation to {args.output} with {frames_written} frames "
+            f"(best fitness: {np.array(best_fitness).item():.4f})"
+        )
         # save mass plot
         if track_mass and len(mass_total) > 0 and getattr(args, "mass_plot", None):
             try:

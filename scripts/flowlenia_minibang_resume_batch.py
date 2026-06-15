@@ -133,8 +133,22 @@ def _prepare_job(raw: dict[str, Any], *, overwrite: bool) -> dict[str, Any]:
 
     original_batch_size = int(_scalar(snapshot, "resume_batch_size", 1))
     original_batch_index = int(_scalar(snapshot, "resume_batch_index", 0))
-    snapshot_interval = int(_scalar(snapshot, "resume_snapshot_interval", _get(args, "snapshot_interval", 100)))
-    jit_microbatch = int(_scalar(snapshot, "resume_jit_microbatch", _get(args, "jit_microbatch", snapshot_interval)))
+    snapshot_interval = int(
+        raw.get(
+            "snapshot_interval",
+            _scalar(snapshot, "resume_snapshot_interval", _get(args, "snapshot_interval", 100)),
+        )
+    )
+    if snapshot_interval < 1:
+        raise ValueError(f"snapshot_interval must be >= 1, got {snapshot_interval}.")
+    jit_microbatch = int(
+        raw.get(
+            "jit_microbatch",
+            _scalar(snapshot, "resume_jit_microbatch", _get(args, "jit_microbatch", snapshot_interval)),
+        )
+    )
+    if jit_microbatch < 1:
+        raise ValueError(f"jit_microbatch must be >= 1, got {jit_microbatch}.")
     horizon_steps = int(end_step) - int(start_step)
     config_sig = _stable_json(flat_args)
     shape_sig = {

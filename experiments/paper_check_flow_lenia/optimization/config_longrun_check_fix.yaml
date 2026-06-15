@@ -9,7 +9,7 @@ substrate:
   C: 3
   k: 9
   kernel_components: 3
-  M: "2,1,0;0,2,1;1,0,2"
+  M: 2,1,0;0,2,1;1,0,2
   dd: 5
   dt: 0.2
   sigma: 0.65
@@ -79,9 +79,6 @@ metric:
   metric_range_end_steps: 300000
   metric_window_size_frames: null
   metric_window_step_frames: null
-  # metric_tau_frames: null
-
-  # DeltaH_s settings
   metric_m_samples: 48
   metric_m_min: 4
   metric_n_proj: 16
@@ -91,7 +88,6 @@ metric:
   metric_periodic: null
   metric_domain_y: null
   metric_domain_x: null
-
   # Lagrangian rollout settings (источник траекторий для DeltaH)
   metric_lagrangian_n_particles: 8192
   metric_lagrangian_init_mode: mass     # mass | uniform

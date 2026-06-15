@@ -1,0 +1,48 @@
+meta:
+  output_root: analysis/results/paper_suite_n0_ci_16
+  conda_env: onerec
+  wandb_mode: disabled
+
+synthetic:
+  families: [S0, S1, S3, S4, S5, S6, S7, S8]
+  seeds: 16
+  seed_base: 100
+  n_particles: 48
+  time_steps: 16384
+  domain_size: 1.0
+  tau_grid_steps: [4, 6, 8, 10]
+  metric_window_size_steps: 16
+  metric_window_step_steps: 8
+  metric_range_start_steps: 0
+  metric_m_samples: 8
+  metric_m_min: 4
+  metric_n_proj: 4
+  metric_null_reps: 1
+  metric_particle_samples: 32
+  metric_dirs_seed: 123
+  metric_seed: 12345
+  metric_delta_h_floor: 0.0
+  metric_msc_floor: 0.01
+  metric_eps: 1.0e-12
+  metric_msc_term: floor_reconstruction_error
+  metric_msc_normalize_by_weight_sum: true
+  render:
+    enabled: false
+    fps: 18
+    size_px: 512
+    max_frames: 512
+    trail_steps: 16
+    particle_radius_px: 3
+    particle_stride: 1
+    max_particles: null
+    codec: mp4v
+  visualization:
+    heatmaps_enabled: true
+    heatmap_cmap: coolwarm
+    heatmap_max_runs: null
+    frame_montage_enabled: true
+    frame_montage_frames: 6
+    frame_montage_seed: 0
+    frame_montage_trail_steps: 64
+    frame_montage_max_particles: null
+    msc_r_tau_steps: null

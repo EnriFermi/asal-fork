@@ -104,6 +104,52 @@ def _progress_text(done: int, total: int, start_time: float, *, item_seconds: fl
     return " ".join(parts)
 
 
+def _bootstrap_ci(values: list[float] | np.ndarray, *, statistic: str = "median", n_boot: int = 2000, seed: int = 4421) -> tuple[float, float]:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float("nan"), float("nan")
+    if arr.size == 1:
+        value = float(arr[0])
+        return value, value
+    rng = np.random.default_rng(int(seed))
+    idx = rng.integers(0, arr.size, size=(int(n_boot), arr.size))
+    samples = arr[idx]
+    if statistic == "mean":
+        stats = np.mean(samples, axis=1)
+    else:
+        stats = np.median(samples, axis=1)
+    return float(np.nanpercentile(stats, 2.5)), float(np.nanpercentile(stats, 97.5))
+
+
+def _tau_profile_ci_rows(tau_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for row in tau_rows:
+        try:
+            key = (str(row["family"]), int(row["tau_steps"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        grouped.setdefault(key, []).append(row)
+    out: list[dict[str, Any]] = []
+    for (family, tau_steps), rows in sorted(grouped.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        vals = np.asarray([float(row["score_by_tau"]) for row in rows], dtype=np.float64)
+        vals = vals[np.isfinite(vals)]
+        lo, hi = _bootstrap_ci(vals, statistic="median")
+        out.append(
+            {
+                "family": family,
+                "tau_steps": int(tau_steps),
+                "n": int(vals.size),
+                "score_by_tau_median": float(np.nanmedian(vals)) if vals.size else float("nan"),
+                "score_by_tau_mean": float(np.nanmean(vals)) if vals.size else float("nan"),
+                "score_by_tau_std": float(np.nanstd(vals, ddof=1)) if vals.size >= 2 else float("nan"),
+                "score_by_tau_ci_low": lo,
+                "score_by_tau_ci_high": hi,
+            }
+        )
+    return out
+
+
 def _tau_grid(cfg: Any) -> list[int]:
     vals = cfg.get("tau_grid_steps", [1, 2, 4, 8, 16, 32, 64]) if cfg is not None else [1, 2, 4, 8, 16, 32, 64]
     return [int(x) for x in vals]
@@ -1096,6 +1142,7 @@ def metrics(config_path: str | Path, *, smoke: bool = False, force: bool = False
 
     write_csv(dirs["root"] / "per_family_scores.csv", score_rows)
     write_csv(dirs["root"] / "tau_profiles.csv", tau_rows)
+    write_csv(dirs["root"] / "tau_profile_ci.csv", _tau_profile_ci_rows(tau_rows))
     write_csv(dirs["root"] / "msc_scale_profiles.csv", msc_scale_rows)
     write_csv(dirs["root"] / "role_recovery.csv", role_rows)
     write_csv(dirs["root"] / "event_localization.csv", event_rows)
