@@ -46,14 +46,16 @@ def _safe_slug(value: Any) -> str:
     return "".join(out).strip("_") or "item"
 
 
-def _select_current_top_row(
+def _select_score_row(
     rows: list[dict[str, str]],
     *,
+    selection_mode: str,
     min_delta_h_quantile: float,
+    max_delta_h_quantile: float,
     traj_id: str | None,
     pair_id: int | None,
     condition: str | None,
-) -> tuple[dict[str, str], float, int]:
+) -> tuple[dict[str, str], float, int, str]:
     finite = [
         row
         for row in rows
@@ -70,16 +72,58 @@ def _select_current_top_row(
 
     threshold = min(_as_float(row.get("delta_h")) for row in finite)
     candidates = finite
+    mode = str(selection_mode).strip().lower()
     if traj_id is None and pair_id is None and condition is None:
         import numpy as np
 
         delta_h = np.asarray([_as_float(row.get("delta_h")) for row in finite], dtype=float)
-        threshold = float(np.quantile(delta_h, float(min_delta_h_quantile)))
-        candidates = [row for row in finite if _as_float(row.get("delta_h")) >= threshold]
+        if mode == "high_delta_max_divergence":
+            threshold = float(np.quantile(delta_h, float(min_delta_h_quantile)))
+            candidates = [row for row in finite if _as_float(row.get("delta_h")) >= threshold]
+        elif mode == "low_delta_min_divergence":
+            threshold = float(np.quantile(delta_h, float(max_delta_h_quantile)))
+            candidates = [row for row in finite if _as_float(row.get("delta_h")) <= threshold]
+        else:
+            raise ValueError(
+                "--selection-mode must be one of "
+                "['high_delta_max_divergence', 'low_delta_min_divergence'], "
+                f"got {selection_mode!r}."
+            )
         if not candidates:
             candidates = finite
-    selected = max(candidates, key=lambda row: _as_float(row.get("branching_score")))
-    return selected, float(threshold), len(candidates)
+    if mode == "high_delta_max_divergence":
+        selected = max(candidates, key=lambda row: _as_float(row.get("branching_score")))
+        rule = "max branching_score among rows with delta_h in top quantile"
+    elif mode == "low_delta_min_divergence":
+        selected = min(candidates, key=lambda row: _as_float(row.get("branching_score")))
+        rule = "min branching_score among rows with delta_h in bottom quantile"
+    else:
+        raise ValueError(
+            "--selection-mode must be one of "
+            "['high_delta_max_divergence', 'low_delta_min_divergence'], "
+            f"got {selection_mode!r}."
+        )
+    return selected, float(threshold), len(candidates), rule
+
+
+def _select_current_top_row(
+    rows: list[dict[str, str]],
+    *,
+    min_delta_h_quantile: float,
+    traj_id: str | None,
+    pair_id: int | None,
+    condition: str | None,
+) -> tuple[dict[str, str], float, int]:
+    selected, threshold, n_candidates, _rule = _select_score_row(
+        rows,
+        selection_mode="high_delta_max_divergence",
+        min_delta_h_quantile=min_delta_h_quantile,
+        max_delta_h_quantile=0.15,
+        traj_id=traj_id,
+        pair_id=pair_id,
+        condition=condition,
+    )
+    return selected, threshold, n_candidates
 
 
 def _is_finite(value: float) -> bool:
@@ -271,6 +315,9 @@ def _run_direct_video_jobs(
     output: Path,
     metadata_path: Path,
     selected: dict[str, str],
+    selection_rule: str,
+    delta_h_threshold: float,
+    n_delta_h_candidates: int,
     scores_path: Path,
     plan_path: Path,
     target_root: Path,
@@ -442,9 +489,12 @@ def _run_direct_video_jobs(
             "render_interval": int(render_interval),
             "horizon_steps": int(horizon_steps),
             "jit_microbatch": int(step_chunk),
+            "selection_rule": str(selection_rule),
             "selection_scores_path": str(scores_path),
             "selection_branch_plan": str(plan_path),
             "target_root": str(target_root),
+            "delta_h_threshold": float(delta_h_threshold),
+            "n_delta_h_candidates": int(n_delta_h_candidates),
             "selected_score_row": selected,
             "jobs": raw_jobs,
         },
@@ -455,7 +505,7 @@ def _run_direct_video_jobs(
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=(
-            "Select the current high-Delta-H/high-divergence Flow-Lenia C2 point, "
+            "Select a Flow-Lenia C2 point by Delta-H/divergence rule, "
             "simulate exactly four fresh branches for that point, and render a 2x2 video."
         )
     )
@@ -467,7 +517,18 @@ def main() -> int:
     ap.add_argument("--target-root", type=Path, default=None)
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--metadata-out", type=Path, default=None)
+    ap.add_argument(
+        "--selection-mode",
+        choices=["high_delta_max_divergence", "low_delta_min_divergence"],
+        default="high_delta_max_divergence",
+        help=(
+            "Point selection rule. Default keeps the old behavior: top Delta-H quantile, "
+            "then max branching_score. low_delta_min_divergence uses bottom Delta-H "
+            "quantile, then min branching_score."
+        ),
+    )
     ap.add_argument("--min-delta-h-quantile", type=float, default=0.75)
+    ap.add_argument("--max-delta-h-quantile", type=float, default=0.15)
     ap.add_argument("--traj-id", default=None)
     ap.add_argument("--pair-id", type=int, default=None)
     ap.add_argument("--condition", default=None)
@@ -538,7 +599,10 @@ def main() -> int:
 
     target_root = args.target_root
     if target_root is None:
-        target_root = output_root / "c2_branching_targeted_branch4_video"
+        if args.selection_mode == "low_delta_min_divergence":
+            target_root = output_root / "c2_branching_targeted_branch4_low_delta_min_divergence_video"
+        else:
+            target_root = output_root / "c2_branching_targeted_branch4_video"
     elif not target_root.is_absolute():
         target_root = (_REPO_ROOT / target_root).resolve()
     target_root.mkdir(parents=True, exist_ok=True)
@@ -555,9 +619,11 @@ def main() -> int:
         meta_path = (_REPO_ROOT / meta_path).resolve()
 
     score_rows = _read_csv(scores_path)
-    selected, threshold, n_candidates = _select_current_top_row(
+    selected, threshold, n_candidates, selection_rule = _select_score_row(
         score_rows,
+        selection_mode=str(args.selection_mode),
         min_delta_h_quantile=float(args.min_delta_h_quantile),
+        max_delta_h_quantile=float(args.max_delta_h_quantile),
         traj_id=args.traj_id,
         pair_id=args.pair_id,
         condition=args.condition,
@@ -597,7 +663,13 @@ def main() -> int:
                     str(int(args.direct_render_interval)),
                     "--horizon-steps",
                     str(int(args.horizon_steps or selected_branch_rows[0]["horizon_steps"])),
+                    "--selection-mode",
+                    str(args.selection_mode),
                 ]
+                if args.selection_mode == "low_delta_min_divergence":
+                    cmd.extend(["--max-delta-h-quantile", str(float(args.max_delta_h_quantile))])
+                else:
+                    cmd.extend(["--min-delta-h-quantile", str(float(args.min_delta_h_quantile))])
                 if args.force:
                     cmd.append("--force")
                 print(" ".join(cmd))
@@ -607,6 +679,9 @@ def main() -> int:
                     output=out_path,
                     metadata_path=meta_path,
                     selected=selected,
+                    selection_rule=selection_rule,
+                    delta_h_threshold=float(threshold),
+                    n_delta_h_candidates=int(n_candidates),
                     scores_path=scores_path,
                     plan_path=plan_path,
                     target_root=target_root,
@@ -639,6 +714,8 @@ def main() -> int:
                 "selection_branch_plan": str(plan_path),
                 "target_root": str(target_root),
                 "jobs_path": str(jobs_path),
+                "selection_mode": str(args.selection_mode),
+                "selection_rule": str(selection_rule),
                 "selected_score_row": selected,
                 "selected_branch_rows": selected_branch_rows,
                 "delta_h_threshold": float(threshold),
@@ -681,7 +758,8 @@ def main() -> int:
         "status": "ok",
         "output": str(out_path),
         "frames_written": int(written),
-        "selection_rule": "max branching_score among current rows with delta_h in top quantile",
+        "selection_mode": str(args.selection_mode),
+        "selection_rule": str(selection_rule),
         "selection_scores_path": str(scores_path),
         "selection_branch_plan": str(plan_path),
         "target_root": str(target_root),
