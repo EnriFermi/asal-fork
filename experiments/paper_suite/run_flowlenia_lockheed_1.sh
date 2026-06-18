@@ -1,7 +1,7 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+set -eu
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "${script_dir}/../.." && pwd)"
 cd "${repo_root}"
 
@@ -38,7 +38,7 @@ run_suite() {
 }
 
 require_file() {
-  local path="$1"
+  path="$1"
   if [ ! -f "${path}" ]; then
     echo "Missing required file: ${path}" >&2
     exit 2
@@ -46,7 +46,7 @@ require_file() {
 }
 
 require_dir() {
-  local path="$1"
+  path="$1"
   if [ ! -d "${path}" ]; then
     echo "Missing required directory: ${path}" >&2
     exit 2
@@ -70,59 +70,59 @@ if [ "${expected_opts}" != "0" ] && [ "${best_count}" -ne "${expected_opts}" ]; 
   exit 3
 fi
 
-heavy_args=()
+heavy_arg=""
 if [ "${allow_heavy}" = "1" ]; then
-  heavy_args+=(--allow-heavy)
+  heavy_arg="--allow-heavy"
 fi
 
-metric_force_args=()
+metric_force_arg=""
 if [ "${force_metrics}" = "1" ]; then
-  metric_force_args+=(--force)
+  metric_force_arg="--force"
 fi
 
-vis_force_args=()
+vis_force_arg=""
 if [ "${force_visualization}" = "1" ]; then
-  vis_force_args+=(--force)
+  vis_force_arg="--force"
 fi
 
-branch_force_args=()
+branch_force_arg=""
 if [ "${force_branches}" = "1" ]; then
-  branch_force_args+=(--force)
+  branch_force_arg="--force"
 fi
 
-apf_force_args=()
+apf_force_arg=""
 if [ "${force_apf}" = "1" ]; then
-  apf_force_args+=(--force)
+  apf_force_arg="--force"
 fi
 
 if [ "${run_frustration}" = "1" ] && [ "${run_c5}" = "1" ]; then
   echo
   echo "[1/9] Flow-Lenia C5 frustration simulation/check"
-  run_suite --layer simulation --task c5 "${heavy_args[@]}"
+  run_suite --layer simulation --task c5 ${heavy_arg}
 fi
 
 if [ "${run_apf}" = "1" ]; then
   echo
   echo "[2/9] Flow-Lenia A-run APF/Lagrangian trajectories"
-  run_py scripts/paper_suite_flowlenia_arun_apf.py "${cfg}" "${apf_force_args[@]}"
+  run_py scripts/paper_suite_flowlenia_arun_apf.py "${cfg}" ${apf_force_arg}
 fi
 
 if [ "${run_c1}" = "1" ]; then
   echo
   echo "[3/9] Flow-Lenia C1 metrics"
-  run_suite --layer metrics --task c1 "${metric_force_args[@]}"
+  run_suite --layer metrics --task c1 ${metric_force_arg}
 fi
 
 if [ "${run_c5}" = "1" ]; then
   echo
   echo "[4/9] Flow-Lenia C5 metrics"
-  run_suite --layer metrics --task c5 "${metric_force_args[@]}"
+  run_suite --layer metrics --task c5 ${metric_force_arg}
 fi
 
 if [ "${run_c2}" = "1" ]; then
   echo
   echo "[5/9] Flow-Lenia C2 trajectory metrics"
-  run_py scripts/paper_suite_c2_flowlenia_metrics.py "${cfg}" "${metric_force_args[@]}"
+  run_py scripts/paper_suite_c2_flowlenia_metrics.py "${cfg}" ${metric_force_arg}
 
   echo
   echo "[6/9] Flow-Lenia C2 event tables"
@@ -130,25 +130,25 @@ if [ "${run_c2}" = "1" ]; then
 
   echo
   echo "[7/9] Flow-Lenia C2 branch simulation"
-  run_py scripts/paper_suite_c2_branching.py "${cfg}" --layer simulation "${heavy_args[@]}" "${branch_force_args[@]}"
+  run_py scripts/paper_suite_c2_branching.py "${cfg}" --layer simulation ${heavy_arg} ${branch_force_arg}
 
   echo
   echo "[8/9] Flow-Lenia C2 branch metrics: APF and CLIP-Chamfer"
-  run_py scripts/paper_suite_c2_branching.py "${cfg}" --layer metrics "${metric_force_args[@]}"
-  run_py scripts/paper_suite_c2_branching.py "${cfg}" --layer metrics --branching-metric clip_chamfer "${metric_force_args[@]}"
+  run_py scripts/paper_suite_c2_branching.py "${cfg}" --layer metrics ${metric_force_arg}
+  run_py scripts/paper_suite_c2_branching.py "${cfg}" --layer metrics --branching-metric clip_chamfer ${metric_force_arg}
 fi
 
 if [ "${run_visualization}" = "1" ]; then
   echo
   echo "[9/9] Flow-Lenia visualizations"
   if [ "${run_c1}" = "1" ]; then
-    run_suite --layer visualization --task c1 "${vis_force_args[@]}"
+    run_suite --layer visualization --task c1 ${vis_force_arg}
   fi
   if [ "${run_c2}" = "1" ]; then
-    run_suite --layer visualization --task c2 "${vis_force_args[@]}"
+    run_suite --layer visualization --task c2 ${vis_force_arg}
   fi
   if [ "${run_c5}" = "1" ]; then
-    run_suite --layer visualization --task c5 "${vis_force_args[@]}"
+    run_suite --layer visualization --task c5 ${vis_force_arg}
   fi
 fi
 
