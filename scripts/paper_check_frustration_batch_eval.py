@@ -56,6 +56,11 @@ from paper_check_frustration_eval import (
 
 _patch_wandb_pandas_check()
 
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover - tqdm is optional for non-interactive environments.
+    tqdm = None
+
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
@@ -84,6 +89,42 @@ def _unstack_tree(tree):
         return []
     batch_size = int(leaves[0].shape[0])
     return [jax.tree_util.tree_map(lambda x, i=i: x[i], tree) for i in range(batch_size)]
+
+
+class _NoProgress:
+    def update(self, n: int = 1) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def _make_progress_bar(*, total: int, desc: str):
+    if tqdm is None or total <= 0 or os.environ.get("PAPER_CHECK_DISABLE_TQDM") == "1":
+        return _NoProgress()
+    return tqdm(
+        total=int(total),
+        desc=desc,
+        dynamic_ncols=True,
+        file=sys.stdout,
+        leave=True,
+        ascii=True,
+    )
+
+
+def _remaining_lane_steps(lanes: list[dict], *, total_steps: int) -> int:
+    out = 0
+    for lane in lanes:
+        state = lane.get("state")
+        if state is None:
+            continue
+        out += max(0, int(total_steps) - int(state.get("current_step", 0)))
+    return int(out)
+
+
+def _progress_delta(*, current_step: int, next_step: int, total_steps: int, n_lanes: int) -> int:
+    advanced = max(0, min(int(next_step), int(total_steps)) - int(current_step))
+    return int(advanced * int(n_lanes))
 
 
 def _take_tree(tree, indices: list[int]):
@@ -629,6 +670,10 @@ def _run_generic_global_lanes(
     if not lanes:
         return
 
+    pbar = _make_progress_bar(
+        total=_remaining_lane_steps(lanes, total_steps=total_steps),
+        desc=f"frustration generic lanes={len(lanes)}",
+    )
     while True:
         active_groups = _group_active_lanes(lanes, total_steps=total_steps)
         if not active_groups:
@@ -707,6 +752,15 @@ def _run_generic_global_lanes(
                 checkpoint_every_steps=checkpoint_every_steps,
                 total_steps=total_steps,
             )
+            pbar.update(
+                _progress_delta(
+                    current_step=current_step,
+                    next_step=next_step,
+                    total_steps=total_steps,
+                    n_lanes=len(group_indices),
+                )
+            )
+    pbar.close()
 
 
 def _run_control_lanes(
@@ -730,6 +784,10 @@ def _run_control_lanes(
     if not lanes:
         return
 
+    pbar = _make_progress_bar(
+        total=_remaining_lane_steps(lanes, total_steps=total_steps),
+        desc=f"frustration control lanes={len(lanes)}",
+    )
     while True:
         active_groups = _group_active_lanes(lanes, total_steps=total_steps)
         if not active_groups:
@@ -857,6 +915,15 @@ def _run_control_lanes(
                 checkpoint_every_steps=checkpoint_every_steps,
                 total_steps=total_steps,
             )
+            pbar.update(
+                _progress_delta(
+                    current_step=current_step,
+                    next_step=next_step,
+                    total_steps=total_steps,
+                    n_lanes=len(group_indices),
+                )
+            )
+    pbar.close()
 
 
 def _run_walls_lanes(
@@ -888,6 +955,10 @@ def _run_walls_lanes(
     if not lanes:
         return
 
+    pbar = _make_progress_bar(
+        total=_remaining_lane_steps(lanes, total_steps=total_steps),
+        desc=f"frustration walls lanes={len(lanes)}",
+    )
     while True:
         active_groups = _group_active_lanes(lanes, total_steps=total_steps)
         if not active_groups:
@@ -1061,6 +1132,15 @@ def _run_walls_lanes(
                 checkpoint_every_steps=checkpoint_every_steps,
                 total_steps=total_steps,
             )
+            pbar.update(
+                _progress_delta(
+                    current_step=current_step,
+                    next_step=next_step,
+                    total_steps=total_steps,
+                    n_lanes=len(group_indices),
+                )
+            )
+    pbar.close()
 
 
 def _finalize_trial(

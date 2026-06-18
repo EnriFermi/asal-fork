@@ -29,6 +29,11 @@ from paper_check_common import (
     write_resolved_yaml,
 )
 
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover - tqdm is optional for non-interactive environments.
+    tqdm = None
+
 
 def _flat_opt_args(cfg):
     return OmegaConf.merge(
@@ -66,6 +71,19 @@ def _chunk_list(items: list[Path], chunk_size: int) -> list[list[Path]]:
     if chunk_size < 1:
         raise ValueError(f"chunk_size must be >= 1, got {chunk_size}.")
     return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+
+def _make_progress_bar(*, total: int, desc: str):
+    if tqdm is None or total <= 0:
+        return None
+    return tqdm(
+        total=int(total),
+        desc=desc,
+        dynamic_ncols=True,
+        file=sys.stdout,
+        leave=True,
+        ascii=True,
+    )
 
 
 def _group_pair_seeds(paper_cfg, group_idx: int) -> tuple[int, int]:
@@ -357,18 +375,30 @@ def main() -> int:
             )
             pending_job_cfgs.append(resolved_job_cfg)
 
-    for batch_idx, job_cfg_batch in enumerate(_chunk_list(pending_job_cfgs, trial_batch_size)):
-        trial_ids = [int(OmegaConf.load(path).get("meta", {}).get("trial_idx")) for path in job_cfg_batch]
-        print(
-            f"[paper_check/frustration] starting batch_idx={batch_idx} "
-            f"batch_size={len(job_cfg_batch)} trial_ids={trial_ids}"
-        )
-        subprocess.run(
-            [sys.executable, str(batch_eval_script), *[str(path) for path in job_cfg_batch]],
-            cwd=str(repo),
-            check=True,
-        )
-        _rebuild_local_summary(save_root_abs)
+    batches = _chunk_list(pending_job_cfgs, trial_batch_size)
+    print(
+        f"[paper_check/frustration] pending_trials={len(pending_job_cfgs)} "
+        f"trial_batch_size={trial_batch_size} n_batches={len(batches)}"
+    )
+    pbar = _make_progress_bar(total=len(pending_job_cfgs), desc="frustration trials")
+    try:
+        for batch_idx, job_cfg_batch in enumerate(batches):
+            trial_ids = [int(OmegaConf.load(path).get("meta", {}).get("trial_idx")) for path in job_cfg_batch]
+            print(
+                f"[paper_check/frustration] starting batch_idx={batch_idx} "
+                f"batch_size={len(job_cfg_batch)} trial_ids={trial_ids}"
+            )
+            subprocess.run(
+                [sys.executable, str(batch_eval_script), *[str(path) for path in job_cfg_batch]],
+                cwd=str(repo),
+                check=True,
+            )
+            if pbar is not None:
+                pbar.update(len(job_cfg_batch))
+            _rebuild_local_summary(save_root_abs)
+    finally:
+        if pbar is not None:
+            pbar.close()
 
     _rebuild_local_summary(save_root_abs)
     return 0
