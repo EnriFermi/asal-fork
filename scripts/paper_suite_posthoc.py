@@ -475,6 +475,7 @@ def _iter_apf_metric_items(root: Path) -> list[dict[str, Any]]:
                     "source_root_rank": int(row.get("source_root_rank", -1)),
                     "source_root": str(row.get("source_root", "")),
                     "source_root_name": str(row.get("source_root_name", "")),
+                    "source_checkpoint_dir": str(row.get("source_checkpoint_dir", "")),
                     "run_seed": int(row.get("run_seed", -1)),
                     "candidate_kind": candidate_kind,
                     "candidate_idx": int(row.get("candidate_idx", 0)),
