@@ -13,7 +13,7 @@ paper_check:
   metric_seed_base: 800003
 optimization:
   base_config: optimization/config_longrun_check_fix.yaml
-  save_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1/optimization
+  save_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/optimization
   resume: true
   save_every: 1
   overrides: {}

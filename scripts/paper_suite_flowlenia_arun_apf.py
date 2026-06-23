@@ -58,10 +58,78 @@ def _output_paths(output_root: Path, traj_id: str) -> dict[str, Path]:
     }
 
 
-def _apf_status(paths: dict[str, Path], *, expected_steps: int | None = None) -> tuple[bool, str]:
+def _expected_rollout_signature(rollout_config: Path, flat: Any) -> dict[str, Any]:
+    keys = (
+        "grid_size",
+        "seed_n_patches",
+        "seed_patch_size",
+        "rollout_steps",
+        "max_steps",
+        "snapshot_interval",
+        "snapshots_per_file",
+        "save_A",
+        "save_F",
+        "save_lagrangian",
+        "lagrangian_n_particles",
+        "lagrangian_init_mode",
+        "lagrangian_flow_channel",
+        "lagrangian_flow_reduce",
+        "lagrangian_channel_mode",
+        "lagrangian_noise_model",
+        "lagrangian_diffusion_scale",
+    )
+    out = {"rollout_config": str(rollout_config)}
+    for key in keys:
+        value = _get(flat, key, None)
+        if value is not None:
+            out[key] = value
+    return out
+
+
+def _saved_rollout_signature(paths: dict[str, Path]) -> dict[str, Any]:
+    cfg_path = paths["config_path"]
+    if not cfg_path.exists():
+        return {}
+    cfg = OmegaConf.load(cfg_path)
+    flat = OmegaConf.merge(
+        cfg.get("meta", {}),
+        cfg.get("substrate", {}),
+        cfg.get("simulation", {}),
+        cfg.get("logging", {}),
+        cfg.get("metric", {}),
+        cfg.get("minibang", {}),
+    )
+    return _expected_rollout_signature(Path(str(cfg.get("rollout_config", ""))), flat)
+
+
+def _signature_mismatch(saved: dict[str, Any], expected: dict[str, Any]) -> str:
+    for key, expected_value in expected.items():
+        if key == "rollout_config":
+            continue
+        if key not in saved:
+            return f"saved config missing {key}"
+        if saved[key] != expected_value:
+            return f"saved config {key}={saved[key]!r}, expected {expected_value!r}"
+    return ""
+
+
+def _apf_status(
+    paths: dict[str, Path],
+    *,
+    expected_steps: int | None = None,
+    expected_signature: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
     ready, message = _base_apf_status(paths)
     if not ready or expected_steps is None:
         return ready, message
+    if expected_signature is not None:
+        try:
+            saved_signature = _saved_rollout_signature(paths)
+        except Exception as exc:
+            return False, f"cannot read saved config {paths['config_path']}: {exc}"
+        mismatch = _signature_mismatch(saved_signature, expected_signature)
+        if mismatch:
+            return False, mismatch
     chunks = list_apf_chunks(paths["apf_dir"])
     if not chunks:
         return False, f"missing APF chunks in {paths['apf_dir']}"
@@ -163,12 +231,17 @@ def _write_manifest(
     selected: list[dict[str, Any]],
     command_rows: list[dict[str, Any]],
     expected_steps: int | None = None,
+    expected_signature: dict[str, Any] | None = None,
 ) -> None:
     trajectories: list[dict[str, Any]] = []
     for row in selected:
         traj_id = str(row["traj_id"])
         paths = _output_paths(output_root, traj_id)
-        apf_ready, apf_message = _apf_status(paths, expected_steps=expected_steps)
+        apf_ready, apf_message = _apf_status(
+            paths,
+            expected_steps=expected_steps,
+            expected_signature=expected_signature,
+        )
         trajectories.append(
             {
                 "traj_id": traj_id,
@@ -200,6 +273,7 @@ def _write_manifest(
         {
             "source_kind": "paper_check_flow_lenia_control_a_lagrangian_sparse_apf",
             "rollout_config": str(rollout_config),
+            "expected_rollout_signature": dict(expected_signature or {}),
             "required_apf_keys": list(REQUIRED_APF_KEYS),
             "n_trajectories": len(trajectories),
             "trajectories": trajectories,
@@ -230,6 +304,7 @@ def run(
     expected_steps = int(_get(section, "rollout_steps", 500_000))
     rollout_cfg, rollout_flat = load_rollout_config(rollout_config, [])
     _validate_rollout_profile(rollout_flat, expected_steps=expected_steps)
+    expected_signature = _expected_rollout_signature(rollout_config, rollout_flat)
 
     n_per_checkpoint = int(_get(section, "n_trajectories_per_checkpoint", 1))
     if n_per_checkpoint != 1:
@@ -296,7 +371,11 @@ def run(
 
     ready_by_traj: dict[str, tuple[bool, str]] = {}
     for row in selected:
-        ready, message = _apf_status(_output_paths(output_root, str(row["traj_id"])), expected_steps=expected_steps)
+        ready, message = _apf_status(
+            _output_paths(output_root, str(row["traj_id"])),
+            expected_steps=expected_steps,
+            expected_signature=expected_signature,
+        )
         ready_by_traj[str(row["traj_id"])] = (ready, message)
     pending = [
         row
@@ -338,6 +417,7 @@ def run(
         selected=selected,
         command_rows=command_rows,
         expected_steps=expected_steps,
+        expected_signature=expected_signature,
     )
 
     if dry_run:
@@ -350,6 +430,7 @@ def run(
             selected=selected,
             command_rows=command_rows,
             expected_steps=expected_steps,
+            expected_signature=expected_signature,
         )
         summary = {
             "status": "dry_run",
@@ -406,7 +487,11 @@ def run(
         for row in command_rows:
             if row["traj_id"] in batch_ids:
                 paths = _output_paths(output_root, str(row["traj_id"]))
-                ready, message = _apf_status(paths, expected_steps=expected_steps)
+                ready, message = _apf_status(
+                    paths,
+                    expected_steps=expected_steps,
+                    expected_signature=expected_signature,
+                )
                 row["status"] = "exists" if ready else "missing_apf"
                 row["message"] = message
         _write_manifest(
@@ -415,11 +500,16 @@ def run(
             selected=selected,
             command_rows=command_rows,
             expected_steps=expected_steps,
+            expected_signature=expected_signature,
         )
 
     n_ready = 0
     for row in selected:
-        ready, _message = _apf_status(_output_paths(output_root, str(row["traj_id"])), expected_steps=expected_steps)
+        ready, _message = _apf_status(
+            _output_paths(output_root, str(row["traj_id"])),
+            expected_steps=expected_steps,
+            expected_signature=expected_signature,
+        )
         n_ready += int(ready)
     status = "ok" if n_ready == len(selected) else "incomplete"
     summary = {
@@ -439,6 +529,7 @@ def run(
         selected=selected,
         command_rows=command_rows,
         expected_steps=expected_steps,
+        expected_signature=expected_signature,
     )
     if status != "ok" and bool(_get(section, "required", True)):
         raise RuntimeError(f"Flow-Lenia A-run APF generation incomplete: {n_ready}/{len(selected)} ready.")

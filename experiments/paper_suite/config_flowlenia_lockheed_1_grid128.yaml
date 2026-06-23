@@ -275,7 +275,7 @@ c2:
     rollout_config: experiments/paper_suite/flowlenia_arun_apf_500k_grid128.yaml
     output_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/arun_lagrangian_apf_500k
     optimized_checkpoint_roots:
-    - experiments/paper_check_flow_lenia/checkpoints_lockheed_1/optimization
+    - experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/optimization
     dedupe_by_run_idx: false
     max_checkpoints: null
   branching:
@@ -393,7 +393,7 @@ simulation:
     run_seed_mode: source_run_idx
     batch_size: 9
     optimized_checkpoint_roots:
-    - experiments/paper_check_flow_lenia/checkpoints_lockheed_1/optimization
+    - experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/optimization
     dedupe_by_run_idx: false
     max_checkpoints: null
   flow_lenia_nnopt_lagrangian_apf:

@@ -176,6 +176,51 @@ def _rebuild_local_summary(save_root: Path) -> None:
     _write_json(save_root / "summary.json", summary)
 
 
+def _cfg_get(cfg, path: tuple[str, ...]):
+    node = cfg
+    for key in path:
+        node = node.get(key, None)
+        if node is None:
+            return None
+    return node
+
+
+def _completed_trial_matches_current_config(
+    *,
+    save_root: Path,
+    trial_idx: int,
+    expected_cfg,
+) -> tuple[bool, str]:
+    resolved_path = save_root / "trial_artifacts" / _trial_name(trial_idx) / "resolved_config.yaml"
+    if not resolved_path.exists():
+        return False, f"missing resolved config {resolved_path}"
+    try:
+        saved_cfg = OmegaConf.load(resolved_path)
+    except Exception as exc:
+        return False, f"cannot read resolved config {resolved_path}: {exc}"
+    keys = (
+        ("substrate", "substrate"),
+        ("substrate", "grid_size"),
+        ("substrate", "seed_n_patches"),
+        ("substrate", "seed_patch_size"),
+        ("protocol", "grid_split"),
+        ("protocol", "warmup_steps"),
+        ("protocol", "total_steps"),
+        ("evaluation", "late_window_start_steps"),
+        ("evaluation", "late_window_end_steps"),
+        ("metric", "sample_every_steps"),
+        ("metric", "metric_window_size_steps"),
+        ("metric", "metric_tau_steps"),
+    )
+    for path in keys:
+        saved = _cfg_get(saved_cfg, path)
+        expected = _cfg_get(expected_cfg, path)
+        if saved != expected:
+            dotted = ".".join(path)
+            return False, f"{dotted}={saved!r}, expected {expected!r}"
+    return True, ""
+
+
 def _build_job_config(
     *,
     paper_cfg,
@@ -350,6 +395,17 @@ def main() -> int:
         for spec in candidate_specs:
             trial_row_json = save_root_abs / "trial_data" / f"{_trial_name(spec['trial_idx'])}.json"
             if trial_row_json.exists():
+                matches, reason = _completed_trial_matches_current_config(
+                    save_root=save_root_abs,
+                    trial_idx=int(spec["trial_idx"]),
+                    expected_cfg=base_hist_cfg,
+                )
+                if not matches:
+                    raise RuntimeError(
+                        "Refusing to reuse stale Flow-Lenia frustration trial "
+                        f"trial_idx={spec['trial_idx']} at {trial_row_json}: {reason}. "
+                        "Use a fresh save_root or remove the stale trial artifacts."
+                    )
                 print(f"[paper_check/frustration] skipping completed trial_idx={spec['trial_idx']}")
                 continue
             resolved_job_cfg = _build_job_config(
