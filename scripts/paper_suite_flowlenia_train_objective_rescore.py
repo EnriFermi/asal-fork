@@ -236,7 +236,7 @@ def _build_rescorer(args: SimpleNamespace):
             "loss": loss,
             "score": info["score"],
             "tau_selected_idx": info["tau_selected_idx"],
-            "tau_selected_steps": info["tau_selected_steps"],
+            "tau_selected_steps": info["tau_best_steps"],
             "score_by_tau": score_by_tau,
             "max_tau_idx": best_idx,
             "max_tau_steps": info["tau_steps"][best_idx],
