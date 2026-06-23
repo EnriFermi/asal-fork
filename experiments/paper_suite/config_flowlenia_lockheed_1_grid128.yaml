@@ -65,18 +65,13 @@ datasets:
     - experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/frustration_simulation
     c1:
       source: apf_lagrangian_split
-      apf_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/arun_lagrangian_apf_500k
+      apf_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/arun_lagrangian_apf_300k_train50
       require_random: true
       expected_window_start_steps: 50000
       expected_window_end_steps: 300000
       metric:
         metric_tau_mode: max_grid
         metric_tau_grid_steps:
-        - 500
-        - 600
-        - 700
-        - 800
-        - 900
         - 1000
         - 2000
         - 3000
@@ -87,11 +82,6 @@ datasets:
         - 8000
         - 9000
         - 10000
-        - 11000
-        - 12000
-        - 13000
-        - 14000
-        - 15000
         metric_tau_steps: 3000
         metric_window_size_steps: 20000
         metric_window_step_steps: 5000
@@ -383,6 +373,22 @@ simulation:
   flow_lenia_arun_lagrangian_apf:
     enabled: true
     required: true
+    rollout_config: experiments/paper_suite/flowlenia_arun_apf_300k_train50_grid128.yaml
+    output_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/arun_lagrangian_apf_300k_train50
+    rollout_steps: 300000
+    n_trajectories_per_checkpoint: 1
+    include_random_baselines: true
+    num_random_baselines: 3
+    run_seed_base: 400003
+    run_seed_mode: source_run_idx
+    batch_size: 9
+    optimized_checkpoint_roots:
+    - experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/optimization
+    dedupe_by_run_idx: false
+    max_checkpoints: null
+  flow_lenia_c2_sparse_lagrangian_apf:
+    enabled: true
+    required: true
     rollout_config: experiments/paper_suite/flowlenia_arun_apf_500k_grid128.yaml
     output_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/arun_lagrangian_apf_500k
     rollout_steps: 500000
@@ -469,7 +475,7 @@ simulation:
     expected_globs:
     - experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/frustration_simulation/trial_data/trial_*_lagrangian.npz
     - experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/frustration_simulation/trial_data/trial_*_embeddings.npz
-  - name: flow_lenia_arun_lagrangian_apf_500k
+  - name: flow_lenia_arun_lagrangian_apf_300k_train50
     task: paper_check_apf
     enabled: true
     required: true
@@ -480,9 +486,9 @@ simulation:
     - scripts/paper_suite_flowlenia_arun_apf.py
     - '{config}'
     expected_paths:
-    - experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/arun_lagrangian_apf_500k/manifest.json
+    - experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/arun_lagrangian_apf_300k_train50/manifest.json
     expected_globs:
-    - experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/arun_lagrangian_apf_500k/flow_opt_*/apf_logs/P_steps_*.npz
+    - experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/arun_lagrangian_apf_300k_train50/flow_opt_*/apf_logs/P_steps_*.npz
     expected_npz_keys:
     - A
     - P

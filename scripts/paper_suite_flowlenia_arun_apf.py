@@ -40,8 +40,8 @@ def _get(cfg: Any, key: str, default: Any = None) -> Any:
         return getattr(cfg, key, default)
 
 
-def _section(cfg: Any) -> Any:
-    return _get(cfg.get("simulation", {}), "flow_lenia_arun_lagrangian_apf", {})
+def _section(cfg: Any, section_key: str = "flow_lenia_arun_lagrangian_apf") -> Any:
+    return _get(cfg.get("simulation", {}), section_key, {})
 
 
 def _output_paths(output_root: Path, traj_id: str) -> dict[str, Path]:
@@ -287,12 +287,13 @@ def run(
     *,
     force: bool = False,
     dry_run: bool = False,
+    section_key: str = "flow_lenia_arun_lagrangian_apf",
 ) -> dict[str, Any]:
     cfg, _ = load_config(config_path)
-    section = _section(cfg)
+    section = _section(cfg, section_key)
     if not bool(_get(section, "enabled", True)):
-        log_event("Flow-Lenia A-run APF disabled", component="arun-apf")
-        return {"status": "disabled"}
+        log_event(f"Flow-Lenia A-run APF disabled section={section_key}", component="arun-apf")
+        return {"status": "disabled", "section": section_key}
 
     output_root = resolve_path(_get(section, "output_root", "experiments/paper_check_flow_lenia/checkpoints/arun_lagrangian_apf_500k"))
     assert output_root is not None
@@ -316,12 +317,12 @@ def run(
     checkpoints = _discover_checkpoints(section)
     log_event(
         "Flow-Lenia A-run APF start "
-        f"force={force} dry_run={dry_run} output_root={output_root} "
+        f"section={section_key} force={force} dry_run={dry_run} output_root={output_root} "
         f"rollout_steps={expected_steps} batch_size={batch_size} n_checkpoints={len(checkpoints)}",
         component="arun-apf",
     )
     if not checkpoints:
-        summary = {"status": "skipped", "reason": "no optimized checkpoints found", "output_root": str(output_root)}
+        summary = {"status": "skipped", "section": section_key, "reason": "no optimized checkpoints found", "output_root": str(output_root)}
         write_json(output_root / "manifest.json", {"source_kind": "paper_check_flow_lenia_control_a_lagrangian_sparse_apf", "trajectories": []})
         write_json(output_root / "simulation_summary.json", summary)
         if bool(_get(section, "required", True)) and not dry_run:
@@ -438,6 +439,7 @@ def run(
         )
         summary = {
             "status": "dry_run",
+            "section": section_key,
             "output_root": str(output_root),
             "rollout_config": str(rollout_config),
             "n_selected": len(selected),
@@ -518,6 +520,7 @@ def run(
     status = "ok" if n_ready == len(selected) else "incomplete"
     summary = {
         "status": status,
+        "section": section_key,
         "output_root": str(output_root),
         "rollout_config": str(rollout_config),
         "n_selected": len(selected),
@@ -546,8 +549,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("config", help="experiments/paper_suite/config.yaml")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--section-key",
+        default="flow_lenia_arun_lagrangian_apf",
+        help="simulation section to read from the paper-suite config",
+    )
     args = parser.parse_args(argv)
-    print(to_plain(run(args.config, force=args.force, dry_run=args.dry_run)))
+    print(to_plain(run(args.config, force=args.force, dry_run=args.dry_run, section_key=args.section_key)))
     return 0
 
 

@@ -187,6 +187,8 @@ echo "  best.pkl count=${best_count}/${expected_opts}"
 echo "  isolated_random_root=${random_root}"
 echo "  random_source_root(copy-only-if-missing)=${random_source_root}"
 echo "  random best.pkl count=${random_count}/${expected_random_baselines}"
+echo "  c1_dense_apf_root=experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/arun_lagrangian_apf_300k_train50"
+echo "  c2_sparse_apf_root=experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/arun_lagrangian_apf_500k"
 echo "  conda_env=${conda_env}"
 echo "  run_id=${run_id}"
 echo "  log_dir=${log_dir}"
@@ -229,56 +231,62 @@ fi
 
 if [ "${run_apf}" = "1" ]; then
   echo
-  echo "[1/10] Flow-Lenia A-run APF/Lagrangian trajectories for C1/C2"
-  run_py scripts/paper_suite_flowlenia_arun_apf.py "${cfg}" ${apf_force_arg}
+  echo "[1/11] Flow-Lenia dense C1 APF/Lagrangian trajectories (train granularity)"
+  run_py scripts/paper_suite_flowlenia_arun_apf.py "${cfg}" --section-key flow_lenia_arun_lagrangian_apf ${apf_force_arg}
 fi
 
 if [ "${run_c1}" = "1" ]; then
   echo
-  echo "[2/10] Flow-Lenia C1 metrics"
+  echo "[2/11] Flow-Lenia C1 metrics"
   run_suite --layer metrics --task c1 ${metric_force_arg}
 fi
 
 if [ "${run_visualization}" = "1" ] && [ "${run_c1}" = "1" ]; then
   echo
-  echo "[3/10] Flow-Lenia C1 visualization"
+  echo "[3/11] Flow-Lenia C1 visualization"
   run_suite --layer visualization --task c1 ${vis_force_arg}
 fi
 
 if [ "${run_frustration}" = "1" ] && [ "${run_c5}" = "1" ]; then
   echo
-  echo "[4/10] Flow-Lenia C5 frustration simulation/check"
+  echo "[4/11] Flow-Lenia C5 frustration simulation/check"
   run_py scripts/run_paper_check_frustration.py "${paper_check_cfg}"
 fi
 
 if [ "${run_c5}" = "1" ]; then
   echo
-  echo "[5/10] Flow-Lenia C5 metrics"
+  echo "[5/11] Flow-Lenia C5 metrics"
   run_suite --layer metrics --task c5 ${metric_force_arg}
 fi
 
 if [ "${run_c2}" = "1" ]; then
+  if [ "${run_apf}" = "1" ]; then
+    echo
+    echo "[6/11] Flow-Lenia sparse C2 APF/Lagrangian trajectories"
+    run_py scripts/paper_suite_flowlenia_arun_apf.py "${cfg}" --section-key flow_lenia_c2_sparse_lagrangian_apf ${apf_force_arg}
+  fi
+
   echo
-  echo "[6/10] Flow-Lenia C2 trajectory metrics"
+  echo "[7/11] Flow-Lenia C2 trajectory metrics"
   run_py scripts/paper_suite_c2_flowlenia_metrics.py "${cfg}" ${metric_force_arg}
 
   echo
-  echo "[7/10] Flow-Lenia C2 event tables"
+  echo "[8/11] Flow-Lenia C2 event tables"
   run_py scripts/paper_suite_c2_events.py "${cfg}"
 
   echo
-  echo "[8/10] Flow-Lenia C2 branch simulation"
+  echo "[9/11] Flow-Lenia C2 branch simulation"
   run_py scripts/paper_suite_c2_branching.py "${cfg}" --layer simulation ${heavy_arg} ${branch_force_arg}
 
   echo
-  echo "[9/10] Flow-Lenia C2 branch metrics: APF and CLIP-Chamfer"
+  echo "[10/11] Flow-Lenia C2 branch metrics: APF and CLIP-Chamfer"
   run_py scripts/paper_suite_c2_branching.py "${cfg}" --layer metrics ${metric_force_arg}
   run_py scripts/paper_suite_c2_branching.py "${cfg}" --layer metrics --branching-metric clip_chamfer ${metric_force_arg}
 fi
 
 if [ "${run_visualization}" = "1" ]; then
   echo
-  echo "[10/10] Flow-Lenia remaining visualizations"
+  echo "[11/11] Flow-Lenia remaining visualizations"
   if [ "${run_c2}" = "1" ]; then
     run_suite --layer visualization --task c2 ${vis_force_arg}
   fi

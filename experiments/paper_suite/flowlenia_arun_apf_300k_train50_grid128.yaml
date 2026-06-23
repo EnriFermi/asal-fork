@@ -1,0 +1,85 @@
+base_config: experiments/paper_check_flow_lenia/frustration_simulation/config_grid128.yaml
+
+rollout:
+  # Dense C1-only Flow-Lenia rollout matching the optimization metric sampling
+  # cadence. C2 keeps using the sparse 500k APF source.
+  substrate:
+    rollout_steps: 300000
+
+  simulation:
+    rollout_steps: 300000
+    max_steps: 300000
+    seed: 0
+    img_size: 224
+    fps: 250
+    video_fps: 30
+    codec: libx264
+    macro_block_size: 1
+    jit_microbatch: 512
+
+  logging:
+    snapshot_interval: 50
+    snapshots_per_file: 50
+    save_A: true
+    save_F: true
+    save_rgb: false
+    save_fp16: true
+    compress: true
+    save_lagrangian: true
+    save_lagrangian_channels: true
+    lagrangian_n_particles: 8192
+    lagrangian_init_mode: mass
+    lagrangian_flow_channel: -1
+    lagrangian_flow_reduce: mass_weighted
+    lagrangian_channel_mode: resample
+    lagrangian_noise_model: rt_box
+    lagrangian_diffusion_scale: 1.0
+
+  metric:
+    metric_tau_mode: max_grid
+    metric_tau_grid_steps: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000]
+    metric_window_size_steps: 20000
+    metric_window_step_steps: 5000
+    metric_tau_steps: 3000
+    metric_range_start_steps: 50000
+    metric_range_end_steps: 300000
+    metric_window_size_frames: null
+    metric_window_step_frames: null
+
+    metric_m_samples: 48
+    metric_m_min: 4
+    metric_n_proj: 16
+    metric_null_reps: 6
+    metric_particle_samples: 64
+    metric_dirs_seed: 123
+    metric_periodic: false
+    metric_domain_y: 128.0
+    metric_domain_x: 128.0
+
+    metric_preprocess_mode: clip
+    metric_scales: null
+    metric_scale_weights: null
+    metric_delta_h_floor: 0.0
+    metric_msc_floor: 0.01
+    metric_msc_term: floor_reconstruction_error
+    metric_msc_normalize_by_weight_sum: true
+    metric_alpha: 0.0
+    metric_beta: 1.0
+    metric_eps: 1.0e-12
+
+minibang:
+  checkpoint_dir: null
+  output_root: null
+  n_trajectories: 1
+  batch_size: 9
+
+  selection_mode: loss
+  include_population: false
+  include_best_traj: false
+  include_final_best: true
+
+  compute_metrics: false
+  compute_delta_h: false
+  compute_clusters: false
+  metrics_strict: true
+  metrics_seed: 12345
