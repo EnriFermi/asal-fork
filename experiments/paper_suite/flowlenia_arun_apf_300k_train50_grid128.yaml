@@ -19,7 +19,7 @@ rollout:
 
   logging:
     snapshot_interval: 50
-    snapshots_per_file: 50
+    snapshots_per_file: 500
     save_A: true
     save_F: true
     save_rgb: false
