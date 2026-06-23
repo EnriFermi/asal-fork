@@ -363,6 +363,28 @@ def _score_maps(metric_eval, metric_seed: int, xy: np.ndarray) -> dict[str, np.n
     return {key: np.asarray(jax.device_get(value)) for key, value in info.items()}
 
 
+def _checkpoint_train_tau_steps(checkpoint_dir_raw: Any) -> int | None:
+    if checkpoint_dir_raw is None or str(checkpoint_dir_raw) == "":
+        return None
+    path = Path(str(checkpoint_dir_raw))
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    tau_path = path / "best_tau.json"
+    if not tau_path.exists():
+        return None
+    try:
+        payload = json.loads(tau_path.read_text())
+    except Exception:
+        return None
+    value = payload.get("tau_steps")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
 def _file_probe(path: Path) -> str:
     try:
         size = path.stat().st_size
@@ -717,7 +739,25 @@ def _compute_c1_from_apf_lagrangian_split(
             full_map,
             eval_mask,
         )
+        full_score_by_tau = np.asarray(info.get("score_by_tau", []), dtype=np.float64).reshape(-1)
+        full_amp_by_tau = np.asarray(info.get("amp_by_tau", []), dtype=np.float64).reshape(-1)
+        full_msc_by_tau = np.asarray(info.get("msc_by_tau", []), dtype=np.float64).reshape(-1)
         tau_steps = np.asarray(info["tau_steps"], dtype=np.int32)
+        if full_score_by_tau.shape[0] != tau_steps.shape[0]:
+            full_mask = np.ones(full_map.shape[1], dtype=bool)
+            full_score_by_tau, full_amp_by_tau, full_msc_by_tau, _full_map = _score_delta_h_map_subset(
+                metric_cfg,
+                full_map,
+                full_mask,
+            )
+        full_selected_idx = int(np.nanargmax(full_score_by_tau))
+        train_tau_steps = _checkpoint_train_tau_steps(item.get("source_checkpoint_dir", None))
+        train_tau_idx = -1
+        if train_tau_steps is not None:
+            matches = np.where(tau_steps == int(train_tau_steps))[0]
+            if matches.size:
+                train_tau_idx = int(matches[0])
+        train_tau_score = float(full_score_by_tau[train_tau_idx]) if train_tau_idx >= 0 else float("nan")
         selected_idx = int(np.nanargmax(sel_score_by_tau))
         eval_values = eval_map[selected_idx]
         full_window_start, full_window_end = _absolute_window_steps(
@@ -745,11 +785,17 @@ def _compute_c1_from_apf_lagrangian_split(
             eval_window_end_steps=eval_window_end.astype(np.int64),
             selection_score_by_tau=sel_score_by_tau,
             eval_score_by_tau=eval_score_by_tau,
+            full_score_by_tau=full_score_by_tau,
             selection_amp_by_tau=sel_amp_by_tau,
             eval_amp_by_tau=eval_amp_by_tau,
+            full_amp_by_tau=full_amp_by_tau,
             selection_msc_by_tau=sel_msc_by_tau,
             eval_msc_by_tau=eval_msc_by_tau,
+            full_msc_by_tau=full_msc_by_tau,
             selected_tau_idx=np.asarray(selected_idx, dtype=np.int32),
+            full_selected_tau_idx=np.asarray(full_selected_idx, dtype=np.int32),
+            train_tau_idx=np.asarray(train_tau_idx, dtype=np.int32),
+            train_tau_steps=np.asarray(-1 if train_tau_steps is None else int(train_tau_steps), dtype=np.int32),
             apf_dir=str(apf_dir),
         )
         score_rows.append(
@@ -767,12 +813,22 @@ def _compute_c1_from_apf_lagrangian_split(
                 "candidate_label": str(item.get("candidate_label", item.get("candidate_kind", "optimized"))),
                 "selected_tau_idx": selected_idx,
                 "selected_tau_steps": int(tau_steps[selected_idx]),
+                "full_selected_tau_idx": full_selected_idx,
+                "full_selected_tau_steps": int(tau_steps[full_selected_idx]),
+                "train_tau_idx": train_tau_idx,
+                "train_tau_steps": int(train_tau_steps) if train_tau_steps is not None else np.nan,
                 "selection_score_mspd": float(sel_score_by_tau[selected_idx]),
                 "selection_amp": float(sel_amp_by_tau[selected_idx]),
                 "selection_msc": float(sel_msc_by_tau[selected_idx]),
                 "eval_score_mspd": float(eval_score_by_tau[selected_idx]),
                 "eval_amp": float(eval_amp_by_tau[selected_idx]),
                 "eval_msc": float(eval_msc_by_tau[selected_idx]),
+                "full_score_selected_mspd": float(full_score_by_tau[selected_idx]),
+                "full_score_max_mspd": float(full_score_by_tau[full_selected_idx]),
+                "full_score_train_tau_mspd": train_tau_score,
+                "full_amp_max": float(full_amp_by_tau[full_selected_idx]) if full_amp_by_tau.size else np.nan,
+                "full_msc_max": float(full_msc_by_tau[full_selected_idx]) if full_msc_by_tau.size else np.nan,
+                "eval_score_max_mspd": float(np.nanmax(eval_score_by_tau)),
                 "selection_delta_h_mean": float(np.nanmean(sel_map[selected_idx])),
                 "selection_delta_h_median": float(np.nanmedian(sel_map[selected_idx])),
                 "selection_delta_h_std": float(np.nanstd(sel_map[selected_idx])),
