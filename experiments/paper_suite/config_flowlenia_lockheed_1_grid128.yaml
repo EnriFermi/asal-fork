@@ -1,0 +1,697 @@
+meta:
+  output_root: analysis/results/paper_suite_flowlenia_lockheed_1_grid128_eval
+  conda_env: onerec
+  wandb_mode: disabled
+synthetic:
+  families:
+  - S0
+  - S1
+  - S3
+  - S4
+  - S5
+  - S6
+  - S7
+  - S8
+  seeds: 1
+  seed_base: 100
+  n_particles: 48
+  time_steps: 16384
+  domain_size: 1.0
+  tau_grid_steps:
+  - 4
+  - 6
+  - 8
+  - 10
+  metric_window_size_steps: 16
+  metric_window_step_steps: 8
+  metric_range_start_steps: 0
+  metric_m_samples: 8
+  metric_m_min: 4
+  metric_n_proj: 4
+  metric_null_reps: 1
+  metric_particle_samples: 32
+  metric_dirs_seed: 123
+  metric_seed: 12345
+  metric_delta_h_floor: 0.0
+  metric_msc_floor: 0.01
+  metric_eps: 1.0e-12
+  metric_msc_term: floor_reconstruction_error
+  metric_msc_normalize_by_weight_sum: true
+  render:
+    enabled: true
+    fps: 18
+    size_px: 512
+    max_frames: 512
+    trail_steps: 16
+    particle_radius_px: 3
+    particle_stride: 1
+    max_particles: null
+    codec: mp4v
+  visualization:
+    heatmaps_enabled: true
+    heatmap_cmap: coolwarm
+    heatmap_max_runs: null
+    frame_montage_enabled: true
+    frame_montage_frames: 6
+    frame_montage_seed: 0
+    frame_montage_trail_steps: 64
+    frame_montage_max_particles: null
+    msc_r_tau_steps: null
+datasets:
+  flow_lenia:
+    enabled: true
+    required: true
+    frustration_roots:
+    - experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/frustration_simulation
+    c1:
+      source: apf_lagrangian_split
+      apf_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/arun_lagrangian_apf_500k
+      require_random: true
+      expected_window_start_steps: 50000
+      expected_window_end_steps: 300000
+      metric:
+        metric_tau_mode: max_grid
+        metric_tau_grid_steps:
+        - 500
+        - 600
+        - 700
+        - 800
+        - 900
+        - 1000
+        - 2000
+        - 3000
+        - 4000
+        - 5000
+        - 6000
+        - 7000
+        - 8000
+        - 9000
+        - 10000
+        - 11000
+        - 12000
+        - 13000
+        - 14000
+        - 15000
+        metric_tau_steps: 3000
+        metric_window_size_steps: 20000
+        metric_window_step_steps: 5000
+        metric_range_start_steps: 0
+        metric_m_samples: 48
+        metric_m_min: 4
+        metric_n_proj: 16
+        metric_null_reps: 6
+        metric_particle_samples: 64
+        metric_periodic: false
+        metric_domain_y: 128.0
+        metric_domain_x: 128.0
+        metric_delta_h_floor: 0.0
+        metric_msc_floor: 0.01
+        metric_msc_term: floor_reconstruction_error
+        metric_msc_normalize_by_weight_sum: true
+    c5:
+      metric:
+        metric_tau_mode: max_grid
+        metric_tau_grid_steps:
+        - 1000
+        - 3000
+        - 5000
+        - 7000
+        - 9000
+        metric_tau_steps: 3000
+        fixed_tau_distribution_steps: 3000
+        metric_window_size_steps: 20000
+        metric_window_step_steps: 5000
+        metric_range_start_steps: 0
+        metric_m_samples: 48
+        metric_m_min: 4
+        metric_n_proj: 16
+        metric_null_reps: 6
+        metric_particle_samples: 64
+        metric_periodic: false
+        metric_domain_y: 128.0
+        metric_domain_x: 128.0
+        metric_delta_h_floor: 0.0
+        metric_msc_floor: 0.01
+        metric_msc_term: floor_reconstruction_error
+        metric_msc_normalize_by_weight_sum: true
+  plife_plus:
+    enabled: false
+    required: false
+    frustration_root: experiments/paper_check_plife_plus/checkpoints/frustration_simulation
+    analysis_config: experiments/paper_check_plife_plus/frustration_simulation/analysis_config.yaml
+    c1:
+      source: lagrangian_root
+      lagrangian_root: experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k
+      require_random: true
+      expected_trajectory_start_steps: 4000
+      expected_trajectory_end_steps: 24000
+      metric:
+        metric_tau_mode: max_grid
+        metric_tau_grid_steps:
+        - 5
+        - 10
+        - 15
+        - 20
+        - 25
+        - 30
+        - 35
+        metric_tau_steps: 25
+        metric_window_size_steps: 100
+        metric_window_step_steps: 50
+        metric_range_start_steps: 0
+        metric_range_end_steps: null
+        metric_m_samples: 48
+        metric_m_min: 4
+        metric_n_proj: 16
+        metric_null_reps: 6
+        metric_particle_samples: 64
+        metric_dirs_seed: 123
+        metric_periodic: true
+        metric_domain_y: 1.0
+        metric_domain_x: 1.0
+        metric_preprocess_mode: clip
+        metric_delta_h_floor: 0.0
+        metric_msc_floor: 0.01
+        metric_msc_term: floor_reconstruction_error
+        metric_msc_normalize_by_weight_sum: true
+        metric_alpha: 1.0
+        metric_beta: 1.0
+        metric_eps: 0.001
+    c5:
+      metric:
+        metric_tau_mode: fixed
+        metric_tau_grid_steps: null
+        metric_tau_steps: 25
+        fixed_tau_distribution_steps: 25
+        metric_window_size_steps: 100
+        metric_window_step_steps: 50
+        metric_range_start_steps: 0
+        metric_range_end_steps: null
+        metric_m_samples: 48
+        metric_m_min: 4
+        metric_n_proj: 16
+        metric_null_reps: 6
+        metric_particle_samples: 64
+        metric_dirs_seed: 123
+        metric_periodic: true
+        metric_domain_y: 1.0
+        metric_domain_x: 1.0
+        metric_preprocess_mode: clip
+        metric_delta_h_floor: 0.0
+        metric_msc_floor: 0.01
+        metric_msc_term: floor_reconstruction_error
+        metric_msc_normalize_by_weight_sum: true
+        metric_alpha: 1.0
+        metric_beta: 1.0
+        metric_eps: 0.001
+  boids:
+    enabled: false
+    required: false
+    frustration_root: experiments/paper_check_boids/checkpoints/frustration_simulation
+    analysis_config: experiments/paper_check_boids/frustration_simulation/analysis_config.yaml
+    c1:
+      metric:
+        metric_tau_mode: max_grid
+        metric_tau_grid_steps:
+        - 100
+        - 200
+        - 400
+        - 800
+        - 1200
+        - 1600
+        - 2000
+        - 3000
+        - 4000
+        metric_tau_steps: 800
+        metric_window_size_steps: 20000
+        metric_window_step_steps: 5000
+        metric_range_start_steps: 0
+        metric_m_samples: 48
+        metric_m_min: 4
+        metric_n_proj: 16
+        metric_null_reps: 6
+        metric_particle_samples: 64
+        metric_periodic: false
+        metric_domain_y: 1.0
+        metric_domain_x: 1.0
+        metric_delta_h_floor: 0.0
+        metric_msc_floor: 0.01
+        metric_msc_term: floor_reconstruction_error
+        metric_msc_normalize_by_weight_sum: true
+    c5:
+      metric:
+        metric_tau_mode: max_grid
+        metric_tau_grid_steps:
+        - 100
+        - 200
+        - 400
+        - 800
+        - 1200
+        - 1600
+        - 2000
+        - 3000
+        - 4000
+        metric_tau_steps: 800
+        fixed_tau_distribution_steps: 800
+        metric_window_size_steps: 20000
+        metric_window_step_steps: 5000
+        metric_range_start_steps: 0
+        metric_m_samples: 48
+        metric_m_min: 4
+        metric_n_proj: 16
+        metric_null_reps: 6
+        metric_particle_samples: 64
+        metric_delta_h_floor: 0.0
+        metric_msc_floor: 0.01
+        metric_msc_term: floor_reconstruction_error
+        metric_msc_normalize_by_weight_sum: true
+c2:
+  required: true
+  trajectory_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/arun_lagrangian_apf_500k
+  legacy_minibang_root: experiments/flow_lenia_mspd/checkpoints/minibang_golden_set/run_longrun_check_v2
+  flow_lenia_highres:
+    enabled: false
+    required: false
+    rollout_config: experiments/paper_suite/flowlenia_arun_apf_500k_grid128.yaml
+    output_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/arun_lagrangian_apf_500k
+    optimized_checkpoint_roots:
+    - experiments/paper_check_flow_lenia/checkpoints_lockheed_1/optimization
+    dedupe_by_run_idx: false
+    max_checkpoints: null
+  branching:
+    enabled: true
+    required: false
+    branch_root: analysis/results/paper_suite_flowlenia_lockheed_1_grid128_eval/c2_branching/branches
+    max_trajectories: 9
+    selection_mode: tau_mean_ranked_high_low
+    n_high: 5
+    n_mid: 5
+    n_low: 5
+    selection_seed: 12345
+    n_points_per_trajectory: 10
+    point_quantile_min: 0.05
+    point_quantile_max: 0.95
+    m_pairs: 5
+    branches_per_time: 3
+    horizon_steps: 20000
+    resume_batch_size: 30
+    min_branch_step: 50000
+    refractory_steps: 5000
+    high_quantile: 0.8
+    mid_quantile_low: 0.4
+    mid_quantile_high: 0.6
+    low_quantile: 0.2
+    feature_max_apf_chunks: 4
+    feature_max_snapshots_per_chunk: 8
+    future_field_weights:
+      A: 1.0
+      P: 0.25
+      F: 0.25
+    branching_metric: apf
+    clip_foundation_model: clip
+    clip_embedding_cache_dir: analysis/results/paper_suite_flowlenia_lockheed_1_grid128_eval/c2_branching/clip_embedding_cache
+    future_field_scales:
+    - 1
+    - 2
+    - 4
+    future_max_frames: 32
+    allow_debug_feature_fallback: false
+    perturb:
+      a_std: 0.02
+      p_std: 0.02
+      lagrangian_xy_std: 1.0
+  plife_plus:
+    enabled: false
+    required: false
+    trajectory_root: experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k
+    output_dir: analysis/results/paper_suite_flowlenia_lockheed_1_grid128_eval/c2_plife_plus_branching
+    branch_root: analysis/results/paper_suite_flowlenia_lockheed_1_grid128_eval/c2_plife_plus_branching/branches
+    max_trajectories: 9
+    selection_mode: tau_mean_ranked_high_low
+    n_high: 5
+    n_mid: 5
+    n_low: 5
+    branches_per_time: 3
+    horizon_steps: 1000
+    min_branch_step: 0
+    refractory_steps: 250
+    future_sample_every_steps: 25
+    branching_metric: clip_chamfer
+    clip_foundation_model: clip
+    clip_embedding_cache_dir: analysis/results/paper_suite_flowlenia_lockheed_1_grid128_eval/c2_plife_plus_branching/clip_embedding_cache
+    clip_max_future_frames: 32
+    render_img_size: 128
+    divergence_max_particles: 128
+    domain_size: 1.0
+    perturb:
+      x_std: 0.003
+      v_std: 0.0
+      c_std: 0.01
+    perturbation_strength_sweep:
+      output_dir: analysis/results/paper_suite/c2_plife_plus_perturbation_strength_sweep
+      conditions:
+      - high
+      n_points: 3
+      strengths:
+      - 0
+      - 0.1
+      - 1
+      - 3
+      - 10
+      reps_per_strength: 1
+      include_pre_perturb_initial_frame: true
+      debug_color_strip: true
+      color_strip_height: 24
+      video_fps: 12
+      panel_size: 192
+      max_video_frames: 128
+      first_frame_count: 4
+c4:
+  enabled: false
+  output_dir: c4_nnopt_vs_mspd_disabled_for_flowlenia_lockheed_1
+  include_random: true
+  foundation_model: clip
+  max_clip_frames: 128
+  clip_range_start_steps: 50000
+  clip_range_end_steps: 300000
+  stat_seed: 0
+  stat_max_exact_permutations: 100000
+  stat_permutation_reps: 20000
+simulation:
+  reuse_existing: true
+  allow_optimization_rerun: false
+  flow_lenia_arun_lagrangian_apf:
+    enabled: true
+    required: true
+    rollout_config: experiments/paper_suite/flowlenia_arun_apf_500k_grid128.yaml
+    output_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/arun_lagrangian_apf_500k
+    rollout_steps: 500000
+    n_trajectories_per_checkpoint: 1
+    include_random_baselines: true
+    num_random_baselines: 3
+    run_seed_base: 400003
+    run_seed_mode: source_run_idx
+    batch_size: 9
+    optimized_checkpoint_roots:
+    - experiments/paper_check_flow_lenia/checkpoints_lockheed_1/optimization
+    dedupe_by_run_idx: false
+    max_checkpoints: null
+  flow_lenia_nnopt_lagrangian_apf:
+    enabled: false
+    required: false
+    rollout_config: experiments/paper_suite/flowlenia_arun_apf_500k_grid128.yaml
+    output_root: experiments/paper_check_flow_lenia/checkpoints/nnopt_lagrangian_apf_500k
+    rollout_steps: 500000
+    n_trajectories_per_checkpoint: 1
+    include_random_baselines: false
+    objective_label: clip_oe
+    traj_prefix: nnopt
+    run_seed_base: 400000
+    run_seed_mode: source_run_idx
+    batch_size: 9
+    optimized_checkpoint_roots:
+    - experiments/paper_check_flow_lenia/checkpoints/clip_oe/optimization
+    dedupe_by_run_idx: false
+    max_checkpoints: null
+  plife_plus_c1_lagrangian:
+    enabled: false
+    required: false
+    base_config: experiments/paper_check_plife_plus/frustration_simulation/config.yaml
+    output_root: experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k
+    smoke_output_root: analysis/results/paper_suite_smoke/plife_plus_c1_lagrangian
+    rollout_steps: 24000
+    total_steps: 24000
+    late_window_start_steps: 4000
+    late_window_end_steps: 24000
+    sample_every_steps: 1
+    metric_tau_mode: max_grid
+    metric_tau_grid_steps:
+    - 5
+    - 10
+    - 15
+    - 20
+    - 25
+    - 30
+    - 35
+    metric_tau_steps: 25
+    metric_window_size_steps: 100
+    metric_window_step_steps: 50
+    include_random_baselines: true
+    num_random_baselines: 3
+    expected_optimized_groups: 7
+    n_trajectories_per_checkpoint: 1
+    include_population: false
+    include_best_traj: false
+    include_final_best: true
+    run_seed_base: 400000
+    run_seed_mode: source_run_idx
+    metric_seed_base: 800000
+    selection_mode: loss
+    batch_size: 7
+    jit_microbatch: 256
+    optimized_checkpoint_roots:
+    - experiments/paper_check_plife_plus/checkpoints/optimization_main
+    dedupe_by_run_idx: false
+    max_checkpoints: null
+  commands:
+  - name: flow_lenia_paper_check_frustration
+    task: paper_check
+    enabled: true
+    required: true
+    heavy: true
+    force_policy: reuse_existing
+    command:
+    - '{python}'
+    - scripts/run_paper_check_frustration.py
+    - experiments/paper_check_flow_lenia/config_lockheed_1_grid128.yaml
+    expected_paths:
+    - experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/frustration_simulation/trial_results.csv
+    expected_globs:
+    - experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/frustration_simulation/trial_data/trial_*_lagrangian.npz
+    - experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/frustration_simulation/trial_data/trial_*_embeddings.npz
+  - name: flow_lenia_arun_lagrangian_apf_500k
+    task: paper_check_apf
+    enabled: true
+    required: true
+    heavy: true
+    always_run: true
+    command:
+    - '{python}'
+    - scripts/paper_suite_flowlenia_arun_apf.py
+    - '{config}'
+    expected_paths:
+    - experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/arun_lagrangian_apf_500k/manifest.json
+    expected_globs:
+    - experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/arun_lagrangian_apf_500k/flow_opt_*/apf_logs/P_steps_*.npz
+    expected_npz_keys:
+    - A
+    - P
+    - F
+    - lagrangian_xy
+    - lagrangian_c
+    - resume_batch_rng_key
+    - state_t
+    - state_mass_cycle_start
+    npz_key_check_limit: 3
+  - name: flow_lenia_nnopt_lagrangian_apf_500k
+    task: nnopt_apf
+    enabled: false
+    required: false
+    heavy: true
+    always_run: true
+    command:
+    - '{python}'
+    - scripts/paper_suite_flowlenia_nnopt_apf.py
+    - '{config}'
+    expected_paths:
+    - experiments/paper_check_flow_lenia/checkpoints/nnopt_lagrangian_apf_500k/manifest.json
+    expected_globs:
+    - experiments/paper_check_flow_lenia/checkpoints/nnopt_lagrangian_apf_500k/nnopt_*/apf_logs/P_steps_*.npz
+    expected_npz_keys:
+    - A
+    - P
+    - F
+    - lagrangian_xy
+    - lagrangian_c
+    - resume_batch_rng_key
+    - state_t
+    - state_mass_cycle_start
+    npz_key_check_limit: 3
+  - name: plife_plus_paper_check_frustration
+    task: paper_check
+    enabled: false
+    required: false
+    heavy: true
+    force_policy: reuse_existing
+    command:
+    - '{python}'
+    - scripts/run_paper_check_frustration.py
+    - experiments/paper_check_plife_plus/config.yaml
+    expected_paths:
+    - experiments/paper_check_plife_plus/checkpoints/frustration_simulation/trial_results.csv
+    expected_globs:
+    - experiments/paper_check_plife_plus/checkpoints/frustration_simulation/trial_data/trial_*_lagrangian.npz
+    - experiments/paper_check_plife_plus/checkpoints/frustration_simulation/trial_data/trial_*_embeddings.npz
+  - name: plife_plus_c1_lagrangian_24k
+    task: paper_check_c1
+    enabled: false
+    required: false
+    heavy: true
+    always_run: true
+    pass_force: true
+    command:
+    - '{python}'
+    - scripts/paper_suite_plife_c1_lagrangian.py
+    - '{config}'
+    expected_paths:
+    - experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k/manifest.json
+    - experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k/trial_results.csv
+    expected_globs:
+    - experiments/paper_check_plife_plus/checkpoints/c1_lagrangian_24k/trial_data/trial_*_lagrangian.npz
+    expected_npz_keys:
+    - xy_control_a
+    - sample_offsets_steps
+    - xy_late_sample_steps
+    - trajectory_start_steps
+    - trajectory_end_steps
+    npz_key_check_limit: 3
+  - name: boids_paper_check_frustration
+    task: paper_check
+    enabled: false
+    required: false
+    heavy: true
+    force_policy: reuse_existing
+    command:
+    - '{python}'
+    - scripts/run_paper_check_frustration.py
+    - experiments/paper_check_boids/config.yaml
+    expected_paths:
+    - experiments/paper_check_boids/checkpoints/frustration_simulation/trial_results.csv
+    expected_globs:
+    - experiments/paper_check_boids/checkpoints/frustration_simulation/trial_data/trial_*_lagrangian.npz
+    - experiments/paper_check_boids/checkpoints/frustration_simulation/trial_data/trial_*_embeddings.npz
+  - name: flow_lenia_c2_highres_rollouts
+    task: c2
+    enabled: false
+    required: false
+    heavy: true
+    always_run: true
+    command:
+    - '{python}'
+    - scripts/paper_suite_c2_flowlenia_highres.py
+    - '{config}'
+    expected_paths:
+    - experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts/manifest.json
+    expected_globs:
+    - experiments/paper_check_flow_lenia/checkpoints/c2_highres_rollouts/flow_opt_*/traj_*/apf_logs/P_steps_*.npz
+    expected_npz_keys:
+    - A
+    - P
+    - F
+    - lagrangian_xy
+    - lagrangian_c
+    - resume_batch_rng_key
+    - state_t
+    - state_mass_cycle_start
+    npz_key_check_limit: 3
+  - name: flow_lenia_minibang_event_detection_legacy
+    task: c2
+    enabled: false
+    required: false
+    heavy: false
+    command:
+    - '{python}'
+    - scripts/flowlenia_minibang_detect.py
+    - experiments/flow_lenia_mspd/checkpoints/minibang_golden_set/run_longrun_check_v2
+    expected_paths:
+    - experiments/flow_lenia_mspd/checkpoints/minibang_golden_set/run_longrun_check_v2/detections/minibang_candidates.csv
+smoke:
+  meta:
+    output_root: analysis/results/paper_suite_smoke
+  synthetic:
+    seeds: 1
+    n_particles: 32
+    time_steps: 96
+    tau_grid_steps:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 12
+    - 16
+    metric_window_size_steps: 24
+    metric_window_step_steps: 12
+    metric_m_samples: 8
+    metric_n_proj: 4
+    metric_null_reps: 1
+    metric_particle_samples: 32
+    metric_delta_h_floor: 0.01
+    metric_msc_floor: 0.01
+    metric_eps: 1.0e-12
+    metric_msc_term: floor_reconstruction_error
+    metric_msc_normalize_by_weight_sum: true
+    render:
+      enabled: true
+      size_px: 256
+      fps: 12
+      max_frames: 96
+      trail_steps: 8
+      particle_radius_px: 4
+    visualization:
+      heatmap_max_runs: null
+      msc_r_tau_steps: null
+  c2:
+    branching:
+      branch_root: analysis/results/paper_suite_smoke/c2_branching/branches
+      max_trajectories: 1
+      selection_mode: tau_mean_ranked_high_low
+      n_high: 2
+      n_mid: 2
+      n_low: 2
+      selection_seed: 12345
+      n_points_per_trajectory: 4
+      m_pairs: 2
+      branches_per_time: 3
+      horizon_steps: 64
+    plife_plus:
+      required: false
+      trajectory_root: analysis/results/paper_suite_smoke/smoke_inputs/plife_plus/frustration_simulation
+      output_dir: analysis/results/paper_suite_smoke/c2_plife_plus_branching
+      branch_root: analysis/results/paper_suite_smoke/c2_plife_plus_branching/branches
+      max_trajectories: 1
+      selection_mode: tau_mean_ranked_high_low
+      n_high: 1
+      n_mid: 1
+      n_low: 1
+      branches_per_time: 2
+      horizon_steps: 16
+      min_branch_step: 0
+      refractory_steps: 0
+      future_sample_every_steps: 4
+      branching_metric: clip_chamfer
+      clip_embedding_cache_dir: analysis/results/paper_suite_smoke/c2_plife_plus_branching/clip_embedding_cache
+      clip_max_future_frames: 4
+      render_img_size: 64
+      divergence_max_particles: 32
+      perturb:
+        x_std: 0.01
+        v_std: 0.0
+        c_std: 0.01
+      perturbation_strength_sweep:
+        output_dir: analysis/results/paper_suite_smoke/c2_plife_plus_perturbation_strength_sweep
+        conditions:
+        - high
+        n_points: 1
+        strengths:
+        - 0
+        - 1
+        reps_per_strength: 1
+        include_pre_perturb_initial_frame: true
+        debug_color_strip: true
+        color_strip_height: 16
+        horizon_steps: 16
+        future_sample_every_steps: 4
+        render_img_size: 64
+        panel_size: 96
+        max_video_frames: 16
+        first_frame_count: 4

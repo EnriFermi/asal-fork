@@ -1,0 +1,28 @@
+meta:
+  machine_idx: ${env:PAPER_MACHINE_IDX,0}
+  num_machines: ${env:PAPER_NUM_MACHINES,1}
+  wandb_project: asal
+  wandb_mode: online
+  output_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval
+paper_check:
+  num_optimizations: 9
+  num_random_baselines: 3
+  optimization_seed_base: 1003
+  random_param_seed_base: 200003
+  pair_seed_base: 400003
+  metric_seed_base: 800003
+optimization:
+  base_config: optimization/config_longrun_check_fix.yaml
+  save_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1/optimization
+  resume: true
+  save_every: 1
+  overrides: {}
+frustration_simulation:
+  base_config: frustration_simulation/config_grid128.yaml
+  save_root: ${meta.output_root}/frustration_simulation
+  resume: true
+  trial_batch_size: 4
+  checkpoint_every_steps: 5000
+  full_embedding_sample_every_steps: 1000
+  log_full_embeddings_for_b: false
+  overrides: {}
