@@ -7,8 +7,8 @@ cd "${repo_root}"
 
 conda_env="${CONDA_ENV:-torchjax}"
 python_bin="${PYTHON_BIN:-python}"
-cfg="${CFG:-experiments/paper_suite/config_flowlenia_lockheed_1_grid128.yaml}"
-paper_check_cfg="${PCFG:-experiments/paper_check_flow_lenia/config_lockheed_1_grid128.yaml}"
+cfg="${FLOWLENIA_LOCKHEED_GRID128_CFG:-experiments/paper_suite/config_flowlenia_lockheed_1_grid128.yaml}"
+paper_check_cfg="${FLOWLENIA_LOCKHEED_GRID128_PCFG:-experiments/paper_check_flow_lenia/config_lockheed_1_grid128.yaml}"
 opt_root="${OPT_ROOT:-experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/optimization}"
 opt_source_root="${OPT_SOURCE_ROOT:-experiments/paper_check_flow_lenia/checkpoints_lockheed_1/optimization}"
 expected_opts="${EXPECTED_OPTS:-9}"
@@ -24,7 +24,7 @@ run_c2="${RUN_C2:-1}"
 run_c5="${RUN_C5:-1}"
 run_visualization="${RUN_VISUALIZATION:-1}"
 
-force_apf="${FORCE_APF:-0}"
+force_apf="${FORCE_APF:-1}"
 force_branches="${FORCE_BRANCHES:-1}"
 force_metrics="${FORCE_METRICS:-1}"
 force_visualization="${FORCE_VISUALIZATION:-1}"
@@ -129,6 +129,27 @@ require_dir() {
     exit 2
   fi
 }
+
+if [ "${CFG+x}" = "x" ] && [ "${FLOWLENIA_LOCKHEED_GRID128_CFG+x}" != "x" ]; then
+  echo "Ignoring generic CFG=${CFG}; use FLOWLENIA_LOCKHEED_GRID128_CFG to override this wrapper." >&2
+fi
+if [ "${PCFG+x}" = "x" ] && [ "${FLOWLENIA_LOCKHEED_GRID128_PCFG+x}" != "x" ]; then
+  echo "Ignoring generic PCFG=${PCFG}; use FLOWLENIA_LOCKHEED_GRID128_PCFG to override this wrapper." >&2
+fi
+case "${cfg}" in
+  *grid128*) ;;
+  *)
+    echo "Refusing non-grid128 paper-suite cfg in grid128 wrapper: ${cfg}" >&2
+    exit 4
+    ;;
+esac
+case "${paper_check_cfg}" in
+  *grid128*) ;;
+  *)
+    echo "Refusing non-grid128 paper-check cfg in grid128 wrapper: ${paper_check_cfg}" >&2
+    exit 4
+    ;;
+esac
 
 require_file "${cfg}"
 require_file "${paper_check_cfg}"

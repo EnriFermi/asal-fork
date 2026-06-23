@@ -391,13 +391,17 @@ def run(
         ready, message = ready_by_traj[str(row["traj_id"])]
         if str(row["traj_id"]) not in run_traj_ids:
             status = "exists"
-            log_event(f"Flow-Lenia A-run APF {idx}/{len(selected)} traj={row['traj_id']} exists", component="arun-apf")
+            log_event(
+                f"Flow-Lenia A-run APF {idx}/{len(selected)} traj={row['traj_id']} exists "
+                f"run_root={paths['run_root']} apf_status={message or 'ready'}",
+                component="arun-apf",
+            )
         else:
             status = "queued"
             reason = "force" if force else message
             log_event(
                 f"Flow-Lenia A-run APF {idx}/{len(selected)} traj={row['traj_id']} queued "
-                f"pre_status={reason}",
+                f"run_root={paths['run_root']} pre_status={reason}",
                 component="arun-apf",
             )
             message = reason
