@@ -175,55 +175,58 @@ if [ "${force_apf}" = "1" ]; then
   apf_force_arg="--force"
 fi
 
-if [ "${run_frustration}" = "1" ] && [ "${run_c5}" = "1" ]; then
-  echo
-  echo "[1/9] Flow-Lenia C5 frustration simulation/check"
-  run_py scripts/run_paper_check_frustration.py "${paper_check_cfg}"
-fi
-
 if [ "${run_apf}" = "1" ]; then
   echo
-  echo "[2/9] Flow-Lenia A-run APF/Lagrangian trajectories"
+  echo "[1/10] Flow-Lenia A-run APF/Lagrangian trajectories for C1/C2"
   run_py scripts/paper_suite_flowlenia_arun_apf.py "${cfg}" ${apf_force_arg}
 fi
 
 if [ "${run_c1}" = "1" ]; then
   echo
-  echo "[3/9] Flow-Lenia C1 metrics"
+  echo "[2/10] Flow-Lenia C1 metrics"
   run_suite --layer metrics --task c1 ${metric_force_arg}
+fi
+
+if [ "${run_visualization}" = "1" ] && [ "${run_c1}" = "1" ]; then
+  echo
+  echo "[3/10] Flow-Lenia C1 visualization"
+  run_suite --layer visualization --task c1 ${vis_force_arg}
+fi
+
+if [ "${run_frustration}" = "1" ] && [ "${run_c5}" = "1" ]; then
+  echo
+  echo "[4/10] Flow-Lenia C5 frustration simulation/check"
+  run_py scripts/run_paper_check_frustration.py "${paper_check_cfg}"
 fi
 
 if [ "${run_c5}" = "1" ]; then
   echo
-  echo "[4/9] Flow-Lenia C5 metrics"
+  echo "[5/10] Flow-Lenia C5 metrics"
   run_suite --layer metrics --task c5 ${metric_force_arg}
 fi
 
 if [ "${run_c2}" = "1" ]; then
   echo
-  echo "[5/9] Flow-Lenia C2 trajectory metrics"
+  echo "[6/10] Flow-Lenia C2 trajectory metrics"
   run_py scripts/paper_suite_c2_flowlenia_metrics.py "${cfg}" ${metric_force_arg}
 
   echo
-  echo "[6/9] Flow-Lenia C2 event tables"
+  echo "[7/10] Flow-Lenia C2 event tables"
   run_py scripts/paper_suite_c2_events.py "${cfg}"
 
   echo
-  echo "[7/9] Flow-Lenia C2 branch simulation"
+  echo "[8/10] Flow-Lenia C2 branch simulation"
   run_py scripts/paper_suite_c2_branching.py "${cfg}" --layer simulation ${heavy_arg} ${branch_force_arg}
 
   echo
-  echo "[8/9] Flow-Lenia C2 branch metrics: APF and CLIP-Chamfer"
+  echo "[9/10] Flow-Lenia C2 branch metrics: APF and CLIP-Chamfer"
   run_py scripts/paper_suite_c2_branching.py "${cfg}" --layer metrics ${metric_force_arg}
   run_py scripts/paper_suite_c2_branching.py "${cfg}" --layer metrics --branching-metric clip_chamfer ${metric_force_arg}
 fi
 
 if [ "${run_visualization}" = "1" ]; then
   echo
-  echo "[9/9] Flow-Lenia visualizations"
-  if [ "${run_c1}" = "1" ]; then
-    run_suite --layer visualization --task c1 ${vis_force_arg}
-  fi
+  echo "[10/10] Flow-Lenia remaining visualizations"
   if [ "${run_c2}" = "1" ]; then
     run_suite --layer visualization --task c2 ${vis_force_arg}
   fi
