@@ -11,7 +11,10 @@ cfg="${FLOWLENIA_LOCKHEED_GRID128_CFG:-experiments/paper_suite/config_flowlenia_
 paper_check_cfg="${FLOWLENIA_LOCKHEED_GRID128_PCFG:-experiments/paper_check_flow_lenia/config_lockheed_1_grid128.yaml}"
 opt_root="${OPT_ROOT:-experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/optimization}"
 opt_source_root="${OPT_SOURCE_ROOT:-experiments/paper_check_flow_lenia/checkpoints_lockheed_1/optimization}"
+random_root="${RANDOM_ROOT:-$(dirname "${opt_root}")/frustration_simulation/random_params}"
+random_source_root="${RANDOM_SOURCE_ROOT:-$(dirname "${opt_source_root}")/frustration_simulation/random_params}"
 expected_opts="${EXPECTED_OPTS:-9}"
+expected_random_baselines="${EXPECTED_RANDOM_BASELINES:-27}"
 result_root="${RESULT_ROOT:-analysis/results/paper_suite_flowlenia_lockheed_1_grid128_eval}"
 run_id="${PAPER_SUITE_RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 log_dir="${PAPER_SUITE_LOG_DIR:-${result_root}/logs}"
@@ -163,13 +166,27 @@ if [ ! -d "${opt_root}" ]; then
 fi
 require_dir "${opt_root}"
 
+if [ ! -d "${random_root}" ]; then
+  require_dir "${random_source_root}"
+  echo "Isolated random baseline input root is missing; copying read-only source checkpoints:"
+  echo "  from=${random_source_root}"
+  echo "  to=${random_root}"
+  mkdir -p "${random_root}"
+  cp -R "${random_source_root}/." "${random_root}/"
+fi
+require_dir "${random_root}"
+
 best_count="$(find "${opt_root}" -mindepth 2 -maxdepth 2 -name best.pkl -print | wc -l | tr -d ' ')"
+random_count="$(find "${random_root}" -mindepth 3 -maxdepth 3 -name best.pkl -print | wc -l | tr -d ' ')"
 echo "Flow-Lenia lockheed_1 grid128 paper-suite recompute"
 echo "  cfg=${cfg}"
 echo "  paper_check_cfg=${paper_check_cfg}"
 echo "  isolated_opt_root=${opt_root}"
 echo "  opt_source_root(copy-only-if-missing)=${opt_source_root}"
 echo "  best.pkl count=${best_count}/${expected_opts}"
+echo "  isolated_random_root=${random_root}"
+echo "  random_source_root(copy-only-if-missing)=${random_source_root}"
+echo "  random best.pkl count=${random_count}/${expected_random_baselines}"
 echo "  conda_env=${conda_env}"
 echo "  run_id=${run_id}"
 echo "  log_dir=${log_dir}"
@@ -178,6 +195,10 @@ echo "  stdout_mode=tee conda_no_capture_output=${conda_no_capture_output} use_s
 
 if [ "${expected_opts}" != "0" ] && [ "${best_count}" -ne "${expected_opts}" ]; then
   echo "Expected ${expected_opts} completed optimizations, found ${best_count}. Set EXPECTED_OPTS=0 to skip this check." >&2
+  exit 3
+fi
+if [ "${expected_random_baselines}" != "0" ] && [ "${random_count}" -ne "${expected_random_baselines}" ]; then
+  echo "Expected ${expected_random_baselines} random baseline checkpoints, found ${random_count}. Set EXPECTED_RANDOM_BASELINES=0 to skip this check." >&2
   exit 3
 fi
 
