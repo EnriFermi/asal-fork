@@ -48,6 +48,38 @@ def _run_dirs(root: Path, runs: str | None, max_runs: int | None) -> list[Path]:
     return out
 
 
+def _load_flat_config(run_dir: Path) -> dict[str, Any]:
+    from omegaconf import OmegaConf
+
+    cfg = OmegaConf.load(run_dir / "optimization_config.yaml")
+    flat = OmegaConf.merge(
+        cfg.get("meta", {}),
+        cfg.get("substrate", {}),
+        cfg.get("evaluation", {}),
+        cfg.get("optimization", {}),
+        cfg.get("logging", {}),
+        cfg.get("metric", {}),
+    )
+    return dict(OmegaConf.to_container(flat, resolve=True))
+
+
+def _cfg_int(flat: dict[str, Any], key: str, default: int | None = None) -> int:
+    value = flat.get(key, default)
+    if value is None:
+        if default is None:
+            raise KeyError(key)
+        value = default
+    return int(value)
+
+
+def _config_metric_range(run_dir: Path) -> tuple[int, int]:
+    flat = _load_flat_config(run_dir)
+    return (
+        _cfg_int(flat, "metric_range_start_steps", 0),
+        _cfg_int(flat, "metric_range_end_steps", _cfg_int(flat, "rollout_steps")),
+    )
+
+
 def _summary_row(run_dir: Path, label: str, summary: dict[str, Any]) -> dict[str, Any]:
     per = [float(x) for x in summary.get("per_rep_score", [])]
     row: dict[str, Any] = {
@@ -105,47 +137,52 @@ def main(argv: list[str] | None = None) -> int:
 
     for i_run, run_dir in enumerate(run_dirs, start=1):
         print(f"[{i_run}/{len(run_dirs)}] {run_dir.name}", flush=True)
-        base_out = out_root / run_dir.name / "range_config_50000_300000"
+        config_range_start, config_range_end = _config_metric_range(run_dir)
+        base_label = f"range_config_{config_range_start}_{config_range_end}"
+        base_out = out_root / run_dir.name / base_label
         base_summary_path = base_out / "summary.json"
-        if args.skip_existing and base_summary_path.exists():
-            print(f"  exists: {base_summary_path}", flush=True)
-        else:
-            cmd = [
-                sys.executable,
-                str(renderer),
-                str(run_dir),
-                "--source-root",
-                str(args.source_root),
-                "--output-dir",
-                str(base_out),
-                "--rep-index",
-                "all",
-                "--img-size",
-                str(args.img_size),
-                "--video-resize-method",
-                str(args.video_resize_method),
-                "--video-stride-steps",
-                str(args.video_stride_steps),
-                "--video-max-steps",
-                str(args.video_max_steps),
-                "--fps",
-                str(args.fps),
-                "--codec",
-                str(args.codec),
-                "--frame-batch-size",
-                str(args.frame_batch_size),
-            ]
-            _run_command(cmd)
-        rows.append(_summary_row(run_dir, "range_config_50000_300000", _load_summary(base_summary_path)))
-        _write_csv(out_root / "batch_summary.csv", rows)
 
         if args.skip_extra_range:
+            if args.skip_existing and base_summary_path.exists():
+                print(f"  exists: {base_summary_path}", flush=True)
+            else:
+                cmd = [
+                    sys.executable,
+                    str(renderer),
+                    str(run_dir),
+                    "--source-root",
+                    str(args.source_root),
+                    "--output-dir",
+                    str(base_out),
+                    "--rep-index",
+                    "all",
+                    "--img-size",
+                    str(args.img_size),
+                    "--video-resize-method",
+                    str(args.video_resize_method),
+                    "--video-stride-steps",
+                    str(args.video_stride_steps),
+                    "--video-max-steps",
+                    str(args.video_max_steps),
+                    "--fps",
+                    str(args.fps),
+                    "--codec",
+                    str(args.codec),
+                    "--frame-batch-size",
+                    str(args.frame_batch_size),
+                ]
+                _run_command(cmd)
+            rows.append(_summary_row(run_dir, base_label, _load_summary(base_summary_path)))
+            _write_csv(out_root / "batch_summary.csv", rows)
             continue
+
         extra_label = f"range_{int(args.extra_range_start_steps)}_{int(args.range_end_steps)}"
         extra_out = out_root / run_dir.name / extra_label
         extra_summary_path = extra_out / "summary.json"
-        if args.skip_existing and extra_summary_path.exists():
+
+        if args.skip_existing and extra_summary_path.exists() and base_summary_path.exists():
             print(f"  exists: {extra_summary_path}", flush=True)
+            print(f"  exists: {base_summary_path}", flush=True)
         else:
             cmd = [
                 sys.executable,
@@ -175,10 +212,18 @@ def main(argv: list[str] | None = None) -> int:
                 str(args.extra_range_start_steps),
                 "--metric-range-end-steps",
                 str(args.range_end_steps),
-                "--skip-video",
+                "--secondary-output-dir",
+                str(base_out),
+                "--secondary-metric-range-start-steps",
+                str(config_range_start),
+                "--secondary-metric-range-end-steps",
+                str(config_range_end),
             ]
             _run_command(cmd)
+
         rows.append(_summary_row(run_dir, extra_label, _load_summary(extra_summary_path)))
+        _write_csv(out_root / "batch_summary.csv", rows)
+        rows.append(_summary_row(run_dir, base_label, _load_summary(base_summary_path)))
         _write_csv(out_root / "batch_summary.csv", rows)
 
     payload = {

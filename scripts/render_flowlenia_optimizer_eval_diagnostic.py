@@ -149,6 +149,109 @@ def _metric_chunk_raw(
     return np.asarray(jax.device_get(loss_raw)), info_np
 
 
+def _metric_chunk_raw_dual(
+    *,
+    flat: Any,
+    substrate: Any,
+    metric_cfg: dict[str, Any],
+    metric_loss_fn: Any,
+    secondary_metric_loss_fn: Any,
+    candidate: dict[str, Any],
+    substrate_param_dims: int,
+    tau_extra_dims: int,
+) -> tuple[np.ndarray, dict[str, np.ndarray], np.ndarray, dict[str, np.ndarray]]:
+    chunk_steps = int(metric_cfg["sample_every_steps"])
+    time_sampling = int(metric_cfg["time_sampling"])
+    lag_n_particles = int(getattr(flat, "metric_lagrangian_n_particles", 256))
+    lag_init_mode = str(getattr(flat, "metric_lagrangian_init_mode", "mass"))
+    lag_flow_channel = int(getattr(flat, "metric_lagrangian_flow_channel", -1))
+    lag_flow_reduce = str(getattr(flat, "metric_lagrangian_flow_reduce", "mass_weighted"))
+    lag_channel_mode = str(getattr(flat, "metric_lagrangian_channel_mode", "mix"))
+    lag_noise_model = str(getattr(flat, "metric_lagrangian_noise_model", "none"))
+    lag_diffusion_scale = float(getattr(flat, "metric_lagrangian_diffusion_scale", 1.0))
+    log_clip_evolution = bool(getattr(flat, "log_clip_evolution", True))
+
+    def rollout_metric_xy(rng, params):
+        k_state, k_pts, k_ch, k_scan = jax.random.split(rng, 4)
+        s0 = substrate.init_state(k_state, params)
+        rt = substrate.RT
+        pts0 = _init_lagrangian_points_jax(
+            s0["A"],
+            n_particles=lag_n_particles,
+            init_mode=lag_init_mode,
+            border=str(getattr(rt, "border", "wall")),
+            sigma=float(getattr(rt, "sigma", 0.0)),
+            key=k_pts,
+        )
+        if lag_channel_mode in ("fixed", "resample"):
+            ch0 = rt.sample_point_channels(pts0, s0["A"], k_ch)
+        else:
+            ch0 = jnp.zeros((lag_n_particles,), dtype=jnp.int32)
+
+        def step_fn(state, key_step):
+            st, pts, ch = state
+            st = substrate.step_state(key_step, st, params)
+            lag_key = jax.random.fold_in(key_step, jnp.uint32(0x4C4147))
+            pts, ch = rt.advect_particles(
+                points=pts,
+                F=st["F"],
+                A=st["A"],
+                channel=lag_flow_channel,
+                reduce=lag_flow_reduce,
+                point_channels=ch,
+                channel_mode=lag_channel_mode,
+                key=lag_key,
+                noise_model=lag_noise_model,
+                diffusion_scale=lag_diffusion_scale,
+            )
+            return (st, pts, ch), None
+
+        def chunk_fn(state, key_chunk):
+            state_next, _ = jax.lax.scan(step_fn, state, jax.random.split(key_chunk, chunk_steps))
+            return state_next, state_next[1]
+
+        (_, _, _), xy_seq = jax.lax.scan(
+            chunk_fn,
+            (s0, pts0, ch0),
+            jax.random.split(k_scan, time_sampling),
+        )
+        return xy_seq
+
+    def calc_loss(rng, params_full):
+        params = params_full[:substrate_param_dims]
+        tau_selector = params_full[substrate_param_dims] if tau_extra_dims else None
+        if log_clip_evolution:
+            rng_roll, rng_metric, _rng_clip = jax.random.split(rng, 3)
+        else:
+            rng_roll, rng_metric = jax.random.split(rng)
+        xy = rollout_metric_xy(rng_roll, params)
+        if tau_extra_dims:
+            loss_a, info_a = metric_loss_fn(rng_metric, xy, tau_selector=tau_selector)
+            loss_b, info_b = secondary_metric_loss_fn(rng_metric, xy, tau_selector=tau_selector)
+        else:
+            loss_a, info_a = metric_loss_fn(rng_metric, xy)
+            loss_b, info_b = secondary_metric_loss_fn(rng_metric, xy)
+        return loss_a, info_a, loss_b, info_b
+
+    calc_loss_vv = jax.vmap(jax.vmap(calc_loss, in_axes=(0, None)), in_axes=(None, 0))
+
+    @jax.jit
+    def eval_chunk_raw(rng, params_chunk):
+        _rng_next, rng_metric_parent = jax.random.split(rng)
+        return calc_loss_vv(jax.random.split(rng_metric_parent, int(flat.bs)), params_chunk)
+
+    params_chunk = jnp.asarray(np.asarray(candidate["params_chunk"], dtype=np.float32), dtype=jnp.float32)
+    loss_a, info_a, loss_b, info_b = eval_chunk_raw(candidate["rng_eval"], params_chunk)
+    info_a_np = {k: np.asarray(jax.device_get(v)) for k, v in info_a.items()}
+    info_b_np = {k: np.asarray(jax.device_get(v)) for k, v in info_b.items()}
+    return (
+        np.asarray(jax.device_get(loss_a)),
+        info_a_np,
+        np.asarray(jax.device_get(loss_b)),
+        info_b_np,
+    )
+
+
 def _render_state_video(
     *,
     flat: Any,
@@ -480,6 +583,111 @@ def _plot_all_rep_maps(
     return paths
 
 
+def _write_all_reps_outputs(
+    *,
+    args: argparse.Namespace,
+    run_dir: Path,
+    out_dir: Path,
+    flat: Any,
+    substrate: Any,
+    metric_cfg: dict[str, Any],
+    candidate: dict[str, Any],
+    loss_raw: np.ndarray,
+    info_raw: dict[str, np.ndarray],
+    render_video: bool,
+    video_info_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    local_idx = int(candidate["chunk_local_idx"])
+    per_rep_score = np.asarray(info_raw["score"][local_idx], dtype=np.float64)
+    delta_h_maps = np.asarray(info_raw["delta_h_map"][local_idx], dtype=np.float32)
+    processed_maps = (
+        np.asarray(info_raw["delta_h_processed_map"][local_idx], dtype=np.float32)
+        if "delta_h_processed_map" in info_raw
+        else None
+    )
+    tau_steps = np.asarray(info_raw["tau_steps"][local_idx, 0], dtype=np.int64)
+    window_start_steps = np.asarray(info_raw["window_start_steps"][local_idx, 0], dtype=np.int64)
+    score_by_tau = np.asarray(info_raw["score_by_tau"][local_idx], dtype=np.float64)
+    selected_tau_steps_all = np.asarray(info_raw["tau_best_steps"][local_idx], dtype=np.int64)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        out_dir / "optimizer_eval_all_reps_metric_maps.npz",
+        delta_h_map_by_rep=delta_h_maps,
+        delta_h_processed_map_by_rep=processed_maps if processed_maps is not None else np.asarray([]),
+        tau_steps=tau_steps,
+        window_start_steps=window_start_steps,
+        score_by_tau_by_rep=score_by_tau,
+        per_rep_score=per_rep_score,
+        loss_raw=np.asarray(loss_raw[local_idx], dtype=np.float32),
+        selected_tau_steps=selected_tau_steps_all,
+    )
+    plot_paths = _plot_all_rep_maps(
+        out_dir=out_dir,
+        delta_h_maps=delta_h_maps,
+        processed_maps=processed_maps,
+        tau_steps=tau_steps,
+        window_start_steps=window_start_steps,
+        score_by_tau=score_by_tau,
+        rep_scores=per_rep_score,
+        selected_tau_steps=selected_tau_steps_all,
+    )
+    for i_rep in range(per_rep_score.shape[0]):
+        _plot_maps(
+            out_dir=out_dir / f"rep_{i_rep}",
+            delta_h_map=delta_h_maps[i_rep],
+            processed_map=processed_maps[i_rep] if processed_maps is not None else None,
+            tau_steps=tau_steps,
+            window_start_steps=window_start_steps,
+            score_by_tau=score_by_tau[i_rep],
+            selected_tau_steps=int(selected_tau_steps_all[i_rep]),
+            selected_score=float(per_rep_score[i_rep]),
+        )
+
+    video_info: dict[str, Any] = dict(video_info_override or {})
+    if render_video:
+        params = np.asarray(candidate["params"], dtype=np.float32)
+        video_info = _render_state_grid_video(
+            flat=flat,
+            substrate=substrate,
+            params=params,
+            rep_keys=candidate["keys"],
+            rep_scores=per_rep_score,
+            output=out_dir / "optimizer_eval_all_reps_state_grid.mp4",
+            img_size=int(args.img_size),
+            fps=int(args.fps),
+            codec=str(args.codec),
+            stride_steps=int(args.video_stride_steps),
+            max_steps=int(args.video_max_steps),
+            frame_batch_size=int(args.frame_batch_size),
+            resize_method=str(args.video_resize_method),
+        )
+
+    summary = {
+        "run_dir": str(run_dir),
+        "source_root": str(args.source_root),
+        "output_dir": str(out_dir),
+        "best_iter": int(candidate["best_iter"]),
+        "pop_idx": int(candidate["pop_idx"]),
+        "chunk_start": int(candidate["chunk_start"]),
+        "chunk_local_idx": int(candidate["chunk_local_idx"]),
+        "rep_mode": "all",
+        "per_rep_score": [float(x) for x in per_rep_score],
+        "optimizer_mean_score": float(np.mean(per_rep_score)),
+        "min_rep_idx": int(np.nanargmin(per_rep_score)),
+        "max_rep_idx": int(np.nanargmax(per_rep_score)),
+        "metric_range_start_steps": _metric_range_start(metric_cfg, flat),
+        "metric_range_end_steps": _metric_range_end(metric_cfg, flat),
+        "metric_n_windows": int(delta_h_maps.shape[-1]),
+        "metric_maps_npz": str(out_dir / "optimizer_eval_all_reps_metric_maps.npz"),
+        **plot_paths,
+        **video_info,
+    }
+    with (out_dir / "summary.json").open("w") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+    return summary
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = Path(args.run_dir)
     out_dir = Path(args.output_dir)
@@ -492,18 +700,47 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.render_mode is not None:
         flat.render_mode = str(args.render_mode)
     substrate, metric_cfg, metric_loss_fn = _build_context(flat, include_maps=True)
+    secondary_flat = None
+    secondary_metric_cfg = None
+    secondary_metric_loss_fn = None
+    secondary_out_dir = Path(args.secondary_output_dir) if getattr(args, "secondary_output_dir", None) else None
+    if secondary_out_dir is not None:
+        if str(args.rep_index).strip().lower() != "all":
+            raise ValueError("--secondary-output-dir is currently supported only with --rep-index all.")
+        secondary_flat = _flat_config(run_dir / "optimization_config.yaml")
+        if args.secondary_metric_range_start_steps is not None:
+            secondary_flat.metric_range_start_steps = int(args.secondary_metric_range_start_steps)
+        if args.secondary_metric_range_end_steps is not None:
+            secondary_flat.metric_range_end_steps = int(args.secondary_metric_range_end_steps)
+        if args.render_mode is not None:
+            secondary_flat.render_mode = str(args.render_mode)
+        _, secondary_metric_cfg, secondary_metric_loss_fn = _build_context(secondary_flat, include_maps=True)
     tau_extra_dims = 1 if str(metric_cfg.get("tau_mode", "fixed")) == "trainable_grid" else 0
     substrate_param_dims = int(substrate.n_params)
     candidate = _best_candidate_and_keys(run_dir, flat, substrate_param_dims, tau_extra_dims)
-    loss_raw, info_raw = _metric_chunk_raw(
-        flat=flat,
-        substrate=substrate,
-        metric_cfg=metric_cfg,
-        metric_loss_fn=metric_loss_fn,
-        candidate=candidate,
-        substrate_param_dims=substrate_param_dims,
-        tau_extra_dims=tau_extra_dims,
-    )
+    if secondary_metric_loss_fn is not None:
+        loss_raw, info_raw, secondary_loss_raw, secondary_info_raw = _metric_chunk_raw_dual(
+            flat=flat,
+            substrate=substrate,
+            metric_cfg=metric_cfg,
+            metric_loss_fn=metric_loss_fn,
+            secondary_metric_loss_fn=secondary_metric_loss_fn,
+            candidate=candidate,
+            substrate_param_dims=substrate_param_dims,
+            tau_extra_dims=tau_extra_dims,
+        )
+    else:
+        loss_raw, info_raw = _metric_chunk_raw(
+            flat=flat,
+            substrate=substrate,
+            metric_cfg=metric_cfg,
+            metric_loss_fn=metric_loss_fn,
+            candidate=candidate,
+            substrate_param_dims=substrate_param_dims,
+            tau_extra_dims=tau_extra_dims,
+        )
+        secondary_loss_raw = None
+        secondary_info_raw = None
 
     local_idx = int(candidate["chunk_local_idx"])
     per_rep_score = np.asarray(info_raw["score"][local_idx], dtype=np.float64)
@@ -518,93 +755,42 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"rep-index must be in [0, {per_rep_score.shape[0] - 1}] or 'best', got {args.rep_index!r}.")
 
     if rep_idx == -1:
-        delta_h_maps = np.asarray(info_raw["delta_h_map"][local_idx], dtype=np.float32)
-        processed_maps = (
-            np.asarray(info_raw["delta_h_processed_map"][local_idx], dtype=np.float32)
-            if "delta_h_processed_map" in info_raw
-            else None
-        )
-        tau_steps = np.asarray(info_raw["tau_steps"][local_idx, 0], dtype=np.int64)
-        window_start_steps = np.asarray(info_raw["window_start_steps"][local_idx, 0], dtype=np.int64)
-        score_by_tau = np.asarray(info_raw["score_by_tau"][local_idx], dtype=np.float64)
-        selected_tau_steps_all = np.asarray(info_raw["tau_best_steps"][local_idx], dtype=np.int64)
-
-        out_dir.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
-            out_dir / "optimizer_eval_all_reps_metric_maps.npz",
-            delta_h_map_by_rep=delta_h_maps,
-            delta_h_processed_map_by_rep=processed_maps if processed_maps is not None else np.asarray([]),
-            tau_steps=tau_steps,
-            window_start_steps=window_start_steps,
-            score_by_tau_by_rep=score_by_tau,
-            per_rep_score=per_rep_score,
-            loss_raw=np.asarray(loss_raw[local_idx], dtype=np.float32),
-            selected_tau_steps=selected_tau_steps_all,
-        )
-        plot_paths = _plot_all_rep_maps(
+        primary_summary = _write_all_reps_outputs(
+            args=args,
+            run_dir=run_dir,
             out_dir=out_dir,
-            delta_h_maps=delta_h_maps,
-            processed_maps=processed_maps,
-            tau_steps=tau_steps,
-            window_start_steps=window_start_steps,
-            score_by_tau=score_by_tau,
-            rep_scores=per_rep_score,
-            selected_tau_steps=selected_tau_steps_all,
+            flat=flat,
+            substrate=substrate,
+            metric_cfg=metric_cfg,
+            candidate=candidate,
+            loss_raw=loss_raw,
+            info_raw=info_raw,
+            render_video=not args.skip_video,
         )
-        for i_rep in range(per_rep_score.shape[0]):
-            _plot_maps(
-                out_dir=out_dir / f"rep_{i_rep}",
-                delta_h_map=delta_h_maps[i_rep],
-                processed_map=processed_maps[i_rep] if processed_maps is not None else None,
-                tau_steps=tau_steps,
-                window_start_steps=window_start_steps,
-                score_by_tau=score_by_tau[i_rep],
-                selected_tau_steps=int(selected_tau_steps_all[i_rep]),
-                selected_score=float(per_rep_score[i_rep]),
-            )
-
-        video_info: dict[str, Any] = {}
-        if not args.skip_video:
-            params = np.asarray(candidate["params"], dtype=np.float32)
-            video_info = _render_state_grid_video(
-                flat=flat,
+        if secondary_out_dir is not None:
+            video_info = {
+                k: v
+                for k, v in primary_summary.items()
+                if k.startswith("all_reps_video_")
+            }
+            secondary_summary = _write_all_reps_outputs(
+                args=args,
+                run_dir=run_dir,
+                out_dir=secondary_out_dir,
+                flat=secondary_flat,
                 substrate=substrate,
-                params=params,
-                rep_keys=candidate["keys"],
-                rep_scores=per_rep_score,
-                output=out_dir / "optimizer_eval_all_reps_state_grid.mp4",
-                img_size=int(args.img_size),
-                fps=int(args.fps),
-                codec=str(args.codec),
-                stride_steps=int(args.video_stride_steps),
-                max_steps=int(args.video_max_steps),
-                frame_batch_size=int(args.frame_batch_size),
-                resize_method=str(args.video_resize_method),
+                metric_cfg=secondary_metric_cfg,
+                candidate=candidate,
+                loss_raw=secondary_loss_raw,
+                info_raw=secondary_info_raw,
+                render_video=False,
+                video_info_override=video_info,
             )
-
-        summary = {
-            "run_dir": str(run_dir),
-            "source_root": str(args.source_root),
-            "output_dir": str(out_dir),
-            "best_iter": int(candidate["best_iter"]),
-            "pop_idx": int(candidate["pop_idx"]),
-            "chunk_start": int(candidate["chunk_start"]),
-            "chunk_local_idx": int(candidate["chunk_local_idx"]),
-            "rep_mode": "all",
-            "per_rep_score": [float(x) for x in per_rep_score],
-            "optimizer_mean_score": float(np.mean(per_rep_score)),
-            "min_rep_idx": int(np.nanargmin(per_rep_score)),
-            "max_rep_idx": int(np.nanargmax(per_rep_score)),
-            "metric_range_start_steps": _metric_range_start(metric_cfg, flat),
-            "metric_range_end_steps": _metric_range_end(metric_cfg, flat),
-            "metric_n_windows": int(delta_h_maps.shape[-1]),
-            "metric_maps_npz": str(out_dir / "optimizer_eval_all_reps_metric_maps.npz"),
-            **plot_paths,
-            **video_info,
-        }
-        with (out_dir / "summary.json").open("w") as f:
-            json.dump(summary, f, indent=2, sort_keys=True)
-        return summary
+            secondary_summary["shares_rollout_with"] = str(out_dir / "summary.json")
+            with (secondary_out_dir / "summary.json").open("w") as f:
+                json.dump(secondary_summary, f, indent=2, sort_keys=True)
+            return {"primary": primary_summary, "secondary": secondary_summary}
+        return primary_summary
 
     score = float(info_raw["score"][local_idx, rep_idx])
     selected_tau_steps = int(info_raw["tau_best_steps"][local_idx, rep_idx])
@@ -696,6 +882,9 @@ def main() -> int:
     parser.add_argument("--frame-batch-size", type=int, default=32)
     parser.add_argument("--metric-range-start-steps", type=int, default=None)
     parser.add_argument("--metric-range-end-steps", type=int, default=None)
+    parser.add_argument("--secondary-output-dir", default=None)
+    parser.add_argument("--secondary-metric-range-start-steps", type=int, default=None)
+    parser.add_argument("--secondary-metric-range-end-steps", type=int, default=None)
     parser.add_argument("--skip-video", action="store_true", help="Compute maps/scores only.")
     parser.add_argument(
         "--video-resize-method",
