@@ -78,6 +78,9 @@ def _entrypoint_command(stage_cfg, repo: Path, resolved_config_path: Path) -> li
 def _build_run_config(paper_cfg, config_path: Path, run_idx: int):
     stage_cfg = paper_cfg.get("optimization", {})
     base_cfg, _ = load_stage_base_config(stage_cfg, config_path.parent)
+    overrides = stage_cfg.get("overrides", None)
+    if overrides:
+        base_cfg = OmegaConf.merge(base_cfg, overrides)
     if base_cfg.get("meta") is None:
         base_cfg.meta = OmegaConf.create()
     if base_cfg.get("logging") is None:

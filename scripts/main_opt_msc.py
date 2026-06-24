@@ -204,6 +204,7 @@ def _save_resume_state(
     pop_objective_loss_traj,
     pop_loss_by_seed_traj,
     pop_rank_by_seed_traj,
+    pop_seed_keys_traj,
     palette_traj,
 ):
     if save_dir is None:
@@ -230,6 +231,7 @@ def _save_resume_state(
         pop_objective_loss_traj=[np.array(x) for x in pop_objective_loss_traj],
         pop_loss_by_seed_traj=[np.array(x) for x in pop_loss_by_seed_traj],
         pop_rank_by_seed_traj=[np.array(x) for x in pop_rank_by_seed_traj],
+        pop_seed_keys_traj=[np.array(x) for x in pop_seed_keys_traj],
         palette_traj=list(palette_traj),
     )
     util.save_pkl(save_dir, "resume_state", payload)
@@ -301,6 +303,7 @@ def _restore_resume_state(
         pop_objective_loss_traj=[np.array(x) for x in checkpoint.get("pop_objective_loss_traj", [])],
         pop_loss_by_seed_traj=[np.array(x) for x in checkpoint.get("pop_loss_by_seed_traj", [])],
         pop_rank_by_seed_traj=[np.array(x) for x in checkpoint.get("pop_rank_by_seed_traj", [])],
+        pop_seed_keys_traj=[np.array(x) for x in checkpoint.get("pop_seed_keys_traj", [])],
         palette_traj=list(checkpoint.get("palette_traj", [])),
     )
 
@@ -839,6 +842,7 @@ def main(cfg, args):
         pop_objective_loss_traj = []
         pop_loss_by_seed_traj = []
         pop_rank_by_seed_traj = []
+        pop_seed_keys_traj = []
         palette_traj = []
         start_iter = 0
         resumed = False
@@ -870,6 +874,7 @@ def main(cfg, args):
                 pop_objective_loss_traj = restored["pop_objective_loss_traj"]
                 pop_loss_by_seed_traj = restored["pop_loss_by_seed_traj"]
                 pop_rank_by_seed_traj = restored["pop_rank_by_seed_traj"]
+                pop_seed_keys_traj = restored["pop_seed_keys_traj"]
                 palette_traj = restored["palette_traj"]
                 resumed = True
                 print(f"Resuming optimization from iter {start_iter} using {args.save_dir}/resume_state.pkl")
@@ -910,9 +915,11 @@ def main(cfg, args):
             loss_dict_chunks = []
             objective_loss_chunks = []
             loss_by_seed_chunks = []
+            shared_seed_keys_for_log = None
             if selection_protocol == "shared_seed_rank":
                 rng, rng_seed_set = split(rng)
                 shared_seed_keys = split(rng_seed_set, int(args.bs))
+                shared_seed_keys_for_log = shared_seed_keys
                 for start in range(0, args.pop_size, pop_batch):
                     end = min(args.pop_size, start + pop_batch)
                     objective_loss_chunk, loss_dict_chunk, loss_by_seed_chunk = eval_chunk_shared_seed(
@@ -982,9 +989,12 @@ def main(cfg, args):
                 pop_loss_by_seed_traj.append(np.array(loss_by_seed_all))
             if rank_by_seed_all is not None:
                 pop_rank_by_seed_traj.append(np.array(rank_by_seed_all))
+            if shared_seed_keys_for_log is not None:
+                pop_seed_keys_traj.append(np.array(shared_seed_keys_for_log))
 
             loss_np = np.array(loss_all)
             objective_loss_np = np.array(objective_loss_all)
+            objective_score_np = -objective_loss_np
             loss_mean = float(loss_np.mean())
             loss_var = float(loss_np.var())
             best_idx = int(np.argmin(loss_np))
@@ -1027,20 +1037,45 @@ def main(cfg, args):
                 "loss_pop_var": loss_var,
                 "best_loss": float(es_state.best_fitness),
                 "best_loss_raw": float(loss_np[best_idx]),
+                "selection_fitness_pop_mean": loss_mean,
+                "selection_fitness_pop_var": loss_var,
+                "selection_fitness_pop_best": float(loss_np[best_idx]),
+                "best_selection_fitness": float(es_state.best_fitness),
                 "objective_loss_pop_mean": float(objective_loss_np.mean()),
                 "objective_loss_pop_var": float(objective_loss_np.var()),
-                "objective_score_pop_mean": float((-objective_loss_np).mean()),
-                "objective_score_pop_best_by_selection": float(-objective_loss_np[best_idx]),
+                "objective_score_pop_mean": float(objective_score_np.mean()),
+                "objective_score_pop_best_by_selection": float(objective_score_np[best_idx]),
                 "best_objective_loss": float(best_objective_loss_traj[-1]),
                 "best_objective_score": float(-best_objective_loss_traj[-1]),
+                "mspd/pop_mean": float(objective_score_np.mean()),
+                "mspd/pop_var": float(objective_score_np.var()),
+                "mspd/pop_std": float(objective_score_np.std()),
+                "mspd/pop_median": float(np.median(objective_score_np)),
+                "mspd/pop_best": float(np.max(objective_score_np)),
+                "mspd/pop_best_by_selection": float(objective_score_np[best_idx]),
+                "mspd/best_selected_so_far": float(-best_objective_loss_traj[-1]),
             }
             if selection_protocol == "shared_seed_rank":
                 rank_np = np.array(rank_by_seed_all)
+                score_by_seed_np = -np.array(loss_by_seed_all)
                 log_dict["selection/mean_rank_pop_mean"] = float(loss_np.mean())
                 log_dict["selection/mean_rank_pop_best"] = float(loss_np[best_idx])
                 log_dict["selection/rank_std_pop_mean"] = float(rank_np.std(axis=1).mean())
-                log_dict["selection/shared_seed_score_pop_best_mean"] = float(-objective_loss_np[best_idx])
-                log_dict["selection/shared_seed_score_pop_best_std"] = float((-np.array(loss_by_seed_all)[best_idx]).std())
+                log_dict["selection/shared_seed_score_pop_best_mean"] = float(objective_score_np[best_idx])
+                log_dict["selection/shared_seed_score_pop_best_std"] = float(score_by_seed_np[best_idx].std())
+                log_dict["mspd/by_seed_pop_mean"] = float(score_by_seed_np.mean())
+                log_dict["mspd/by_seed_pop_best"] = float(score_by_seed_np.max())
+                log_dict["mspd/by_seed_pop_std"] = float(score_by_seed_np.std())
+                log_dict["mspd/selected_candidate_seed_mean"] = float(score_by_seed_np[best_idx].mean())
+                log_dict["mspd/selected_candidate_seed_std"] = float(score_by_seed_np[best_idx].std())
+                log_dict["mspd/selected_candidate_seed_min"] = float(score_by_seed_np[best_idx].min())
+                log_dict["mspd/selected_candidate_seed_max"] = float(score_by_seed_np[best_idx].max())
+                for i_seed in range(score_by_seed_np.shape[1]):
+                    seed_scores = score_by_seed_np[:, i_seed]
+                    log_dict[f"mspd_seed/{i_seed:02d}_pop_mean"] = float(seed_scores.mean())
+                    log_dict[f"mspd_seed/{i_seed:02d}_pop_best"] = float(seed_scores.max())
+                    log_dict[f"mspd_seed/{i_seed:02d}_pop_std"] = float(seed_scores.std())
+                    log_dict[f"mspd_seed/{i_seed:02d}_selected_candidate"] = float(score_by_seed_np[best_idx, i_seed])
             for k, v in loss_dict_all.items():
                 v_np = np.array(v)
                 log_dict[f"metric/{k}_pop_mean"] = float(v_np.mean())
@@ -1112,7 +1147,11 @@ def main(cfg, args):
             )
             if selection_protocol == "shared_seed_rank":
                 data_item["loss_by_seed"] = loss_by_seed_all
+                if len(data) == 0 or "score_by_seed" in data[0]:
+                    data_item["score_by_seed"] = -loss_by_seed_all
                 data_item["rank_by_seed"] = rank_by_seed_all
+                if shared_seed_keys_for_log is not None and (len(data) == 0 or "seed_keys" in data[0]):
+                    data_item["seed_keys"] = shared_seed_keys_for_log
             data.append(data_item)
             if palette_stats is not None:
                 palette_traj.append(dict(iter=i_iter, **palette_stats))
@@ -1121,14 +1160,40 @@ def main(cfg, args):
             if args.save_dir is not None and (i_iter % save_interval == 0 or i_iter == args.n_iters - 1):
                 data_save = jax.tree.map(lambda *x: np.array(jnp.stack(x, axis=0)), *data)
                 util.save_pkl(args.save_dir, "data", data_save)
+                best_selection_fitness = float(es_state.best_fitness)
+                best_objective_loss = float(best_objective_loss_traj[-1])
                 best = (best_member_np, np.array(es_state.best_fitness))
                 util.save_pkl(args.save_dir, "best", best)
+                util.save_pkl(args.save_dir, "best_objective", (best_member_np, np.array(best_objective_loss)))
+                util.save_json(
+                    args.save_dir,
+                    "best_selection",
+                    dict(
+                        selection_protocol=str(selection_protocol),
+                        best_params_source="rank_fitness" if selection_protocol == "shared_seed_rank" else "objective_loss",
+                        best_pkl_loss_kind=(
+                            "selection_fitness_mean_rank"
+                            if selection_protocol == "shared_seed_rank"
+                            else "objective_loss"
+                        ),
+                        best_selection_fitness=best_selection_fitness,
+                        best_objective_loss=best_objective_loss,
+                        best_objective_score=float(-best_objective_loss),
+                    ),
+                )
                 if optimize_tau:
                     util.save_json(args.save_dir, "best_tau", best_tau_traj[-1])
                 if len(best_params_traj) > 0:
+                    selection_fitness_arr = np.array(best_loss_traj)
                     traj = dict(
                         params=np.stack(best_params_traj, axis=0),
-                        loss=np.array(best_loss_traj),
+                        loss=selection_fitness_arr,
+                        selection_fitness=selection_fitness_arr,
+                        loss_kind=(
+                            "selection_fitness_mean_rank"
+                            if selection_protocol == "shared_seed_rank"
+                            else "objective_loss"
+                        ),
                         selection_protocol=str(selection_protocol),
                     )
                     if len(best_objective_loss_traj) > 0:
@@ -1143,9 +1208,16 @@ def main(cfg, args):
                         )
                     util.save_pkl(args.save_dir, "best_traj", traj)
                 if len(pop_params_traj) > 0:
+                    selection_fitness_arr = np.stack(pop_loss_traj, axis=0)
                     pop_traj = dict(
                         params=np.stack(pop_params_traj, axis=0),
-                        loss=np.stack(pop_loss_traj, axis=0),
+                        loss=selection_fitness_arr,
+                        selection_fitness=selection_fitness_arr,
+                        loss_kind=(
+                            "selection_fitness_mean_rank"
+                            if selection_protocol == "shared_seed_rank"
+                            else "objective_loss"
+                        ),
                         selection_protocol=str(selection_protocol),
                     )
                     if len(pop_objective_loss_traj) > 0:
@@ -1158,6 +1230,18 @@ def main(cfg, args):
                         pop_traj["score_by_seed"] = -loss_by_seed_arr
                     if len(pop_rank_by_seed_traj) > 0:
                         pop_traj["rank_by_seed"] = np.stack(pop_rank_by_seed_traj, axis=0)
+                    if len(pop_seed_keys_traj) > 0:
+                        seed_keys_arr = np.stack(pop_seed_keys_traj, axis=0)
+                        pop_traj["seed_key_semantics"] = (
+                            "score_by_seed[iter, pop_idx, seed_idx] uses seed_keys[iter, seed_idx]"
+                        )
+                        if seed_keys_arr.shape[0] == len(pop_loss_traj):
+                            pop_traj["seed_keys"] = seed_keys_arr
+                        else:
+                            pop_traj["seed_keys_partial"] = seed_keys_arr
+                            pop_traj["seed_keys_partial_start_iter"] = int(
+                                len(pop_loss_traj) - seed_keys_arr.shape[0]
+                            )
                     if optimize_tau and len(pop_tau_traj) > 0:
                         pop_traj["tau_selector_raw"] = np.stack([x["latent"] for x in pop_tau_traj], axis=0)
                         pop_traj["tau_idx"] = np.stack([x["idx"] for x in pop_tau_traj], axis=0)
@@ -1188,6 +1272,7 @@ def main(cfg, args):
                     pop_objective_loss_traj=pop_objective_loss_traj,
                     pop_loss_by_seed_traj=pop_loss_by_seed_traj,
                     pop_rank_by_seed_traj=pop_rank_by_seed_traj,
+                    pop_seed_keys_traj=pop_seed_keys_traj,
                     palette_traj=palette_traj,
                 )
 
