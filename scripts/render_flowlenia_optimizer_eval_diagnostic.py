@@ -477,6 +477,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     out_dir = Path(args.output_dir)
     _activate_source_root(Path(args.source_root))
     flat = _flat_config(run_dir / "optimization_config.yaml")
+    if args.metric_range_start_steps is not None:
+        flat.metric_range_start_steps = int(args.metric_range_start_steps)
+    if args.metric_range_end_steps is not None:
+        flat.metric_range_end_steps = int(args.metric_range_end_steps)
     if args.render_mode is not None:
         flat.render_mode = str(args.render_mode)
     substrate, metric_cfg, metric_loss_fn = _build_context(flat, include_maps=True)
@@ -551,22 +555,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 selected_score=float(per_rep_score[i_rep]),
             )
 
-        params = np.asarray(candidate["params"], dtype=np.float32)
-        video_info = _render_state_grid_video(
-            flat=flat,
-            substrate=substrate,
-            params=params,
-            rep_keys=candidate["keys"],
-            rep_scores=per_rep_score,
-            output=out_dir / "optimizer_eval_all_reps_state_grid.mp4",
-            img_size=int(args.img_size),
-            fps=int(args.fps),
-            codec=str(args.codec),
-            stride_steps=int(args.video_stride_steps),
-            max_steps=int(args.video_max_steps),
-            frame_batch_size=int(args.frame_batch_size),
-            resize_method=str(args.video_resize_method),
-        )
+        video_info: dict[str, Any] = {}
+        if not args.skip_video:
+            params = np.asarray(candidate["params"], dtype=np.float32)
+            video_info = _render_state_grid_video(
+                flat=flat,
+                substrate=substrate,
+                params=params,
+                rep_keys=candidate["keys"],
+                rep_scores=per_rep_score,
+                output=out_dir / "optimizer_eval_all_reps_state_grid.mp4",
+                img_size=int(args.img_size),
+                fps=int(args.fps),
+                codec=str(args.codec),
+                stride_steps=int(args.video_stride_steps),
+                max_steps=int(args.video_max_steps),
+                frame_batch_size=int(args.frame_batch_size),
+                resize_method=str(args.video_resize_method),
+            )
 
         summary = {
             "run_dir": str(run_dir),
@@ -581,6 +587,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "optimizer_mean_score": float(np.mean(per_rep_score)),
             "min_rep_idx": int(np.nanargmin(per_rep_score)),
             "max_rep_idx": int(np.nanargmax(per_rep_score)),
+            "metric_range_start_steps": int(metric_cfg["range_start_steps"]),
+            "metric_range_end_steps": int(metric_cfg["range_end_steps"]),
+            "metric_n_windows": int(metric_cfg["n_windows"]),
             "metric_maps_npz": str(out_dir / "optimizer_eval_all_reps_metric_maps.npz"),
             **plot_paths,
             **video_info,
@@ -622,20 +631,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     params = np.asarray(candidate["params"], dtype=np.float32)
-    video_info = _render_state_video(
-        flat=flat,
-        substrate=substrate,
-        params=params,
-        rep_key=candidate["keys"][rep_idx],
-        output=out_dir / "optimizer_eval_state_video.mp4",
-        img_size=int(args.img_size),
-        fps=int(args.fps),
-        codec=str(args.codec),
-        stride_steps=int(args.video_stride_steps),
-        max_steps=int(args.video_max_steps),
-        frame_batch_size=int(args.frame_batch_size),
-        resize_method=str(args.video_resize_method),
-    )
+    video_info: dict[str, Any] = {}
+    if not args.skip_video:
+        video_info = _render_state_video(
+            flat=flat,
+            substrate=substrate,
+            params=params,
+            rep_key=candidate["keys"][rep_idx],
+            output=out_dir / "optimizer_eval_state_video.mp4",
+            img_size=int(args.img_size),
+            fps=int(args.fps),
+            codec=str(args.codec),
+            stride_steps=int(args.video_stride_steps),
+            max_steps=int(args.video_max_steps),
+            frame_batch_size=int(args.frame_batch_size),
+            resize_method=str(args.video_resize_method),
+        )
 
     summary = {
         "run_dir": str(run_dir),
@@ -650,6 +661,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "optimizer_mean_score": float(np.mean(per_rep_score)),
         "selected_rep_score": float(score),
         "selected_tau_steps": int(selected_tau_steps),
+        "metric_range_start_steps": int(metric_cfg["range_start_steps"]),
+        "metric_range_end_steps": int(metric_cfg["range_end_steps"]),
+        "metric_n_windows": int(metric_cfg["n_windows"]),
         "metric_maps_npz": str(out_dir / "optimizer_eval_metric_maps.npz"),
         **plot_paths,
         **video_info,
@@ -672,6 +686,9 @@ def main() -> int:
     parser.add_argument("--video-stride-steps", type=int, default=1000)
     parser.add_argument("--video-max-steps", type=int, default=300000)
     parser.add_argument("--frame-batch-size", type=int, default=32)
+    parser.add_argument("--metric-range-start-steps", type=int, default=None)
+    parser.add_argument("--metric-range-end-steps", type=int, default=None)
+    parser.add_argument("--skip-video", action="store_true", help="Compute maps/scores only.")
     parser.add_argument(
         "--video-resize-method",
         default="linear",
