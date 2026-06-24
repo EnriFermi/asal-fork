@@ -87,6 +87,31 @@ def _canonicalize_params_init(name):
     return aliases[normalized]
 
 
+def _normalize_selection_protocol(name):
+    if name is None:
+        return "mean_loss"
+    normalized = str(name).strip().lower().replace("-", "_")
+    aliases = {
+        "mean": "mean_loss",
+        "mean_loss": "mean_loss",
+        "mean_score": "mean_loss",
+        "legacy": "mean_loss",
+        "legacy_mean": "mean_loss",
+        "shared_seed_rank": "shared_seed_rank",
+        "shared_seeds_rank": "shared_seed_rank",
+        "common_seed_rank": "shared_seed_rank",
+        "common_seeds_rank": "shared_seed_rank",
+        "seed_rank": "shared_seed_rank",
+        "rank": "shared_seed_rank",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            "Unknown optimization selection protocol "
+            f"{name!r}. Use 'mean_loss' or 'shared_seed_rank'."
+        )
+    return aliases[normalized]
+
+
 def _replace_state_fields(state, **updates):
     if hasattr(state, "replace"):
         return state.replace(**updates)
@@ -167,13 +192,18 @@ def _save_resume_state(
     substrate_param_dims,
     optimize_tau,
     params_init,
+    selection_protocol,
     data,
     best_params_traj,
     best_tau_traj,
     best_loss_traj,
+    best_objective_loss_traj,
     pop_params_traj,
     pop_tau_traj,
     pop_loss_traj,
+    pop_objective_loss_traj,
+    pop_loss_by_seed_traj,
+    pop_rank_by_seed_traj,
     palette_traj,
 ):
     if save_dir is None:
@@ -186,15 +216,20 @@ def _save_resume_state(
         substrate_param_dims=int(substrate_param_dims),
         optimize_tau=bool(optimize_tau),
         params_init=str(params_init),
+        selection_protocol=str(selection_protocol),
         rng=np.array(rng),
         es_state=_to_numpy_tree(es_state),
         data=[] if len(data) == 0 else _to_numpy_tree(data),
         best_params_traj=[np.array(x) for x in best_params_traj],
         best_tau_traj=list(best_tau_traj),
         best_loss_traj=np.asarray(best_loss_traj, dtype=np.float32),
+        best_objective_loss_traj=np.asarray(best_objective_loss_traj, dtype=np.float32),
         pop_params_traj=[np.array(x) for x in pop_params_traj],
         pop_tau_traj=list(pop_tau_traj),
         pop_loss_traj=[np.array(x) for x in pop_loss_traj],
+        pop_objective_loss_traj=[np.array(x) for x in pop_objective_loss_traj],
+        pop_loss_by_seed_traj=[np.array(x) for x in pop_loss_by_seed_traj],
+        pop_rank_by_seed_traj=[np.array(x) for x in pop_rank_by_seed_traj],
         palette_traj=list(palette_traj),
     )
     util.save_pkl(save_dir, "resume_state", payload)
@@ -208,6 +243,7 @@ def _restore_resume_state(
     substrate_param_dims,
     optimize_tau,
     params_init,
+    selection_protocol,
 ):
     if checkpoint is None:
         return None
@@ -237,6 +273,19 @@ def _restore_resume_state(
         raise ValueError(
             f"Resume checkpoint params_init mismatch: checkpoint={ckpt_params_init!r}, current={params_init!r}."
         )
+    ckpt_selection_protocol = str(checkpoint.get("selection_protocol", "mean_loss"))
+    if ckpt_selection_protocol != str(selection_protocol):
+        raise ValueError(
+            "Resume checkpoint selection_protocol mismatch: "
+            f"checkpoint={ckpt_selection_protocol!r}, current={selection_protocol!r}. "
+            "Use a fresh output_root or disable resume for a protocol change."
+        )
+    restored_best_loss_traj = [float(x) for x in np.asarray(checkpoint.get("best_loss_traj", []))]
+    restored_best_objective_loss_traj = [
+        float(x) for x in np.asarray(checkpoint.get("best_objective_loss_traj", []))
+    ]
+    if not restored_best_objective_loss_traj:
+        restored_best_objective_loss_traj = list(restored_best_loss_traj)
     return dict(
         next_iter=int(checkpoint.get("next_iter", 0)),
         rng=jnp.asarray(checkpoint["rng"]),
@@ -244,10 +293,14 @@ def _restore_resume_state(
         data=list(checkpoint.get("data", [])),
         best_params_traj=[np.array(x) for x in checkpoint.get("best_params_traj", [])],
         best_tau_traj=list(checkpoint.get("best_tau_traj", [])),
-        best_loss_traj=[float(x) for x in np.asarray(checkpoint.get("best_loss_traj", []))],
+        best_loss_traj=restored_best_loss_traj,
+        best_objective_loss_traj=restored_best_objective_loss_traj,
         pop_params_traj=[np.array(x) for x in checkpoint.get("pop_params_traj", [])],
         pop_tau_traj=list(checkpoint.get("pop_tau_traj", [])),
         pop_loss_traj=[np.array(x) for x in checkpoint.get("pop_loss_traj", [])],
+        pop_objective_loss_traj=[np.array(x) for x in checkpoint.get("pop_objective_loss_traj", [])],
+        pop_loss_by_seed_traj=[np.array(x) for x in checkpoint.get("pop_loss_by_seed_traj", [])],
+        pop_rank_by_seed_traj=[np.array(x) for x in checkpoint.get("pop_rank_by_seed_traj", [])],
         palette_traj=list(checkpoint.get("palette_traj", [])),
     )
 
@@ -494,6 +547,13 @@ def main(cfg, args):
         run.summary["metric_cfg/trainable_tau"] = bool(optimize_tau)
         if optimize_tau:
             run.summary["metric_cfg/tau_grid_steps"] = str(metric_cfg.get("tau_steps_list", []))
+        selection_protocol = _normalize_selection_protocol(
+            getattr(args, "selection_protocol", getattr(args, "optimization_selection_protocol", "mean_loss"))
+        )
+        run.summary["optimizer/selection_protocol"] = selection_protocol
+        run.summary["optimizer/bs"] = int(args.bs)
+        if selection_protocol == "shared_seed_rank":
+            run.summary["optimizer/shared_seed_rank_n_seeds"] = int(args.bs)
 
         chunk_steps = int(metric_cfg["sample_every_steps"])
         time_sampling = int(metric_cfg["time_sampling"])
@@ -722,12 +782,28 @@ def main(cfg, args):
         calc_loss_vv = jax.vmap(jax.vmap(calc_loss, in_axes=(0, None)), in_axes=(None, 0))
 
         @jax.jit
-        def eval_chunk(rng, params_chunk):
+        def eval_chunk_mean_loss(rng, params_chunk):
             rng, _rng = split(rng)
             loss, loss_dict = calc_loss_vv(split(_rng, args.bs), params_chunk)
             loss = loss.mean(axis=1)
             loss_dict = jax.tree.map(lambda x: x.mean(axis=1), loss_dict)
             return rng, loss, loss_dict
+
+        @jax.jit
+        def eval_chunk_shared_seed(params_chunk, seed_keys):
+            loss_by_seed, loss_dict_by_seed = calc_loss_vv(seed_keys, params_chunk)
+            objective_loss = loss_by_seed.mean(axis=1)
+            loss_dict = jax.tree.map(lambda x: x.mean(axis=1), loss_dict_by_seed)
+            return objective_loss, loss_dict, loss_by_seed
+
+        @jax.jit
+        def rank_fitness_from_loss_by_seed(loss_by_seed):
+            # CMA-ES minimizes fitness. Raw loss is -score, so lower loss means better
+            # for each shared seed. Rank 0 is best for that seed.
+            order_1 = jnp.argsort(loss_by_seed, axis=0)
+            rank_by_seed = jnp.argsort(order_1, axis=0).astype(jnp.float32)
+            mean_rank = jnp.mean(rank_by_seed, axis=1)
+            return mean_rank, rank_by_seed
 
         strategy = evosax.Sep_CMA_ES(
             popsize=args.pop_size,
@@ -756,9 +832,13 @@ def main(cfg, args):
         best_params_traj = []
         best_tau_traj = []
         best_loss_traj = []
+        best_objective_loss_traj = []
         pop_params_traj = []
         pop_tau_traj = []
         pop_loss_traj = []
+        pop_objective_loss_traj = []
+        pop_loss_by_seed_traj = []
+        pop_rank_by_seed_traj = []
         palette_traj = []
         start_iter = 0
         resumed = False
@@ -774,6 +854,7 @@ def main(cfg, args):
                     substrate_param_dims=substrate_param_dims,
                     optimize_tau=optimize_tau,
                     params_init=params_init,
+                    selection_protocol=selection_protocol,
                 )
                 start_iter = restored["next_iter"]
                 rng = restored["rng"]
@@ -782,9 +863,13 @@ def main(cfg, args):
                 best_params_traj = restored["best_params_traj"]
                 best_tau_traj = restored["best_tau_traj"]
                 best_loss_traj = restored["best_loss_traj"]
+                best_objective_loss_traj = restored["best_objective_loss_traj"]
                 pop_params_traj = restored["pop_params_traj"]
                 pop_tau_traj = restored["pop_tau_traj"]
                 pop_loss_traj = restored["pop_loss_traj"]
+                pop_objective_loss_traj = restored["pop_objective_loss_traj"]
+                pop_loss_by_seed_traj = restored["pop_loss_by_seed_traj"]
+                pop_rank_by_seed_traj = restored["pop_rank_by_seed_traj"]
                 palette_traj = restored["palette_traj"]
                 resumed = True
                 print(f"Resuming optimization from iter {start_iter} using {args.save_dir}/resume_state.pkl")
@@ -823,16 +908,45 @@ def main(cfg, args):
 
             loss_chunks = []
             loss_dict_chunks = []
-            rng_eval = rng
-            for start in range(0, args.pop_size, pop_batch):
-                end = min(args.pop_size, start + pop_batch)
-                rng_eval, loss_chunk, loss_dict_chunk = eval_chunk(rng_eval, params_full[start:end])
-                loss_chunks.append(loss_chunk)
-                loss_dict_chunks.append(loss_dict_chunk)
-            rng = rng_eval
-
-            loss_all = jnp.concatenate(loss_chunks, axis=0)
+            objective_loss_chunks = []
+            loss_by_seed_chunks = []
+            if selection_protocol == "shared_seed_rank":
+                rng, rng_seed_set = split(rng)
+                shared_seed_keys = split(rng_seed_set, int(args.bs))
+                for start in range(0, args.pop_size, pop_batch):
+                    end = min(args.pop_size, start + pop_batch)
+                    objective_loss_chunk, loss_dict_chunk, loss_by_seed_chunk = eval_chunk_shared_seed(
+                        params_full[start:end],
+                        shared_seed_keys,
+                    )
+                    objective_loss_chunks.append(objective_loss_chunk)
+                    loss_by_seed_chunks.append(loss_by_seed_chunk)
+                    loss_dict_chunks.append(loss_dict_chunk)
+                objective_loss_all = jnp.concatenate(objective_loss_chunks, axis=0)
+                loss_by_seed_all = jnp.concatenate(loss_by_seed_chunks, axis=0)
+                loss_all, rank_by_seed_all = rank_fitness_from_loss_by_seed(loss_by_seed_all)
+            else:
+                rng_eval = rng
+                for start in range(0, args.pop_size, pop_batch):
+                    end = min(args.pop_size, start + pop_batch)
+                    rng_eval, loss_chunk, loss_dict_chunk = eval_chunk_mean_loss(rng_eval, params_full[start:end])
+                    loss_chunks.append(loss_chunk)
+                    objective_loss_chunks.append(loss_chunk)
+                    loss_dict_chunks.append(loss_dict_chunk)
+                rng = rng_eval
+                loss_all = jnp.concatenate(loss_chunks, axis=0)
+                objective_loss_all = jnp.concatenate(objective_loss_chunks, axis=0)
+                loss_by_seed_all = None
+                rank_by_seed_all = None
             loss_dict_all = jax.tree.map(lambda *xs: jnp.concatenate(xs, axis=0), *loss_dict_chunks)
+            loss_dict_all = dict(loss_dict_all)
+            loss_dict_all["objective_loss"] = objective_loss_all
+            loss_dict_all["objective_score"] = -objective_loss_all
+            if selection_protocol == "shared_seed_rank":
+                loss_dict_all["selection_fitness_mean_rank"] = loss_all
+                loss_dict_all["selection_rank_std"] = jnp.std(rank_by_seed_all, axis=1)
+                loss_dict_all["selection_rank_min"] = jnp.min(rank_by_seed_all, axis=1)
+                loss_dict_all["selection_rank_max"] = jnp.max(rank_by_seed_all, axis=1)
 
             es_state = strategy.tell(params_full, loss_all, es_state, es_params)
 
@@ -863,11 +977,21 @@ def main(cfg, args):
                     )
                 )
             pop_loss_traj.append(np.array(loss_all))
+            pop_objective_loss_traj.append(np.array(objective_loss_all))
+            if loss_by_seed_all is not None:
+                pop_loss_by_seed_traj.append(np.array(loss_by_seed_all))
+            if rank_by_seed_all is not None:
+                pop_rank_by_seed_traj.append(np.array(rank_by_seed_all))
 
             loss_np = np.array(loss_all)
+            objective_loss_np = np.array(objective_loss_all)
             loss_mean = float(loss_np.mean())
             loss_var = float(loss_np.var())
             best_idx = int(np.argmin(loss_np))
+            if not best_objective_loss_traj or float(best_loss_traj[-1]) < float(best_loss_traj[-2]) - 1e-12:
+                best_objective_loss_traj.append(float(objective_loss_np[best_idx]))
+            else:
+                best_objective_loss_traj.append(float(best_objective_loss_traj[-1]))
 
             pca_img = None
             if pca_every > 0 and (i_iter % pca_every == 0) and len(pop_params_traj) > 1:
@@ -903,7 +1027,20 @@ def main(cfg, args):
                 "loss_pop_var": loss_var,
                 "best_loss": float(es_state.best_fitness),
                 "best_loss_raw": float(loss_np[best_idx]),
+                "objective_loss_pop_mean": float(objective_loss_np.mean()),
+                "objective_loss_pop_var": float(objective_loss_np.var()),
+                "objective_score_pop_mean": float((-objective_loss_np).mean()),
+                "objective_score_pop_best_by_selection": float(-objective_loss_np[best_idx]),
+                "best_objective_loss": float(best_objective_loss_traj[-1]),
+                "best_objective_score": float(-best_objective_loss_traj[-1]),
             }
+            if selection_protocol == "shared_seed_rank":
+                rank_np = np.array(rank_by_seed_all)
+                log_dict["selection/mean_rank_pop_mean"] = float(loss_np.mean())
+                log_dict["selection/mean_rank_pop_best"] = float(loss_np[best_idx])
+                log_dict["selection/rank_std_pop_mean"] = float(rank_np.std(axis=1).mean())
+                log_dict["selection/shared_seed_score_pop_best_mean"] = float(-objective_loss_np[best_idx])
+                log_dict["selection/shared_seed_score_pop_best_std"] = float((-np.array(loss_by_seed_all)[best_idx]).std())
             for k, v in loss_dict_all.items():
                 v_np = np.array(v)
                 log_dict[f"metric/{k}_pop_mean"] = float(v_np.mean())
@@ -966,7 +1103,17 @@ def main(cfg, args):
                 log_dict["pop_pca_traj_3d"] = pca_img
             run.log(log_dict)
 
-            data.append(dict(best_loss=es_state.best_fitness, loss=loss_all, loss_dict=loss_dict_all))
+            data_item = dict(
+                best_loss=es_state.best_fitness,
+                best_objective_loss=jnp.asarray(best_objective_loss_traj[-1], dtype=jnp.float32),
+                loss=loss_all,
+                objective_loss=objective_loss_all,
+                loss_dict=loss_dict_all,
+            )
+            if selection_protocol == "shared_seed_rank":
+                data_item["loss_by_seed"] = loss_by_seed_all
+                data_item["rank_by_seed"] = rank_by_seed_all
+            data.append(data_item)
             if palette_stats is not None:
                 palette_traj.append(dict(iter=i_iter, **palette_stats))
             pbar.set_postfix(best_loss=es_state.best_fitness.item())
@@ -982,7 +1129,11 @@ def main(cfg, args):
                     traj = dict(
                         params=np.stack(best_params_traj, axis=0),
                         loss=np.array(best_loss_traj),
+                        selection_protocol=str(selection_protocol),
                     )
+                    if len(best_objective_loss_traj) > 0:
+                        traj["objective_loss"] = np.array(best_objective_loss_traj)
+                        traj["objective_score"] = -np.array(best_objective_loss_traj)
                     if optimize_tau and len(best_tau_traj) > 0:
                         traj["tau_idx"] = np.asarray([x["tau_idx"] for x in best_tau_traj], dtype=np.int32)
                         traj["tau_steps"] = np.asarray([x["tau_steps"] for x in best_tau_traj], dtype=np.int32)
@@ -995,7 +1146,18 @@ def main(cfg, args):
                     pop_traj = dict(
                         params=np.stack(pop_params_traj, axis=0),
                         loss=np.stack(pop_loss_traj, axis=0),
+                        selection_protocol=str(selection_protocol),
                     )
+                    if len(pop_objective_loss_traj) > 0:
+                        objective_loss_arr = np.stack(pop_objective_loss_traj, axis=0)
+                        pop_traj["objective_loss"] = objective_loss_arr
+                        pop_traj["objective_score"] = -objective_loss_arr
+                    if len(pop_loss_by_seed_traj) > 0:
+                        loss_by_seed_arr = np.stack(pop_loss_by_seed_traj, axis=0)
+                        pop_traj["loss_by_seed"] = loss_by_seed_arr
+                        pop_traj["score_by_seed"] = -loss_by_seed_arr
+                    if len(pop_rank_by_seed_traj) > 0:
+                        pop_traj["rank_by_seed"] = np.stack(pop_rank_by_seed_traj, axis=0)
                     if optimize_tau and len(pop_tau_traj) > 0:
                         pop_traj["tau_selector_raw"] = np.stack([x["latent"] for x in pop_tau_traj], axis=0)
                         pop_traj["tau_idx"] = np.stack([x["idx"] for x in pop_tau_traj], axis=0)
@@ -1014,13 +1176,18 @@ def main(cfg, args):
                     substrate_param_dims=substrate_param_dims,
                     optimize_tau=optimize_tau,
                     params_init=params_init,
+                    selection_protocol=selection_protocol,
                     data=data,
                     best_params_traj=best_params_traj,
                     best_tau_traj=best_tau_traj,
                     best_loss_traj=best_loss_traj,
+                    best_objective_loss_traj=best_objective_loss_traj,
                     pop_params_traj=pop_params_traj,
                     pop_tau_traj=pop_tau_traj,
                     pop_loss_traj=pop_loss_traj,
+                    pop_objective_loss_traj=pop_objective_loss_traj,
+                    pop_loss_by_seed_traj=pop_loss_by_seed_traj,
+                    pop_rank_by_seed_traj=pop_rank_by_seed_traj,
                     palette_traj=palette_traj,
                 )
 

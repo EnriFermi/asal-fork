@@ -3,7 +3,7 @@ meta:
   num_machines: ${env:PAPER_NUM_MACHINES,1}
   wandb_project: asal
   wandb_mode: online
-  output_root: experiments/paper_check_flow_lenia/checkpoints_grid32_torus_bs8
+  output_root: experiments/paper_check_flow_lenia/checkpoints_grid32_torus_bs8_shared_seed_rank
 
 paper_check:
   num_optimizations: 9

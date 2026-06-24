@@ -60,6 +60,11 @@ optimization:
   pop_size: 8
   n_iters: 100
   sigma: 0.2
+  # Opt-in only for the grid32 torus experiment: every generation evaluates all
+  # candidates on the same bs seeds, ranks candidates per seed, then sends mean
+  # rank to CMA-ES. Raw MSPD losses are still saved in pop_traj.objective_loss
+  # and per-seed values in pop_traj.loss_by_seed/score_by_seed.
+  selection_protocol: shared_seed_rank
 
 logging:
   wandb_project: asal
