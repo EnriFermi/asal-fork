@@ -130,7 +130,12 @@ def _flat_for_run(run_dir: Path, fallback_config: Path) -> tuple[SimpleNamespace
     return _flat_optimization_config(fallback_config), fallback_config, False
 
 
-def _checkpoint_root_from_suite(cfg: Any) -> Path:
+def _checkpoint_root_from_suite(cfg: Any, checkpoint_root: str | Path | None = None) -> Path:
+    if checkpoint_root is not None:
+        root = resolve_path(checkpoint_root)
+        if root is None or not root.exists():
+            raise FileNotFoundError(f"Optimization checkpoint root not found: {root}")
+        return root
     section = _get(_get(cfg.get("simulation", {}), "flow_lenia_arun_lagrangian_apf", {}), "optimized_checkpoint_roots", None)
     roots = list(section or [])
     if not roots:
@@ -274,24 +279,64 @@ def _best_pop_candidate(run_dir: Path, saved_best_loss: float) -> dict[str, Any]
     }
 
 
+def _apply_metric_objective_override(args: SimpleNamespace, override: str | None) -> SimpleNamespace:
+    if override is None:
+        return args
+    out = SimpleNamespace(**vars(args))
+    name = str(override).strip().lower()
+    if name in {"legacy", "legacy_msc", "legacy_msc_t"}:
+        out.metric_objective = "legacy_msc_t"
+    elif name in {"mspd", "paper_mspd", "new_mspd"}:
+        out.metric_objective = "mspd"
+    elif name == "mspd_no_norm":
+        out.metric_objective = "custom"
+        out.metric_msc_term = "floor_reconstruction_error"
+        out.metric_msc_floor = 0.01
+        out.metric_msc_normalize_by_weight_sum = False
+        out.metric_alpha = 0.0
+        out.metric_beta = 1.0
+    elif name == "mspd_no_floor":
+        out.metric_objective = "custom"
+        out.metric_msc_term = "floor_reconstruction_error"
+        out.metric_msc_floor = 0.0
+        out.metric_msc_normalize_by_weight_sum = True
+        out.metric_alpha = 0.0
+        out.metric_beta = 1.0
+    elif name == "mspd_no_norm_no_floor":
+        out.metric_objective = "custom"
+        out.metric_msc_term = "floor_reconstruction_error"
+        out.metric_msc_floor = 0.0
+        out.metric_msc_normalize_by_weight_sum = False
+        out.metric_alpha = 0.0
+        out.metric_beta = 1.0
+    elif name == "overlap_norm":
+        out.metric_objective = "custom"
+        out.metric_msc_term = "overlap"
+        out.metric_msc_normalize_by_weight_sum = True
+        out.metric_alpha = 0.0
+        out.metric_beta = 1.0
+    elif name == "overlap_no_norm":
+        out.metric_objective = "custom"
+        out.metric_msc_term = "overlap"
+        out.metric_msc_normalize_by_weight_sum = False
+        out.metric_alpha = 0.0
+        out.metric_beta = 1.0
+    else:
+        valid = (
+            "legacy_msc_t, mspd, mspd_no_norm, mspd_no_floor, "
+            "mspd_no_norm_no_floor, overlap_norm, overlap_no_norm"
+        )
+        raise ValueError(f"Unknown metric objective override {override!r}. Valid: {valid}")
+    return out
+
+
 def _build_rescorer(
     args: SimpleNamespace,
     *,
     include_maps: bool = True,
     metric_objective_override: str | None = None,
 ):
-    if metric_objective_override is not None:
-        args = SimpleNamespace(**vars(args))
-        if str(metric_objective_override).strip().lower() in {"legacy", "legacy_msc", "legacy_msc_t"}:
-            args.metric_objective = "legacy_msc_t"
-        elif str(metric_objective_override).strip().lower() in {"mspd", "paper_mspd", "new_mspd"}:
-            args.metric_objective = "mspd"
-        else:
-            raise ValueError(
-                "metric_objective_override must be one of "
-                "'legacy_msc_t' or 'mspd', got "
-                f"{metric_objective_override!r}."
-            )
+    args = _apply_metric_objective_override(args, metric_objective_override)
     base_substrate = substrates.create_substrate(
         args.substrate,
         **util.substrate_kwargs_from_args(args),
@@ -321,6 +366,7 @@ def _build_rescorer(
     lag_channel_mode = str(getattr(args, "metric_lagrangian_channel_mode", "mix"))
     lag_noise_model = str(getattr(args, "metric_lagrangian_noise_model", "none"))
     lag_diffusion_scale = float(getattr(args, "metric_lagrangian_diffusion_scale", 1.0))
+    log_clip_evolution = bool(getattr(args, "log_clip_evolution", True))
 
     if str(getattr(args, "metric_trajectory_source", "lagrangian")).strip().lower() != "lagrangian":
         raise ValueError("This rescorer currently supports metric_trajectory_source='lagrangian' only.")
@@ -375,7 +421,10 @@ def _build_rescorer(
 
     @jax.jit
     def eval_one(rng, params, tau_raw):
-        rng_roll, rng_metric = jax.random.split(rng)
+        if log_clip_evolution:
+            rng_roll, rng_metric, _rng_clip = jax.random.split(rng, 3)
+        else:
+            rng_roll, rng_metric = jax.random.split(rng)
         xy = rollout_metric_xy(rng_roll, params)
         loss, info = metric_loss_fn(rng_metric, xy, tau_selector=tau_raw)
         out = {
@@ -412,6 +461,7 @@ def _run_replay(
     config_path: str | Path,
     *,
     optimization_config: str | Path,
+    checkpoint_root: str | Path | None,
     output_dir: str | Path | None,
     force: bool,
     max_runs: int | None,
@@ -421,7 +471,7 @@ def _run_replay(
     metric_objective_override: str | None,
 ) -> dict[str, Any]:
     suite_cfg, _ = load_config(config_path)
-    opt_root = _checkpoint_root_from_suite(suite_cfg)
+    opt_root = _checkpoint_root_from_suite(suite_cfg, checkpoint_root=checkpoint_root)
     opt_cfg_path = resolve_path(optimization_config)
     if opt_cfg_path is None or not opt_cfg_path.exists():
         raise FileNotFoundError(f"Optimization config not found: {opt_cfg_path}")
@@ -464,6 +514,7 @@ def _run_replay(
         pop_batch = int(getattr(run_flat, "pop_batch", pop_size))
         bs = int(getattr(run_flat, "bs", 1))
         params_init = str(getattr(run_flat, "params_init", "strategy_default"))
+        log_clip_evolution = bool(getattr(run_flat, "log_clip_evolution", True))
         seed = int(getattr(run_flat, "seed"))
         _best_params, saved_loss = _load_best_checkpoint(run_dir)
         candidate = _best_pop_candidate(run_dir, saved_loss)
@@ -501,6 +552,7 @@ def _run_replay(
                 "pop_size": pop_size,
                 "pop_batch": pop_batch,
                 "params_init": params_init,
+                "log_clip_evolution": log_clip_evolution,
                 "best_iter": int(candidate["best_iter"]),
                 "pop_idx": int(candidate["pop_idx"]),
                 "saved_best_loss": saved_loss,
@@ -558,6 +610,7 @@ def _run_replay(
                         "run": run_dir.name,
                         "variant": variant_name,
                         "optimizer_seed": seed,
+                        "log_clip_evolution": log_clip_evolution,
                         "best_iter": int(candidate["best_iter"]),
                         "pop_idx": int(candidate["pop_idx"]),
                         "pop_best_mspd": -float(candidate["pop_best_loss"]),
@@ -613,6 +666,7 @@ def run(
     config_path: str | Path,
     *,
     optimization_config: str | Path,
+    checkpoint_root: str | Path | None,
     output_dir: str | Path | None,
     force: bool,
     max_runs: int | None,
@@ -622,7 +676,7 @@ def run(
     metric_objective_override: str | None,
 ) -> dict[str, Any]:
     suite_cfg, _ = load_config(config_path)
-    opt_root = _checkpoint_root_from_suite(suite_cfg)
+    opt_root = _checkpoint_root_from_suite(suite_cfg, checkpoint_root=checkpoint_root)
     opt_cfg_path = resolve_path(optimization_config)
     if opt_cfg_path is None or not opt_cfg_path.exists():
         raise FileNotFoundError(f"Optimization config not found: {opt_cfg_path}")
@@ -734,6 +788,11 @@ def main(argv: list[str] | None = None) -> int:
         default="experiments/paper_check_flow_lenia/optimization/config_longrun_check_fix.yaml",
         help="optimization base config used for training",
     )
+    parser.add_argument(
+        "--checkpoint-root",
+        default=None,
+        help="override optimization checkpoint root; use '.' with --run-name run_008 for a copied run directory",
+    )
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--max-runs", type=int, default=None)
@@ -758,7 +817,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--metric-objective-override",
         default=None,
-        choices=("legacy_msc_t", "mspd"),
+        choices=(
+            "legacy_msc_t",
+            "mspd",
+            "mspd_no_norm",
+            "mspd_no_floor",
+            "mspd_no_norm_no_floor",
+            "overlap_norm",
+            "overlap_no_norm",
+        ),
         help="override metric.metric_objective for replay/rescore without editing saved configs",
     )
     args = parser.parse_args(argv)
@@ -766,6 +833,7 @@ def main(argv: list[str] | None = None) -> int:
         result = _run_replay(
             args.config,
             optimization_config=args.optimization_config,
+            checkpoint_root=args.checkpoint_root,
             output_dir=args.output_dir,
             force=args.force,
             max_runs=args.max_runs,
@@ -778,6 +846,7 @@ def main(argv: list[str] | None = None) -> int:
         result = run(
             args.config,
             optimization_config=args.optimization_config,
+            checkpoint_root=args.checkpoint_root,
             output_dir=args.output_dir,
             force=args.force,
             max_runs=args.max_runs,
