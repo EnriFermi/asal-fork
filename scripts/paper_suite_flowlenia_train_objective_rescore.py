@@ -141,7 +141,14 @@ def _checkpoint_root_from_suite(cfg: Any) -> Path:
     return root
 
 
-def _run_dirs(root: Path, max_runs: int | None) -> list[Path]:
+def _run_dirs(root: Path, max_runs: int | None, run_name: str | None = None) -> list[Path]:
+    if run_name is not None:
+        name = str(run_name).strip()
+        run_dir = root / name
+        if not run_dir.is_dir() or not (run_dir / "best.pkl").exists():
+            raise FileNotFoundError(f"Requested run {name!r} not found under {root} or missing best.pkl.")
+        return [run_dir]
+
     dirs = [p for p in sorted(root.glob("run_*")) if p.is_dir() and (p / "best.pkl").exists()]
     if max_runs is not None:
         dirs = dirs[: int(max_runs)]
@@ -159,28 +166,82 @@ def _optimizer_eval_keys(
     pop_size: int,
     pop_batch: int,
     bs: int,
+    init_policy: str = "config",
+    ask_split: bool = True,
+    eval_split_mode: str = "main",
+    extra_splits_after_init: int = 0,
+    extra_splits_each_iter_before_eval: int = 0,
 ) -> jax.Array:
     rng = jax.random.PRNGKey(int(seed))
+    policy = str(init_policy).strip().lower()
     mode = str(params_init or "strategy_default").strip().lower().replace("-", "_")
-    if mode in {"strategy_default", "optimizer_default", "default"}:
+    if policy == "config":
+        if mode in {"strategy_default", "optimizer_default", "default"}:
+            rng, _rng_init = jax.random.split(rng)
+        elif mode in {"substrate_default", "default_params", "smart"}:
+            rng, _rng_mean, _rng_init = jax.random.split(rng, 3)
+        else:
+            raise ValueError(f"Unknown params_init={params_init!r}.")
+    elif policy == "none":
+        pass
+    elif policy == "one":
         rng, _rng_init = jax.random.split(rng)
-    elif mode in {"substrate_default", "default_params", "smart"}:
+    elif policy == "three":
         rng, _rng_mean, _rng_init = jax.random.split(rng, 3)
     else:
-        raise ValueError(f"Unknown params_init={params_init!r}.")
+        raise ValueError(f"Unknown init_policy={init_policy!r}.")
+    for _ in range(int(extra_splits_after_init)):
+        rng, _unused = jax.random.split(rng)
 
     for i_iter in range(int(best_iter) + 1):
-        rng, _rng_ask = jax.random.split(rng)
+        if ask_split:
+            rng, _rng_ask = jax.random.split(rng)
+        for _ in range(int(extra_splits_each_iter_before_eval)):
+            rng, _unused = jax.random.split(rng)
         rng_eval = rng
         for start in range(0, int(pop_size), int(pop_batch)):
             end = min(int(pop_size), start + int(pop_batch))
-            rng_next, rng_metric_parent = jax.random.split(rng_eval)
+            if eval_split_mode == "main":
+                rng_next, rng_metric_parent = jax.random.split(rng_eval)
+            elif eval_split_mode == "parent_first":
+                rng_metric_parent, rng_next = jax.random.split(rng_eval)
+            elif eval_split_mode == "no_presplit":
+                rng_next = rng_eval
+                rng_metric_parent = rng_eval
+            else:
+                raise ValueError(f"Unknown eval_split_mode={eval_split_mode!r}.")
             keys = jax.random.split(rng_metric_parent, int(bs))
             if i_iter == int(best_iter) and start <= int(pop_idx) < end:
                 return keys
             rng_eval = rng_next
         rng = rng_eval
     raise RuntimeError("Failed to reconstruct optimizer evaluation RNG keys.")
+
+
+def _optimizer_rng_debug_variants() -> list[dict[str, Any]]:
+    return [
+        {"variant": "main_config", "init_policy": "config", "ask_split": True, "eval_split_mode": "main"},
+        {"variant": "no_init_split", "init_policy": "none", "ask_split": True, "eval_split_mode": "main"},
+        {"variant": "force_one_init_split", "init_policy": "one", "ask_split": True, "eval_split_mode": "main"},
+        {"variant": "force_three_init_split", "init_policy": "three", "ask_split": True, "eval_split_mode": "main"},
+        {"variant": "no_ask_split", "init_policy": "config", "ask_split": False, "eval_split_mode": "main"},
+        {"variant": "eval_parent_first", "init_policy": "config", "ask_split": True, "eval_split_mode": "parent_first"},
+        {"variant": "eval_no_presplit", "init_policy": "config", "ask_split": True, "eval_split_mode": "no_presplit"},
+        {
+            "variant": "extra_split_after_init",
+            "init_policy": "config",
+            "ask_split": True,
+            "eval_split_mode": "main",
+            "extra_splits_after_init": 1,
+        },
+        {
+            "variant": "extra_split_each_iter_before_eval",
+            "init_policy": "config",
+            "ask_split": True,
+            "eval_split_mode": "main",
+            "extra_splits_each_iter_before_eval": 1,
+        },
+    ]
 
 
 def _best_pop_candidate(run_dir: Path, saved_best_loss: float) -> dict[str, Any]:
@@ -213,7 +274,7 @@ def _best_pop_candidate(run_dir: Path, saved_best_loss: float) -> dict[str, Any]
     }
 
 
-def _build_rescorer(args: SimpleNamespace):
+def _build_rescorer(args: SimpleNamespace, *, include_maps: bool = True):
     base_substrate = substrates.create_substrate(
         args.substrate,
         **util.substrate_kwargs_from_args(args),
@@ -233,7 +294,7 @@ def _build_rescorer(args: SimpleNamespace):
         args.metric_domain_x = float(metric_space_defaults["domain_x"])
 
     metric_cfg = resolve_metric_config(args)
-    metric_loss_fn = make_metric_loss_fn(metric_cfg, include_maps=True)
+    metric_loss_fn = make_metric_loss_fn(metric_cfg, include_maps=include_maps)
     chunk_steps = int(metric_cfg["sample_every_steps"])
     time_sampling = int(metric_cfg["time_sampling"])
     lag_n_particles = int(getattr(args, "metric_lagrangian_n_particles", 256))
@@ -300,18 +361,32 @@ def _build_rescorer(args: SimpleNamespace):
         rng_roll, rng_metric = jax.random.split(rng)
         xy = rollout_metric_xy(rng_roll, params)
         loss, info = metric_loss_fn(rng_metric, xy, tau_selector=tau_raw)
-        score_by_tau = info["score_by_tau"]
-        best_idx = jnp.argmax(score_by_tau)
-        return {
+        out = {
             "loss": loss,
             "score": info["score"],
             "tau_selected_idx": info["tau_selected_idx"],
             "tau_selected_steps": info["tau_best_steps"],
-            "score_by_tau": score_by_tau,
-            "max_tau_idx": best_idx,
-            "max_tau_steps": info["tau_steps"][best_idx],
-            "max_tau_score": score_by_tau[best_idx],
         }
+        if include_maps:
+            score_by_tau = info["score_by_tau"]
+            best_idx = jnp.argmax(score_by_tau)
+            out.update(
+                {
+                    "score_by_tau": score_by_tau,
+                    "max_tau_idx": best_idx,
+                    "max_tau_steps": info["tau_steps"][best_idx],
+                    "max_tau_score": score_by_tau[best_idx],
+                }
+            )
+        else:
+            out.update(
+                {
+                    "max_tau_idx": info["tau_selected_idx"],
+                    "max_tau_steps": info["tau_best_steps"],
+                    "max_tau_score": info["score_tau_max"],
+                }
+            )
+        return out
 
     return eval_one, metric_cfg
 
@@ -323,6 +398,8 @@ def _run_replay(
     output_dir: str | Path | None,
     force: bool,
     max_runs: int | None,
+    run_name: str | None,
+    debug_rng_variants: bool,
 ) -> dict[str, Any]:
     suite_cfg, _ = load_config(config_path)
     opt_root = _checkpoint_root_from_suite(suite_cfg)
@@ -336,18 +413,20 @@ def _run_replay(
     else:
         out_dir = ensure_dir(resolve_path(output_dir) or Path(output_dir))
     replay_path = out_dir / "train_objective_replay.csv"
+    variants_path = out_dir / "train_objective_replay_rng_variants.csv"
     summary_path = out_dir / "train_objective_replay_summary.json"
-    if not force and replay_path.exists():
+    if not force and replay_path.exists() and (not debug_rng_variants or variants_path.exists()):
         return {"status": "exists", "replay": str(replay_path)}
 
-    run_dirs = _run_dirs(opt_root, max_runs)
+    run_dirs = _run_dirs(opt_root, max_runs, run_name=run_name)
     first_flat, first_config_path, _first_has_run_config = _flat_for_run(run_dirs[0], opt_cfg_path)
     if not _first_has_run_config:
         raise FileNotFoundError(
             f"Exact optimizer replay requires per-run optimization_config.yaml, missing for {run_dirs[0]}."
         )
-    eval_one, metric_cfg = _build_rescorer(first_flat)
+    eval_one, metric_cfg = _build_rescorer(first_flat, include_maps=False)
     rows: list[dict[str, Any]] = []
+    variant_rows: list[dict[str, Any]] = []
     log_event(
         f"Flow-Lenia train objective replay start n_runs={len(run_dirs)} opt_root={opt_root} evaluator_config={first_config_path}",
         component="train-replay",
@@ -417,8 +496,57 @@ def _run_replay(
                 "tau_selector_raw": float(candidate["tau_selector_raw"]),
             }
         )
+        _write_csv(replay_path, rows)
+        if debug_rng_variants:
+            for variant in _optimizer_rng_debug_variants():
+                variant_name = str(variant["variant"])
+                keys_variant = _optimizer_eval_keys(
+                    seed=seed,
+                    params_init=params_init,
+                    best_iter=int(candidate["best_iter"]),
+                    pop_idx=int(candidate["pop_idx"]),
+                    pop_size=pop_size,
+                    pop_batch=pop_batch,
+                    bs=bs,
+                    init_policy=str(variant.get("init_policy", "config")),
+                    ask_split=bool(variant.get("ask_split", True)),
+                    eval_split_mode=str(variant.get("eval_split_mode", "main")),
+                    extra_splits_after_init=int(variant.get("extra_splits_after_init", 0)),
+                    extra_splits_each_iter_before_eval=int(variant.get("extra_splits_each_iter_before_eval", 0)),
+                )
+                variant_scores: list[float] = []
+                variant_losses: list[float] = []
+                for key in keys_variant:
+                    out = eval_one(key, params, tau_raw)
+                    out_np = {name: np.asarray(jax.device_get(value)) for name, value in out.items()}
+                    variant_losses.append(float(np.asarray(out_np["loss"]).reshape(-1)[0]))
+                    variant_scores.append(float(np.asarray(out_np["score"]).reshape(-1)[0]))
+                variant_mspd = float(np.mean(np.asarray(variant_scores, dtype=np.float64)))
+                variant_loss = float(np.mean(np.asarray(variant_losses, dtype=np.float64)))
+                variant_rows.append(
+                    {
+                        "run": run_dir.name,
+                        "variant": variant_name,
+                        "optimizer_seed": seed,
+                        "best_iter": int(candidate["best_iter"]),
+                        "pop_idx": int(candidate["pop_idx"]),
+                        "pop_best_mspd": -float(candidate["pop_best_loss"]),
+                        "variant_mspd_mean": variant_mspd,
+                        "variant_mspd_minus_pop_best_mspd": float(
+                            variant_mspd - (-float(candidate["pop_best_loss"]))
+                        ),
+                        "variant_loss_mean": variant_loss,
+                        "variant_loss_minus_pop_best_loss": float(
+                            variant_loss - float(candidate["pop_best_loss"])
+                        ),
+                        "variant_mspd_rep_values": ";".join(f"{x:.9g}" for x in variant_scores),
+                    }
+                )
+                _write_csv(variants_path, variant_rows)
 
     _write_csv(replay_path, rows)
+    if debug_rng_variants:
+        _write_csv(variants_path, variant_rows)
     summary = {
         "status": "ok",
         "optimization_root": str(opt_root),
@@ -427,6 +555,7 @@ def _run_replay(
         "n_runs": len(run_dirs),
         "metric_summary": metric_summary(metric_cfg),
         "replay": str(replay_path),
+        "rng_variants": str(variants_path) if debug_rng_variants else None,
     }
     write_json(summary_path, to_plain(summary))
     log_event(f"Flow-Lenia train objective replay done replay={replay_path}", component="train-replay")
@@ -456,6 +585,7 @@ def run(
     output_dir: str | Path | None,
     force: bool,
     max_runs: int | None,
+    run_name: str | None,
     n_reps: int | None,
     seed_base: int,
 ) -> dict[str, Any]:
@@ -481,7 +611,7 @@ def run(
         return {"status": "exists", "aggregate": str(agg_path), "reps": str(reps_path)}
 
     eval_one, metric_cfg = _build_rescorer(flat)
-    run_dirs = _run_dirs(opt_root, max_runs)
+    run_dirs = _run_dirs(opt_root, max_runs, run_name=run_name)
     rep_rows: list[dict[str, Any]] = []
     agg_rows: list[dict[str, Any]] = []
     log_event(
@@ -543,6 +673,8 @@ def run(
                 "saved_minus_rescore_max_mean": float(saved_mspd - np.nanmean(max_arr)) if np.isfinite(saved_mspd) else np.nan,
             }
         )
+        _write_csv(reps_path, rep_rows)
+        _write_csv(agg_path, agg_rows)
 
     _write_csv(reps_path, rep_rows)
     _write_csv(agg_path, agg_rows)
@@ -573,12 +705,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--max-runs", type=int, default=None)
+    parser.add_argument("--run-name", default=None, help="single run directory name, for example run_008")
     parser.add_argument("--n-reps", type=int, default=None, help="fresh stochastic reps per checkpoint; default=optimization.bs")
     parser.add_argument("--seed-base", type=int, default=12345000)
     parser.add_argument(
         "--replay-optimizer-best",
         action="store_true",
         help="re-evaluate the best pop_traj candidate with the exact RNG keys used during optimization",
+    )
+    parser.add_argument(
+        "--debug-rng-variants",
+        action="store_true",
+        help="with --replay-optimizer-best, also evaluate several RNG reconstruction variants for diagnosis",
     )
     args = parser.parse_args(argv)
     if args.replay_optimizer_best:
@@ -588,6 +726,8 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=args.output_dir,
             force=args.force,
             max_runs=args.max_runs,
+            run_name=args.run_name,
+            debug_rng_variants=args.debug_rng_variants,
         )
     else:
         result = run(
@@ -596,6 +736,7 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=args.output_dir,
             force=args.force,
             max_runs=args.max_runs,
+            run_name=args.run_name,
             n_reps=args.n_reps,
             seed_base=args.seed_base,
         )
