@@ -190,6 +190,9 @@ def _best_candidate_and_keys(run_dir: Path, flat: SimpleNamespace, substrate_par
     max_param_diff = 0.0
     max_tau_diff = 0.0
     keys = None
+    best_params_chunk = None
+    best_rng_eval = None
+    best_chunk_start = None
     pop_batch = int(getattr(flat, "pop_batch", int(flat.pop_size)))
     bs = int(getattr(flat, "bs", 1))
     for i_iter in range(pop_loss.shape[0]):
@@ -206,18 +209,25 @@ def _best_candidate_and_keys(run_dir: Path, flat: SimpleNamespace, substrate_par
             rng_next, rng_metric_parent = jax.random.split(rng_eval)
             if i_iter == best_iter and start <= pop_idx < end:
                 keys = jax.random.split(rng_metric_parent, bs)
+                best_rng_eval = rng_eval
+                best_params_chunk = params_full_np[start:end]
+                best_chunk_start = int(start)
             rng_eval = rng_next
         rng = rng_eval
         es_state = strategy.tell(params_full, jnp.asarray(pop_loss[i_iter]), es_state, es_params)
 
-    if keys is None:
+    if keys is None or best_rng_eval is None or best_params_chunk is None or best_chunk_start is None:
         raise RuntimeError("Could not reconstruct best evaluation keys.")
     return {
         "best_iter": int(best_iter),
         "pop_idx": int(pop_idx),
+        "chunk_start": int(best_chunk_start),
+        "chunk_local_idx": int(pop_idx - best_chunk_start),
         "pop_best_loss": float(pop_loss[best_iter, pop_idx]),
         "params": pop_params[best_iter, pop_idx],
+        "params_chunk": best_params_chunk,
         "tau_raw": float(pop_tau_raw[best_iter, pop_idx]) if tau_extra_dims else 0.0,
+        "rng_eval": best_rng_eval,
         "keys": keys,
         "max_param_diff": max_param_diff,
         "max_tau_diff": max_tau_diff,
@@ -291,34 +301,45 @@ def run(run_dir: Path, source_root: Path, output_csv: Path) -> dict[str, Any]:
         (_, _, _), xy_seq = jax.lax.scan(chunk_fn, (s0, pts0, ch0), jax.random.split(k_scan, time_sampling))
         return xy_seq
 
-    @jax.jit
-    def eval_one(rng, params, tau_raw):
+    def calc_loss(rng, params_full):
+        params = params_full[:substrate_param_dims]
+        tau_selector = params_full[substrate_param_dims] if tau_extra_dims else None
         if log_clip_evolution:
             rng_roll, rng_metric, _rng_clip = jax.random.split(rng, 3)
         else:
             rng_roll, rng_metric = jax.random.split(rng)
         xy = rollout_metric_xy(rng_roll, params)
-        loss, info = metric_loss_fn(rng_metric, xy, tau_selector=tau_raw if tau_extra_dims else None)
-        out = {"loss": loss}
-        for key in COMPONENT_KEYS:
-            if key in info:
-                out[key] = info[key]
-        return out
+        if tau_extra_dims:
+            return metric_loss_fn(rng_metric, xy, tau_selector=tau_selector)
+        return metric_loss_fn(rng_metric, xy)
 
-    params = jnp.asarray(np.asarray(candidate["params"], dtype=np.float32), dtype=jnp.float32)
-    tau_raw = jnp.asarray(float(candidate["tau_raw"]), dtype=jnp.float32)
-    values: dict[str, list[float]] = {key: [] for key in ("loss",) + COMPONENT_KEYS}
-    for key in candidate["keys"]:
-        out = eval_one(key, params, tau_raw)
-        out_np = {k: np.asarray(jax.device_get(v)) for k, v in out.items()}
-        for k, v in out_np.items():
-            values.setdefault(k, []).append(float(np.asarray(v).reshape(-1)[0]))
+    calc_loss_vv = jax.vmap(jax.vmap(calc_loss, in_axes=(0, None)), in_axes=(None, 0))
+
+    @jax.jit
+    def eval_chunk(rng, params_chunk):
+        rng, rng_metric_parent = jax.random.split(rng)
+        loss, loss_dict = calc_loss_vv(jax.random.split(rng_metric_parent, int(flat.bs)), params_chunk)
+        loss = loss.mean(axis=1)
+        loss_dict = jax.tree.map(lambda x: x.mean(axis=1), loss_dict)
+        return rng, loss, loss_dict
+
+    params_chunk = jnp.asarray(np.asarray(candidate["params_chunk"], dtype=np.float32), dtype=jnp.float32)
+    _rng_next, loss_chunk, loss_dict_chunk = eval_chunk(candidate["rng_eval"], params_chunk)
+    loss_np = np.asarray(jax.device_get(loss_chunk), dtype=np.float64)
+    loss_dict_np = {k: np.asarray(jax.device_get(v)) for k, v in loss_dict_chunk.items()}
+    local_idx = int(candidate["chunk_local_idx"])
+    values: dict[str, float] = {"loss": float(loss_np[local_idx])}
+    for key in COMPONENT_KEYS:
+        if key in loss_dict_np:
+            values[key] = float(np.asarray(loss_dict_np[key][local_idx]).reshape(-1)[0])
 
     row: dict[str, Any] = {
         "run_dir": str(run_dir),
         "source_root": str(source_root),
         "best_iter": candidate["best_iter"],
         "pop_idx": candidate["pop_idx"],
+        "chunk_start": candidate["chunk_start"],
+        "chunk_local_idx": candidate["chunk_local_idx"],
         "pop_best_loss": candidate["pop_best_loss"],
         "pop_best_mspd": -candidate["pop_best_loss"],
         "pop_reconstruction_max_param_abs_diff": candidate["max_param_diff"],
@@ -328,12 +349,8 @@ def run(run_dir: Path, source_root: Path, output_csv: Path) -> dict[str, Any]:
         "metric_scale_normalization": str(metric_cfg.get("scale_normalization", "")),
         "metric_msc_floor": float(metric_cfg.get("msc_floor", 0.0)),
     }
-    for key, vals in values.items():
-        if not vals:
-            continue
-        replay = float(np.mean(np.asarray(vals, dtype=np.float64)))
+    for key, replay in values.items():
         row[f"replay_{key}"] = replay
-        row[f"replay_{key}_rep_values"] = ";".join(f"{x:.9g}" for x in vals)
         saved_key = key
         if key == "loss":
             saved = candidate["pop_best_loss"]
