@@ -29,6 +29,33 @@ from clip_deltah_msc_metric import make_metric_loss_fn, metric_summary, resolve_
 from paper_suite_common import ensure_dir, load_config, log_event, resolve_path, to_plain, write_json
 
 
+REPLAY_COMPONENT_KEYS = (
+    "score",
+    "msc",
+    "amp",
+    "delta_h_mean",
+    "delta_h_std",
+    "delta_h_min",
+    "delta_h_max",
+    "h_real_mean",
+    "h_null_mean",
+    "h_real_minus_null_mean",
+    "h_real_over_null_mean",
+    "h_delta_over_real_mean",
+    "score_tau_max",
+    "score_tau_mean",
+    "score_tau_min",
+    "msc_tau_max",
+    "msc_tau_mean",
+    "msc_tau_min",
+    "tau_selected_idx",
+    "tau_best_steps",
+    "dx_norm_mean",
+    "speed_norm_mean",
+    "position_std_mean",
+)
+
+
 def _get(obj: Any, key: str, default: Any = None) -> Any:
     if obj is None:
         return default
@@ -279,6 +306,27 @@ def _best_pop_candidate(run_dir: Path, saved_best_loss: float) -> dict[str, Any]
     }
 
 
+def _saved_optimizer_components(run_dir: Path, best_iter: int, pop_idx: int) -> dict[str, float]:
+    data_path = run_dir / "data.pkl"
+    if not data_path.exists():
+        return {}
+    data = _load_pickle(data_path)
+    if not isinstance(data, dict):
+        return {}
+    loss_dict = data.get("loss_dict")
+    if not isinstance(loss_dict, dict):
+        return {}
+    out: dict[str, float] = {}
+    for key in REPLAY_COMPONENT_KEYS:
+        if key not in loss_dict:
+            continue
+        arr = np.asarray(loss_dict[key])
+        if arr.ndim < 2 or best_iter >= arr.shape[0] or pop_idx >= arr.shape[1]:
+            continue
+        out[key] = float(np.asarray(arr[best_iter, pop_idx]).reshape(-1)[0])
+    return out
+
+
 def _apply_metric_objective_override(args: SimpleNamespace, override: str | None) -> SimpleNamespace:
     if override is None:
         return args
@@ -433,6 +481,9 @@ def _build_rescorer(
             "tau_selected_idx": info["tau_selected_idx"],
             "tau_selected_steps": info["tau_best_steps"],
         }
+        for key in REPLAY_COMPONENT_KEYS:
+            if key in info and key not in out:
+                out[key] = info[key]
         if include_maps:
             score_by_tau = info["score_by_tau"]
             best_idx = jnp.argmax(score_by_tau)
@@ -518,6 +569,11 @@ def _run_replay(
         seed = int(getattr(run_flat, "seed"))
         _best_params, saved_loss = _load_best_checkpoint(run_dir)
         candidate = _best_pop_candidate(run_dir, saved_loss)
+        saved_components = _saved_optimizer_components(
+            run_dir,
+            int(candidate["best_iter"]),
+            int(candidate["pop_idx"]),
+        )
         keys = _optimizer_eval_keys(
             seed=seed,
             params_init=params_init,
@@ -533,6 +589,7 @@ def _run_replay(
         scores: list[float] = []
         max_scores: list[float] = []
         selected_tau_steps: list[int] = []
+        component_values: dict[str, list[float]] = {key: [] for key in REPLAY_COMPONENT_KEYS}
         for key in keys:
             out = eval_one(key, params, tau_raw)
             out_np = {name: np.asarray(jax.device_get(value)) for name, value in out.items()}
@@ -540,37 +597,51 @@ def _run_replay(
             scores.append(float(np.asarray(out_np["score"]).reshape(-1)[0]))
             max_scores.append(float(np.asarray(out_np["max_tau_score"]).reshape(-1)[0]))
             selected_tau_steps.append(int(np.asarray(out_np["tau_selected_steps"]).reshape(-1)[0]))
+            for component_key in REPLAY_COMPONENT_KEYS:
+                if component_key in out_np:
+                    component_values[component_key].append(
+                        float(np.asarray(out_np[component_key]).reshape(-1)[0])
+                    )
         replay_loss = float(np.mean(np.asarray(losses, dtype=np.float64)))
         replay_mspd = float(np.mean(np.asarray(scores, dtype=np.float64)))
-        rows.append(
-            {
-                "run": run_dir.name,
-                "run_config_path": str(run_config_path),
-                "run_config_exact": bool(has_run_config),
-                "optimizer_seed": seed,
-                "bs": bs,
-                "pop_size": pop_size,
-                "pop_batch": pop_batch,
-                "params_init": params_init,
-                "log_clip_evolution": log_clip_evolution,
-                "best_iter": int(candidate["best_iter"]),
-                "pop_idx": int(candidate["pop_idx"]),
-                "saved_best_loss": saved_loss,
-                "saved_best_mspd": -saved_loss if np.isfinite(saved_loss) else np.nan,
-                "pop_best_loss": float(candidate["pop_best_loss"]),
-                "pop_best_mspd": -float(candidate["pop_best_loss"]),
-                "saved_loss_minus_pop_best_loss": float(candidate["saved_loss_minus_pop_best_loss"]),
-                "replay_loss_mean": replay_loss,
-                "replay_mspd_mean": replay_mspd,
-                "replay_max_tau_mspd_mean": float(np.mean(np.asarray(max_scores, dtype=np.float64))),
-                "replay_loss_minus_pop_best_loss": float(replay_loss - float(candidate["pop_best_loss"])),
-                "replay_mspd_minus_pop_best_mspd": float(replay_mspd - (-float(candidate["pop_best_loss"]))),
-                "replay_mspd_rep_values": ";".join(f"{x:.9g}" for x in scores),
-                "replay_loss_rep_values": ";".join(f"{x:.9g}" for x in losses),
-                "replay_selected_tau_steps": ";".join(str(x) for x in selected_tau_steps),
-                "tau_selector_raw": float(candidate["tau_selector_raw"]),
-            }
-        )
+        row = {
+            "run": run_dir.name,
+            "run_config_path": str(run_config_path),
+            "run_config_exact": bool(has_run_config),
+            "optimizer_seed": seed,
+            "bs": bs,
+            "pop_size": pop_size,
+            "pop_batch": pop_batch,
+            "params_init": params_init,
+            "log_clip_evolution": log_clip_evolution,
+            "best_iter": int(candidate["best_iter"]),
+            "pop_idx": int(candidate["pop_idx"]),
+            "saved_best_loss": saved_loss,
+            "saved_best_mspd": -saved_loss if np.isfinite(saved_loss) else np.nan,
+            "pop_best_loss": float(candidate["pop_best_loss"]),
+            "pop_best_mspd": -float(candidate["pop_best_loss"]),
+            "saved_loss_minus_pop_best_loss": float(candidate["saved_loss_minus_pop_best_loss"]),
+            "replay_loss_mean": replay_loss,
+            "replay_mspd_mean": replay_mspd,
+            "replay_max_tau_mspd_mean": float(np.mean(np.asarray(max_scores, dtype=np.float64))),
+            "replay_loss_minus_pop_best_loss": float(replay_loss - float(candidate["pop_best_loss"])),
+            "replay_mspd_minus_pop_best_mspd": float(replay_mspd - (-float(candidate["pop_best_loss"]))),
+            "replay_mspd_rep_values": ";".join(f"{x:.9g}" for x in scores),
+            "replay_loss_rep_values": ";".join(f"{x:.9g}" for x in losses),
+            "replay_selected_tau_steps": ";".join(str(x) for x in selected_tau_steps),
+            "tau_selector_raw": float(candidate["tau_selector_raw"]),
+        }
+        for component_key, values in component_values.items():
+            if not values:
+                continue
+            replay_value = float(np.mean(np.asarray(values, dtype=np.float64)))
+            row[f"replay_metric_{component_key}"] = replay_value
+            row[f"replay_metric_{component_key}_rep_values"] = ";".join(f"{x:.9g}" for x in values)
+            if component_key in saved_components:
+                saved_value = float(saved_components[component_key])
+                row[f"saved_metric_{component_key}"] = saved_value
+                row[f"diff_metric_{component_key}"] = float(replay_value - saved_value)
+        rows.append(row)
         _write_csv(replay_path, rows)
         if debug_rng_variants:
             variants = _optimizer_rng_debug_variants()
