@@ -4,14 +4,14 @@ meta:
 
 substrate:
   substrate: lenia_flow
-  rollout_steps: 300000
-  grid_size: 32
+  rollout_steps: 10000
+  grid_size: 24
   C: 3
   k: 9
   kernel_components: 3
   M: 2,1,0;0,2,1;1,0,2
   dd: 5
-  dt: 0.2
+  dt: 0.8
   sigma: 0.65
   border: torus
   mix_rule: stoch
@@ -55,7 +55,7 @@ evaluation:
   log_clip_evolution: false
 
 optimization:
-  bs: 8
+  bs: 1
   pop_batch: 8
   pop_size: 8
   n_iters: 100
@@ -68,12 +68,12 @@ logging:
 metric:
   metric_trajectory_source: lagrangian
   metric_tau_mode: trainable_grid
-  metric_tau_grid_steps: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000]
-  metric_window_size_steps: 20000
-  metric_window_step_steps: 5000
+  metric_tau_grid_steps: [50, 100, 150, 200, 250, 300, 350, 400, 450, 500]
+  metric_window_size_steps: 1000
+  metric_window_step_steps: 200
   metric_tau_steps: 3000
-  metric_range_start_steps: 50000
-  metric_range_end_steps: 300000
+  metric_range_start_steps: 2000
+  metric_range_end_steps: 10000
   metric_window_size_frames: null
   metric_window_step_frames: null
   metric_m_samples: 48
