@@ -23,6 +23,24 @@ from paper_check_common import (
 )
 
 
+def _explicit_run_indices(paper_section) -> list[int] | None:
+    raw = paper_section.get("run_indices", None)
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        values = [part.strip() for part in raw.split(",") if part.strip()]
+    else:
+        values = list(raw)
+    out = [int(v) for v in values]
+    if not out:
+        raise ValueError("paper_check.run_indices was provided but is empty.")
+    if len(set(out)) != len(out):
+        raise ValueError(f"paper_check.run_indices contains duplicates: {out}")
+    if any(v < 0 for v in out):
+        raise ValueError(f"paper_check.run_indices must be non-negative, got {out}")
+    return out
+
+
 def _entrypoint_command(stage_cfg, repo: Path, resolved_config_path: Path) -> list[str]:
     raw = stage_cfg.get("entrypoint", stage_cfg.get("objective", "msc"))
     name = str(raw).strip().lower().replace("-", "_")
@@ -98,11 +116,15 @@ def main() -> int:
 
     paper_cfg, config_path = load_paper_check_config(sys.argv[1])
     machine_idx, num_machines = validate_machine_config(paper_cfg)
-    total_runs = int(paper_cfg.get("paper_check", {}).get("num_optimizations", 1))
-    if total_runs < 1:
-        raise ValueError(f"paper_check.num_optimizations must be >= 1, got {total_runs}.")
-
-    assigned = shard_indices(total_runs, machine_idx, num_machines)
+    paper_section = paper_cfg.get("paper_check", {})
+    explicit_runs = _explicit_run_indices(paper_section)
+    if explicit_runs is None:
+        total_runs = int(paper_section.get("num_optimizations", 1))
+        if total_runs < 1:
+            raise ValueError(f"paper_check.num_optimizations must be >= 1, got {total_runs}.")
+        assigned = shard_indices(total_runs, machine_idx, num_machines)
+    else:
+        assigned = [idx for pos, idx in enumerate(explicit_runs) if pos % num_machines == machine_idx]
     print(
         f"[paper_check/optimization] machine_idx={machine_idx} num_machines={num_machines} "
         f"assigned_runs={assigned}"
