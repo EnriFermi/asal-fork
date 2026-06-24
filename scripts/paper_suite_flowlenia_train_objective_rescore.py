@@ -400,6 +400,7 @@ def _run_replay(
     max_runs: int | None,
     run_name: str | None,
     debug_rng_variants: bool,
+    debug_rng_variant: str | None,
 ) -> dict[str, Any]:
     suite_cfg, _ = load_config(config_path)
     opt_root = _checkpoint_root_from_suite(suite_cfg)
@@ -498,7 +499,14 @@ def _run_replay(
         )
         _write_csv(replay_path, rows)
         if debug_rng_variants:
-            for variant in _optimizer_rng_debug_variants():
+            variants = _optimizer_rng_debug_variants()
+            if debug_rng_variant is not None:
+                requested_variant = str(debug_rng_variant).strip()
+                variants = [v for v in variants if str(v["variant"]) == requested_variant]
+                if not variants:
+                    valid = ", ".join(str(v["variant"]) for v in _optimizer_rng_debug_variants())
+                    raise ValueError(f"Unknown --debug-rng-variant={requested_variant!r}. Valid variants: {valid}")
+            for variant in variants:
                 variant_name = str(variant["variant"])
                 keys_variant = _optimizer_eval_keys(
                     seed=seed,
@@ -718,6 +726,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="with --replay-optimizer-best, also evaluate several RNG reconstruction variants for diagnosis",
     )
+    parser.add_argument(
+        "--debug-rng-variant",
+        default=None,
+        help="with --debug-rng-variants, evaluate only one named RNG variant",
+    )
     args = parser.parse_args(argv)
     if args.replay_optimizer_best:
         result = _run_replay(
@@ -728,6 +741,7 @@ def main(argv: list[str] | None = None) -> int:
             max_runs=args.max_runs,
             run_name=args.run_name,
             debug_rng_variants=args.debug_rng_variants,
+            debug_rng_variant=args.debug_rng_variant,
         )
     else:
         result = run(
