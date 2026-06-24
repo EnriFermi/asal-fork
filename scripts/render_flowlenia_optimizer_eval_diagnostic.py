@@ -398,6 +398,14 @@ def _plot_maps(
     return paths
 
 
+def _metric_range_start(metric_cfg: dict[str, Any], flat: Any) -> int:
+    return int(metric_cfg.get("range_start_steps", getattr(flat, "metric_range_start_steps", 0)))
+
+
+def _metric_range_end(metric_cfg: dict[str, Any], flat: Any) -> int:
+    return int(metric_cfg.get("range_end_steps", getattr(flat, "metric_range_end_steps", getattr(flat, "rollout_steps", 0))))
+
+
 def _plot_all_rep_maps(
     *,
     out_dir: Path,
@@ -587,9 +595,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "optimizer_mean_score": float(np.mean(per_rep_score)),
             "min_rep_idx": int(np.nanargmin(per_rep_score)),
             "max_rep_idx": int(np.nanargmax(per_rep_score)),
-            "metric_range_start_steps": int(metric_cfg["range_start_steps"]),
-            "metric_range_end_steps": int(metric_cfg["range_end_steps"]),
-            "metric_n_windows": int(metric_cfg["n_windows"]),
+            "metric_range_start_steps": _metric_range_start(metric_cfg, flat),
+            "metric_range_end_steps": _metric_range_end(metric_cfg, flat),
+            "metric_n_windows": int(delta_h_maps.shape[-1]),
             "metric_maps_npz": str(out_dir / "optimizer_eval_all_reps_metric_maps.npz"),
             **plot_paths,
             **video_info,
@@ -661,9 +669,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "optimizer_mean_score": float(np.mean(per_rep_score)),
         "selected_rep_score": float(score),
         "selected_tau_steps": int(selected_tau_steps),
-        "metric_range_start_steps": int(metric_cfg["range_start_steps"]),
-        "metric_range_end_steps": int(metric_cfg["range_end_steps"]),
-        "metric_n_windows": int(metric_cfg["n_windows"]),
+        "metric_range_start_steps": _metric_range_start(metric_cfg, flat),
+        "metric_range_end_steps": _metric_range_end(metric_cfg, flat),
+        "metric_n_windows": int(delta_h_map.shape[-1]),
         "metric_maps_npz": str(out_dir / "optimizer_eval_metric_maps.npz"),
         **plot_paths,
         **video_info,
