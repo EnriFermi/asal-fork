@@ -274,7 +274,24 @@ def _best_pop_candidate(run_dir: Path, saved_best_loss: float) -> dict[str, Any]
     }
 
 
-def _build_rescorer(args: SimpleNamespace, *, include_maps: bool = True):
+def _build_rescorer(
+    args: SimpleNamespace,
+    *,
+    include_maps: bool = True,
+    metric_objective_override: str | None = None,
+):
+    if metric_objective_override is not None:
+        args = SimpleNamespace(**vars(args))
+        if str(metric_objective_override).strip().lower() in {"legacy", "legacy_msc", "legacy_msc_t"}:
+            args.metric_objective = "legacy_msc_t"
+        elif str(metric_objective_override).strip().lower() in {"mspd", "paper_mspd", "new_mspd"}:
+            args.metric_objective = "mspd"
+        else:
+            raise ValueError(
+                "metric_objective_override must be one of "
+                "'legacy_msc_t' or 'mspd', got "
+                f"{metric_objective_override!r}."
+            )
     base_substrate = substrates.create_substrate(
         args.substrate,
         **util.substrate_kwargs_from_args(args),
@@ -401,6 +418,7 @@ def _run_replay(
     run_name: str | None,
     debug_rng_variants: bool,
     debug_rng_variant: str | None,
+    metric_objective_override: str | None,
 ) -> dict[str, Any]:
     suite_cfg, _ = load_config(config_path)
     opt_root = _checkpoint_root_from_suite(suite_cfg)
@@ -425,7 +443,11 @@ def _run_replay(
         raise FileNotFoundError(
             f"Exact optimizer replay requires per-run optimization_config.yaml, missing for {run_dirs[0]}."
         )
-    eval_one, metric_cfg = _build_rescorer(first_flat, include_maps=False)
+    eval_one, metric_cfg = _build_rescorer(
+        first_flat,
+        include_maps=False,
+        metric_objective_override=metric_objective_override,
+    )
     rows: list[dict[str, Any]] = []
     variant_rows: list[dict[str, Any]] = []
     log_event(
@@ -564,6 +586,7 @@ def _run_replay(
         "metric_summary": metric_summary(metric_cfg),
         "replay": str(replay_path),
         "rng_variants": str(variants_path) if debug_rng_variants else None,
+        "metric_objective_override": metric_objective_override,
     }
     write_json(summary_path, to_plain(summary))
     log_event(f"Flow-Lenia train objective replay done replay={replay_path}", component="train-replay")
@@ -596,6 +619,7 @@ def run(
     run_name: str | None,
     n_reps: int | None,
     seed_base: int,
+    metric_objective_override: str | None,
 ) -> dict[str, Any]:
     suite_cfg, _ = load_config(config_path)
     opt_root = _checkpoint_root_from_suite(suite_cfg)
@@ -618,7 +642,7 @@ def run(
     if not force and agg_path.exists() and reps_path.exists():
         return {"status": "exists", "aggregate": str(agg_path), "reps": str(reps_path)}
 
-    eval_one, metric_cfg = _build_rescorer(flat)
+    eval_one, metric_cfg = _build_rescorer(flat, metric_objective_override=metric_objective_override)
     run_dirs = _run_dirs(opt_root, max_runs, run_name=run_name)
     rep_rows: list[dict[str, Any]] = []
     agg_rows: list[dict[str, Any]] = []
@@ -731,6 +755,12 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="with --debug-rng-variants, evaluate only one named RNG variant",
     )
+    parser.add_argument(
+        "--metric-objective-override",
+        default=None,
+        choices=("legacy_msc_t", "mspd"),
+        help="override metric.metric_objective for replay/rescore without editing saved configs",
+    )
     args = parser.parse_args(argv)
     if args.replay_optimizer_best:
         result = _run_replay(
@@ -742,6 +772,7 @@ def main(argv: list[str] | None = None) -> int:
             run_name=args.run_name,
             debug_rng_variants=args.debug_rng_variants,
             debug_rng_variant=args.debug_rng_variant,
+            metric_objective_override=args.metric_objective_override,
         )
     else:
         result = run(
@@ -753,6 +784,7 @@ def main(argv: list[str] | None = None) -> int:
             run_name=args.run_name,
             n_reps=args.n_reps,
             seed_base=args.seed_base,
+            metric_objective_override=args.metric_objective_override,
         )
     print(to_plain(result))
     return 0
