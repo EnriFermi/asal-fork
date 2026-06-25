@@ -440,6 +440,7 @@ def _save_openai_es_resume_state(
     pop_objective_loss_traj,
     pop_loss_by_seed_traj,
     pop_seed_keys_traj,
+    pop_relative_score_by_seed_traj,
     pop_epsilon_traj,
     pop_direction_score_diff_traj,
     palette_traj,
@@ -478,6 +479,9 @@ def _save_openai_es_resume_state(
         pop_objective_loss_traj=[np.array(x) for x in pop_objective_loss_traj],
         pop_loss_by_seed_traj=[np.array(x) for x in pop_loss_by_seed_traj],
         pop_seed_keys_traj=[np.array(x) for x in pop_seed_keys_traj],
+        pop_relative_score_by_seed_traj=[
+            np.array(x) for x in pop_relative_score_by_seed_traj
+        ],
         pop_epsilon_traj=[np.array(x) for x in pop_epsilon_traj],
         pop_direction_score_diff_traj=[np.array(x) for x in pop_direction_score_diff_traj],
         palette_traj=list(palette_traj),
@@ -574,6 +578,9 @@ def _restore_openai_es_resume_state(
         pop_objective_loss_traj=[np.array(x) for x in checkpoint.get("pop_objective_loss_traj", [])],
         pop_loss_by_seed_traj=[np.array(x) for x in checkpoint.get("pop_loss_by_seed_traj", [])],
         pop_seed_keys_traj=[np.array(x) for x in checkpoint.get("pop_seed_keys_traj", [])],
+        pop_relative_score_by_seed_traj=[
+            np.array(x) for x in checkpoint.get("pop_relative_score_by_seed_traj", [])
+        ],
         pop_epsilon_traj=[np.array(x) for x in checkpoint.get("pop_epsilon_traj", [])],
         pop_direction_score_diff_traj=[
             np.array(x) for x in checkpoint.get("pop_direction_score_diff_traj", [])
@@ -1215,6 +1222,7 @@ def main(cfg, args):
                     pop_objective_loss_traj = restored["pop_objective_loss_traj"]
                     pop_loss_by_seed_traj = restored["pop_loss_by_seed_traj"]
                     pop_seed_keys_traj = restored["pop_seed_keys_traj"]
+                    pop_relative_score_by_seed_traj = restored["pop_relative_score_by_seed_traj"]
                     pop_epsilon_traj = restored["pop_epsilon_traj"]
                     pop_direction_score_diff_traj = restored["pop_direction_score_diff_traj"]
                     palette_traj = restored["palette_traj"]
@@ -1351,6 +1359,8 @@ def main(cfg, args):
                         loss_by_seed_arr = np.stack(pop_loss_by_seed_traj, axis=0)
                         pop_traj["loss_by_seed"] = loss_by_seed_arr
                         pop_traj["score_by_seed"] = -loss_by_seed_arr
+                    if len(pop_relative_score_by_seed_traj) > 0:
+                        pop_traj["relative_score_by_seed"] = np.stack(pop_relative_score_by_seed_traj, axis=0)
                     if len(pop_seed_keys_traj) > 0:
                         pop_traj["seed_keys"] = np.stack(pop_seed_keys_traj, axis=0)
                         pop_traj["seed_key_semantics"] = (
@@ -1401,6 +1411,7 @@ def main(cfg, args):
                     pop_objective_loss_traj=pop_objective_loss_traj,
                     pop_loss_by_seed_traj=pop_loss_by_seed_traj,
                     pop_seed_keys_traj=pop_seed_keys_traj,
+                    pop_relative_score_by_seed_traj=pop_relative_score_by_seed_traj,
                     pop_epsilon_traj=pop_epsilon_traj,
                     pop_direction_score_diff_traj=pop_direction_score_diff_traj,
                     palette_traj=palette_traj,
@@ -1431,9 +1442,17 @@ def main(cfg, args):
                 loss_by_seed_all, loss_dict_by_seed_all = eval_openai_population(params_full, seed_keys)
                 objective_loss_all = jnp.mean(loss_by_seed_all, axis=1)
                 score_by_seed_all = -loss_by_seed_all
+                rel_eps = float(getattr(args, "openai_es_relative_eps", 1e-8))
+                score_seed_mean = jnp.mean(score_by_seed_all, axis=0, keepdims=True)
+                score_seed_std = jnp.std(score_by_seed_all, axis=0, keepdims=True)
+                relative_score_by_seed_all = jnp.where(
+                    score_seed_std > rel_eps,
+                    (score_by_seed_all - score_seed_mean) / (score_seed_std + rel_eps),
+                    jnp.zeros_like(score_by_seed_all),
+                )
                 objective_score_all = -objective_loss_all
                 direction_score_diff = jnp.mean(
-                    score_by_seed_all[:n_pairs] - score_by_seed_all[n_pairs:],
+                    relative_score_by_seed_all[:n_pairs] - relative_score_by_seed_all[n_pairs:],
                     axis=1,
                 )
                 grad = jnp.sum(direction_score_diff[:, None] * eps, axis=0) / (
@@ -1507,6 +1526,7 @@ def main(cfg, args):
                 pop_objective_loss_traj.append(np.asarray(objective_loss_all, dtype=np.float32))
                 pop_loss_by_seed_traj.append(np.asarray(loss_by_seed_all, dtype=np.float32))
                 pop_seed_keys_traj.append(np.asarray(seed_keys))
+                pop_relative_score_by_seed_traj.append(np.asarray(relative_score_by_seed_all, dtype=np.float32))
                 pop_epsilon_traj.append(np.asarray(eps, dtype=np.float32))
                 pop_direction_score_diff_traj.append(np.asarray(direction_score_diff, dtype=np.float32))
 
@@ -1516,6 +1536,7 @@ def main(cfg, args):
                 loss_mean = float(loss_np.mean())
                 loss_var = float(loss_np.var())
                 score_by_seed_np = np.asarray(score_by_seed_all, dtype=np.float32)
+                relative_score_by_seed_np = np.asarray(relative_score_by_seed_all, dtype=np.float32)
                 grad_norm = float(jnp.linalg.norm(grad))
                 update_norm = float(jnp.linalg.norm(adam_update))
                 theta_norm = float(jnp.linalg.norm(theta_eval))
@@ -1597,6 +1618,8 @@ def main(cfg, args):
                     "mspd/by_seed_pop_mean": float(score_by_seed_np.mean()),
                     "mspd/by_seed_pop_best": float(score_by_seed_np.max()),
                     "mspd/by_seed_pop_std": float(score_by_seed_np.std()),
+                    "openai_es/relative_score_by_seed_mean": float(relative_score_by_seed_np.mean()),
+                    "openai_es/relative_score_by_seed_std": float(relative_score_by_seed_np.std()),
                     "openai_es/center_smoothed_score": float(center_score),
                     "openai_es/best_center_smoothed_score": float(best_score_so_far),
                     "openai_es/best_perturb_score": float(best_perturb_score),
@@ -1661,6 +1684,7 @@ def main(cfg, args):
                     loss_dict=loss_dict_all,
                     loss_by_seed=loss_by_seed_all,
                     score_by_seed=score_by_seed_all,
+                    relative_score_by_seed=relative_score_by_seed_all,
                     seed_keys=seed_keys,
                     epsilon=eps,
                     direction_score_diff=direction_score_diff,
