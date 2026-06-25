@@ -6,7 +6,7 @@ meta:
   output_root: experiments/paper_check_flow_lenia/checkpoints_grid32_torus_bs8_mean_loss
 
 paper_check:
-  num_optimizations: 9
+  num_optimizations: 1
   num_random_baselines: 3
   optimization_seed_base: 1003
   random_param_seed_base: 200003
@@ -16,7 +16,7 @@ paper_check:
 optimization:
   base_config: optimization/config_mspd_grid32_torus_bs8.yaml
   save_root: ${meta.output_root}/optimization
-  resume: true
+  resume: false
   save_every: 1
   overrides:
     optimization:
