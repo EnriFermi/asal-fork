@@ -1,6 +1,6 @@
 meta:
   seed: 1
-  save_dir: experiments/flow_lenia_mspd/checkpoints/grid32_torus_bs8_test
+  save_dir: experiments/flow_lenia_mspd/checkpoints/grid32_torus_bs8_batched_racing_test
 
 substrate:
   substrate: lenia_flow
@@ -55,16 +55,20 @@ evaluation:
   log_clip_evolution: false
 
 optimization:
+  # For batched_racing, bs is the only exposed racing knob:
+  # it is the final per-candidate rollout budget for candidates that survive
+  # all racing stages. The stage schedule is derived automatically.
   bs: 8
   pop_batch: 8
   pop_size: 8
   n_iters: 100
   sigma: 0.2
-  # Opt-in only for the grid32 torus experiment: every generation evaluates all
-  # candidates on the same bs seeds, ranks candidates per seed, then sends mean
-  # rank to CMA-ES. Raw MSPD losses are still saved in pop_traj.objective_loss
-  # and per-seed values in pop_traj.loss_by_seed/score_by_seed.
-  selection_protocol: shared_seed_rank
+  # Batched Racing CMA-ES:
+  #   Stage 0 evaluates all candidates on r0 common seeds.
+  #   Stage 1 evaluates top(3*mu) on r1 additional common seeds.
+  #   Stage 2 evaluates top(1.5*mu) on r2 additional common seeds.
+  #   CMA-ES receives negative mean relative score.
+  selection_protocol: batched_racing
 
 logging:
   wandb_project: asal

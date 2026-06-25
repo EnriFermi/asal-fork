@@ -1,6 +1,7 @@
 import os
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
+import math
 import sys
 from pathlib import Path
 
@@ -103,13 +104,72 @@ def _normalize_selection_protocol(name):
         "common_seeds_rank": "shared_seed_rank",
         "seed_rank": "shared_seed_rank",
         "rank": "shared_seed_rank",
+        "batched_racing": "batched_racing",
+        "racing": "batched_racing",
+        "batched_racing_cma_es": "batched_racing",
+        "racing_cma_es": "batched_racing",
     }
     if normalized not in aliases:
         raise ValueError(
             "Unknown optimization selection protocol "
-            f"{name!r}. Use 'mean_loss' or 'shared_seed_rank'."
+            f"{name!r}. Use 'mean_loss', 'shared_seed_rank', or 'batched_racing'."
         )
     return aliases[normalized]
+
+
+def _selection_loss_kind(selection_protocol: str) -> str:
+    if selection_protocol == "shared_seed_rank":
+        return "selection_fitness_mean_rank"
+    if selection_protocol == "batched_racing":
+        return "selection_fitness_negative_mean_relative_score"
+    return "objective_loss"
+
+
+def _best_params_source(selection_protocol: str) -> str:
+    if selection_protocol == "shared_seed_rank":
+        return "rank_fitness"
+    if selection_protocol == "batched_racing":
+        return "selection_fitness"
+    return "objective_loss"
+
+
+def _racing_stage_plan(pop_size: int, final_budget: int) -> dict[str, int]:
+    pop_size = int(pop_size)
+    final_budget = int(final_budget)
+    if pop_size < 1:
+        raise ValueError(f"pop_size must be >= 1, got {pop_size}.")
+    if final_budget < 1:
+        raise ValueError(f"bs/final racing rollout budget must be >= 1, got {final_budget}.")
+
+    if final_budget == 1:
+        r0, r1, r2 = 1, 0, 0
+    elif final_budget == 2:
+        r0, r1, r2 = 1, 1, 0
+    else:
+        r0 = max(1, final_budget // 4)
+        r1 = max(1, final_budget // 4)
+        r2 = final_budget - r0 - r1
+        if r2 < 1:
+            r2 = 1
+            if r1 > 1:
+                r1 -= 1
+            else:
+                r0 = max(1, final_budget - r1 - r2)
+
+    mu = max(1, pop_size // 2)
+    active1 = min(pop_size, max(1, int(math.ceil(3.0 * mu))))
+    active2 = min(active1, max(1, int(math.ceil(1.5 * mu))))
+    generation_rollout_budget = pop_size * r0 + active1 * r1 + active2 * r2
+    return {
+        "final_budget": int(final_budget),
+        "r0": int(r0),
+        "r1": int(r1),
+        "r2": int(r2),
+        "mu": int(mu),
+        "active1_size": int(active1),
+        "active2_size": int(active2),
+        "generation_rollout_budget": int(generation_rollout_budget),
+    }
 
 
 def _replace_state_fields(state, **updates):
@@ -205,6 +265,8 @@ def _save_resume_state(
     pop_loss_by_seed_traj,
     pop_rank_by_seed_traj,
     pop_seed_keys_traj,
+    pop_relative_score_by_seed_traj,
+    pop_eval_mask_by_seed_traj,
     palette_traj,
 ):
     if save_dir is None:
@@ -232,6 +294,8 @@ def _save_resume_state(
         pop_loss_by_seed_traj=[np.array(x) for x in pop_loss_by_seed_traj],
         pop_rank_by_seed_traj=[np.array(x) for x in pop_rank_by_seed_traj],
         pop_seed_keys_traj=[np.array(x) for x in pop_seed_keys_traj],
+        pop_relative_score_by_seed_traj=[np.array(x) for x in pop_relative_score_by_seed_traj],
+        pop_eval_mask_by_seed_traj=[np.array(x) for x in pop_eval_mask_by_seed_traj],
         palette_traj=list(palette_traj),
     )
     util.save_pkl(save_dir, "resume_state", payload)
@@ -304,6 +368,10 @@ def _restore_resume_state(
         pop_loss_by_seed_traj=[np.array(x) for x in checkpoint.get("pop_loss_by_seed_traj", [])],
         pop_rank_by_seed_traj=[np.array(x) for x in checkpoint.get("pop_rank_by_seed_traj", [])],
         pop_seed_keys_traj=[np.array(x) for x in checkpoint.get("pop_seed_keys_traj", [])],
+        pop_relative_score_by_seed_traj=[
+            np.array(x) for x in checkpoint.get("pop_relative_score_by_seed_traj", [])
+        ],
+        pop_eval_mask_by_seed_traj=[np.array(x) for x in checkpoint.get("pop_eval_mask_by_seed_traj", [])],
         palette_traj=list(checkpoint.get("palette_traj", [])),
     )
 
@@ -557,6 +625,11 @@ def main(cfg, args):
         run.summary["optimizer/bs"] = int(args.bs)
         if selection_protocol == "shared_seed_rank":
             run.summary["optimizer/shared_seed_rank_n_seeds"] = int(args.bs)
+        racing_plan = None
+        if selection_protocol == "batched_racing":
+            racing_plan = _racing_stage_plan(int(args.pop_size), int(args.bs))
+            for k, v in racing_plan.items():
+                run.summary[f"optimizer/racing_{k}"] = int(v)
 
         chunk_steps = int(metric_cfg["sample_every_steps"])
         time_sampling = int(metric_cfg["time_sampling"])
@@ -800,6 +873,10 @@ def main(cfg, args):
             return objective_loss, loss_dict, loss_by_seed
 
         @jax.jit
+        def eval_chunk_seed_block(params_chunk, seed_keys):
+            return calc_loss_vv(seed_keys, params_chunk)
+
+        @jax.jit
         def rank_fitness_from_loss_by_seed(loss_by_seed):
             # CMA-ES minimizes fitness. Raw loss is -score, so lower loss means better
             # for each shared seed. Rank 0 is best for that seed.
@@ -843,6 +920,8 @@ def main(cfg, args):
         pop_loss_by_seed_traj = []
         pop_rank_by_seed_traj = []
         pop_seed_keys_traj = []
+        pop_relative_score_by_seed_traj = []
+        pop_eval_mask_by_seed_traj = []
         palette_traj = []
         start_iter = 0
         resumed = False
@@ -875,6 +954,8 @@ def main(cfg, args):
                 pop_loss_by_seed_traj = restored["pop_loss_by_seed_traj"]
                 pop_rank_by_seed_traj = restored["pop_rank_by_seed_traj"]
                 pop_seed_keys_traj = restored["pop_seed_keys_traj"]
+                pop_relative_score_by_seed_traj = restored["pop_relative_score_by_seed_traj"]
+                pop_eval_mask_by_seed_traj = restored["pop_eval_mask_by_seed_traj"]
                 palette_traj = restored["palette_traj"]
                 resumed = True
                 print(f"Resuming optimization from iter {start_iter} using {args.save_dir}/resume_state.pkl")
@@ -916,6 +997,9 @@ def main(cfg, args):
             objective_loss_chunks = []
             loss_by_seed_chunks = []
             shared_seed_keys_for_log = None
+            racing_relative_score_by_seed_all = None
+            racing_eval_mask_by_seed_all = None
+            loss_dict_all = None
             if selection_protocol == "shared_seed_rank":
                 rng, rng_seed_set = split(rng)
                 shared_seed_keys = split(rng_seed_set, int(args.bs))
@@ -932,6 +1016,99 @@ def main(cfg, args):
                 objective_loss_all = jnp.concatenate(objective_loss_chunks, axis=0)
                 loss_by_seed_all = jnp.concatenate(loss_by_seed_chunks, axis=0)
                 loss_all, rank_by_seed_all = rank_fitness_from_loss_by_seed(loss_by_seed_all)
+            elif selection_protocol == "batched_racing":
+                if racing_plan is None:
+                    raise RuntimeError("batched_racing selected but racing_plan was not initialized.")
+                rng, rng_seed_set = split(rng)
+                final_budget = int(racing_plan["final_budget"])
+                shared_seed_keys = split(rng_seed_set, final_budget)
+                shared_seed_keys_for_log = shared_seed_keys
+                loss_by_seed_np = np.full((int(args.pop_size), final_budget), np.nan, dtype=np.float32)
+                relative_score_by_seed_np = np.full((int(args.pop_size), final_budget), np.nan, dtype=np.float32)
+                eval_mask_by_seed_np = np.zeros((int(args.pop_size), final_budget), dtype=bool)
+                metric_mats: dict[str, np.ndarray] = {}
+                seed_start = 0
+                rel_eps = float(getattr(args, "racing_relative_eps", 1e-8))
+
+                def update_relative_scores(active_idx_np: np.ndarray, seed_slice: slice) -> None:
+                    block_loss = loss_by_seed_np[active_idx_np, seed_slice]
+                    block_score = -block_loss
+                    mean = np.nanmean(block_score, axis=0, keepdims=True)
+                    std = np.nanstd(block_score, axis=0, keepdims=True)
+                    rel = np.where(std > rel_eps, (block_score - mean) / (std + rel_eps), 0.0)
+                    relative_score_by_seed_np[active_idx_np, seed_slice] = rel.astype(np.float32)
+
+                def mean_relative_score() -> np.ndarray:
+                    valid = np.isfinite(relative_score_by_seed_np)
+                    count = np.maximum(valid.sum(axis=1), 1)
+                    summed = np.nansum(relative_score_by_seed_np, axis=1)
+                    out = summed / count
+                    return np.asarray(out, dtype=np.float32)
+
+                def evaluate_racing_stage(active_idx_np: np.ndarray, n_seeds: int) -> None:
+                    nonlocal seed_start
+                    n_seeds = int(n_seeds)
+                    if n_seeds <= 0 or active_idx_np.size == 0:
+                        return
+                    seed_slice = slice(seed_start, seed_start + n_seeds)
+                    seed_keys_block = shared_seed_keys[seed_slice]
+                    for start in range(0, int(active_idx_np.size), pop_batch):
+                        chunk_idx = np.asarray(active_idx_np[start : start + pop_batch], dtype=np.int32)
+                        loss_block, loss_dict_block = eval_chunk_seed_block(
+                            params_full[jnp.asarray(chunk_idx)],
+                            seed_keys_block,
+                        )
+                        loss_block_np = np.asarray(loss_block, dtype=np.float32)
+                        loss_by_seed_np[chunk_idx, seed_slice] = loss_block_np
+                        eval_mask_by_seed_np[chunk_idx, seed_slice] = True
+                        loss_dict_block_np = jax.tree.map(lambda x: np.asarray(x), loss_dict_block)
+                        for key, value in dict(loss_dict_block_np).items():
+                            arr = np.asarray(value, dtype=np.float32)
+                            if arr.ndim < 2:
+                                arr = arr.reshape(arr.shape[0], n_seeds)
+                            elif arr.ndim > 2:
+                                arr = arr.reshape(arr.shape[0], arr.shape[1], -1).mean(axis=2)
+                            if key not in metric_mats:
+                                metric_mats[key] = np.full(
+                                    (int(args.pop_size), final_budget),
+                                    np.nan,
+                                    dtype=np.float32,
+                                )
+                            metric_mats[key][chunk_idx, seed_slice] = arr
+                    update_relative_scores(active_idx_np, seed_slice)
+                    seed_start += n_seeds
+
+                all_idx = np.arange(int(args.pop_size), dtype=np.int32)
+                evaluate_racing_stage(all_idx, int(racing_plan["r0"]))
+                stage0_relative_score_np = mean_relative_score()
+                order0 = np.argsort(-stage0_relative_score_np, kind="mergesort")
+                stage0_rank_np = np.argsort(order0, kind="mergesort").astype(np.float32)
+                active1_idx = order0[: int(racing_plan["active1_size"])].astype(np.int32)
+                evaluate_racing_stage(active1_idx, int(racing_plan["r1"]))
+                order1 = np.argsort(-mean_relative_score(), kind="mergesort")
+                active2_idx = order1[: int(racing_plan["active2_size"])].astype(np.int32)
+                evaluate_racing_stage(active2_idx, int(racing_plan["r2"]))
+
+                raw_loss_valid = np.isfinite(loss_by_seed_np)
+                raw_loss_count = np.maximum(raw_loss_valid.sum(axis=1), 1)
+                objective_loss_np_host = np.nansum(loss_by_seed_np, axis=1) / raw_loss_count
+                relative_score_np = mean_relative_score()
+                loss_all = jnp.asarray(-relative_score_np, dtype=jnp.float32)
+                objective_loss_all = jnp.asarray(objective_loss_np_host, dtype=jnp.float32)
+                loss_by_seed_all = jnp.asarray(loss_by_seed_np, dtype=jnp.float32)
+                rank_by_seed_all = None
+                racing_relative_score_by_seed_all = jnp.asarray(relative_score_by_seed_np, dtype=jnp.float32)
+                racing_eval_mask_by_seed_all = jnp.asarray(eval_mask_by_seed_np)
+                loss_dict_all = {
+                    key: jnp.asarray(
+                        np.nansum(value, axis=1) / np.maximum(np.isfinite(value).sum(axis=1), 1),
+                        dtype=jnp.float32,
+                    )
+                    for key, value in metric_mats.items()
+                }
+                loss_dict_all["selection_racing_mean_relative_score"] = jnp.asarray(relative_score_np, dtype=jnp.float32)
+                loss_dict_all["selection_racing_eval_count"] = jnp.asarray(raw_loss_count, dtype=jnp.float32)
+                loss_dict_all["selection_racing_stage0_rank"] = jnp.asarray(stage0_rank_np, dtype=jnp.float32)
             else:
                 rng_eval = rng
                 for start in range(0, args.pop_size, pop_batch):
@@ -945,8 +1122,9 @@ def main(cfg, args):
                 objective_loss_all = jnp.concatenate(objective_loss_chunks, axis=0)
                 loss_by_seed_all = None
                 rank_by_seed_all = None
-            loss_dict_all = jax.tree.map(lambda *xs: jnp.concatenate(xs, axis=0), *loss_dict_chunks)
-            loss_dict_all = dict(loss_dict_all)
+            if loss_dict_all is None:
+                loss_dict_all = jax.tree.map(lambda *xs: jnp.concatenate(xs, axis=0), *loss_dict_chunks)
+                loss_dict_all = dict(loss_dict_all)
             loss_dict_all["objective_loss"] = objective_loss_all
             loss_dict_all["objective_score"] = -objective_loss_all
             if selection_protocol == "shared_seed_rank":
@@ -954,6 +1132,8 @@ def main(cfg, args):
                 loss_dict_all["selection_rank_std"] = jnp.std(rank_by_seed_all, axis=1)
                 loss_dict_all["selection_rank_min"] = jnp.min(rank_by_seed_all, axis=1)
                 loss_dict_all["selection_rank_max"] = jnp.max(rank_by_seed_all, axis=1)
+            elif selection_protocol == "batched_racing":
+                loss_dict_all["selection_fitness_negative_mean_relative_score"] = loss_all
 
             es_state = strategy.tell(params_full, loss_all, es_state, es_params)
 
@@ -991,6 +1171,10 @@ def main(cfg, args):
                 pop_rank_by_seed_traj.append(np.array(rank_by_seed_all))
             if shared_seed_keys_for_log is not None:
                 pop_seed_keys_traj.append(np.array(shared_seed_keys_for_log))
+            if racing_relative_score_by_seed_all is not None:
+                pop_relative_score_by_seed_traj.append(np.array(racing_relative_score_by_seed_all))
+            if racing_eval_mask_by_seed_all is not None:
+                pop_eval_mask_by_seed_traj.append(np.array(racing_eval_mask_by_seed_all))
 
             loss_np = np.array(loss_all)
             objective_loss_np = np.array(objective_loss_all)
@@ -1076,6 +1260,44 @@ def main(cfg, args):
                     log_dict[f"mspd_seed/{i_seed:02d}_pop_best"] = float(seed_scores.max())
                     log_dict[f"mspd_seed/{i_seed:02d}_pop_std"] = float(seed_scores.std())
                     log_dict[f"mspd_seed/{i_seed:02d}_selected_candidate"] = float(score_by_seed_np[best_idx, i_seed])
+            elif selection_protocol == "batched_racing":
+                score_by_seed_np = -np.array(loss_by_seed_all)
+                rel_by_seed_np = np.array(racing_relative_score_by_seed_all)
+                eval_mask_np = np.array(racing_eval_mask_by_seed_all, dtype=bool)
+                eval_counts = eval_mask_np.sum(axis=1)
+                selected_seed_scores = score_by_seed_np[best_idx]
+                selected_seed_scores = selected_seed_scores[np.isfinite(selected_seed_scores)]
+                log_dict["selection/racing_fitness_pop_mean"] = float(loss_np.mean())
+                log_dict["selection/racing_fitness_pop_best"] = float(loss_np[best_idx])
+                log_dict["selection/racing_eval_count_pop_mean"] = float(eval_counts.mean())
+                log_dict["selection/racing_eval_count_pop_min"] = float(eval_counts.min())
+                log_dict["selection/racing_eval_count_pop_max"] = float(eval_counts.max())
+                log_dict["selection/racing_selected_eval_count"] = float(eval_counts[best_idx])
+                log_dict["selection/racing_relative_score_pop_best"] = float(-loss_np[best_idx])
+                log_dict["selection/racing_relative_score_pop_mean"] = float((-loss_np).mean())
+                log_dict["mspd/by_seed_pop_mean"] = float(np.nanmean(score_by_seed_np))
+                log_dict["mspd/by_seed_pop_best"] = float(np.nanmax(score_by_seed_np))
+                log_dict["mspd/by_seed_pop_std"] = float(np.nanstd(score_by_seed_np))
+                if selected_seed_scores.size > 0:
+                    log_dict["mspd/selected_candidate_seed_mean"] = float(np.nanmean(selected_seed_scores))
+                    log_dict["mspd/selected_candidate_seed_std"] = float(np.nanstd(selected_seed_scores))
+                    log_dict["mspd/selected_candidate_seed_min"] = float(np.nanmin(selected_seed_scores))
+                    log_dict["mspd/selected_candidate_seed_max"] = float(np.nanmax(selected_seed_scores))
+                for i_seed in range(score_by_seed_np.shape[1]):
+                    seed_scores = score_by_seed_np[:, i_seed]
+                    finite_seed = seed_scores[np.isfinite(seed_scores)]
+                    if finite_seed.size == 0:
+                        continue
+                    log_dict[f"mspd_seed/{i_seed:02d}_pop_mean"] = float(np.nanmean(seed_scores))
+                    log_dict[f"mspd_seed/{i_seed:02d}_pop_best"] = float(np.nanmax(seed_scores))
+                    log_dict[f"mspd_seed/{i_seed:02d}_pop_std"] = float(np.nanstd(seed_scores))
+                    if np.isfinite(score_by_seed_np[best_idx, i_seed]):
+                        log_dict[f"mspd_seed/{i_seed:02d}_selected_candidate"] = float(score_by_seed_np[best_idx, i_seed])
+                    rel_scores = rel_by_seed_np[:, i_seed]
+                    finite_rel = rel_scores[np.isfinite(rel_scores)]
+                    if finite_rel.size > 0:
+                        log_dict[f"racing_seed/{i_seed:02d}_relative_mean"] = float(np.nanmean(rel_scores))
+                        log_dict[f"racing_seed/{i_seed:02d}_relative_best"] = float(np.nanmax(rel_scores))
             for k, v in loss_dict_all.items():
                 v_np = np.array(v)
                 log_dict[f"metric/{k}_pop_mean"] = float(v_np.mean())
@@ -1145,11 +1367,19 @@ def main(cfg, args):
                 objective_loss=objective_loss_all,
                 loss_dict=loss_dict_all,
             )
-            if selection_protocol == "shared_seed_rank":
+            if selection_protocol in {"shared_seed_rank", "batched_racing"}:
                 data_item["loss_by_seed"] = loss_by_seed_all
                 if len(data) == 0 or "score_by_seed" in data[0]:
                     data_item["score_by_seed"] = -loss_by_seed_all
+            if selection_protocol == "shared_seed_rank":
                 data_item["rank_by_seed"] = rank_by_seed_all
+                if shared_seed_keys_for_log is not None and (len(data) == 0 or "seed_keys" in data[0]):
+                    data_item["seed_keys"] = shared_seed_keys_for_log
+            elif selection_protocol == "batched_racing":
+                if len(data) == 0 or "relative_score_by_seed" in data[0]:
+                    data_item["relative_score_by_seed"] = racing_relative_score_by_seed_all
+                if len(data) == 0 or "eval_mask_by_seed" in data[0]:
+                    data_item["eval_mask_by_seed"] = racing_eval_mask_by_seed_all
                 if shared_seed_keys_for_log is not None and (len(data) == 0 or "seed_keys" in data[0]):
                     data_item["seed_keys"] = shared_seed_keys_for_log
             data.append(data_item)
@@ -1170,12 +1400,8 @@ def main(cfg, args):
                     "best_selection",
                     dict(
                         selection_protocol=str(selection_protocol),
-                        best_params_source="rank_fitness" if selection_protocol == "shared_seed_rank" else "objective_loss",
-                        best_pkl_loss_kind=(
-                            "selection_fitness_mean_rank"
-                            if selection_protocol == "shared_seed_rank"
-                            else "objective_loss"
-                        ),
+                        best_params_source=_best_params_source(selection_protocol),
+                        best_pkl_loss_kind=_selection_loss_kind(selection_protocol),
                         best_selection_fitness=best_selection_fitness,
                         best_objective_loss=best_objective_loss,
                         best_objective_score=float(-best_objective_loss),
@@ -1189,11 +1415,7 @@ def main(cfg, args):
                         params=np.stack(best_params_traj, axis=0),
                         loss=selection_fitness_arr,
                         selection_fitness=selection_fitness_arr,
-                        loss_kind=(
-                            "selection_fitness_mean_rank"
-                            if selection_protocol == "shared_seed_rank"
-                            else "objective_loss"
-                        ),
+                        loss_kind=_selection_loss_kind(selection_protocol),
                         selection_protocol=str(selection_protocol),
                     )
                     if len(best_objective_loss_traj) > 0:
@@ -1213,11 +1435,7 @@ def main(cfg, args):
                         params=np.stack(pop_params_traj, axis=0),
                         loss=selection_fitness_arr,
                         selection_fitness=selection_fitness_arr,
-                        loss_kind=(
-                            "selection_fitness_mean_rank"
-                            if selection_protocol == "shared_seed_rank"
-                            else "objective_loss"
-                        ),
+                        loss_kind=_selection_loss_kind(selection_protocol),
                         selection_protocol=str(selection_protocol),
                     )
                     if len(pop_objective_loss_traj) > 0:
@@ -1230,11 +1448,22 @@ def main(cfg, args):
                         pop_traj["score_by_seed"] = -loss_by_seed_arr
                     if len(pop_rank_by_seed_traj) > 0:
                         pop_traj["rank_by_seed"] = np.stack(pop_rank_by_seed_traj, axis=0)
+                    if len(pop_relative_score_by_seed_traj) > 0:
+                        pop_traj["relative_score_by_seed"] = np.stack(pop_relative_score_by_seed_traj, axis=0)
+                    if len(pop_eval_mask_by_seed_traj) > 0:
+                        pop_traj["eval_mask_by_seed"] = np.stack(pop_eval_mask_by_seed_traj, axis=0)
                     if len(pop_seed_keys_traj) > 0:
                         seed_keys_arr = np.stack(pop_seed_keys_traj, axis=0)
-                        pop_traj["seed_key_semantics"] = (
-                            "score_by_seed[iter, pop_idx, seed_idx] uses seed_keys[iter, seed_idx]"
-                        )
+                        if selection_protocol == "batched_racing":
+                            pop_traj["seed_key_semantics"] = (
+                                "score_by_seed[iter, pop_idx, seed_idx] uses seed_keys[iter, seed_idx] "
+                                "when eval_mask_by_seed is true; NaN means the candidate was not evaluated "
+                                "on that racing seed block."
+                            )
+                        else:
+                            pop_traj["seed_key_semantics"] = (
+                                "score_by_seed[iter, pop_idx, seed_idx] uses seed_keys[iter, seed_idx]"
+                            )
                         if seed_keys_arr.shape[0] == len(pop_loss_traj):
                             pop_traj["seed_keys"] = seed_keys_arr
                         else:
@@ -1273,6 +1502,8 @@ def main(cfg, args):
                     pop_loss_by_seed_traj=pop_loss_by_seed_traj,
                     pop_rank_by_seed_traj=pop_rank_by_seed_traj,
                     pop_seed_keys_traj=pop_seed_keys_traj,
+                    pop_relative_score_by_seed_traj=pop_relative_score_by_seed_traj,
+                    pop_eval_mask_by_seed_traj=pop_eval_mask_by_seed_traj,
                     palette_traj=palette_traj,
                 )
 
