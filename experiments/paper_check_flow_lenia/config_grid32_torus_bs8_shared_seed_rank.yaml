@@ -1,0 +1,23 @@
+meta:
+  machine_idx: ${env:PAPER_MACHINE_IDX,0}
+  num_machines: ${env:PAPER_NUM_MACHINES,1}
+  wandb_project: asal
+  wandb_mode: online
+  output_root: experiments/paper_check_flow_lenia/checkpoints_grid32_torus_bs8_shared_seed_rank
+
+paper_check:
+  num_optimizations: 9
+  num_random_baselines: 3
+  optimization_seed_base: 1003
+  random_param_seed_base: 200003
+  pair_seed_base: 400003
+  metric_seed_base: 800003
+
+optimization:
+  base_config: optimization/config_mspd_grid32_torus_bs8.yaml
+  save_root: ${meta.output_root}/optimization
+  resume: true
+  save_every: 1
+  overrides:
+    optimization:
+      selection_protocol: shared_seed_rank

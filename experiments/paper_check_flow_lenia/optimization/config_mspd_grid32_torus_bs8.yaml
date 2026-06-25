@@ -1,6 +1,6 @@
 meta:
   seed: 1
-  save_dir: experiments/flow_lenia_mspd/checkpoints/grid32_torus_bs8_test
+  save_dir: experiments/flow_lenia_mspd/checkpoints/grid32_torus_bs8_batched_racing_test
 
 substrate:
   substrate: lenia_flow
@@ -65,6 +65,7 @@ optimization:
   # rank to CMA-ES. Raw MSPD losses are still saved in pop_traj.objective_loss
   # and per-seed values in pop_traj.loss_by_seed/score_by_seed.
   selection_protocol: shared_seed_rank
+
 
 logging:
   wandb_project: asal
