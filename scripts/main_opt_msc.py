@@ -117,6 +117,30 @@ def _normalize_selection_protocol(name):
     return aliases[normalized]
 
 
+def _normalize_optimizer_algorithm(name):
+    if name is None:
+        return "cma_es"
+    normalized = str(name).strip().lower().replace("-", "_")
+    aliases = {
+        "cma": "cma_es",
+        "cma_es": "cma_es",
+        "sep_cma_es": "cma_es",
+        "evosax": "cma_es",
+        "mirrored_openai_es": "mirrored_openai_es",
+        "mirrored_batch_openai_es": "mirrored_openai_es",
+        "openai_es": "mirrored_openai_es",
+        "batch_openai_es": "mirrored_openai_es",
+        "mirrored_es": "mirrored_openai_es",
+        "antithetic_openai_es": "mirrored_openai_es",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            "Unknown optimizer_algorithm "
+            f"{name!r}. Use 'cma_es' or 'mirrored_openai_es'."
+        )
+    return aliases[normalized]
+
+
 def _selection_loss_kind(selection_protocol: str) -> str:
     if selection_protocol == "shared_seed_rank":
         return "selection_fitness_mean_rank"
@@ -273,6 +297,7 @@ def _save_resume_state(
         return
     payload = dict(
         version=1,
+        optimizer_algorithm="cma_es",
         next_iter=int(next_iter),
         pop_size=int(pop_size),
         candidate_dims=int(candidate_dims),
@@ -313,6 +338,13 @@ def _restore_resume_state(
 ):
     if checkpoint is None:
         return None
+    ckpt_optimizer_algorithm = str(checkpoint.get("optimizer_algorithm", "cma_es"))
+    if ckpt_optimizer_algorithm != "cma_es":
+        raise ValueError(
+            "Resume checkpoint optimizer_algorithm mismatch: "
+            f"checkpoint={ckpt_optimizer_algorithm!r}, current='cma_es'. "
+            "Use a fresh output_root or disable resume for an algorithm change."
+        )
     ckpt_pop_size = int(checkpoint.get("pop_size"))
     if ckpt_pop_size != int(pop_size):
         raise ValueError(
@@ -372,6 +404,180 @@ def _restore_resume_state(
             np.array(x) for x in checkpoint.get("pop_relative_score_by_seed_traj", [])
         ],
         pop_eval_mask_by_seed_traj=[np.array(x) for x in checkpoint.get("pop_eval_mask_by_seed_traj", [])],
+        palette_traj=list(checkpoint.get("palette_traj", [])),
+    )
+
+
+def _save_openai_es_resume_state(
+    save_dir,
+    *,
+    next_iter,
+    rng,
+    theta,
+    adam_m,
+    adam_v,
+    adam_t,
+    candidate_dims,
+    substrate_param_dims,
+    optimize_tau,
+    params_init,
+    n_pairs,
+    n_seeds,
+    sigma,
+    lr,
+    adam_beta1,
+    adam_beta2,
+    adam_eps,
+    data,
+    center_traj,
+    best_params_traj,
+    best_tau_traj,
+    best_loss_traj,
+    best_objective_loss_traj,
+    pop_params_traj,
+    pop_tau_traj,
+    pop_loss_traj,
+    pop_objective_loss_traj,
+    pop_loss_by_seed_traj,
+    pop_seed_keys_traj,
+    pop_epsilon_traj,
+    pop_direction_score_diff_traj,
+    palette_traj,
+):
+    if save_dir is None:
+        return
+    payload = dict(
+        version=1,
+        optimizer_algorithm="mirrored_openai_es",
+        next_iter=int(next_iter),
+        candidate_dims=int(candidate_dims),
+        substrate_param_dims=int(substrate_param_dims),
+        optimize_tau=bool(optimize_tau),
+        params_init=str(params_init),
+        n_pairs=int(n_pairs),
+        n_seeds=int(n_seeds),
+        sigma=float(sigma),
+        lr=float(lr),
+        adam_beta1=float(adam_beta1),
+        adam_beta2=float(adam_beta2),
+        adam_eps=float(adam_eps),
+        rng=np.array(rng),
+        theta=np.array(theta),
+        adam_m=np.array(adam_m),
+        adam_v=np.array(adam_v),
+        adam_t=int(adam_t),
+        data=[] if len(data) == 0 else _to_numpy_tree(data),
+        center_traj=[_to_numpy_tree(x) for x in center_traj],
+        best_params_traj=[np.array(x) for x in best_params_traj],
+        best_tau_traj=list(best_tau_traj),
+        best_loss_traj=np.asarray(best_loss_traj, dtype=np.float32),
+        best_objective_loss_traj=np.asarray(best_objective_loss_traj, dtype=np.float32),
+        pop_params_traj=[np.array(x) for x in pop_params_traj],
+        pop_tau_traj=list(pop_tau_traj),
+        pop_loss_traj=[np.array(x) for x in pop_loss_traj],
+        pop_objective_loss_traj=[np.array(x) for x in pop_objective_loss_traj],
+        pop_loss_by_seed_traj=[np.array(x) for x in pop_loss_by_seed_traj],
+        pop_seed_keys_traj=[np.array(x) for x in pop_seed_keys_traj],
+        pop_epsilon_traj=[np.array(x) for x in pop_epsilon_traj],
+        pop_direction_score_diff_traj=[np.array(x) for x in pop_direction_score_diff_traj],
+        palette_traj=list(palette_traj),
+    )
+    util.save_pkl(save_dir, "resume_state", payload)
+
+
+def _restore_openai_es_resume_state(
+    checkpoint,
+    *,
+    candidate_dims,
+    substrate_param_dims,
+    optimize_tau,
+    params_init,
+    n_pairs,
+    n_seeds,
+    sigma,
+    lr,
+    adam_beta1,
+    adam_beta2,
+    adam_eps,
+):
+    if checkpoint is None:
+        return None
+    ckpt_optimizer_algorithm = str(checkpoint.get("optimizer_algorithm", "cma_es"))
+    if ckpt_optimizer_algorithm != "mirrored_openai_es":
+        raise ValueError(
+            "Resume checkpoint optimizer_algorithm mismatch: "
+            f"checkpoint={ckpt_optimizer_algorithm!r}, current='mirrored_openai_es'. "
+            "Use a fresh output_root or disable resume for an algorithm change."
+        )
+    ckpt_candidate_dims = int(checkpoint.get("candidate_dims"))
+    if ckpt_candidate_dims != int(candidate_dims):
+        raise ValueError(
+            f"Resume checkpoint candidate_dims mismatch: checkpoint={ckpt_candidate_dims}, current={int(candidate_dims)}."
+        )
+    ckpt_substrate_dims = int(checkpoint.get("substrate_param_dims"))
+    if ckpt_substrate_dims != int(substrate_param_dims):
+        raise ValueError(
+            f"Resume checkpoint substrate_param_dims mismatch: checkpoint={ckpt_substrate_dims}, "
+            f"current={int(substrate_param_dims)}."
+        )
+    ckpt_optimize_tau = bool(checkpoint.get("optimize_tau", False))
+    if ckpt_optimize_tau != bool(optimize_tau):
+        raise ValueError(
+            f"Resume checkpoint optimize_tau mismatch: checkpoint={ckpt_optimize_tau}, current={bool(optimize_tau)}."
+        )
+    ckpt_params_init = str(checkpoint.get("params_init", "strategy_default"))
+    if ckpt_params_init != str(params_init):
+        raise ValueError(
+            f"Resume checkpoint params_init mismatch: checkpoint={ckpt_params_init!r}, current={params_init!r}."
+        )
+    checks = {
+        "n_pairs": (int(checkpoint.get("n_pairs")), int(n_pairs)),
+        "n_seeds": (int(checkpoint.get("n_seeds")), int(n_seeds)),
+        "sigma": (float(checkpoint.get("sigma")), float(sigma)),
+        "lr": (float(checkpoint.get("lr")), float(lr)),
+        "adam_beta1": (float(checkpoint.get("adam_beta1")), float(adam_beta1)),
+        "adam_beta2": (float(checkpoint.get("adam_beta2")), float(adam_beta2)),
+        "adam_eps": (float(checkpoint.get("adam_eps")), float(adam_eps)),
+    }
+    for key, (ckpt_value, current_value) in checks.items():
+        if key in {"sigma", "lr", "adam_beta1", "adam_beta2", "adam_eps"}:
+            mismatch = not np.isclose(ckpt_value, current_value, rtol=0.0, atol=1e-12)
+        else:
+            mismatch = ckpt_value != current_value
+        if mismatch:
+            raise ValueError(
+                f"Resume checkpoint {key} mismatch: checkpoint={ckpt_value}, current={current_value}. "
+                "Use a fresh output_root or disable resume for an optimizer protocol change."
+            )
+    restored_best_loss_traj = [float(x) for x in np.asarray(checkpoint.get("best_loss_traj", []))]
+    restored_best_objective_loss_traj = [
+        float(x) for x in np.asarray(checkpoint.get("best_objective_loss_traj", []))
+    ]
+    if not restored_best_objective_loss_traj:
+        restored_best_objective_loss_traj = list(restored_best_loss_traj)
+    return dict(
+        next_iter=int(checkpoint.get("next_iter", 0)),
+        rng=jnp.asarray(checkpoint["rng"]),
+        theta=jnp.asarray(checkpoint["theta"], dtype=jnp.float32),
+        adam_m=jnp.asarray(checkpoint["adam_m"], dtype=jnp.float32),
+        adam_v=jnp.asarray(checkpoint["adam_v"], dtype=jnp.float32),
+        adam_t=int(checkpoint.get("adam_t", 0)),
+        data=list(checkpoint.get("data", [])),
+        center_traj=[_to_numpy_tree(x) for x in checkpoint.get("center_traj", [])],
+        best_params_traj=[np.array(x) for x in checkpoint.get("best_params_traj", [])],
+        best_tau_traj=list(checkpoint.get("best_tau_traj", [])),
+        best_loss_traj=restored_best_loss_traj,
+        best_objective_loss_traj=restored_best_objective_loss_traj,
+        pop_params_traj=[np.array(x) for x in checkpoint.get("pop_params_traj", [])],
+        pop_tau_traj=list(checkpoint.get("pop_tau_traj", [])),
+        pop_loss_traj=[np.array(x) for x in checkpoint.get("pop_loss_traj", [])],
+        pop_objective_loss_traj=[np.array(x) for x in checkpoint.get("pop_objective_loss_traj", [])],
+        pop_loss_by_seed_traj=[np.array(x) for x in checkpoint.get("pop_loss_by_seed_traj", [])],
+        pop_seed_keys_traj=[np.array(x) for x in checkpoint.get("pop_seed_keys_traj", [])],
+        pop_epsilon_traj=[np.array(x) for x in checkpoint.get("pop_epsilon_traj", [])],
+        pop_direction_score_diff_traj=[
+            np.array(x) for x in checkpoint.get("pop_direction_score_diff_traj", [])
+        ],
         palette_traj=list(checkpoint.get("palette_traj", [])),
     )
 
@@ -589,6 +795,10 @@ def main(cfg, args):
         if (not hasattr(args, "metric_domain_x")) or (getattr(args, "metric_domain_x", None) is None):
             args.metric_domain_x = float(metric_space_defaults["domain_x"])
 
+        optimizer_algorithm = _normalize_optimizer_algorithm(
+            getattr(args, "optimizer_algorithm", getattr(args, "optimization_algorithm", "cma_es"))
+        )
+        run.summary["optimizer/algorithm"] = optimizer_algorithm
         params_init = _canonicalize_params_init(getattr(args, "params_init", "strategy_default"))
         run.summary["optimizer/params_init"] = params_init
         trajectory_source, trajectory_sample_info = _infer_metric_trajectory_source(args, substrate)
@@ -622,11 +832,12 @@ def main(cfg, args):
             getattr(args, "selection_protocol", getattr(args, "optimization_selection_protocol", "mean_loss"))
         )
         run.summary["optimizer/selection_protocol"] = selection_protocol
+        run.summary["optimizer/selection_protocol_used"] = bool(optimizer_algorithm == "cma_es")
         run.summary["optimizer/bs"] = int(args.bs)
-        if selection_protocol == "shared_seed_rank":
+        if optimizer_algorithm == "cma_es" and selection_protocol == "shared_seed_rank":
             run.summary["optimizer/shared_seed_rank_n_seeds"] = int(args.bs)
         racing_plan = None
-        if selection_protocol == "batched_racing":
+        if optimizer_algorithm == "cma_es" and selection_protocol == "batched_racing":
             racing_plan = _racing_stage_plan(int(args.pop_size), int(args.bs))
             for k, v in racing_plan.items():
                 run.summary[f"optimizer/racing_{k}"] = int(v)
@@ -927,6 +1138,545 @@ def main(cfg, args):
         resumed = False
         rng = jax.random.PRNGKey(args.seed)
         candidate_dims = int(substrate_param_dims + tau_extra_dims)
+        if optimizer_algorithm == "mirrored_openai_es":
+            n_pairs = int(getattr(args, "openai_es_n_pairs", max(1, int(args.pop_size) // 2)))
+            n_seeds = int(getattr(args, "openai_es_n_seeds", int(args.bs)))
+            es_sigma = float(getattr(args, "openai_es_sigma", getattr(args, "sigma", 0.1)))
+            es_lr = float(getattr(args, "openai_es_lr", getattr(args, "lr", 0.03)))
+            adam_beta1 = float(getattr(args, "openai_es_adam_beta1", 0.9))
+            adam_beta2 = float(getattr(args, "openai_es_adam_beta2", 0.999))
+            adam_eps = float(getattr(args, "openai_es_adam_eps", 1.0e-8))
+            init_noise = float(getattr(args, "openai_es_init_noise", 0.0))
+            if n_pairs < 1:
+                raise ValueError(f"openai_es_n_pairs must be >= 1, got {n_pairs}.")
+            if n_seeds < 1:
+                raise ValueError(f"openai_es_n_seeds must be >= 1, got {n_seeds}.")
+            if es_sigma <= 0.0:
+                raise ValueError(f"openai_es_sigma must be > 0, got {es_sigma}.")
+            if es_lr <= 0.0:
+                raise ValueError(f"openai_es_lr must be > 0, got {es_lr}.")
+            if not (0.0 <= adam_beta1 < 1.0):
+                raise ValueError(f"openai_es_adam_beta1 must be in [0, 1), got {adam_beta1}.")
+            if not (0.0 <= adam_beta2 < 1.0):
+                raise ValueError(f"openai_es_adam_beta2 must be in [0, 1), got {adam_beta2}.")
+
+            openai_pop_size = 2 * n_pairs
+            run.summary["optimizer/openai_es_n_pairs"] = int(n_pairs)
+            run.summary["optimizer/openai_es_n_seeds"] = int(n_seeds)
+            run.summary["optimizer/openai_es_sigma"] = float(es_sigma)
+            run.summary["optimizer/openai_es_lr"] = float(es_lr)
+            run.summary["optimizer/openai_es_adam_beta1"] = float(adam_beta1)
+            run.summary["optimizer/openai_es_adam_beta2"] = float(adam_beta2)
+            run.summary["optimizer/openai_es_adam_eps"] = float(adam_eps)
+            run.summary["optimizer/openai_es_init_noise"] = float(init_noise)
+            run.summary["optimizer/openai_es_pop_size"] = int(openai_pop_size)
+            run.summary["optimizer/openai_es_rollouts_per_iter"] = int(openai_pop_size * n_seeds)
+
+            center_traj = []
+            pop_epsilon_traj = []
+            pop_direction_score_diff_traj = []
+            theta = None
+            adam_m = None
+            adam_v = None
+            adam_t = 0
+
+            if resume_enabled:
+                resume_state = _load_resume_state(args.save_dir)
+                if resume_state is not None:
+                    restored = _restore_openai_es_resume_state(
+                        resume_state,
+                        candidate_dims=candidate_dims,
+                        substrate_param_dims=substrate_param_dims,
+                        optimize_tau=optimize_tau,
+                        params_init=params_init,
+                        n_pairs=n_pairs,
+                        n_seeds=n_seeds,
+                        sigma=es_sigma,
+                        lr=es_lr,
+                        adam_beta1=adam_beta1,
+                        adam_beta2=adam_beta2,
+                        adam_eps=adam_eps,
+                    )
+                    start_iter = restored["next_iter"]
+                    rng = restored["rng"]
+                    theta = restored["theta"]
+                    adam_m = restored["adam_m"]
+                    adam_v = restored["adam_v"]
+                    adam_t = restored["adam_t"]
+                    data = restored["data"]
+                    center_traj = restored["center_traj"]
+                    best_params_traj = restored["best_params_traj"]
+                    best_tau_traj = restored["best_tau_traj"]
+                    best_loss_traj = restored["best_loss_traj"]
+                    best_objective_loss_traj = restored["best_objective_loss_traj"]
+                    pop_params_traj = restored["pop_params_traj"]
+                    pop_tau_traj = restored["pop_tau_traj"]
+                    pop_loss_traj = restored["pop_loss_traj"]
+                    pop_objective_loss_traj = restored["pop_objective_loss_traj"]
+                    pop_loss_by_seed_traj = restored["pop_loss_by_seed_traj"]
+                    pop_seed_keys_traj = restored["pop_seed_keys_traj"]
+                    pop_epsilon_traj = restored["pop_epsilon_traj"]
+                    pop_direction_score_diff_traj = restored["pop_direction_score_diff_traj"]
+                    palette_traj = restored["palette_traj"]
+                    resumed = True
+                    print(f"Resuming mirrored_openai_es from iter {start_iter} using {args.save_dir}/resume_state.pkl")
+
+            if not resumed:
+                if params_init == "strategy_default":
+                    theta = jnp.zeros((candidate_dims,), dtype=jnp.float32)
+                elif params_init == "substrate_default":
+                    rng, rng_mean = split(rng)
+                    theta = _build_candidate_init_mean(
+                        substrate=substrate,
+                        rng_mean=rng_mean,
+                        optimize_tau=optimize_tau,
+                    )
+                else:
+                    raise ValueError(f"Unhandled params_init {params_init!r}.")
+                if init_noise > 0.0:
+                    rng, rng_init_noise = split(rng)
+                    theta = theta + init_noise * jax.random.normal(
+                        rng_init_noise,
+                        theta.shape,
+                        dtype=theta.dtype,
+                    )
+                adam_m = jnp.zeros_like(theta)
+                adam_v = jnp.zeros_like(theta)
+                adam_t = 0
+
+            run.summary["resume/enabled"] = bool(resume_enabled)
+            run.summary["resume/loaded"] = bool(resumed)
+            run.summary["resume/start_iter"] = int(start_iter)
+            if args.save_dir is not None:
+                run.summary["resume/checkpoint_path"] = os.path.join(args.save_dir, "resume_state.pkl")
+            if start_iter >= int(args.n_iters):
+                print(
+                    f"Run already completed for n_iters={int(args.n_iters)} "
+                    f"(resume checkpoint next_iter={int(start_iter)}). Nothing to do."
+                )
+                return
+
+            def eval_openai_population(params_full_batch, seed_keys):
+                loss_by_seed_chunks = []
+                loss_dict_chunks = []
+                for start in range(0, int(params_full_batch.shape[0]), pop_batch):
+                    end = min(int(params_full_batch.shape[0]), start + pop_batch)
+                    loss_by_seed_chunk, loss_dict_by_seed_chunk = eval_chunk_seed_block(
+                        params_full_batch[start:end],
+                        seed_keys,
+                    )
+                    loss_by_seed_chunks.append(loss_by_seed_chunk)
+                    loss_dict_chunks.append(loss_dict_by_seed_chunk)
+                loss_by_seed_all_local = jnp.concatenate(loss_by_seed_chunks, axis=0)
+                loss_dict_by_seed_all_local = jax.tree.map(
+                    lambda *xs: jnp.concatenate(xs, axis=0),
+                    *loss_dict_chunks,
+                )
+                return loss_by_seed_all_local, loss_dict_by_seed_all_local
+
+            def save_openai_artifacts(i_iter):
+                data_save = jax.tree.map(lambda *x: np.array(jnp.stack(x, axis=0)), *data)
+                util.save_pkl(args.save_dir, "data", data_save)
+                best_selection_fitness = float(best_loss_traj[-1])
+                best_objective_loss = float(best_objective_loss_traj[-1])
+                best_member_np = np.asarray(best_params_traj[-1], dtype=np.float32)
+                util.save_pkl(args.save_dir, "best", (best_member_np, np.array(best_selection_fitness)))
+                util.save_pkl(args.save_dir, "best_objective", (best_member_np, np.array(best_objective_loss)))
+                util.save_json(
+                    args.save_dir,
+                    "best_selection",
+                    dict(
+                        optimizer_algorithm="mirrored_openai_es",
+                        best_params_source="best_center_smoothed_score",
+                        best_pkl_loss_kind="negative_smoothed_mspd",
+                        best_selection_fitness=best_selection_fitness,
+                        best_objective_loss=best_objective_loss,
+                        best_objective_score=float(-best_objective_loss),
+                        n_pairs=int(n_pairs),
+                        n_seeds=int(n_seeds),
+                        sigma=float(es_sigma),
+                        lr=float(es_lr),
+                    ),
+                )
+                if optimize_tau:
+                    util.save_json(args.save_dir, "best_tau", best_tau_traj[-1])
+                if len(center_traj) > 0:
+                    center_traj_save = jax.tree.map(
+                        lambda *x: np.array(jnp.stack(x, axis=0)),
+                        *center_traj,
+                    )
+                    util.save_pkl(args.save_dir, "center_traj", center_traj_save)
+                if len(best_params_traj) > 0:
+                    selection_fitness_arr = np.asarray(best_loss_traj, dtype=np.float32)
+                    traj = dict(
+                        params=np.stack(best_params_traj, axis=0),
+                        loss=selection_fitness_arr,
+                        selection_fitness=selection_fitness_arr,
+                        loss_kind="negative_smoothed_mspd",
+                        optimizer_algorithm="mirrored_openai_es",
+                    )
+                    if len(best_objective_loss_traj) > 0:
+                        traj["objective_loss"] = np.asarray(best_objective_loss_traj, dtype=np.float32)
+                        traj["objective_score"] = -np.asarray(best_objective_loss_traj, dtype=np.float32)
+                    if optimize_tau and len(best_tau_traj) > 0:
+                        traj["tau_idx"] = np.asarray([x["tau_idx"] for x in best_tau_traj], dtype=np.int32)
+                        traj["tau_steps"] = np.asarray([x["tau_steps"] for x in best_tau_traj], dtype=np.int32)
+                        traj["tau_frames"] = np.asarray([x["tau_frames"] for x in best_tau_traj], dtype=np.int32)
+                        traj["tau_selector_raw"] = np.asarray(
+                            [x["tau_selector_raw"] for x in best_tau_traj],
+                            dtype=np.float32,
+                        )
+                    util.save_pkl(args.save_dir, "best_traj", traj)
+                if len(pop_params_traj) > 0:
+                    objective_loss_arr = np.stack(pop_objective_loss_traj, axis=0)
+                    loss_arr = np.stack(pop_loss_traj, axis=0)
+                    pop_traj = dict(
+                        params=np.stack(pop_params_traj, axis=0),
+                        loss=loss_arr,
+                        selection_fitness=loss_arr,
+                        loss_kind="objective_loss",
+                        optimizer_algorithm="mirrored_openai_es",
+                        objective_loss=objective_loss_arr,
+                        objective_score=-objective_loss_arr,
+                        perturbation_pair_idx=np.tile(
+                            np.concatenate((np.arange(n_pairs), np.arange(n_pairs))).astype(np.int32),
+                            (len(pop_params_traj), 1),
+                        ),
+                        perturbation_sign=np.tile(
+                            np.concatenate((np.ones(n_pairs), -np.ones(n_pairs))).astype(np.float32),
+                            (len(pop_params_traj), 1),
+                        ),
+                    )
+                    if len(pop_loss_by_seed_traj) > 0:
+                        loss_by_seed_arr = np.stack(pop_loss_by_seed_traj, axis=0)
+                        pop_traj["loss_by_seed"] = loss_by_seed_arr
+                        pop_traj["score_by_seed"] = -loss_by_seed_arr
+                    if len(pop_seed_keys_traj) > 0:
+                        pop_traj["seed_keys"] = np.stack(pop_seed_keys_traj, axis=0)
+                        pop_traj["seed_key_semantics"] = (
+                            "score_by_seed[iter, candidate_idx, seed_idx] uses "
+                            "seed_keys[iter, seed_idx]. Candidates 0..n_pairs-1 are theta+sigma*epsilon; "
+                            "candidates n_pairs..2*n_pairs-1 are theta-sigma*epsilon with the same pair_idx."
+                        )
+                    if len(pop_epsilon_traj) > 0:
+                        pop_traj["epsilon"] = np.stack(pop_epsilon_traj, axis=0)
+                    if len(pop_direction_score_diff_traj) > 0:
+                        pop_traj["direction_score_diff"] = np.stack(pop_direction_score_diff_traj, axis=0)
+                    if optimize_tau and len(pop_tau_traj) > 0:
+                        pop_traj["tau_selector_raw"] = np.stack([x["latent"] for x in pop_tau_traj], axis=0)
+                        pop_traj["tau_idx"] = np.stack([x["idx"] for x in pop_tau_traj], axis=0)
+                        pop_traj["tau_steps"] = np.stack([x["steps"] for x in pop_tau_traj], axis=0)
+                        pop_traj["tau_frames"] = np.stack([x["frames"] for x in pop_tau_traj], axis=0)
+                    util.save_pkl(args.save_dir, "pop_traj", pop_traj)
+                if len(palette_traj) > 0:
+                    util.save_pkl(args.save_dir, "palette_traj", palette_traj)
+                _save_openai_es_resume_state(
+                    args.save_dir,
+                    next_iter=i_iter + 1,
+                    rng=rng,
+                    theta=theta,
+                    adam_m=adam_m,
+                    adam_v=adam_v,
+                    adam_t=adam_t,
+                    candidate_dims=candidate_dims,
+                    substrate_param_dims=substrate_param_dims,
+                    optimize_tau=optimize_tau,
+                    params_init=params_init,
+                    n_pairs=n_pairs,
+                    n_seeds=n_seeds,
+                    sigma=es_sigma,
+                    lr=es_lr,
+                    adam_beta1=adam_beta1,
+                    adam_beta2=adam_beta2,
+                    adam_eps=adam_eps,
+                    data=data,
+                    center_traj=center_traj,
+                    best_params_traj=best_params_traj,
+                    best_tau_traj=best_tau_traj,
+                    best_loss_traj=best_loss_traj,
+                    best_objective_loss_traj=best_objective_loss_traj,
+                    pop_params_traj=pop_params_traj,
+                    pop_tau_traj=pop_tau_traj,
+                    pop_loss_traj=pop_loss_traj,
+                    pop_objective_loss_traj=pop_objective_loss_traj,
+                    pop_loss_by_seed_traj=pop_loss_by_seed_traj,
+                    pop_seed_keys_traj=pop_seed_keys_traj,
+                    pop_epsilon_traj=pop_epsilon_traj,
+                    pop_direction_score_diff_traj=pop_direction_score_diff_traj,
+                    palette_traj=palette_traj,
+                )
+
+            best_score_so_far = (
+                float(-best_objective_loss_traj[-1])
+                if len(best_objective_loss_traj) > 0
+                else -float("inf")
+            )
+            pbar = tqdm(range(start_iter, args.n_iters), initial=start_iter, total=args.n_iters)
+            for i_iter in pbar:
+                theta_eval = theta
+                rng, rng_eps, rng_seed = jax.random.split(rng, 3)
+                eps = jax.random.normal(
+                    rng_eps,
+                    (n_pairs, candidate_dims),
+                    dtype=jnp.float32,
+                )
+                seed_keys = split(rng_seed, n_seeds)
+                params_full = jnp.concatenate(
+                    (
+                        theta_eval[None, :] + es_sigma * eps,
+                        theta_eval[None, :] - es_sigma * eps,
+                    ),
+                    axis=0,
+                )
+                loss_by_seed_all, loss_dict_by_seed_all = eval_openai_population(params_full, seed_keys)
+                objective_loss_all = jnp.mean(loss_by_seed_all, axis=1)
+                score_by_seed_all = -loss_by_seed_all
+                objective_score_all = -objective_loss_all
+                direction_score_diff = jnp.mean(
+                    score_by_seed_all[:n_pairs] - score_by_seed_all[n_pairs:],
+                    axis=1,
+                )
+                grad = jnp.sum(direction_score_diff[:, None] * eps, axis=0) / (
+                    2.0 * float(n_pairs) * float(es_sigma)
+                )
+                adam_t += 1
+                adam_m = adam_beta1 * adam_m + (1.0 - adam_beta1) * grad
+                adam_v = adam_beta2 * adam_v + (1.0 - adam_beta2) * (grad * grad)
+                adam_m_hat = adam_m / (1.0 - adam_beta1 ** adam_t)
+                adam_v_hat = adam_v / (1.0 - adam_beta2 ** adam_t)
+                adam_update = es_lr * adam_m_hat / (jnp.sqrt(adam_v_hat) + adam_eps)
+                theta = theta_eval + adam_update
+
+                loss_dict_all = jax.tree.map(lambda x: jnp.mean(x, axis=1), loss_dict_by_seed_all)
+                loss_dict_all = dict(loss_dict_all)
+                pair_score_diff_per_candidate = jnp.concatenate(
+                    (direction_score_diff, -direction_score_diff),
+                    axis=0,
+                )
+                loss_dict_all["objective_loss"] = objective_loss_all
+                loss_dict_all["objective_score"] = objective_score_all
+                loss_dict_all["openai_es_pair_score_diff"] = pair_score_diff_per_candidate
+
+                theta_eval_np = np.asarray(theta_eval, dtype=np.float32)
+                center_params_np = np.asarray(theta_eval_np[:substrate_param_dims], dtype=np.float32)
+                center_tau_info = None
+                if optimize_tau:
+                    center_tau_info = tau_info_from_latent(theta_eval_np[substrate_param_dims])
+                center_score = float(jnp.mean(score_by_seed_all))
+                center_loss = float(-center_score)
+                best_perturb_idx = int(np.argmax(np.asarray(objective_score_all)))
+                best_perturb_score = float(np.asarray(objective_score_all)[best_perturb_idx])
+
+                if center_score > best_score_so_far:
+                    best_score_so_far = center_score
+                    best_params_for_iter = center_params_np
+                    best_tau_for_iter = center_tau_info
+                    best_loss_for_iter = center_loss
+                else:
+                    best_params_for_iter = np.asarray(best_params_traj[-1], dtype=np.float32)
+                    best_tau_for_iter = best_tau_traj[-1] if optimize_tau else None
+                    best_loss_for_iter = float(best_loss_traj[-1])
+
+                best_params_traj.append(best_params_for_iter)
+                if optimize_tau:
+                    best_tau_traj.append(best_tau_for_iter)
+                best_loss_traj.append(best_loss_for_iter)
+                best_objective_loss_traj.append(best_loss_for_iter)
+
+                params_full_np = np.asarray(params_full, dtype=np.float32)
+                pop_params_np, pop_tau_latent_np = split_population_params_np(params_full_np)
+                pop_params_traj.append(pop_params_np)
+                if optimize_tau:
+                    tau_idx = []
+                    tau_steps = []
+                    tau_frames = []
+                    for raw_tau in np.asarray(pop_tau_latent_np):
+                        info = tau_info_from_latent(raw_tau)
+                        tau_idx.append(info["tau_idx"])
+                        tau_steps.append(info["tau_steps"])
+                        tau_frames.append(info["tau_frames"])
+                    pop_tau_traj.append(
+                        dict(
+                            latent=np.asarray(pop_tau_latent_np, dtype=np.float32),
+                            idx=np.asarray(tau_idx, dtype=np.int32),
+                            steps=np.asarray(tau_steps, dtype=np.int32),
+                            frames=np.asarray(tau_frames, dtype=np.int32),
+                        )
+                    )
+                pop_loss_traj.append(np.asarray(objective_loss_all, dtype=np.float32))
+                pop_objective_loss_traj.append(np.asarray(objective_loss_all, dtype=np.float32))
+                pop_loss_by_seed_traj.append(np.asarray(loss_by_seed_all, dtype=np.float32))
+                pop_seed_keys_traj.append(np.asarray(seed_keys))
+                pop_epsilon_traj.append(np.asarray(eps, dtype=np.float32))
+                pop_direction_score_diff_traj.append(np.asarray(direction_score_diff, dtype=np.float32))
+
+                objective_loss_np = np.asarray(objective_loss_all, dtype=np.float32)
+                objective_score_np = -objective_loss_np
+                loss_np = objective_loss_np
+                loss_mean = float(loss_np.mean())
+                loss_var = float(loss_np.var())
+                score_by_seed_np = np.asarray(score_by_seed_all, dtype=np.float32)
+                grad_norm = float(jnp.linalg.norm(grad))
+                update_norm = float(jnp.linalg.norm(adam_update))
+                theta_norm = float(jnp.linalg.norm(theta_eval))
+
+                center_item = dict(
+                    params=jnp.asarray(center_params_np),
+                    theta=jnp.asarray(theta_eval_np),
+                    loss=jnp.asarray(center_loss, dtype=jnp.float32),
+                    objective_loss=jnp.asarray(center_loss, dtype=jnp.float32),
+                    objective_score=jnp.asarray(center_score, dtype=jnp.float32),
+                    best_loss=jnp.asarray(best_loss_for_iter, dtype=jnp.float32),
+                    best_objective_score=jnp.asarray(best_score_so_far, dtype=jnp.float32),
+                    grad_norm=jnp.asarray(grad_norm, dtype=jnp.float32),
+                    update_norm=jnp.asarray(update_norm, dtype=jnp.float32),
+                    theta_norm=jnp.asarray(theta_norm, dtype=jnp.float32),
+                    best_perturb_score=jnp.asarray(best_perturb_score, dtype=jnp.float32),
+                    best_perturb_idx=jnp.asarray(best_perturb_idx, dtype=jnp.int32),
+                )
+                if optimize_tau:
+                    center_item["tau_idx"] = jnp.asarray(center_tau_info["tau_idx"], dtype=jnp.int32)
+                    center_item["tau_steps"] = jnp.asarray(center_tau_info["tau_steps"], dtype=jnp.int32)
+                    center_item["tau_frames"] = jnp.asarray(center_tau_info["tau_frames"], dtype=jnp.int32)
+                    center_item["tau_selector_raw"] = jnp.asarray(
+                        center_tau_info["tau_selector_raw"],
+                        dtype=jnp.float32,
+                    )
+                center_traj.append(center_item)
+
+                pca_img = None
+                if pca_every > 0 and (i_iter % pca_every == 0) and len(pop_params_traj) > 1:
+                    try:
+                        import matplotlib.pyplot as plt
+                        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+                        hist = pop_params_traj[-pca_history:]
+                        pop_hist = np.stack(hist, axis=0)
+                        T_hist, P_hist, D_hist = pop_hist.shape
+                        X = pop_hist.reshape(T_hist * P_hist, D_hist)
+                        times = np.repeat(np.arange(T_hist), P_hist)
+                        X_centered = X - X.mean(axis=0, keepdims=True)
+                        _, _, Vt = np.linalg.svd(X_centered, full_matrices=False)
+                        pcs = X_centered @ Vt[:2].T
+
+                        fig = plt.figure(figsize=(6, 5))
+                        ax = fig.add_subplot(111, projection="3d")
+                        ax.scatter(pcs[:, 0], pcs[:, 1], times, c=times, cmap="viridis", s=3)
+                        ax.set_xlabel("PC1")
+                        ax.set_ylabel("PC2")
+                        ax.set_zlabel("iter")
+                        ax.set_title(f"OpenAI-ES perturbation PCA up to iter {i_iter}")
+                        pca_img = wandb.Image(fig)
+                        plt.close(fig)
+                    except Exception as e:
+                        print(f"PCA population logging failed at iter {i_iter}: {e}")
+
+                log_dict = {
+                    "iter": i_iter,
+                    "loss_pop_mean": loss_mean,
+                    "loss_pop_var": loss_var,
+                    "best_loss": float(best_loss_traj[-1]),
+                    "best_loss_raw": float(loss_np[best_perturb_idx]),
+                    "selection_fitness_pop_mean": loss_mean,
+                    "selection_fitness_pop_var": loss_var,
+                    "selection_fitness_pop_best": float(np.min(loss_np)),
+                    "best_selection_fitness": float(best_loss_traj[-1]),
+                    "objective_loss_pop_mean": float(objective_loss_np.mean()),
+                    "objective_loss_pop_var": float(objective_loss_np.var()),
+                    "objective_score_pop_mean": float(objective_score_np.mean()),
+                    "objective_score_pop_best_by_selection": float(objective_score_np[best_perturb_idx]),
+                    "best_objective_loss": float(best_objective_loss_traj[-1]),
+                    "best_objective_score": float(-best_objective_loss_traj[-1]),
+                    "mspd/pop_mean": float(objective_score_np.mean()),
+                    "mspd/pop_var": float(objective_score_np.var()),
+                    "mspd/pop_std": float(objective_score_np.std()),
+                    "mspd/pop_median": float(np.median(objective_score_np)),
+                    "mspd/pop_best": float(np.max(objective_score_np)),
+                    "mspd/pop_best_by_selection": float(objective_score_np[best_perturb_idx]),
+                    "mspd/best_selected_so_far": float(-best_objective_loss_traj[-1]),
+                    "mspd/by_seed_pop_mean": float(score_by_seed_np.mean()),
+                    "mspd/by_seed_pop_best": float(score_by_seed_np.max()),
+                    "mspd/by_seed_pop_std": float(score_by_seed_np.std()),
+                    "openai_es/center_smoothed_score": float(center_score),
+                    "openai_es/best_center_smoothed_score": float(best_score_so_far),
+                    "openai_es/best_perturb_score": float(best_perturb_score),
+                    "openai_es/best_perturb_idx": float(best_perturb_idx),
+                    "openai_es/direction_score_diff_mean": float(np.asarray(direction_score_diff).mean()),
+                    "openai_es/direction_score_diff_std": float(np.asarray(direction_score_diff).std()),
+                    "openai_es/grad_norm": grad_norm,
+                    "openai_es/update_norm": update_norm,
+                    "openai_es/theta_norm": theta_norm,
+                    "openai_es/adam_t": float(adam_t),
+                }
+                for i_seed in range(score_by_seed_np.shape[1]):
+                    seed_scores = score_by_seed_np[:, i_seed]
+                    log_dict[f"mspd_seed/{i_seed:02d}_pop_mean"] = float(seed_scores.mean())
+                    log_dict[f"mspd_seed/{i_seed:02d}_pop_best"] = float(seed_scores.max())
+                    log_dict[f"mspd_seed/{i_seed:02d}_pop_std"] = float(seed_scores.std())
+                    log_dict[f"mspd_seed/{i_seed:02d}_best_perturb"] = float(score_by_seed_np[best_perturb_idx, i_seed])
+                for k, v in loss_dict_all.items():
+                    v_np = np.array(v)
+                    log_dict[f"metric/{k}_pop_mean"] = float(v_np.mean())
+                    log_dict[f"metric/{k}_pop_var"] = float(v_np.var())
+                if optimize_tau:
+                    log_dict["metric/tau_trainable_idx_center"] = float(center_tau_info["tau_idx"])
+                    log_dict["metric/tau_trainable_steps_center"] = float(center_tau_info["tau_steps"])
+                    log_dict["metric/tau_trainable_frames_center"] = float(center_tau_info["tau_frames"])
+                    log_dict["metric/tau_trainable_raw_center"] = float(center_tau_info["tau_selector_raw"])
+                    tau_best_pop = tau_info_from_latent(np.asarray(pop_tau_latent_np)[best_perturb_idx])
+                    log_dict["metric/tau_trainable_idx_pop_best"] = float(tau_best_pop["tau_idx"])
+                    log_dict["metric/tau_trainable_steps_pop_best"] = float(tau_best_pop["tau_steps"])
+                    log_dict["metric/tau_trainable_frames_pop_best"] = float(tau_best_pop["tau_frames"])
+                    log_dict["metric/tau_trainable_raw_pop_best"] = float(tau_best_pop["tau_selector_raw"])
+
+                palette_stats = util.flow_lenia_palette_stats(center_params_np, substrate)
+                if palette_stats is not None:
+                    try:
+                        import matplotlib.pyplot as plt
+
+                        fig = plt.figure(figsize=(6, 2))
+                        ax = fig.add_subplot(111)
+                        im = ax.imshow(palette_stats["w_soft"], aspect="auto", cmap="viridis")
+                        ax.set_xlabel("kernel")
+                        ax.set_ylabel("RGB")
+                        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                        log_dict["pcolor_palette"] = wandb.Image(fig)
+                        plt.close(fig)
+                    except Exception as e:
+                        print(f"Palette logging failed: {e}")
+                    ent = palette_stats["entropy"]
+                    log_dict["pcolor_entropy_mean"] = float(ent.mean())
+                    log_dict["pcolor_entropy_r"] = float(ent[0])
+                    log_dict["pcolor_entropy_g"] = float(ent[1])
+                    log_dict["pcolor_entropy_b"] = float(ent[2])
+                if pca_img is not None:
+                    log_dict["pop_pca_traj_3d"] = pca_img
+                run.log(log_dict)
+
+                data_item = dict(
+                    best_loss=jnp.asarray(best_loss_traj[-1], dtype=jnp.float32),
+                    best_objective_loss=jnp.asarray(best_objective_loss_traj[-1], dtype=jnp.float32),
+                    loss=objective_loss_all,
+                    objective_loss=objective_loss_all,
+                    loss_dict=loss_dict_all,
+                    loss_by_seed=loss_by_seed_all,
+                    score_by_seed=score_by_seed_all,
+                    seed_keys=seed_keys,
+                    epsilon=eps,
+                    direction_score_diff=direction_score_diff,
+                    theta=theta_eval,
+                    grad=grad,
+                    adam_update=adam_update,
+                )
+                data.append(data_item)
+                if palette_stats is not None:
+                    palette_traj.append(dict(iter=i_iter, **palette_stats))
+                pbar.set_postfix(best_loss=float(best_loss_traj[-1]), center_score=float(center_score))
+
+                if args.save_dir is not None and (i_iter % save_interval == 0 or i_iter == args.n_iters - 1):
+                    save_openai_artifacts(i_iter)
+            return
+
         if resume_enabled:
             resume_state = _load_resume_state(args.save_dir)
             if resume_state is not None:
