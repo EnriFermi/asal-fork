@@ -11,7 +11,7 @@ substrate:
   kernel_components: 3
   M: 2,1,0;0,2,1;1,0,2
   dd: 5
-  dt: 0.8
+  dt: 0.2
   sigma: 0.65
   border: torus
   mix_rule: stoch
@@ -55,11 +55,11 @@ evaluation:
   log_clip_evolution: false
 
 optimization:
-  bs: 1
-  pop_batch: 8
+  bs: 4
+  pop_batch: 32
   pop_size: 8
   n_iters: 100
-  sigma: 0.2
+  sigma: 0.5
   # Opt-in only for the grid32 torus experiment: every generation evaluates all
   # candidates on the same bs seeds, ranks candidates per seed, then sends mean
   # rank to CMA-ES. Raw MSPD losses are still saved in pop_traj.objective_loss
@@ -75,9 +75,9 @@ metric:
   metric_tau_mode: trainable_grid
   metric_tau_grid_steps: [50, 100, 150, 200, 250, 300, 350, 400, 450, 500]
   metric_window_size_steps: 1000
-  metric_window_step_steps: 200
+  metric_window_step_steps: 500
   metric_tau_steps: 3000
-  metric_range_start_steps: 2000
+  metric_range_start_steps: 1000
   metric_range_end_steps: 10000
   metric_window_size_frames: null
   metric_window_step_frames: null
