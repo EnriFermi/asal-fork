@@ -1,0 +1,35 @@
+meta:
+  machine_idx: ${env:PAPER_MACHINE_IDX,0}
+  num_machines: ${env:PAPER_NUM_MACHINES,1}
+  wandb_project: asal
+  wandb_mode: online
+  output_root: experiments/paper_check_flow_lenia/checkpoints_grid32_torus_bs8_openai_es
+
+paper_check:
+  num_optimizations: 9
+  num_random_baselines: 3
+  optimization_seed_base: 1003
+  random_param_seed_base: 200003
+  pair_seed_base: 400003
+  metric_seed_base: 800003
+
+optimization:
+  base_config: optimization/config_mspd_grid32_torus_bs8.yaml
+  save_root: ${meta.output_root}/optimization
+  resume: true
+  save_every: 1
+  overrides:
+    optimization:
+      # Mirrored Batch OpenAI-ES:
+      #   evaluates theta +/- sigma * epsilon_i on a common seed block,
+      #   estimates an antithetic gradient from MSPD differences,
+      #   and updates the center theta with Adam ascent.
+      optimizer_algorithm: mirrored_openai_es
+      selection_protocol: mean_loss
+      openai_es_n_pairs: 4
+      openai_es_n_seeds: 8
+      openai_es_sigma: 0.2
+      openai_es_lr: 0.03
+      openai_es_adam_beta1: 0.9
+      openai_es_adam_beta2: 0.999
+      openai_es_adam_eps: 1.0e-8
