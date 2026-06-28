@@ -7,7 +7,7 @@ cd "${repo_root}"
 
 conda_env="${CONDA_ENV:-torchjax}"
 python_bin="${PYTHON_BIN:-python}"
-cfg="${CFG:-experiments/paper_suite/config_flowlenia_lockheed_1_opt4_openai_es_c1_27random.yaml}"
+cfg="${PAPER_SUITE_CFG:-experiments/paper_suite/config_flowlenia_lockheed_1_opt4_openai_es_c1_27random.yaml}"
 opt_run="${OPT_RUN:-experiments/paper_check_flow_lenia/checkpoints_lockheed_1_opt4_openai_es/optimization/run_004}"
 random_root="${RANDOM_ROOT:-experiments/paper_check_flow_lenia/checkpoints_lockheed_1/frustration_simulation/random_params}"
 expected_random_baselines="${EXPECTED_RANDOM_BASELINES:-27}"
