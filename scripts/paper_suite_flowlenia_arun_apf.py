@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -191,11 +192,21 @@ def _rollout_traj_id(base_traj_id: str, *, rollout_seed_idx: int, n_rollout_seed
     return f"{base_traj_id}_seed_{int(rollout_seed_idx):03d}"
 
 
-def _random_checkpoint_dir(row: dict[str, Any], random_idx: int) -> Path:
-    source_root = Path(row["source_root"])
+def _random_checkpoint_dir(section: Any, row: dict[str, Any], random_idx: int) -> Path:
     source_run_idx = int(row.get("source_run_idx", -1))
     if source_run_idx < 0:
         raise ValueError(f"Cannot derive random checkpoint dir without source_run_idx: {row}")
+    random_root_raw = _get(section, "random_checkpoint_root", None)
+    if random_root_raw not in (None, ""):
+        random_root = resolve_path(random_root_raw)
+        if random_root is None:
+            raise FileNotFoundError(f"random_checkpoint_root could not be resolved: {random_root_raw}")
+        return (
+            random_root
+            / f"group_{source_run_idx:03d}"
+            / f"random_{int(random_idx):03d}"
+        )
+    source_root = Path(row["source_root"])
     return (
         source_root.parent
         / "frustration_simulation"
@@ -203,6 +214,31 @@ def _random_checkpoint_dir(row: dict[str, Any], random_idx: int) -> Path:
         / f"group_{source_run_idx:03d}"
         / f"random_{int(random_idx):03d}"
     )
+
+
+def _random_checkpoint_dirs(section: Any, row: dict[str, Any], n_random: int) -> list[Path]:
+    mode = str(_get(section, "random_checkpoint_selection", "per_source_group")).strip().lower()
+    random_root_raw = _get(section, "random_checkpoint_root", None)
+    if random_root_raw not in (None, "") and mode in {"all_groups_flat", "global_flat", "flat"}:
+        random_root = resolve_path(random_root_raw)
+        if random_root is None or not random_root.exists():
+            raise FileNotFoundError(f"random_checkpoint_root not found: {random_root_raw}")
+
+        def sort_key(best_path: Path) -> tuple[int, int, str]:
+            group_match = re.match(r"group_(\d+)$", best_path.parent.parent.name)
+            random_match = re.match(r"random_(\d+)$", best_path.parent.name)
+            group_idx = int(group_match.group(1)) if group_match else 10**9
+            random_idx = int(random_match.group(1)) if random_match else 10**9
+            return group_idx, random_idx, str(best_path)
+
+        dirs = [path.parent for path in sorted(random_root.glob("group_*/random_*/best.pkl"), key=sort_key)]
+        if len(dirs) < int(n_random):
+            raise FileNotFoundError(
+                f"Need {int(n_random)} random checkpoints under {random_root}/group_*/random_*/best.pkl, "
+                f"found {len(dirs)}."
+            )
+        return dirs[: int(n_random)]
+    return [_random_checkpoint_dir(section, row, random_idx) for random_idx in range(int(n_random))]
 
 
 def _select_one_checkpoint(
@@ -382,8 +418,7 @@ def run(
                     n_rollout_seeds=n_rollout_seeds,
                 )
             )
-        for random_idx in range(n_random):
-            random_dir = _random_checkpoint_dir(row, random_idx)
+        for random_idx, random_dir in enumerate(_random_checkpoint_dirs(section, row, n_random)):
             if not (random_dir / "best.pkl").exists():
                 raise FileNotFoundError(
                     "Missing random baseline checkpoint for Flow-Lenia A-run APF. "
