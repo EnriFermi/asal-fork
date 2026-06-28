@@ -59,13 +59,13 @@ simulation:
     output_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1_opt4_openai_es/c1_lagrangian_apf_300k_train50_27random_16seeds
     rollout_steps: 300000
     n_trajectories_per_checkpoint: 1
-    n_rollout_seeds_per_checkpoint: 16
+    n_rollout_seeds_per_checkpoint: 8
     run_seed_rep_stride: 1
     include_random_baselines: true
     num_random_baselines: 27
     run_seed_base: 400003
     run_seed_mode: source_run_idx
-    batch_size: 7
+    batch_size: 16
     optimized_checkpoint_dirs:
     - experiments/paper_check_flow_lenia/checkpoints_lockheed_1_opt4_openai_es/optimization/run_004
     dedupe_by_run_idx: false
