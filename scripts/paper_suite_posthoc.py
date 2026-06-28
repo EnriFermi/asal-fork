@@ -476,7 +476,10 @@ def _iter_apf_metric_items(root: Path) -> list[dict[str, Any]]:
                     "source_root": str(row.get("source_root", "")),
                     "source_root_name": str(row.get("source_root_name", "")),
                     "source_checkpoint_dir": str(row.get("source_checkpoint_dir", "")),
+                    "base_run_seed": int(row.get("base_run_seed", row.get("run_seed", -1))),
                     "run_seed": int(row.get("run_seed", -1)),
+                    "rollout_seed_idx": int(row.get("rollout_seed_idx", 0)),
+                    "rollout_seed_count": int(row.get("rollout_seed_count", 1)),
                     "candidate_kind": candidate_kind,
                     "candidate_idx": int(row.get("candidate_idx", 0)),
                     "candidate_label": str(row.get("candidate_label", candidate_kind)),
@@ -500,7 +503,10 @@ def _iter_apf_metric_items(root: Path) -> list[dict[str, Any]]:
                 "source_root_rank": -1,
                 "source_root": "",
                 "source_root_name": "",
+                "base_run_seed": -1,
                 "run_seed": -1,
+                "rollout_seed_idx": 0,
+                "rollout_seed_count": 1,
                 "candidate_kind": _canonicalize_kind(traj_dir.name, traj_dir.name),
                 "candidate_idx": 0,
                 "candidate_label": traj_dir.name,
@@ -809,6 +815,10 @@ def _compute_c1_from_apf_lagrangian_split(
                 "source_root_name": str(item.get("source_root_name", "arun_lagrangian_apf_500k")),
                 "source_optimized_run_idx": int(item.get("source_optimized_run_idx", idx - 1)),
                 "optimized_run_idx": int(item.get("optimized_run_idx", idx - 1)),
+                "base_run_seed": int(item.get("base_run_seed", item.get("run_seed", -1))),
+                "run_seed": int(item.get("run_seed", -1)),
+                "rollout_seed_idx": int(item.get("rollout_seed_idx", 0)),
+                "rollout_seed_count": int(item.get("rollout_seed_count", 1)),
                 "candidate_kind": str(item.get("candidate_kind", "optimized")),
                 "candidate_idx": int(item.get("candidate_idx", 0)),
                 "candidate_label": str(item.get("candidate_label", item.get("candidate_kind", "optimized"))),
@@ -1259,14 +1269,25 @@ def _group_contrasts(frame: pd.DataFrame, metric: str) -> pd.DataFrame:
         randoms = group[group["candidate_kind"] == "random"]
         if opt.empty or randoms.empty:
             continue
-        opt_value = safe_float(opt.iloc[0][metric])
+        opt_values = [safe_float(v) for v in opt[metric]]
         rand_values = [safe_float(v) for v in randoms[metric]]
+        opt_arr = np.asarray(opt_values, dtype=np.float64)
+        rand_arr = np.asarray(rand_values, dtype=np.float64)
+        opt_finite = opt_arr[np.isfinite(opt_arr)]
+        rand_finite = rand_arr[np.isfinite(rand_arr)]
+        if opt_finite.size == 0 or rand_finite.size == 0:
+            continue
+        opt_value = float(np.nanmedian(opt_finite))
         rand_median = nanmedian(rand_values)
         rows.append(
             {
                 "optimized_run_idx": int(group_idx),
                 f"{metric}__optimized": opt_value,
+                f"{metric}__optimized_median": opt_value,
+                f"{metric}__optimized_mean": float(np.nanmean(opt_finite)),
                 f"{metric}__random_median": rand_median,
+                f"{metric}__random_mean": float(np.nanmean(rand_finite)),
+                "n_optimized": int(opt_finite.size),
                 "n_random": int(len(rand_values)),
                 "delta_vs_random_median": float(opt_value - rand_median),
             }
