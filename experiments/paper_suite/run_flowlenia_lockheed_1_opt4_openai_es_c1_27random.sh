@@ -9,9 +9,7 @@ conda_env="${CONDA_ENV:-torchjax}"
 python_bin="${PYTHON_BIN:-python}"
 cfg="${CFG:-experiments/paper_suite/config_flowlenia_lockheed_1_opt4_openai_es_c1_27random.yaml}"
 opt_run="${OPT_RUN:-experiments/paper_check_flow_lenia/checkpoints_lockheed_1_opt4_openai_es/optimization/run_004}"
-random_root="${RANDOM_ROOT:-experiments/paper_check_flow_lenia/checkpoints_lockheed_1_opt4_openai_es/frustration_simulation/random_params/group_004}"
-random_source_root="${RANDOM_SOURCE_ROOT:-experiments/paper_check_flow_lenia/checkpoints_lockheed_1_grid128_eval/frustration_simulation/random_params/group_004}"
-random_fallback_root="${RANDOM_FALLBACK_ROOT:-experiments/paper_check_flow_lenia/checkpoints_lockheed_1/frustration_simulation/random_params/group_004}"
+random_root="${RANDOM_ROOT:-experiments/paper_check_flow_lenia/checkpoints_lockheed_1/frustration_simulation/random_params}"
 expected_random_baselines="${EXPECTED_RANDOM_BASELINES:-27}"
 expected_rollout_seeds="${EXPECTED_ROLLOUT_SEEDS:-16}"
 result_root="${RESULT_ROOT:-analysis/results/paper_suite_flowlenia_lockheed_1_opt4_openai_es_c1_27random_16seeds}"
@@ -121,34 +119,13 @@ require_dir() {
 
 require_file "${cfg}"
 require_file "${opt_run}/best.pkl"
-
-if [ ! -d "${random_root}" ]; then
-  if [ -d "${random_source_root}" ]; then
-    echo "Isolated random group is missing; copying:"
-    echo "  from=${random_source_root}"
-    echo "  to=${random_root}"
-    mkdir -p "$(dirname "${random_root}")"
-    cp -R "${random_source_root}" "${random_root}"
-  elif [ -d "${random_fallback_root}" ]; then
-    echo "Isolated random group is missing; copying fallback:"
-    echo "  from=${random_fallback_root}"
-    echo "  to=${random_root}"
-    mkdir -p "$(dirname "${random_root}")"
-    cp -R "${random_fallback_root}" "${random_root}"
-  else
-    echo "Missing random baseline source group:" >&2
-    echo "  primary=${random_source_root}" >&2
-    echo "  fallback=${random_fallback_root}" >&2
-    exit 2
-  fi
-fi
 require_dir "${random_root}"
 
-random_count="$(find "${random_root}" -mindepth 2 -maxdepth 2 -name best.pkl -print | wc -l | tr -d ' ')"
+random_count="$(find "${random_root}" -mindepth 3 -maxdepth 3 -name best.pkl -print | wc -l | tr -d ' ')"
 echo "Flow-Lenia lockheed_1 opt_004 OpenAI-ES C1: one optimized vs 27 random, ${expected_rollout_seeds} rollout seeds each"
 echo "  cfg=${cfg}"
 echo "  opt_run=${opt_run}"
-echo "  random_root=${random_root}"
+echo "  random_root=${random_root} (flat group_*/random_*)"
 echo "  random best.pkl count=${random_count}/${expected_random_baselines}"
 echo "  rollout seeds per checkpoint=${expected_rollout_seeds}"
 echo "  result_root=${result_root}"
@@ -158,9 +135,11 @@ echo "  log_dir=${log_dir}"
 echo "  master_log=${master_log}"
 echo "  stdout_mode=tee conda_no_capture_output=${conda_no_capture_output} use_stdbuf=${use_stdbuf}"
 
-if [ "${expected_random_baselines}" != "0" ] && [ "${random_count}" -ne "${expected_random_baselines}" ]; then
-  echo "Expected ${expected_random_baselines} random baseline checkpoints, found ${random_count}. Set EXPECTED_RANDOM_BASELINES=0 to skip this check." >&2
+if [ "${expected_random_baselines}" != "0" ] && [ "${random_count}" -lt "${expected_random_baselines}" ]; then
+  echo "Expected ${expected_random_baselines} random baseline checkpoints in ${random_root}, found ${random_count}." >&2
   exit 3
+elif [ "${expected_random_baselines}" != "0" ] && [ "${random_count}" -gt "${expected_random_baselines}" ]; then
+  echo "Found ${random_count} random baseline checkpoints; APF will use the first ${expected_random_baselines}."
 fi
 
 apf_force_arg=""

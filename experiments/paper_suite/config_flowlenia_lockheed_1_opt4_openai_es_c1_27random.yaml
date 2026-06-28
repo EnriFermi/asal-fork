@@ -63,6 +63,8 @@ simulation:
     run_seed_rep_stride: 1
     include_random_baselines: true
     num_random_baselines: 27
+    random_checkpoint_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1/frustration_simulation/random_params
+    random_checkpoint_selection: all_groups_flat
     run_seed_base: 400003
     run_seed_mode: source_run_idx
     batch_size: 7
