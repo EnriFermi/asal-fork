@@ -171,11 +171,24 @@ def _paper_check_control_a_seed(section: Any, row: dict[str, Any], suite_idx: in
     return int(base + 2 * group_idx)
 
 
+def _rollout_run_seed(section: Any, base_seed: int, rollout_seed_idx: int) -> int:
+    stride = int(_get(section, "run_seed_rep_stride", 1))
+    if stride < 1:
+        raise ValueError(f"run_seed_rep_stride must be >= 1, got {stride}.")
+    return int(base_seed + stride * int(rollout_seed_idx))
+
+
 def _candidate_traj_id(row: dict[str, Any], *, candidate_kind: str, candidate_idx: int) -> str:
     base = _traj_id(row)
     if candidate_kind == "optimized":
         return base
     return f"{base}_{candidate_kind}_{candidate_idx:03d}"
+
+
+def _rollout_traj_id(base_traj_id: str, *, rollout_seed_idx: int, n_rollout_seeds: int) -> str:
+    if int(n_rollout_seeds) == 1:
+        return str(base_traj_id)
+    return f"{base_traj_id}_seed_{int(rollout_seed_idx):03d}"
 
 
 def _random_checkpoint_dir(row: dict[str, Any], random_idx: int) -> Path:
@@ -204,6 +217,8 @@ def _select_one_checkpoint(
     candidate_kind: str,
     candidate_idx: int,
     candidate_label: str,
+    rollout_seed_idx: int = 0,
+    n_rollout_seeds: int = 1,
 ) -> dict[str, Any]:
     selected = select_params(checkpoint_dir, rollout_flat)
     if not selected:
@@ -217,7 +232,11 @@ def _select_one_checkpoint(
     item["source_root_rank"] = int(row["source_root_rank"])
     item["source_run_idx"] = int(row.get("source_run_idx", -1))
     item["suite_run_idx"] = int(row.get("run_idx", suite_idx))
-    item["run_seed"] = _paper_check_control_a_seed(section, row, suite_idx)
+    base_seed = _paper_check_control_a_seed(section, row, suite_idx)
+    item["base_run_seed"] = int(base_seed)
+    item["run_seed"] = _rollout_run_seed(section, base_seed, rollout_seed_idx)
+    item["rollout_seed_idx"] = int(rollout_seed_idx)
+    item["rollout_seed_count"] = int(n_rollout_seeds)
     item["candidate_kind"] = str(candidate_kind)
     item["candidate_idx"] = int(candidate_idx)
     item["candidate_label"] = str(candidate_label)
@@ -252,7 +271,10 @@ def _write_manifest(
                 "source_root_rank": int(row.get("source_root_rank", -1)),
                 "source_run_idx": int(row.get("source_run_idx", -1)),
                 "suite_run_idx": int(row.get("suite_run_idx", row["selection_idx"])),
+                "base_run_seed": int(row.get("base_run_seed", row.get("run_seed", -1))),
                 "run_seed": int(row.get("run_seed", -1)),
+                "rollout_seed_idx": int(row.get("rollout_seed_idx", 0)),
+                "rollout_seed_count": int(row.get("rollout_seed_count", 1)),
                 "candidate_kind": str(row.get("candidate_kind", "optimized")),
                 "candidate_idx": int(row.get("candidate_idx", 0)),
                 "candidate_label": str(row.get("candidate_label", "optimized")),
@@ -307,10 +329,14 @@ def run(
     _validate_rollout_profile(rollout_flat, expected_steps=expected_steps)
     expected_signature = _expected_rollout_signature(rollout_config, rollout_flat)
 
-    n_per_checkpoint = int(_get(section, "n_trajectories_per_checkpoint", 1))
-    if n_per_checkpoint != 1:
-        raise ValueError("Flow-Lenia A-run APF currently expects n_trajectories_per_checkpoint=1.")
-    rollout_flat.n_trajectories = int(n_per_checkpoint)
+    n_rollout_seeds = int(
+        _get(section, "n_rollout_seeds_per_checkpoint", _get(section, "n_trajectories_per_checkpoint", 1))
+    )
+    if n_rollout_seeds < 1:
+        raise ValueError(f"n_rollout_seeds_per_checkpoint must be >= 1, got {n_rollout_seeds}.")
+    # Parameter selection remains one parameter vector per checkpoint. Multiple
+    # trajectories here mean repeated stochastic rollouts of that same vector.
+    rollout_flat.n_trajectories = 1
     batch_size = max(1, int(_get(section, "batch_size", _get(rollout_flat, "batch_size", 1))))
     rollout_flat.batch_size = int(batch_size)
 
@@ -318,7 +344,8 @@ def run(
     log_event(
         "Flow-Lenia A-run APF start "
         f"section={section_key} force={force} dry_run={dry_run} output_root={output_root} "
-        f"rollout_steps={expected_steps} batch_size={batch_size} n_checkpoints={len(checkpoints)}",
+        f"rollout_steps={expected_steps} batch_size={batch_size} n_checkpoints={len(checkpoints)} "
+        f"n_rollout_seeds_per_checkpoint={n_rollout_seeds}",
         component="arun-apf",
     )
     if not checkpoints:
@@ -333,20 +360,28 @@ def run(
     include_random = bool(_get(section, "include_random_baselines", True))
     n_random = int(_get(section, "num_random_baselines", 3)) if include_random else 0
     for suite_idx, row in enumerate(checkpoints):
-        selected.append(
-            _select_one_checkpoint(
-                row=row,
-                section=section,
-                rollout_flat=rollout_flat,
-                suite_idx=suite_idx,
-                selection_idx=len(selected),
-                checkpoint_dir=Path(row["checkpoint_dir"]),
-                traj_id=_candidate_traj_id(row, candidate_kind="optimized", candidate_idx=0),
-                candidate_kind="optimized",
-                candidate_idx=0,
-                candidate_label="optimized",
+        optimized_base_traj_id = _candidate_traj_id(row, candidate_kind="optimized", candidate_idx=0)
+        for rollout_seed_idx in range(n_rollout_seeds):
+            selected.append(
+                _select_one_checkpoint(
+                    row=row,
+                    section=section,
+                    rollout_flat=rollout_flat,
+                    suite_idx=suite_idx,
+                    selection_idx=len(selected),
+                    checkpoint_dir=Path(row["checkpoint_dir"]),
+                    traj_id=_rollout_traj_id(
+                        optimized_base_traj_id,
+                        rollout_seed_idx=rollout_seed_idx,
+                        n_rollout_seeds=n_rollout_seeds,
+                    ),
+                    candidate_kind="optimized",
+                    candidate_idx=0,
+                    candidate_label="optimized",
+                    rollout_seed_idx=rollout_seed_idx,
+                    n_rollout_seeds=n_rollout_seeds,
+                )
             )
-        )
         for random_idx in range(n_random):
             random_dir = _random_checkpoint_dir(row, random_idx)
             if not (random_dir / "best.pkl").exists():
@@ -355,20 +390,28 @@ def run(
                     f"Expected {random_dir / 'best.pkl'} for suite_group={suite_idx}, "
                     f"source_run_idx={int(row.get('source_run_idx', -1))}, random_idx={random_idx}."
                 )
-            selected.append(
-                _select_one_checkpoint(
-                    row=row,
-                    section=section,
-                    rollout_flat=rollout_flat,
-                    suite_idx=suite_idx,
-                    selection_idx=len(selected),
-                    checkpoint_dir=random_dir,
-                    traj_id=_candidate_traj_id(row, candidate_kind="random", candidate_idx=random_idx),
-                    candidate_kind="random",
-                    candidate_idx=random_idx,
-                    candidate_label=f"random_{random_idx:03d}",
+            random_base_traj_id = _candidate_traj_id(row, candidate_kind="random", candidate_idx=random_idx)
+            for rollout_seed_idx in range(n_rollout_seeds):
+                selected.append(
+                    _select_one_checkpoint(
+                        row=row,
+                        section=section,
+                        rollout_flat=rollout_flat,
+                        suite_idx=suite_idx,
+                        selection_idx=len(selected),
+                        checkpoint_dir=random_dir,
+                        traj_id=_rollout_traj_id(
+                            random_base_traj_id,
+                            rollout_seed_idx=rollout_seed_idx,
+                            n_rollout_seeds=n_rollout_seeds,
+                        ),
+                        candidate_kind="random",
+                        candidate_idx=random_idx,
+                        candidate_label=f"random_{random_idx:03d}",
+                        rollout_seed_idx=rollout_seed_idx,
+                        n_rollout_seeds=n_rollout_seeds,
+                    )
                 )
-            )
 
     ready_by_traj: dict[str, tuple[bool, str]] = {}
     for row in selected:

@@ -631,11 +631,11 @@ def _load_c1_raw_scores(ds_dir: Path) -> pd.DataFrame:
     return _selected_eval_scores_from_tau_table(ds_dir / "c1_tau_opt_random_by_item.csv")
 
 
-def _c1_group_deltas(raw: pd.DataFrame) -> tuple[list[Any], np.ndarray, dict[Any, np.ndarray], dict[Any, float]]:
+def _c1_group_deltas(raw: pd.DataFrame) -> tuple[list[Any], np.ndarray, dict[Any, np.ndarray], dict[Any, np.ndarray]]:
     groups = []
     deltas = []
     random_values: dict[Any, np.ndarray] = {}
-    optimized_values: dict[Any, float] = {}
+    optimized_values: dict[Any, np.ndarray] = {}
     if raw.empty:
         return groups, np.asarray([], dtype=np.float64), random_values, optimized_values
     raw = raw.copy()
@@ -645,12 +645,12 @@ def _c1_group_deltas(raw: pd.DataFrame) -> tuple[list[Any], np.ndarray, dict[Any
         rand = sub[sub["candidate_kind"].astype(str) == "random"]["score_numeric"].dropna().to_numpy(dtype=np.float64)
         if opt.size == 0 or rand.size == 0:
             continue
-        opt_val = float(opt[0])
+        opt_val = float(np.nanmedian(opt))
         rand_med = float(np.nanmedian(rand))
         groups.append(group)
         deltas.append(opt_val - rand_med)
         random_values[group] = rand
-        optimized_values[group] = opt_val
+        optimized_values[group] = opt
     return groups, np.asarray(deltas, dtype=np.float64), random_values, optimized_values
 
 
@@ -666,11 +666,16 @@ def _plot_c1_paired_raw_clean(dataset: str, ds_dir: Path, figures: Path) -> dict
         rand = random_values[group]
         opt = optimized_values[group]
         jitter = np.linspace(-0.11, 0.11, rand.size) if rand.size > 1 else np.asarray([0.0])
-        ax.scatter(i + jitter, rand, s=28, color="#9a9a9a", alpha=0.85, edgecolor="white", linewidth=0.4, zorder=2)
+        rand_alpha = 0.32 if rand.size > 80 else 0.85
+        rand_size = 15 if rand.size > 80 else 28
+        ax.scatter(i + jitter, rand, s=rand_size, color="#9a9a9a", alpha=rand_alpha, edgecolor="white", linewidth=0.25, zorder=2)
         rand_med = float(np.nanmedian(rand))
+        opt_med = float(np.nanmedian(opt))
+        opt_jitter = np.linspace(-0.045, 0.045, opt.size) if opt.size > 1 else np.asarray([0.0])
         ax.plot([i - 0.18, i + 0.18], [rand_med, rand_med], color="#222222", linewidth=1.4, zorder=3)
-        ax.plot([i, i], [rand_med, opt], color="#777777", linewidth=0.9, alpha=0.65, zorder=1)
-        ax.scatter(i, opt, s=76, color="#4c78a8", edgecolor="white", linewidth=0.8, zorder=4)
+        ax.plot([i, i], [rand_med, opt_med], color="#777777", linewidth=0.9, alpha=0.65, zorder=1)
+        ax.scatter(i + opt_jitter, opt, s=34, color="#4c78a8", alpha=0.88, edgecolor="white", linewidth=0.45, zorder=4)
+        ax.scatter(i, opt_med, s=78, color="#1f4e79", marker="D", edgecolor="white", linewidth=0.8, zorder=5)
     ax.set_xticks(np.arange(len(groups)), [str(g) for g in groups], rotation=35 if len(groups) > 10 else 0, ha="right" if len(groups) > 10 else "center")
     ax.set_xlabel("matched group id")
     ax.set_ylabel("held-out MSPD score")
