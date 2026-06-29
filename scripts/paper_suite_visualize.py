@@ -694,7 +694,15 @@ def _plot_c1_paired_raw_clean(dataset: str, ds_dir: Path, figures: Path) -> dict
     return {f"c1_{dataset}_paired_raw_clean": str(out)}
 
 
-def _plot_c1_candidate_mean_scores(dataset: str, ds_dir: Path, figures: Path) -> dict[str, str]:
+def _plot_c1_candidate_aggregate_scores(
+    dataset: str,
+    ds_dir: Path,
+    figures: Path,
+    *,
+    statistic: str,
+) -> dict[str, str]:
+    if statistic not in {"mean", "median"}:
+        raise ValueError(f"Unsupported C1 candidate statistic: {statistic}")
     raw = _load_c1_raw_scores(ds_dir)
     required = {"optimized_run_idx", "candidate_kind", "candidate_idx", "eval_score_mspd"}
     if raw.empty or not required.issubset(raw.columns):
@@ -715,14 +723,15 @@ def _plot_c1_candidate_mean_scores(dataset: str, ds_dir: Path, figures: Path) ->
         label_col = "candidate_label" if "candidate_label" in randoms.columns else "candidate_idx"
         random_summary = (
             randoms.groupby(["candidate_idx", label_col], dropna=False)["score_numeric"]
-            .agg(["mean", "count"])
+            .agg(["mean", "median", "count"])
             .reset_index()
             .sort_values(["candidate_idx", label_col], kind="mergesort")
         )
         if random_summary.empty:
             continue
         groups.append(group)
-        panels.append((float(np.nanmean(opt)), random_summary))
+        opt_value = float(np.nanmean(opt)) if statistic == "mean" else float(np.nanmedian(opt))
+        panels.append((opt_value, random_summary))
     if not panels:
         return {}
 
@@ -735,26 +744,35 @@ def _plot_c1_candidate_mean_scores(dataset: str, ds_dir: Path, figures: Path) ->
         squeeze=False,
         constrained_layout=True,
     )
-    for ax, group, (opt_med, random_summary) in zip(axes[:, 0], groups, panels):
-        y = random_summary["mean"].to_numpy(dtype=np.float64)
+    for ax, group, (opt_value, random_summary) in zip(axes[:, 0], groups, panels):
+        y = random_summary[statistic].to_numpy(dtype=np.float64)
         x = np.arange(1, y.size + 1)
-        ax.scatter(x, y, s=44, color="#8f8f8f", edgecolor="white", linewidth=0.6, zorder=3, label="random mean")
-        ax.scatter([0], [opt_med], s=88, color="#1f4e79", marker="D", edgecolor="white", linewidth=0.8, zorder=4, label="optimized mean")
-        ax.axhline(float(np.nanmean(y)), color="#333333", linestyle="--", linewidth=1.1, alpha=0.75, label="mean(random means)")
-        ax.plot([0, x[-1]], [opt_med, opt_med], color="#1f4e79", linewidth=1.0, alpha=0.35)
+        random_center = float(np.nanmean(y)) if statistic == "mean" else float(np.nanmedian(y))
+        ax.scatter(x, y, s=44, color="#8f8f8f", edgecolor="white", linewidth=0.6, zorder=3, label=f"random {statistic}")
+        ax.scatter([0], [opt_value], s=88, color="#1f4e79", marker="D", edgecolor="white", linewidth=0.8, zorder=4, label=f"optimized {statistic}")
+        ax.axhline(random_center, color="#333333", linestyle="--", linewidth=1.1, alpha=0.75, label=f"{statistic}(random {statistic}s)")
+        ax.plot([0, x[-1]], [opt_value, opt_value], color="#1f4e79", linewidth=1.0, alpha=0.35)
         labels = ["opt"] + [f"r{int(v):02d}" if np.isfinite(float(v)) else "r?" for v in random_summary["candidate_idx"]]
         ax.set_xticks(np.arange(0, y.size + 1), labels, rotation=60 if y.size > 12 else 0, ha="right" if y.size > 12 else "center")
-        ax.set_ylabel("mean held-out MSPD")
-        ax.set_title(f"{dataset}: per-candidate mean MSPD, group {group}")
+        ax.set_ylabel(f"{statistic} held-out MSPD")
+        ax.set_title(f"{dataset}: per-candidate {statistic} MSPD, group {group}")
         ax.grid(axis="y", color="#dddddd", linewidth=0.7, alpha=0.75)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
         ax.legend(frameon=False, loc="best")
     axes[-1, 0].set_xlabel("candidate")
-    out = figures / f"c1_{dataset}_candidate_mean_scores.png"
+    out = figures / f"c1_{dataset}_candidate_{statistic}_scores.png"
     _save(fig, out)
     plt.close(fig)
-    return {f"c1_{dataset}_candidate_mean_scores": str(out)}
+    return {f"c1_{dataset}_candidate_{statistic}_scores": str(out)}
+
+
+def _plot_c1_candidate_mean_scores(dataset: str, ds_dir: Path, figures: Path) -> dict[str, str]:
+    return _plot_c1_candidate_aggregate_scores(dataset, ds_dir, figures, statistic="mean")
+
+
+def _plot_c1_candidate_median_scores(dataset: str, ds_dir: Path, figures: Path) -> dict[str, str]:
+    return _plot_c1_candidate_aggregate_scores(dataset, ds_dir, figures, statistic="median")
 
 
 def _symmetric_heatmap_limit(arrays: list[np.ndarray], *, percentile: float = 98.0) -> float:
@@ -2017,6 +2035,7 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
             if task in {"all", "c1", "c6"}:
                 paths.update(_plot_c1_paired_raw_clean(dataset, ds_dir, figures))
                 paths.update(_plot_c1_candidate_mean_scores(dataset, ds_dir, figures))
+                paths.update(_plot_c1_candidate_median_scores(dataset, ds_dir, figures))
                 paths.update(_plot_c1(dataset, ds_dir, figures))
             if task in {"all", "c5", "c6"}:
                 paths.update(_plot_c5_frustration_clean(dataset, ds_dir, figures))
