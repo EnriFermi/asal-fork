@@ -11,13 +11,16 @@ cfg="experiments/paper_suite/config_flowlenia_lockheed_1_opt4_openai_es_robust_p
 source_run="experiments/paper_check_flow_lenia/checkpoints_lockheed_1_opt4_openai_es/optimization/run_004"
 selected_run="experiments/paper_check_flow_lenia/checkpoints_lockheed_1_opt4_openai_es_robust_pioneer/optimization/run_004"
 result_root="analysis/results/paper_suite_flowlenia_lockheed_1_opt4_openai_es_robust_pioneer_c1_16seeds"
-apf_root="experiments/paper_check_flow_lenia/checkpoints_lockheed_1_opt4_openai_es_robust_pioneer/c1_lagrangian_apf_300k_train50_16seeds"
+optimized_apf_root="experiments/paper_check_flow_lenia/checkpoints_lockheed_1_opt4_openai_es_robust_pioneer/c1_lagrangian_apf_300k_train50_16seeds"
+existing_random_apf_root="experiments/paper_check_flow_lenia/checkpoints_lockheed_1_opt4_openai_es/c1_lagrangian_apf_300k_train50_27random_16seeds"
+combined_apf_root="experiments/paper_check_flow_lenia/checkpoints_lockheed_1_opt4_openai_es_robust_pioneer/c1_lagrangian_apf_300k_train50_robust_plus_27random_16seeds"
 run_id="${PAPER_SUITE_RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 log_dir="${PAPER_SUITE_LOG_DIR:-${result_root}/logs}"
 master_log="${PAPER_SUITE_MASTER_LOG:-${log_dir}/${run_id}_master.log}"
 
 force_export="${FORCE_EXPORT:-0}"
 force_apf="${FORCE_APF:-0}"
+force_manifest="${FORCE_MANIFEST:-1}"
 force_metrics="${FORCE_METRICS:-1}"
 force_visualization="${FORCE_VISUALIZATION:-1}"
 conda_no_capture_output="${CONDA_NO_CAPTURE_OUTPUT:-1}"
@@ -111,22 +114,25 @@ require_file() {
 
 require_file "${cfg}"
 require_file "${source_run}/pop_traj.pkl"
+require_file "${existing_random_apf_root}/manifest.json"
 
 echo "Flow-Lenia lockheed_1 opt_004 OpenAI-ES robust-pioneer C1"
 echo "  cfg=${cfg}"
 echo "  source_run=${source_run}"
 echo "  selected_run=${selected_run}"
-echo "  apf_root=${apf_root}"
+echo "  optimized_apf_root=${optimized_apf_root}"
+echo "  existing_random_apf_root=${existing_random_apf_root}"
+echo "  combined_apf_root=${combined_apf_root}"
 echo "  result_root=${result_root}"
 echo "  selection=top EWMA robust-trend iterations, max seed LCB"
 echo "  lcb_z=2.0 trend_quantile=90 ewma_beta=0.85 trim_frac=0.125"
 echo "  rollout seeds per checkpoint=16"
-echo "  random baselines=disabled"
+echo "  random baselines=reuse existing 27 x 16 APF trajectories"
 echo "  conda_env=${conda_env}"
 echo "  run_id=${run_id}"
 echo "  log_dir=${log_dir}"
 echo "  master_log=${master_log}"
-echo "  force_export=${force_export} force_apf=${force_apf} force_metrics=${force_metrics} force_visualization=${force_visualization}"
+echo "  force_export=${force_export} force_apf=${force_apf} force_manifest=${force_manifest} force_metrics=${force_metrics} force_visualization=${force_visualization}"
 
 export_force_arg=""
 if [ "${force_export}" = "1" ]; then
@@ -136,6 +142,11 @@ fi
 apf_force_arg=""
 if [ "${force_apf}" = "1" ]; then
   apf_force_arg="--force"
+fi
+
+manifest_force_arg=""
+if [ "${force_manifest}" = "1" ]; then
+  manifest_force_arg="--force"
 fi
 
 metric_force_arg=""
@@ -149,19 +160,29 @@ if [ "${force_visualization}" = "1" ]; then
 fi
 
 echo
-echo "[1/4] Export robust pioneer candidate"
+echo "[1/5] Export robust pioneer candidate"
 run_py scripts/export_flowlenia_openai_es_robust_pioneer.py "${source_run}" --output-dir "${selected_run}" --lcb-z 2.0 --trend-quantile 90 --ewma-beta 0.85 --trim-frac 0.125 ${export_force_arg}
 
 echo
-echo "[2/4] Flow-Lenia dense C1 APF/Lagrangian trajectories"
+echo "[2/5] Flow-Lenia dense C1 APF/Lagrangian trajectories"
 run_py scripts/paper_suite_flowlenia_arun_apf.py "${cfg}" --section-key flow_lenia_arun_lagrangian_apf ${apf_force_arg}
 
 echo
-echo "[3/4] Flow-Lenia C1 metrics"
+echo "[3/5] Build combined optimized+random APF manifest"
+run_py scripts/build_flowlenia_c1_combined_apf_manifest.py \
+  --optimized-root "${optimized_apf_root}" \
+  --random-root "${existing_random_apf_root}" \
+  --output-root "${combined_apf_root}" \
+  --expected-optimized 16 \
+  --expected-random 432 \
+  ${manifest_force_arg}
+
+echo
+echo "[4/5] Flow-Lenia C1 metrics"
 run_py scripts/run_paper_suite.py "${cfg}" --layer metrics --task c1 ${metric_force_arg}
 
 echo
-echo "[4/4] Flow-Lenia C1 visualization"
+echo "[5/5] Flow-Lenia C1 visualization"
 run_py scripts/run_paper_suite.py "${cfg}" --layer visualization --task c1 ${vis_force_arg}
 
 echo
