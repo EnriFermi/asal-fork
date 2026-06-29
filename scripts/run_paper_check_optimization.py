@@ -41,6 +41,64 @@ def _explicit_run_indices(paper_section) -> list[int] | None:
     return out
 
 
+def _values_from_index_list(raw) -> list[int]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        values = [part.strip() for part in raw.split(",") if part.strip()]
+    else:
+        values = list(raw)
+    return [int(v) for v in values]
+
+
+def _explicit_run_indices_by_machine(paper_section, *, machine_idx: int, num_machines: int) -> list[int] | None:
+    raw = paper_section.get("run_indices_by_machine", None)
+    if raw is None:
+        raw = paper_section.get("machine_run_indices", None)
+    if raw is None:
+        return None
+    if paper_section.get("run_indices", None) is not None:
+        raise ValueError("Use either paper_check.run_indices or paper_check.run_indices_by_machine, not both.")
+
+    if isinstance(raw, str):
+        raise ValueError(
+            "paper_check.run_indices_by_machine must be a mapping/list, for example "
+            "{0: [0,2,4], 1: [1,3]}."
+        )
+
+    by_machine: dict[int, list[int]] = {}
+    if isinstance(raw, (list, tuple)) or OmegaConf.is_list(raw):
+        for idx, values in enumerate(raw):
+            by_machine[int(idx)] = _values_from_index_list(values)
+    else:
+        for key, values in raw.items():
+            key_text = str(key).strip()
+            if key_text.startswith("machine_"):
+                key_text = key_text[len("machine_") :]
+            by_machine[int(key_text)] = _values_from_index_list(values)
+
+    expected_keys = set(range(int(num_machines)))
+    got_keys = set(by_machine)
+    if got_keys != expected_keys:
+        raise ValueError(
+            "paper_check.run_indices_by_machine keys must exactly match configured machines "
+            f"{sorted(expected_keys)}, got {sorted(got_keys)}."
+        )
+
+    all_runs: list[int] = []
+    for idx in sorted(by_machine):
+        runs = by_machine[idx]
+        if any(v < 0 for v in runs):
+            raise ValueError(f"paper_check.run_indices_by_machine[{idx}] contains negative run ids: {runs}")
+        if len(set(runs)) != len(runs):
+            raise ValueError(f"paper_check.run_indices_by_machine[{idx}] contains duplicates: {runs}")
+        all_runs.extend(runs)
+    duplicates = sorted({v for v in all_runs if all_runs.count(v) > 1})
+    if duplicates:
+        raise ValueError(f"paper_check.run_indices_by_machine assigns runs to multiple machines: {duplicates}")
+    return list(by_machine[int(machine_idx)])
+
+
 def _entrypoint_command(stage_cfg, repo: Path, resolved_config_path: Path) -> list[str]:
     raw = stage_cfg.get("entrypoint", stage_cfg.get("objective", "msc"))
     name = str(raw).strip().lower().replace("-", "_")
@@ -131,17 +189,28 @@ def main() -> int:
     paper_cfg, config_path = load_paper_check_config(sys.argv[1])
     machine_idx, num_machines = validate_machine_config(paper_cfg)
     paper_section = paper_cfg.get("paper_check", {})
-    explicit_runs = _explicit_run_indices(paper_section)
-    if explicit_runs is None:
+    explicit_by_machine = _explicit_run_indices_by_machine(
+        paper_section,
+        machine_idx=machine_idx,
+        num_machines=num_machines,
+    )
+    assignment_mode = "run_indices_by_machine" if explicit_by_machine is not None else "modulo"
+    if explicit_by_machine is not None:
+        assigned = explicit_by_machine
+    else:
+        explicit_runs = _explicit_run_indices(paper_section)
+        if explicit_runs is not None:
+            assignment_mode = "run_indices_modulo"
+    if explicit_by_machine is None and explicit_runs is None:
         total_runs = int(paper_section.get("num_optimizations", 1))
         if total_runs < 1:
             raise ValueError(f"paper_check.num_optimizations must be >= 1, got {total_runs}.")
         assigned = shard_indices(total_runs, machine_idx, num_machines)
-    else:
+    elif explicit_by_machine is None:
         assigned = [idx for pos, idx in enumerate(explicit_runs) if pos % num_machines == machine_idx]
     print(
         f"[paper_check/optimization] machine_idx={machine_idx} num_machines={num_machines} "
-        f"assigned_runs={assigned}"
+        f"assignment_mode={assignment_mode} assigned_runs={assigned}"
     )
 
     repo = repo_root()
