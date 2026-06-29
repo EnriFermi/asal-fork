@@ -109,6 +109,17 @@ def _build_run_config(paper_cfg, config_path: Path, run_idx: int):
     if save_every is not None:
         base_cfg.logging.save_every = int(save_every)
 
+    fixed_eval_from_pair = bool(
+        stage_cfg.get("fixed_eval_seed_base_from_pair_seed_base", False)
+        or stage_cfg.get("eval_seed_base_from_pair_seed_base", False)
+    )
+    if fixed_eval_from_pair:
+        if base_cfg.get("optimization") is None:
+            base_cfg.optimization = OmegaConf.create()
+        pair_seed_base = int(paper_section.get("pair_seed_base", 400_003))
+        base_cfg.optimization.eval_seed_mode = str(base_cfg.optimization.get("eval_seed_mode", "fixed"))
+        base_cfg.optimization.fixed_eval_seed_base = int(pair_seed_base + 2 * int(run_idx))
+
     resolved_config_path = run_save_dir_abs / "optimization_config.yaml"
     return base_cfg, write_resolved_yaml(resolved_config_path, base_cfg)
 

@@ -196,6 +196,39 @@ def _racing_stage_plan(pop_size: int, final_budget: int) -> dict[str, int]:
     }
 
 
+def _normalize_eval_seed_mode(name):
+    if name is None:
+        return "rolling"
+    normalized = str(name).strip().lower().replace("-", "_")
+    aliases = {
+        "rolling": "rolling",
+        "resampled": "rolling",
+        "resample": "rolling",
+        "fresh": "rolling",
+        "legacy": "rolling",
+        "fixed": "fixed",
+        "fixed_bank": "fixed",
+        "fixed_seed_bank": "fixed",
+        "fixed_init": "fixed",
+        "fixed_initial_states": "fixed",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            "Unknown eval_seed_mode "
+            f"{name!r}. Use 'rolling' or 'fixed'."
+        )
+    return aliases[normalized]
+
+
+def _fixed_eval_seed_bank(base_seed: int, n_seeds: int) -> jax.Array:
+    if int(n_seeds) < 1:
+        raise ValueError(f"n_seeds must be >= 1, got {n_seeds}.")
+    return jnp.stack(
+        [jax.random.PRNGKey(int(base_seed) + i) for i in range(int(n_seeds))],
+        axis=0,
+    )
+
+
 def _replace_state_fields(state, **updates):
     if hasattr(state, "replace"):
         return state.replace(**updates)
@@ -841,6 +874,23 @@ def main(cfg, args):
         run.summary["optimizer/selection_protocol"] = selection_protocol
         run.summary["optimizer/selection_protocol_used"] = bool(optimizer_algorithm == "cma_es")
         run.summary["optimizer/bs"] = int(args.bs)
+        eval_seed_mode = _normalize_eval_seed_mode(
+            getattr(args, "eval_seed_mode", getattr(args, "optimization_eval_seed_mode", "rolling"))
+        )
+        fixed_eval_seed_base = int(
+            getattr(
+                args,
+                "fixed_eval_seed_base",
+                getattr(args, "optimization_fixed_eval_seed_base", int(args.seed) + 1_000_003),
+            )
+        )
+        run.summary["optimizer/eval_seed_mode"] = str(eval_seed_mode)
+        if eval_seed_mode == "fixed":
+            run.summary["optimizer/fixed_eval_seed_base"] = int(fixed_eval_seed_base)
+            run.summary["optimizer/fixed_eval_seed_semantics"] = (
+                "evaluation PRNG keys are PRNGKey(fixed_eval_seed_base + seed_idx) "
+                "and are reused across optimization iterations"
+            )
         if optimizer_algorithm == "cma_es" and selection_protocol == "shared_seed_rank":
             run.summary["optimizer/shared_seed_rank_n_seeds"] = int(args.bs)
         racing_plan = None
@@ -1178,6 +1228,11 @@ def main(cfg, args):
             run.summary["optimizer/openai_es_init_noise"] = float(init_noise)
             run.summary["optimizer/openai_es_pop_size"] = int(openai_pop_size)
             run.summary["optimizer/openai_es_rollouts_per_iter"] = int(openai_pop_size * n_seeds)
+            openai_fixed_seed_keys = (
+                _fixed_eval_seed_bank(fixed_eval_seed_base, n_seeds)
+                if eval_seed_mode == "fixed"
+                else None
+            )
 
             center_traj = []
             pop_epsilon_traj = []
@@ -1425,13 +1480,17 @@ def main(cfg, args):
             pbar = tqdm(range(start_iter, args.n_iters), initial=start_iter, total=args.n_iters)
             for i_iter in pbar:
                 theta_eval = theta
-                rng, rng_eps, rng_seed = jax.random.split(rng, 3)
+                if openai_fixed_seed_keys is None:
+                    rng, rng_eps, rng_seed = jax.random.split(rng, 3)
+                    seed_keys = split(rng_seed, n_seeds)
+                else:
+                    rng, rng_eps = jax.random.split(rng, 2)
+                    seed_keys = openai_fixed_seed_keys
                 eps = jax.random.normal(
                     rng_eps,
                     (n_pairs, candidate_dims),
                     dtype=jnp.float32,
                 )
-                seed_keys = split(rng_seed, n_seeds)
                 params_full = jnp.concatenate(
                     (
                         theta_eval[None, :] + es_sigma * eps,
@@ -1760,6 +1819,16 @@ def main(cfg, args):
             )
             return
 
+        fixed_bs_seed_keys = (
+            _fixed_eval_seed_bank(fixed_eval_seed_base, int(args.bs))
+            if eval_seed_mode == "fixed"
+            else None
+        )
+        fixed_racing_seed_keys = (
+            _fixed_eval_seed_bank(fixed_eval_seed_base, int(racing_plan["final_budget"]))
+            if eval_seed_mode == "fixed" and racing_plan is not None
+            else None
+        )
         pbar = tqdm(range(start_iter, args.n_iters), initial=start_iter, total=args.n_iters)
 
         for i_iter in pbar:
@@ -1775,8 +1844,11 @@ def main(cfg, args):
             racing_eval_mask_by_seed_all = None
             loss_dict_all = None
             if selection_protocol == "shared_seed_rank":
-                rng, rng_seed_set = split(rng)
-                shared_seed_keys = split(rng_seed_set, int(args.bs))
+                if fixed_bs_seed_keys is None:
+                    rng, rng_seed_set = split(rng)
+                    shared_seed_keys = split(rng_seed_set, int(args.bs))
+                else:
+                    shared_seed_keys = fixed_bs_seed_keys
                 shared_seed_keys_for_log = shared_seed_keys
                 for start in range(0, args.pop_size, pop_batch):
                     end = min(args.pop_size, start + pop_batch)
@@ -1793,9 +1865,12 @@ def main(cfg, args):
             elif selection_protocol == "batched_racing":
                 if racing_plan is None:
                     raise RuntimeError("batched_racing selected but racing_plan was not initialized.")
-                rng, rng_seed_set = split(rng)
                 final_budget = int(racing_plan["final_budget"])
-                shared_seed_keys = split(rng_seed_set, final_budget)
+                if fixed_racing_seed_keys is None:
+                    rng, rng_seed_set = split(rng)
+                    shared_seed_keys = split(rng_seed_set, final_budget)
+                else:
+                    shared_seed_keys = fixed_racing_seed_keys
                 shared_seed_keys_for_log = shared_seed_keys
                 loss_by_seed_np = np.full((int(args.pop_size), final_budget), np.nan, dtype=np.float32)
                 relative_score_by_seed_np = np.full((int(args.pop_size), final_budget), np.nan, dtype=np.float32)
@@ -1884,14 +1959,25 @@ def main(cfg, args):
                 loss_dict_all["selection_racing_eval_count"] = jnp.asarray(raw_loss_count, dtype=jnp.float32)
                 loss_dict_all["selection_racing_stage0_rank"] = jnp.asarray(stage0_rank_np, dtype=jnp.float32)
             else:
-                rng_eval = rng
-                for start in range(0, args.pop_size, pop_batch):
-                    end = min(args.pop_size, start + pop_batch)
-                    rng_eval, loss_chunk, loss_dict_chunk = eval_chunk_mean_loss(rng_eval, params_full[start:end])
-                    loss_chunks.append(loss_chunk)
-                    objective_loss_chunks.append(loss_chunk)
-                    loss_dict_chunks.append(loss_dict_chunk)
-                rng = rng_eval
+                if fixed_bs_seed_keys is None:
+                    rng_eval = rng
+                    for start in range(0, args.pop_size, pop_batch):
+                        end = min(args.pop_size, start + pop_batch)
+                        rng_eval, loss_chunk, loss_dict_chunk = eval_chunk_mean_loss(rng_eval, params_full[start:end])
+                        loss_chunks.append(loss_chunk)
+                        objective_loss_chunks.append(loss_chunk)
+                        loss_dict_chunks.append(loss_dict_chunk)
+                    rng = rng_eval
+                else:
+                    for start in range(0, args.pop_size, pop_batch):
+                        end = min(args.pop_size, start + pop_batch)
+                        loss_chunk, loss_dict_chunk, _loss_by_seed_chunk = eval_chunk_shared_seed(
+                            params_full[start:end],
+                            fixed_bs_seed_keys,
+                        )
+                        loss_chunks.append(loss_chunk)
+                        objective_loss_chunks.append(loss_chunk)
+                        loss_dict_chunks.append(loss_dict_chunk)
                 loss_all = jnp.concatenate(loss_chunks, axis=0)
                 objective_loss_all = jnp.concatenate(objective_loss_chunks, axis=0)
                 loss_by_seed_all = None
