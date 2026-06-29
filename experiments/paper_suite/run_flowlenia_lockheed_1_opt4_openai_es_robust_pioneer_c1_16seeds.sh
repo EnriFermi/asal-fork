@@ -13,7 +13,7 @@ selected_run="experiments/paper_check_flow_lenia/checkpoints_lockheed_1_opt4_ope
 result_root="analysis/results/paper_suite_flowlenia_lockheed_1_opt4_openai_es_robust_pioneer_c1_16seeds"
 optimized_apf_root="experiments/paper_check_flow_lenia/checkpoints_lockheed_1_opt4_openai_es_robust_pioneer/c1_lagrangian_apf_300k_train50_16seeds"
 existing_random_apf_root="experiments/paper_check_flow_lenia/checkpoints_lockheed_1_opt4_openai_es/c1_lagrangian_apf_300k_train50_27random_16seeds"
-combined_apf_root="experiments/paper_check_flow_lenia/checkpoints_lockheed_1_opt4_openai_es_robust_pioneer/c1_lagrangian_apf_300k_train50_robust_plus_27random_16seeds"
+combined_apf_root="experiments/paper_check_flow_lenia/checkpoints_lockheed_1_opt4_openai_es_robust_pioneer/c1_lagrangian_apf_300k_train50_robust16_plus_27random_existingseeds"
 run_id="${PAPER_SUITE_RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 log_dir="${PAPER_SUITE_LOG_DIR:-${result_root}/logs}"
 master_log="${PAPER_SUITE_MASTER_LOG:-${log_dir}/${run_id}_master.log}"
@@ -127,7 +127,7 @@ echo "  result_root=${result_root}"
 echo "  selection=top EWMA robust-trend iterations, max seed LCB"
 echo "  lcb_z=2.0 trend_quantile=90 ewma_beta=0.85 trim_frac=0.125"
 echo "  rollout seeds per checkpoint=16"
-echo "  random baselines=reuse existing 27 x 16 APF trajectories"
+echo "  random baselines=reuse existing 27 APF baselines; current root has 8 rollout seeds each"
 echo "  conda_env=${conda_env}"
 echo "  run_id=${run_id}"
 echo "  log_dir=${log_dir}"
@@ -174,7 +174,7 @@ run_py scripts/build_flowlenia_c1_combined_apf_manifest.py \
   --random-root "${existing_random_apf_root}" \
   --output-root "${combined_apf_root}" \
   --expected-optimized 16 \
-  --expected-random 432 \
+  --expected-random-candidates 27 \
   ${manifest_force_arg}
 
 echo

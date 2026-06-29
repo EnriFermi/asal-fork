@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,20 @@ def _check_ready(row: dict[str, Any]) -> None:
         raise FileNotFoundError(f"No P_steps_*.npz chunks for {row.get('traj_id')}: {apf_dir}")
 
 
+def _candidate_key(row: dict[str, Any]) -> str:
+    if "candidate_idx" in row and row.get("candidate_idx") not in (None, ""):
+        try:
+            return f"idx:{int(row['candidate_idx'])}"
+        except Exception:
+            return f"idx:{row['candidate_idx']}"
+    label = str(row.get("candidate_label", "")).strip()
+    if label:
+        return f"label:{label}"
+    traj_id = str(row.get("traj_id", "")).strip()
+    traj_id = re.sub(r"_seed_\d+$", "", traj_id)
+    return f"traj:{traj_id}"
+
+
 def build(
     *,
     optimized_root: Path,
@@ -63,6 +78,7 @@ def build(
     output_root: Path,
     expected_optimized: int | None,
     expected_random: int | None,
+    expected_random_candidates: int | None,
     force: bool,
 ) -> dict[str, Any]:
     output_manifest = output_root / "manifest.json"
@@ -91,6 +107,12 @@ def build(
         raise ValueError(f"No optimized rows found in {optimized_root}/manifest.json.")
     if not random_rows:
         raise ValueError(f"No random rows found in {random_root}/manifest.json.")
+    random_candidate_keys = sorted({_candidate_key(row) for row in random_rows})
+    if expected_random_candidates is not None and len(random_candidate_keys) != int(expected_random_candidates):
+        raise ValueError(
+            f"Expected {expected_random_candidates} random candidates, found {len(random_candidate_keys)} "
+            f"from {len(random_rows)} random rows in {random_root}."
+        )
 
     optimized_run_idx = int(opt_rows[0].get("suite_run_idx", opt_rows[0].get("optimized_run_idx", 0)))
     trajectories: list[dict[str, Any]] = []
@@ -126,6 +148,8 @@ def build(
         "random_root": str(random_root),
         "n_optimized": len(opt_rows),
         "n_random": len(random_rows),
+        "n_random_candidates": len(random_candidate_keys),
+        "random_candidate_keys": random_candidate_keys,
         "n_trajectories": len(trajectories),
         "trajectories": trajectories,
         "commands": [],
@@ -143,6 +167,7 @@ def main() -> int:
     parser.add_argument("--output-root", required=True, help="Output root where combined manifest.json will be written.")
     parser.add_argument("--expected-optimized", type=int, default=None)
     parser.add_argument("--expected-random", type=int, default=None)
+    parser.add_argument("--expected-random-candidates", type=int, default=None)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     build(
@@ -151,6 +176,7 @@ def main() -> int:
         output_root=Path(args.output_root),
         expected_optimized=args.expected_optimized,
         expected_random=args.expected_random,
+        expected_random_candidates=args.expected_random_candidates,
         force=bool(args.force),
     )
     return 0
