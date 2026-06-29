@@ -694,6 +694,69 @@ def _plot_c1_paired_raw_clean(dataset: str, ds_dir: Path, figures: Path) -> dict
     return {f"c1_{dataset}_paired_raw_clean": str(out)}
 
 
+def _plot_c1_candidate_median_scores(dataset: str, ds_dir: Path, figures: Path) -> dict[str, str]:
+    raw = _load_c1_raw_scores(ds_dir)
+    required = {"optimized_run_idx", "candidate_kind", "candidate_idx", "eval_score_mspd"}
+    if raw.empty or not required.issubset(raw.columns):
+        return {}
+    raw = raw.copy()
+    raw["score_numeric"] = pd.to_numeric(raw["eval_score_mspd"], errors="coerce")
+    raw = raw[np.isfinite(raw["score_numeric"].to_numpy(dtype=np.float64))]
+    if raw.empty:
+        return {}
+
+    groups = []
+    panels = []
+    for group, sub in raw.groupby("optimized_run_idx", sort=True):
+        opt = sub[sub["candidate_kind"].astype(str) == "optimized"]["score_numeric"].to_numpy(dtype=np.float64)
+        randoms = sub[sub["candidate_kind"].astype(str) == "random"].copy()
+        if opt.size == 0 or randoms.empty:
+            continue
+        label_col = "candidate_label" if "candidate_label" in randoms.columns else "candidate_idx"
+        random_summary = (
+            randoms.groupby(["candidate_idx", label_col], dropna=False)["score_numeric"]
+            .agg(["median", "count"])
+            .reset_index()
+            .sort_values(["candidate_idx", label_col], kind="mergesort")
+        )
+        if random_summary.empty:
+            continue
+        groups.append(group)
+        panels.append((float(np.nanmedian(opt)), random_summary))
+    if not panels:
+        return {}
+
+    plt = _ensure_matplotlib()
+    n_panels = len(panels)
+    fig, axes = plt.subplots(
+        n_panels,
+        1,
+        figsize=(max(8.0, 0.28 * max(len(p[1]) for p in panels) + 2.0), max(3.6, 2.8 * n_panels)),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    for ax, group, (opt_med, random_summary) in zip(axes[:, 0], groups, panels):
+        y = random_summary["median"].to_numpy(dtype=np.float64)
+        x = np.arange(1, y.size + 1)
+        ax.scatter(x, y, s=44, color="#8f8f8f", edgecolor="white", linewidth=0.6, zorder=3, label="random median")
+        ax.scatter([0], [opt_med], s=88, color="#1f4e79", marker="D", edgecolor="white", linewidth=0.8, zorder=4, label="optimized median")
+        ax.axhline(float(np.nanmedian(y)), color="#333333", linestyle="--", linewidth=1.1, alpha=0.75, label="median(random medians)")
+        ax.plot([0, x[-1]], [opt_med, opt_med], color="#1f4e79", linewidth=1.0, alpha=0.35)
+        labels = ["opt"] + [f"r{int(v):02d}" if np.isfinite(float(v)) else "r?" for v in random_summary["candidate_idx"]]
+        ax.set_xticks(np.arange(0, y.size + 1), labels, rotation=60 if y.size > 12 else 0, ha="right" if y.size > 12 else "center")
+        ax.set_ylabel("median held-out MSPD")
+        ax.set_title(f"{dataset}: per-candidate median MSPD, group {group}")
+        ax.grid(axis="y", color="#dddddd", linewidth=0.7, alpha=0.75)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.legend(frameon=False, loc="best")
+    axes[-1, 0].set_xlabel("candidate")
+    out = figures / f"c1_{dataset}_candidate_median_scores.png"
+    _save(fig, out)
+    plt.close(fig)
+    return {f"c1_{dataset}_candidate_median_scores": str(out)}
+
+
 def _symmetric_heatmap_limit(arrays: list[np.ndarray], *, percentile: float = 98.0) -> float:
     vals = []
     for arr in arrays:
@@ -1953,6 +2016,7 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
             ds_dir = output_root / dataset
             if task in {"all", "c1", "c6"}:
                 paths.update(_plot_c1_paired_raw_clean(dataset, ds_dir, figures))
+                paths.update(_plot_c1_candidate_median_scores(dataset, ds_dir, figures))
                 paths.update(_plot_c1(dataset, ds_dir, figures))
             if task in {"all", "c5", "c6"}:
                 paths.update(_plot_c5_frustration_clean(dataset, ds_dir, figures))
