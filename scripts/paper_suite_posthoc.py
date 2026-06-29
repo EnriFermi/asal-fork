@@ -872,9 +872,36 @@ def _compute_c1_from_apf_lagrangian_split(
         )
     if require_random and contrast_df.empty:
         raise ValueError(f"{dataset_name}: C1 APF interleaved holdout source {root} has random rows but no matched groups.")
+    if contrast_df.empty:
+        contrast_df = pd.DataFrame(
+            columns=[
+                "optimized_run_idx",
+                "eval_score_mspd__optimized",
+                "eval_score_mspd__optimized_median",
+                "eval_score_mspd__optimized_mean",
+                "eval_score_mspd__random_median",
+                "eval_score_mspd__random_mean",
+                "n_optimized",
+                "n_random",
+                "delta_vs_random_median",
+            ]
+        )
     score_df.to_csv(output_dir / "checkpoint_scores.csv", index=False)
     contrast_df.to_csv(output_dir / "group_contrasts.csv", index=False)
-    summary = sign_test_greater(contrast_df["delta_vs_random_median"].tolist())
+    summary = sign_test_greater(contrast_df["delta_vs_random_median"].tolist() if "delta_vs_random_median" in contrast_df.columns else [])
+    if not require_random and len(contrast_df) == 0:
+        opt_scores = np.asarray(
+            [safe_float(v) for v in score_df.get("eval_score_mspd", [])],
+            dtype=np.float64,
+        )
+        opt_scores = opt_scores[np.isfinite(opt_scores)]
+        summary.update(
+            {
+                "comparison_note": "optimized_only_diagnostic_no_random_contrast",
+                "optimized_score_median": float(np.nanmedian(opt_scores)) if opt_scores.size else float("nan"),
+                "optimized_score_mean": float(np.nanmean(opt_scores)) if opt_scores.size else float("nan"),
+            }
+        )
     summary.update(
         {
             "source": "apf_lagrangian_split",
