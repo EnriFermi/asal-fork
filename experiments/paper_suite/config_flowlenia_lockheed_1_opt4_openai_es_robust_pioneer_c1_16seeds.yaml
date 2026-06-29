@@ -9,7 +9,7 @@ datasets:
     required: true
     c1:
       source: apf_lagrangian_split
-      apf_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1_opt4_openai_es_robust_pioneer/c1_lagrangian_apf_300k_train50_robust_plus_27random_16seeds
+      apf_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1_opt4_openai_es_robust_pioneer/c1_lagrangian_apf_300k_train50_robust16_plus_27random_existingseeds
       require_random: true
       expected_window_start_steps: 50000
       expected_window_end_steps: 300000
