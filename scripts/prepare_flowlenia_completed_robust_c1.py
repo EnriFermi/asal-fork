@@ -135,6 +135,7 @@ def _write_c1_config(
     rollout_config: str,
     selected_dirs: list[str],
     random_checkpoint_root: str,
+    random_checkpoint_selection: str,
     n_rollout_seeds: int,
     num_random_baselines: int,
     batch_size: int,
@@ -207,7 +208,7 @@ def _write_c1_config(
                 "include_random_baselines": True,
                 "num_random_baselines": int(num_random_baselines),
                 "random_checkpoint_root": random_checkpoint_root,
-                "random_checkpoint_selection": "all_groups_flat",
+                "random_checkpoint_selection": str(random_checkpoint_selection),
                 "run_seed_base": int(pair_seed_base),
                 "run_seed_mode": "source_run_idx",
                 "batch_size": int(batch_size),
@@ -231,6 +232,12 @@ def main() -> int:
     parser.add_argument("--result-root", required=True)
     parser.add_argument("--apf-root", required=True)
     parser.add_argument("--random-checkpoint-root", required=True)
+    parser.add_argument(
+        "--random-checkpoint-selection",
+        default="all_groups_flat",
+        choices=["all_groups_flat", "global_flat", "flat", "per_source_group"],
+        help="How to pick random checkpoints for each optimized run.",
+    )
     parser.add_argument("--rollout-config", default="experiments/paper_suite/flowlenia_arun_apf_300k_train50_grid128.yaml")
     parser.add_argument("--n-rollout-seeds", type=int, default=4)
     parser.add_argument("--num-random-baselines", type=int, default=27)
@@ -250,6 +257,7 @@ def main() -> int:
     result_root = str(args.result_root)
     apf_root = str(args.apf_root)
     random_checkpoint_root = str(args.random_checkpoint_root)
+    random_checkpoint_selection = str(args.random_checkpoint_selection)
     rollout_config = str(args.rollout_config)
 
     if not source_root.exists():
@@ -298,6 +306,7 @@ def main() -> int:
         rollout_config=rollout_config,
         selected_dirs=selected_dirs,
         random_checkpoint_root=random_checkpoint_root,
+        random_checkpoint_selection=random_checkpoint_selection,
         n_rollout_seeds=int(args.n_rollout_seeds),
         num_random_baselines=int(args.num_random_baselines),
         batch_size=int(args.batch_size),
@@ -314,6 +323,7 @@ def main() -> int:
         "result_root": result_root,
         "apf_root": apf_root,
         "random_checkpoint_root": random_checkpoint_root,
+        "random_checkpoint_selection": random_checkpoint_selection,
         "n_completed_runs": len(completed),
         "completed_run_indices": [int(row["run_idx"]) for row in completed],
         "n_rollout_seeds": int(args.n_rollout_seeds),
