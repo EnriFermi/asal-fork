@@ -157,6 +157,7 @@ def _write_c1_config(
                     "require_random": True,
                     "expected_window_start_steps": 50000,
                     "expected_window_end_steps": 300000,
+                    "metric_seed_protocol": "optimization_metric",
                     "metric": {
                         "metric_tau_mode": "max_grid",
                         "metric_tau_grid_steps": [
@@ -211,6 +212,7 @@ def _write_c1_config(
                 "random_checkpoint_selection": str(random_checkpoint_selection),
                 "run_seed_base": int(pair_seed_base),
                 "run_seed_mode": "source_run_idx",
+                "run_seed_protocol": "optimization_metric",
                 "batch_size": int(batch_size),
                 "optimized_checkpoint_dirs": selected_dirs,
                 "dedupe_by_run_idx": False,

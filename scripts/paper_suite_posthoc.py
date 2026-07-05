@@ -358,9 +358,41 @@ def _metric_config_from_timing(metric_cfg_raw: Any, *, rollout_steps: int, sampl
     return resolve_metric_config(args)
 
 
-def _score_maps(metric_eval, metric_seed: int, xy: np.ndarray) -> dict[str, np.ndarray]:
-    _loss, info = metric_eval(jax.random.PRNGKey(int(metric_seed)), jnp.asarray(xy, dtype=jnp.float32))
+def _score_maps(metric_eval, metric_seed: Any, xy: np.ndarray) -> dict[str, np.ndarray]:
+    if isinstance(metric_seed, (int, np.integer)):
+        key = jax.random.PRNGKey(int(metric_seed))
+    else:
+        key = jnp.asarray(metric_seed, dtype=jnp.uint32)
+        if tuple(key.shape) != (2,):
+            raise ValueError(f"metric_seed key must have shape (2,), got {tuple(key.shape)}.")
+    _loss, info = metric_eval(key, jnp.asarray(xy, dtype=jnp.float32))
     return {key: np.asarray(jax.device_get(value)) for key, value in info.items()}
+
+
+def _normalize_metric_seed_protocol(value: Any) -> str:
+    text = str(value if value is not None else "posthoc_index").strip().lower().replace("-", "_")
+    if text in {"", "posthoc_index", "posthoc", "legacy", "selection_idx"}:
+        return "posthoc_index"
+    if text in {"optimization_metric", "optimization", "main_opt_msc", "opt_metric"}:
+        return "optimization_metric"
+    raise ValueError(
+        f"Unknown C1 metric_seed_protocol={value!r}. Use 'posthoc_index' or 'optimization_metric'."
+    )
+
+
+def _c1_metric_seed(c1_cfg: Any, item: dict[str, Any], idx: int) -> tuple[Any, str]:
+    protocol = _normalize_metric_seed_protocol(cfg_get(c1_cfg, "metric_seed_protocol", "posthoc_index"))
+    if protocol == "optimization_metric":
+        run_seed = item.get("run_seed", None)
+        if run_seed is None:
+            raise ValueError(
+                f"C1 metric_seed_protocol='optimization_metric' requires run_seed in manifest item {item.get('traj_id')!r}."
+            )
+        _rng_roll, rng_metric = jax.random.split(jax.random.PRNGKey(int(run_seed)), 2)
+        key_np = np.asarray(rng_metric, dtype=np.uint32)
+        return rng_metric, f"optimization_metric:{int(key_np[0])},{int(key_np[1])}"
+    metric_seed = 10_000_000 + int(item.get("selection_idx", idx - 1))
+    return int(metric_seed), f"posthoc_index:{metric_seed}"
 
 
 def _checkpoint_train_tau_steps(checkpoint_dir_raw: Any) -> int | None:
@@ -732,7 +764,7 @@ def _compute_c1_from_apf_lagrangian_split(
                 f"{dataset_name}: invalid C1 APF lagrangian path={apf_dir} error={type(exc).__name__}: {exc}"
             ) from exc
 
-        metric_seed = 10_000_000 + int(item.get("selection_idx", idx - 1))
+        metric_seed, metric_seed_label = _c1_metric_seed(c1_cfg, item, idx)
         info = _score_maps(metric_eval, metric_seed, xy_full)
         full_map = np.asarray(info["delta_h_map"], dtype=np.float64)
         selection_mask, eval_mask = _interleaved_window_masks(full_map.shape[1])
@@ -817,6 +849,10 @@ def _compute_c1_from_apf_lagrangian_split(
                 "optimized_run_idx": int(item.get("optimized_run_idx", idx - 1)),
                 "base_run_seed": int(item.get("base_run_seed", item.get("run_seed", -1))),
                 "run_seed": int(item.get("run_seed", -1)),
+                "metric_seed_protocol": _normalize_metric_seed_protocol(
+                    cfg_get(c1_cfg, "metric_seed_protocol", "posthoc_index")
+                ),
+                "metric_seed": metric_seed_label,
                 "rollout_seed_idx": int(item.get("rollout_seed_idx", 0)),
                 "rollout_seed_count": int(item.get("rollout_seed_count", 1)),
                 "candidate_kind": str(item.get("candidate_kind", "optimized")),

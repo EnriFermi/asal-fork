@@ -78,6 +78,23 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     raise ValueError(f"Cannot parse boolean value {value!r}.")
 
 
+def _normalize_run_seed_protocol(value: Any) -> str:
+    text = str(value if value is not None else "minibang").strip().lower().replace("-", "_")
+    if text in {"", "minibang", "legacy", "legacy_minibang", "apf", "control_a"}:
+        return "minibang"
+    if text in {
+        "optimization_metric",
+        "optimization",
+        "main_opt_msc",
+        "main_opt_metric",
+        "opt_metric",
+    }:
+        return "optimization_metric"
+    raise ValueError(
+        f"Unknown run_seed_protocol={value!r}. Use 'minibang' or 'optimization_metric'."
+    )
+
+
 def _load_pkl_if_exists(path: Path) -> Any | None:
     if not path.exists():
         return None
@@ -1372,22 +1389,75 @@ def simulate_batch(
     selection0 = int(selected_batch[0]["selection_idx"])
     run_seed_values = [row.get("run_seed", None) for row in selected_batch]
     use_run_seed_batch = all(seed is not None for seed in run_seed_values)
+    run_seed_protocol = _normalize_run_seed_protocol(_get(args, "run_seed_protocol", "minibang"))
+    snapshot_interval = max(1, int(_get(args, "snapshot_interval", 50)))
+    total_steps_raw = _get(args, "rollout_steps", None)
+    if total_steps_raw is None:
+        total_steps_raw = _get(args, "max_steps", substrate.rollout_steps)
+    if total_steps_raw is None:
+        total_steps_raw = substrate.rollout_steps
+    total_steps = int(total_steps_raw)
+    max_steps = _get(args, "max_steps", None)
+    if max_steps is not None:
+        total_steps = min(total_steps, int(max_steps))
+    jit_microbatch = max(1, int(_get(args, "jit_microbatch", min(64, snapshot_interval))))
+    if run_seed_protocol == "optimization_metric":
+        if not use_run_seed_batch:
+            raise ValueError("run_seed_protocol='optimization_metric' requires explicit run_seed for every trajectory.")
+        sample_every_steps = int(_get(args, "sample_every_steps", snapshot_interval))
+        if sample_every_steps != snapshot_interval:
+            raise ValueError(
+                "run_seed_protocol='optimization_metric' requires sample_every_steps == snapshot_interval "
+                f"to reproduce main_opt_msc metric rollout keys exactly; got sample_every_steps={sample_every_steps}, "
+                f"snapshot_interval={snapshot_interval}."
+            )
+        if total_steps % snapshot_interval != 0:
+            raise ValueError(
+                "run_seed_protocol='optimization_metric' requires rollout_steps divisible by snapshot_interval; "
+                f"got rollout_steps={total_steps}, snapshot_interval={snapshot_interval}."
+            )
+        if jit_microbatch < snapshot_interval:
+            raise ValueError(
+                "run_seed_protocol='optimization_metric' requires jit_microbatch >= snapshot_interval so each "
+                f"metric sample uses one unsplit optimization chunk key; got jit_microbatch={jit_microbatch}, "
+                f"snapshot_interval={snapshot_interval}."
+            )
     if use_run_seed_batch:
         seeds = [int(seed) for seed in run_seed_values]
-        init_pairs = [jax.random.split(jax.random.PRNGKey(seed), 2) for seed in seeds]
-        rng_batch = jnp.stack([pair[0] for pair in init_pairs], axis=0)
-        init_keys = jnp.stack([pair[1] for pair in init_pairs], axis=0)
-        lag_pairs = [
-            jax.random.split(jax.random.fold_in(jax.random.PRNGKey(seed), jnp.uint32(0x4D5343)), 2)
-            for seed in seeds
-        ]
-        lag_keys = jnp.stack([pair[0] for pair in lag_pairs], axis=0)
-        ch_keys = jnp.stack([pair[1] for pair in lag_pairs], axis=0)
+        if run_seed_protocol == "optimization_metric":
+            eval_keys = jnp.stack([jax.random.PRNGKey(seed) for seed in seeds], axis=0)
+            roll_metric_pairs = jax.vmap(lambda key: jax.random.split(key, 2))(eval_keys)
+            rng_roll = roll_metric_pairs[:, 0]
+            metric_keys = roll_metric_pairs[:, 1]
+            roll_parts = jax.vmap(lambda key: jax.random.split(key, 4))(rng_roll)
+            init_keys = roll_parts[:, 0]
+            lag_keys = roll_parts[:, 1]
+            ch_keys = roll_parts[:, 2]
+            scan_keys = roll_parts[:, 3]
+            n_scan_chunks = int(total_steps // snapshot_interval)
+            rng_batch = jax.vmap(lambda key: jax.random.split(key, n_scan_chunks))(scan_keys)
+            rng_chunk_idx = jnp.asarray(0, dtype=jnp.int32)
+        else:
+            init_pairs = [jax.random.split(jax.random.PRNGKey(seed), 2) for seed in seeds]
+            rng_batch = jnp.stack([pair[0] for pair in init_pairs], axis=0)
+            init_keys = jnp.stack([pair[1] for pair in init_pairs], axis=0)
+            metric_keys = None
+            scan_keys = None
+            rng_chunk_idx = None
+            lag_pairs = [
+                jax.random.split(jax.random.fold_in(jax.random.PRNGKey(seed), jnp.uint32(0x4D5343)), 2)
+                for seed in seeds
+            ]
+            lag_keys = jnp.stack([pair[0] for pair in lag_pairs], axis=0)
+            ch_keys = jnp.stack([pair[1] for pair in lag_pairs], axis=0)
     else:
         init_keys = jax.random.split(jax.random.PRNGKey(seed0 + 1009 * (selection0 + 1)), B)
         lag_keys = jax.random.split(jax.random.PRNGKey(int(_get(args, "lagrangian_seed", seed0)) + 9173 * (selection0 + 1)), B)
         ch_keys = jax.random.split(jax.random.PRNGKey(int(_get(args, "lagrangian_seed", seed0)) + 1877 * (selection0 + 1)), B)
         rng_batch = None
+        metric_keys = None
+        scan_keys = None
+        rng_chunk_idx = None
 
     init_states = jax.jit(lambda keys, params: jax.vmap(substrate.init_state)(keys, params))
     states = init_states(init_keys, params_batch)
@@ -1417,14 +1487,44 @@ def simulate_batch(
 
     lag_xy, lag_ch = jax.jit(lambda A0, kp, kc: jax.vmap(init_lag_one)(A0, kp, kc))(states["A"], lag_keys, ch_keys)
 
-    stepper_cache: dict[tuple[int, int, bool], Any] = {}
+    stepper_cache: dict[tuple[int, int, bool, str], Any] = {}
 
     def get_stepper(n_steps: int):
-        key = (int(n_steps), B, bool(use_run_seed_batch))
+        key = (int(n_steps), B, bool(use_run_seed_batch), run_seed_protocol)
         if key in stepper_cache:
             return stepper_cache[key]
 
-        if use_run_seed_batch:
+        if use_run_seed_batch and run_seed_protocol == "optimization_metric":
+            def advance(states_in, lag_xy_in, lag_ch_in, params_in, scan_chunk_keys_in, chunk_idx_in):
+                chunk_keys = scan_chunk_keys_in[:, chunk_idx_in]
+                rngs = jax.vmap(lambda key_in: jax.random.split(key_in, int(n_steps)))(chunk_keys)
+                rngs = jnp.swapaxes(rngs, 0, 1)
+
+                def scan_body(carry, keys_step):
+                    st, pts, ch = carry
+
+                    def one_step(key_i, st_i, pts_i, ch_i, params_i):
+                        st_next = substrate.step_state(key_i, st_i, params_i)
+                        lag_key = jax.random.fold_in(key_i, jnp.uint32(0x4C4147))
+                        pts_next, ch_next = rt.advect_particles(
+                            points=pts_i,
+                            F=st_next["F"],
+                            A=st_next["A"],
+                            channel=lag_flow_channel,
+                            reduce=lag_flow_reduce,
+                            point_channels=ch_i,
+                            channel_mode=lag_channel_mode,
+                            key=lag_key,
+                            noise_model=lag_noise_model,
+                            diffusion_scale=lag_diffusion_scale,
+                        )
+                        return st_next, pts_next, ch_next
+
+                    return jax.vmap(one_step)(keys_step, st, pts, ch, params_in), None
+
+                (st_out, pts_out, ch_out), _ = jax.lax.scan(scan_body, (states_in, lag_xy_in, lag_ch_in), rngs)
+                return st_out, pts_out, ch_out, scan_chunk_keys_in, chunk_idx_in + jnp.asarray(1, dtype=jnp.int32)
+        elif use_run_seed_batch:
             def advance(states_in, lag_xy_in, lag_ch_in, params_in, rng_batch_in):
                 split = jax.vmap(lambda key_in: jax.random.split(key_in, 2))(rng_batch_in)
                 rng_next = split[:, 0]
@@ -1489,17 +1589,6 @@ def simulate_batch(
         return stepper_cache[key]
 
     capture_cache: dict[tuple[int, int], Any] = {}
-    snapshot_interval = max(1, int(_get(args, "snapshot_interval", 50)))
-    total_steps_raw = _get(args, "rollout_steps", None)
-    if total_steps_raw is None:
-        total_steps_raw = _get(args, "max_steps", substrate.rollout_steps)
-    if total_steps_raw is None:
-        total_steps_raw = substrate.rollout_steps
-    total_steps = int(total_steps_raw)
-    max_steps = _get(args, "max_steps", None)
-    if max_steps is not None:
-        total_steps = min(total_steps, int(max_steps))
-    jit_microbatch = max(1, int(_get(args, "jit_microbatch", min(64, snapshot_interval))))
     lagrangian_seed = int(_get(args, "lagrangian_seed", seed0))
     for i, run in enumerate(runs):
         run_seed_i = int(run_seed_values[i]) if use_run_seed_batch else int(seed0)
@@ -1512,7 +1601,10 @@ def simulate_batch(
         run["resume_lagrangian_seed"] = int(run_seed_i if use_run_seed_batch else lagrangian_seed)
 
     rng = jax.random.PRNGKey(seed0 + 991 * (selection0 + 1))
-    resume_rng_key = rng_batch if use_run_seed_batch else rng
+    if use_run_seed_batch and run_seed_protocol == "optimization_metric":
+        resume_rng_key = scan_keys
+    else:
+        resume_rng_key = rng_batch if use_run_seed_batch else rng
 
     _capture_snapshot(
         step=0,
@@ -1534,14 +1626,26 @@ def simulate_batch(
             target_next_snapshot = min(total_steps, ((steps_done // snapshot_interval) + 1) * snapshot_interval)
             while steps_done < target_next_snapshot:
                 n = min(jit_microbatch, target_next_snapshot - steps_done)
-                if use_run_seed_batch:
+                if use_run_seed_batch and run_seed_protocol == "optimization_metric":
+                    states, lag_xy, lag_ch, rng_batch, rng_chunk_idx = get_stepper(n)(
+                        states,
+                        lag_xy,
+                        lag_ch,
+                        params_batch,
+                        rng_batch,
+                        rng_chunk_idx,
+                    )
+                elif use_run_seed_batch:
                     states, lag_xy, lag_ch, rng_batch = get_stepper(n)(states, lag_xy, lag_ch, params_batch, rng_batch)
                 else:
                     rng, subkey = jax.random.split(rng)
                     states, lag_xy, lag_ch = get_stepper(n)(states, lag_xy, lag_ch, params_batch, subkey)
                 steps_done += n
                 pbar.update(n)
-            resume_rng_key = rng_batch if use_run_seed_batch else rng
+            if use_run_seed_batch and run_seed_protocol == "optimization_metric":
+                resume_rng_key = scan_keys
+            else:
+                resume_rng_key = rng_batch if use_run_seed_batch else rng
             _capture_snapshot(
                 step=steps_done,
                 states=states,
