@@ -78,6 +78,7 @@ def _expected_rollout_signature(rollout_config: Path, flat: Any) -> dict[str, An
         "lagrangian_channel_mode",
         "lagrangian_noise_model",
         "lagrangian_diffusion_scale",
+        "run_seed_protocol",
     )
     out = {"rollout_config": str(rollout_config)}
     for key in keys:
@@ -101,6 +102,23 @@ def _saved_rollout_signature(paths: dict[str, Path]) -> dict[str, Any]:
         cfg.get("minibang", {}),
     )
     return _expected_rollout_signature(Path(str(cfg.get("rollout_config", ""))), flat)
+
+
+def _apply_section_rollout_overrides(rollout_cfg: Any, rollout_flat: Any, section: Any) -> tuple[Any, Any]:
+    passthrough_keys = (
+        "run_seed_protocol",
+    )
+    cfg_out = OmegaConf.create(OmegaConf.to_container(rollout_cfg, resolve=False))
+    flat_out = OmegaConf.create(OmegaConf.to_container(rollout_flat, resolve=False))
+    if cfg_out.get("minibang", None) is None:
+        cfg_out.minibang = OmegaConf.create()
+    for key in passthrough_keys:
+        value = _get(section, key, None)
+        if value is None:
+            continue
+        flat_out[key] = value
+        cfg_out.minibang[key] = value
+    return cfg_out, flat_out
 
 
 def _signature_mismatch(saved: dict[str, Any], expected: dict[str, Any]) -> str:
@@ -362,6 +380,7 @@ def run(
 
     expected_steps = int(_get(section, "rollout_steps", 500_000))
     rollout_cfg, rollout_flat = load_rollout_config(rollout_config, [])
+    rollout_cfg, rollout_flat = _apply_section_rollout_overrides(rollout_cfg, rollout_flat, section)
     _validate_rollout_profile(rollout_flat, expected_steps=expected_steps)
     expected_signature = _expected_rollout_signature(rollout_config, rollout_flat)
 
