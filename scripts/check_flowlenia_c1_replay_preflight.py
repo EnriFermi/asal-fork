@@ -556,6 +556,34 @@ def _snapshot_diff_summary(apf: dict[str, np.ndarray], ref: dict[str, np.ndarray
     return out
 
 
+def _xy_diff_summary(apf_xy: np.ndarray, ref_xy: np.ndarray, *, atol: float) -> dict[str, Any]:
+    if np.asarray(apf_xy).shape != np.asarray(ref_xy).shape:
+        return {
+            "status": "shape_mismatch",
+            "apf_shape": list(np.asarray(apf_xy).shape),
+            "ref_shape": list(np.asarray(ref_xy).shape),
+        }
+    diff = np.asarray(apf_xy, dtype=np.float32) - np.asarray(ref_xy, dtype=np.float32)
+    per_sample_max = np.nanmax(np.abs(diff).reshape((diff.shape[0], -1)), axis=1)
+    per_sample_mean = np.nanmean(np.abs(diff).reshape((diff.shape[0], -1)), axis=1)
+    first_failed = np.flatnonzero(per_sample_max > float(atol))
+    return {
+        "status": "ok" if not first_failed.size else "failed",
+        "max_abs_xy_diff": float(np.nanmax(np.abs(diff))),
+        "mean_abs_xy_diff": float(np.nanmean(np.abs(diff))),
+        "per_sample_max_abs_xy_diff": [float(x) for x in per_sample_max.reshape(-1)],
+        "per_sample_mean_abs_xy_diff": [float(x) for x in per_sample_mean.reshape(-1)],
+        "first_failed_sample_idx": int(first_failed[0]) if first_failed.size else None,
+    }
+
+
+def _seed_int_from_prng_key(key: Any) -> int | None:
+    arr = np.asarray(key, dtype=np.uint32).reshape(-1)
+    if arr.size == 2 and int(arr[0]) == 0:
+        return int(arr[1])
+    return None
+
+
 def _config_value_diff(left: Any, right: Any, keys: list[str]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for key in keys:
@@ -845,6 +873,111 @@ def _run_replay_smoke(
             pop_idx=int(batch_inputs["pop_idx"]),
             seed_idx=int(batch_inputs["seed_idx"]),
         )
+
+    optimizer_context_apf: dict[str, Any] = {"status": "skipped", "reason": "no optimizer batch inputs"}
+    if batch_inputs is not None:
+        params_batch = np.asarray(batch_inputs["params_batch"], dtype=np.float32)
+        seed_keys = np.asarray(batch_inputs["seed_keys"], dtype=np.uint32)
+        pop_idx = int(batch_inputs["pop_idx"])
+        selected_seed_idx = int(batch_inputs["seed_idx"])
+        selected_seed_int = _seed_int_from_prng_key(seed_keys[selected_seed_idx])
+        seed_ints = [_seed_int_from_prng_key(seed_keys[i]) for i in range(seed_keys.shape[0])]
+
+        def run_apf_context(
+            *,
+            context_name: str,
+            rows: list[dict[str, Any]],
+            selected_traj_id: str,
+        ) -> dict[str, Any]:
+            context_root = output_root / f"run_{run_idx:03d}_seed_{seed_idx:03d}_{rollout_steps}_{context_name}"
+            if context_root.exists():
+                shutil.rmtree(context_root)
+            context_flat = dict(flat_dict)
+            context_flat["batch_size"] = len(rows)
+            context_flat["n_trajectories"] = len(rows)
+            if int(context_flat.get("jit_microbatch", sample_every)) < sample_every:
+                context_flat["jit_microbatch"] = sample_every
+            simulate_batch(
+                selected_batch=rows,
+                cfg=rollout_cfg_i,
+                flat_args=context_flat,
+                output_root=context_root,
+                overwrite=True,
+            )
+            context_apf_dir = context_root / selected_traj_id / "apf_logs"
+            context_initial = _load_first_apf_snapshot(context_apf_dir)
+            context_steps, context_xy_all = _load_lagrangian_series(context_apf_dir)
+            context_xy = np.asarray(context_xy_all[np.asarray(context_steps) > 0], dtype=np.float32)
+            return {
+                "status": "ok",
+                "context_name": context_name,
+                "output_root": str(context_root),
+                "selected_traj_id": selected_traj_id,
+                "batch_size": int(len(rows)),
+                "apf_steps": [int(x) for x in np.asarray(context_steps).reshape(-1)],
+                "initial_snapshot_diff_vs_optimizer_reference": _snapshot_diff_summary(
+                    context_initial,
+                    reference_initial_snapshot,
+                ),
+                "diff_vs_optimizer_reference": _xy_diff_summary(context_xy, opt_xy, atol=atol),
+                "diff_vs_single_selected_apf": _xy_diff_summary(context_xy, apf_xy, atol=atol),
+                "diff_vs_scalar_reference": _xy_diff_summary(context_xy, scalar_opt_xy, atol=atol),
+            }
+
+        optimizer_context_apf = {
+            "status": "skipped",
+            "reason": "selected optimizer PRNGKey is not representable as PRNGKey(int)",
+            "selected_seed_key": [int(x) for x in np.asarray(seed_keys[selected_seed_idx]).reshape(-1)],
+        }
+        if selected_seed_int is not None:
+            same_seed_rows = []
+            for j in range(params_batch.shape[0]):
+                same_seed_rows.append(
+                    {
+                        "traj_id": f"pop_same_seed_pop_{j:03d}_seed_{selected_seed_idx:03d}",
+                        "selection_idx": int(j),
+                        "source_run_idx": int(run_idx),
+                        "run_seed": int(selected_seed_int),
+                        "params": np.asarray(params_batch[j], dtype=np.float32),
+                        "loss": float("nan"),
+                    }
+                )
+            optimizer_context_apf = {
+                "status": "ok",
+                "selected_seed_int": int(selected_seed_int),
+                "same_seed_pop_batch": run_apf_context(
+                    context_name="pop_same_seed_apf",
+                    rows=same_seed_rows,
+                    selected_traj_id=f"pop_same_seed_pop_{pop_idx:03d}_seed_{selected_seed_idx:03d}",
+                ),
+            }
+        if all(seed_int is not None for seed_int in seed_ints):
+            grid_rows = []
+            for j in range(params_batch.shape[0]):
+                for k_seed, seed_int in enumerate(seed_ints):
+                    grid_rows.append(
+                        {
+                            "traj_id": f"pop_seed_grid_pop_{j:03d}_seed_{k_seed:03d}",
+                            "selection_idx": int(j * seed_keys.shape[0] + k_seed),
+                            "source_run_idx": int(run_idx),
+                            "run_seed": int(seed_int),
+                            "params": np.asarray(params_batch[j], dtype=np.float32),
+                            "loss": float("nan"),
+                        }
+                    )
+            if optimizer_context_apf.get("status") != "ok":
+                optimizer_context_apf = {"status": "ok"}
+            optimizer_context_apf["all_seeds_pop_grid"] = run_apf_context(
+                context_name="pop_all_seeds_flat_apf",
+                rows=grid_rows,
+                selected_traj_id=f"pop_seed_grid_pop_{pop_idx:03d}_seed_{selected_seed_idx:03d}",
+            )
+        elif seed_keys.size:
+            optimizer_context_apf["all_seeds_pop_grid"] = {
+                "status": "skipped",
+                "reason": "at least one optimizer PRNGKey is not representable as PRNGKey(int)",
+                "seed_keys": [[int(x) for x in np.asarray(key).reshape(-1)] for key in seed_keys],
+            }
     if apf_xy.shape != opt_xy.shape:
         raise ValueError(f"APF/optimization xy shape mismatch: apf={apf_xy.shape}, opt={opt_xy.shape}")
     diff = np.asarray(apf_xy, dtype=np.float32) - np.asarray(opt_xy, dtype=np.float32)
@@ -865,6 +998,7 @@ def _run_replay_smoke(
         "selected_checkpoint_audit": selected_audit,
         "reference_mode": reference_mode,
         "reference_details": reference_details,
+        "optimizer_context_apf": optimizer_context_apf,
         "initial_snapshot_diff": _snapshot_diff_summary(apf_initial_snapshot, reference_initial_snapshot),
         "scalar_initial_snapshot_diff": _snapshot_diff_summary(apf_initial_snapshot, scalar_initial_snapshot),
         "apf_vs_rollout_config_initial_snapshot_diff": _snapshot_diff_summary(apf_initial_snapshot, rollout_initial_snapshot),
