@@ -447,6 +447,99 @@ def _optimization_lagrangian_xy_from_optimizer_batch(
     return np.asarray(jax.device_get(xy), dtype=np.float32)
 
 
+def _optimization_lagrangian_xy_from_flat_pair_batch(
+    *,
+    opt_flat: Any,
+    params_batch: np.ndarray,
+    seed_keys: np.ndarray,
+    pop_idx: int,
+    seed_idx: int,
+    rollout_steps: int,
+    sample_every_steps: int,
+) -> np.ndarray:
+    import jax
+    import jax.numpy as jnp
+    from flowlenia_minibang_simulate import _init_lagrangian_points_jax
+
+    args = OmegaConf.create(OmegaConf.to_container(opt_flat, resolve=True))
+    args.rollout_steps = int(rollout_steps)
+    args.sample_every_steps = int(sample_every_steps)
+    substrate = _make_substrate(args)
+    params_np = np.asarray(params_batch, dtype=np.float32)
+    seed_np = np.asarray(seed_keys, dtype=np.uint32)
+    n_pop = int(params_np.shape[0])
+    n_seed = int(seed_np.shape[0])
+    params_flat = np.repeat(params_np, n_seed, axis=0)
+    seed_flat = np.tile(seed_np[None, :, :], (n_pop, 1, 1)).reshape((n_pop * n_seed, 2))
+    params_j = jnp.asarray(params_flat)
+    seed_keys_j = jnp.asarray(seed_flat)
+
+    _ = substrate.init_state(jax.random.PRNGKey(0), params_j[0])
+    rt = substrate.RT
+
+    lag_n = int(_get(args, "metric_lagrangian_n_particles", 8192))
+    lag_init_mode = str(_get(args, "metric_lagrangian_init_mode", "mass"))
+    lag_flow_channel = int(_get(args, "metric_lagrangian_flow_channel", -1))
+    lag_flow_reduce = str(_get(args, "metric_lagrangian_flow_reduce", "mass_weighted"))
+    lag_channel_mode = str(_get(args, "metric_lagrangian_channel_mode", "resample"))
+    lag_noise_model = str(_get(args, "metric_lagrangian_noise_model", "rt_box"))
+    lag_diffusion_scale = float(_get(args, "metric_lagrangian_diffusion_scale", 1.0))
+
+    def rollout_one(eval_key, params):
+        rng_roll = _metric_roll_key(args, eval_key)
+        k_state, k_pts, k_ch, k_scan = jax.random.split(rng_roll, 4)
+        s0 = substrate.init_state(k_state, params)
+        if "F" not in s0:
+            raise ValueError("Optimization-style replay requires Flow-Lenia state with F.")
+        pts0 = _init_lagrangian_points_jax(
+            s0["A"],
+            n_particles=lag_n,
+            init_mode=lag_init_mode,
+            border=str(getattr(rt, "border", "wall")),
+            sigma=float(getattr(rt, "sigma", 0.0)),
+            key=k_pts,
+        )
+        if lag_channel_mode in ("fixed", "resample"):
+            ch0 = rt.sample_point_channels(pts0, s0["A"], k_ch)
+        else:
+            ch0 = jnp.zeros((lag_n,), dtype=jnp.int32)
+
+        def step_fn(state, key_step):
+            st, pts, ch = state
+            st = substrate.step_state(key_step, st, params)
+            lag_key = jax.random.fold_in(key_step, jnp.uint32(0x4C4147))
+            pts, ch = rt.advect_particles(
+                points=pts,
+                F=st["F"],
+                A=st["A"],
+                channel=lag_flow_channel,
+                reduce=lag_flow_reduce,
+                point_channels=ch,
+                channel_mode=lag_channel_mode,
+                key=lag_key,
+                noise_model=lag_noise_model,
+                diffusion_scale=lag_diffusion_scale,
+            )
+            return (st, pts, ch), None
+
+        def chunk_fn(state, key_chunk):
+            state_next, _ = jax.lax.scan(step_fn, state, jax.random.split(key_chunk, int(sample_every_steps)))
+            return state_next, state_next[1]
+
+        time_sampling = int(rollout_steps) // int(sample_every_steps)
+        (_, _, _), xy_seq = jax.lax.scan(
+            chunk_fn,
+            (s0, pts0, ch0),
+            jax.random.split(k_scan, time_sampling),
+        )
+        return xy_seq
+
+    xy_all = jax.vmap(rollout_one)(seed_keys_j, params_j)
+    flat_idx = int(pop_idx) * n_seed + int(seed_idx)
+    xy = xy_all[flat_idx]
+    return np.asarray(jax.device_get(xy), dtype=np.float32)
+
+
 def _optimization_initial_snapshot_from_optimizer_batch(
     *,
     opt_flat: Any,
@@ -1033,6 +1126,7 @@ def _run_replay_smoke(
     opt_xy_with_initial = scalar_opt_xy_with_initial
     reference_initial_snapshot = scalar_initial_snapshot
     batch_inputs = _optimizer_batch_reference_inputs(run_dir, int(seed_idx))
+    flat_pair_vmap_xy: np.ndarray | None = None
     if batch_inputs is not None:
         reference_mode = "optimizer_original_pop_batch"
         reference_details = {
@@ -1061,6 +1155,15 @@ def _run_replay_smoke(
             rollout_steps=int(rollout_steps),
             sample_every_steps=sample_every,
             include_initial=True,
+        )
+        flat_pair_vmap_xy = _optimization_lagrangian_xy_from_flat_pair_batch(
+            opt_flat=opt_flat,
+            params_batch=np.asarray(batch_inputs["params_batch"], dtype=np.float32),
+            seed_keys=np.asarray(batch_inputs["seed_keys"], dtype=np.uint32),
+            pop_idx=int(batch_inputs["pop_idx"]),
+            seed_idx=int(batch_inputs["seed_idx"]),
+            rollout_steps=int(rollout_steps),
+            sample_every_steps=sample_every,
         )
         reference_initial_snapshot = _optimization_initial_snapshot_from_optimizer_batch(
             opt_flat=opt_flat,
@@ -1189,11 +1292,19 @@ def _run_replay_smoke(
     per_sample_mean = np.nanmean(np.abs(diff).reshape((diff.shape[0], -1)), axis=1)
     first_failed = np.flatnonzero(per_sample_max > float(atol))
     ok = bool(max_abs <= float(atol))
+    flat_pair_vmap_reference = None
+    if flat_pair_vmap_xy is not None:
+        flat_pair_vmap_reference = {
+            "diff_vs_optimizer_nested_reference": _xy_diff_summary(flat_pair_vmap_xy, opt_xy, atol=atol),
+            "diff_vs_single_selected_apf": _xy_diff_summary(flat_pair_vmap_xy, apf_xy, atol=atol),
+            "diff_vs_scalar_reference": _xy_diff_summary(flat_pair_vmap_xy, scalar_opt_xy, atol=atol),
+        }
     return {
         "status": "ok" if ok else "failed",
         "selected_checkpoint_audit": selected_audit,
         "reference_mode": reference_mode,
         "reference_details": reference_details,
+        "flat_pair_vmap_reference": flat_pair_vmap_reference,
         "optimizer_context_apf": optimizer_context_apf,
         "one_step_diagnostic": one_step,
         "initial_snapshot_diff": _snapshot_diff_summary(apf_initial_snapshot, reference_initial_snapshot),
