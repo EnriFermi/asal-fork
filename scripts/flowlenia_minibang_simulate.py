@@ -1426,9 +1426,14 @@ def simulate_batch(
         seeds = [int(seed) for seed in run_seed_values]
         if run_seed_protocol == "optimization_metric":
             eval_keys = jnp.stack([jax.random.PRNGKey(seed) for seed in seeds], axis=0)
-            roll_metric_pairs = jax.vmap(lambda key: jax.random.split(key, 2))(eval_keys)
-            rng_roll = roll_metric_pairs[:, 0]
-            metric_keys = roll_metric_pairs[:, 1]
+            if _as_bool(_get(args, "log_clip_evolution", False), False):
+                roll_metric_clip = jax.vmap(lambda key: jax.random.split(key, 3))(eval_keys)
+                rng_roll = roll_metric_clip[:, 0]
+                metric_keys = roll_metric_clip[:, 1]
+            else:
+                roll_metric_pairs = jax.vmap(lambda key: jax.random.split(key, 2))(eval_keys)
+                rng_roll = roll_metric_pairs[:, 0]
+                metric_keys = roll_metric_pairs[:, 1]
             roll_parts = jax.vmap(lambda key: jax.random.split(key, 4))(rng_roll)
             init_keys = roll_parts[:, 0]
             lag_keys = roll_parts[:, 1]
