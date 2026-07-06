@@ -616,7 +616,7 @@ def _load_first_apf_snapshot(apf_dir: Path) -> dict[str, np.ndarray]:
             raise ValueError(f"{first_path} has empty steps.")
         idx = int(np.argmin(np.abs(steps - 0)))
         out = {"steps": steps}
-        for key in ("A", "P", "F", "lagrangian_xy", "lagrangian_c"):
+        for key in ("A", "P", "F", "lagrangian_xy", "lagrangian_c", "resume_stepper_mode"):
             if key in data.files:
                 arr = np.asarray(data[key])
                 out[key] = arr[idx]
@@ -1000,6 +1000,7 @@ def _run_replay_smoke(
     output_root: Path,
     atol: float,
 ) -> dict[str, Any]:
+    import flowlenia_minibang_simulate as minibang_sim
     from flowlenia_minibang_common import load_config as load_rollout_config
     from flowlenia_minibang_simulate import _load_lagrangian_series, simulate_batch
 
@@ -1292,6 +1293,10 @@ def _run_replay_smoke(
     per_sample_mean = np.nanmean(np.abs(diff).reshape((diff.shape[0], -1)), axis=1)
     first_failed = np.flatnonzero(per_sample_max > float(atol))
     ok = bool(max_abs <= float(atol))
+    apf_chunk_stepper_mode = None
+    if "resume_stepper_mode" in apf_initial_snapshot:
+        raw_mode = np.asarray(apf_initial_snapshot["resume_stepper_mode"])
+        apf_chunk_stepper_mode = str(raw_mode.item() if raw_mode.shape == () else raw_mode.reshape(-1)[0])
     flat_pair_vmap_reference = None
     if flat_pair_vmap_xy is not None:
         flat_pair_vmap_reference = {
@@ -1302,6 +1307,8 @@ def _run_replay_smoke(
     return {
         "status": "ok" if ok else "failed",
         "selected_checkpoint_audit": selected_audit,
+        "apf_module_stepper_mode": str(getattr(minibang_sim, "OPTIMIZATION_METRIC_STEPPER_MODE", "missing")),
+        "apf_chunk_stepper_mode": apf_chunk_stepper_mode,
         "reference_mode": reference_mode,
         "reference_details": reference_details,
         "flat_pair_vmap_reference": flat_pair_vmap_reference,
