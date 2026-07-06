@@ -155,9 +155,12 @@ def _group_optimized_scores(score_rows: list[dict[str, str]]) -> dict[int, list[
     for row in score_rows:
         if str(row.get("candidate_kind", "")).strip() != "optimized":
             continue
-        run_idx = _to_int(row.get("optimized_run_idx"))
+        # selected_root/run_XXX is keyed by the original optimization run id.
+        # In completed-run subsets, optimized_run_idx is a dense suite index and
+        # can refer to a different original run.
+        run_idx = _to_int(row.get("source_optimized_run_idx"))
         if run_idx is None:
-            run_idx = _to_int(row.get("source_optimized_run_idx"))
+            run_idx = _to_int(row.get("optimized_run_idx"))
         if run_idx is None:
             continue
         grouped.setdefault(run_idx, []).append(row)
@@ -179,6 +182,22 @@ def _summarize_one(run_idx: int, selected: dict[str, Any], sim_rows: list[dict[s
     rollout_seed_idx = [x for x in rollout_seed_idx if x is not None]
     run_seed_values = [_to_int(row.get("run_seed")) for row in sim_rows]
     run_seed_values = [x for x in run_seed_values if x is not None]
+    suite_run_values = [_to_int(row.get("optimized_run_idx")) for row in sim_rows]
+    suite_run_values = [x for x in suite_run_values if x is not None]
+    source_run_values = [_to_int(row.get("source_optimized_run_idx")) for row in sim_rows]
+    source_run_values = [x for x in source_run_values if x is not None]
+
+    sim_by_seed = {}
+    for sim_row in sim_rows:
+        seed_idx = _to_int(sim_row.get("rollout_seed_idx"))
+        if seed_idx is None:
+            continue
+        sim_by_seed[int(seed_idx)] = _to_float(sim_row.get("full_score_train_tau_mspd"))
+    common_seed_diffs = []
+    for seed_idx, opt_val in enumerate(opt_seed_scores):
+        sim_val = sim_by_seed.get(seed_idx, float("nan"))
+        if math.isfinite(opt_val) and math.isfinite(sim_val):
+            common_seed_diffs.append(float(opt_val) - float(sim_val))
 
     row: dict[str, Any] = {
         "run": f"run_{run_idx:03d}",
@@ -193,10 +212,13 @@ def _summarize_one(run_idx: int, selected: dict[str, Any], sim_rows: list[dict[s
         "optimizer_seed_min_mspd": meta.get("seed_min_mspd", np.nan),
         "optimizer_seed_max_mspd": meta.get("seed_max_mspd", np.nan),
         "simulation_n_rows": len(sim_rows),
+        "simulation_suite_optimized_run_idx": ";".join(str(x) for x in sorted(set(suite_run_values))),
+        "simulation_source_optimized_run_idx": ";".join(str(x) for x in sorted(set(source_run_values))),
         "simulation_rollout_seed_idx": ";".join(str(x) for x in sorted(set(rollout_seed_idx))),
         "simulation_run_seeds": ";".join(str(x) for x in sorted(set(run_seed_values))),
         "simulation_eval_score_mspd_values": _format_list(eval_values),
         "simulation_full_score_train_tau_mspd_values": _format_list(full_train_values),
+        "per_seed_optimizer_minus_simulation_full_train": _format_list(common_seed_diffs),
         "selected_candidate_json": str(selected["selected_path"]),
     }
     row.update(_stats("simulation_eval_score_mspd", eval_values))
@@ -212,7 +234,15 @@ def _summarize_one(run_idx: int, selected: dict[str, Any], sim_rows: list[dict[s
     row["optimizer_minus_simulation_eval_mean"] = (
         opt_score - sim_eval_mean if math.isfinite(opt_score) and math.isfinite(sim_eval_mean) else np.nan
     )
-    row["simulation_status"] = "ok" if sim_rows else "missing_simulation_rows"
+    if not sim_rows:
+        status = "missing_simulation_rows"
+    elif len(_finite(opt_seed_scores)) != len(_finite(full_train_values)):
+        status = "seed_count_mismatch"
+    elif len(set(source_run_values)) != 1 or int(source_run_values[0]) != int(run_idx):
+        status = "source_run_mismatch"
+    else:
+        status = "ok"
+    row["simulation_status"] = status
     return row
 
 

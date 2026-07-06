@@ -103,6 +103,54 @@ def _discover_completed_runs(source_root: Path) -> list[dict[str, Any]]:
     return [row for row in rows if row["completed"]]
 
 
+def _optimization_eval_seed_count(run_dir: Path) -> int | None:
+    cfg_path = run_dir / "optimization_config.yaml"
+    if not cfg_path.exists():
+        return None
+    cfg = OmegaConf.load(cfg_path)
+    opt = cfg.get("optimization", {})
+    algorithm = str(opt.get("optimizer_algorithm", opt.get("optimization_algorithm", "cma_es"))).strip().lower()
+    if algorithm in {
+        "mirrored_openai_es",
+        "mirrored_batch_openai_es",
+        "openai_es",
+        "batch_openai_es",
+        "mirrored_es",
+        "antithetic_openai_es",
+    }:
+        raw = opt.get("openai_es_n_seeds", None)
+    else:
+        raw = opt.get("bs", None)
+    return None if raw is None else int(raw)
+
+
+def _validate_rollout_seed_count(completed: list[dict[str, Any]], requested: int) -> None:
+    missing = []
+    mismatches = []
+    for row in completed:
+        run_dir = Path(row["run_dir"])
+        expected = _optimization_eval_seed_count(run_dir)
+        if expected is None:
+            missing.append(str(run_dir))
+            continue
+        if int(expected) != int(requested):
+            mismatches.append((int(row["run_idx"]), str(run_dir), int(expected), int(requested)))
+    if missing:
+        raise ValueError(
+            "Cannot validate n_rollout_seeds against optimization configs; missing eval seed count for: "
+            + ", ".join(missing[:5])
+        )
+    if mismatches:
+        rows = [
+            f"run_{run_idx:03d}: optimization eval seed count={expected}, requested C1 n_rollout_seeds={requested} ({run_dir})"
+            for run_idx, run_dir, expected, requested in mismatches[:10]
+        ]
+        raise ValueError(
+            "C1 n_rollout_seeds must match the optimization eval seed count for exact fixed-init replay:\n"
+            + "\n".join(rows)
+        )
+
+
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
@@ -267,6 +315,7 @@ def main() -> int:
     completed = _discover_completed_runs(source_root)
     if not completed:
         raise RuntimeError(f"No completed optimization runs found under {source_root}.")
+    _validate_rollout_seed_count(completed, int(args.n_rollout_seeds))
 
     selected_dirs: list[str] = []
     selected_rows: list[dict[str, Any]] = []
