@@ -230,6 +230,50 @@ def _optimization_lagrangian_xy(
     return np.asarray(jax.device_get(xy_seq), dtype=np.float32)
 
 
+def _optimization_initial_snapshot(
+    *,
+    opt_flat: Any,
+    params: np.ndarray,
+    run_seed: int,
+) -> dict[str, np.ndarray]:
+    import jax
+    import jax.numpy as jnp
+    from flowlenia_minibang_simulate import _init_lagrangian_points_jax
+
+    args = OmegaConf.create(OmegaConf.to_container(opt_flat, resolve=True))
+    substrate = _make_substrate(args)
+    params_j = jnp.asarray(np.asarray(params, dtype=np.float32))
+    rng_roll, _rng_metric = jax.random.split(jax.random.PRNGKey(int(run_seed)), 2)
+    k_state, k_pts, k_ch, _k_scan = jax.random.split(rng_roll, 4)
+    s0 = substrate.init_state(k_state, params_j)
+    if "F" not in s0:
+        raise ValueError("Optimization-style replay requires Flow-Lenia state with F.")
+    rt = substrate.RT
+
+    lag_n = int(_get(args, "metric_lagrangian_n_particles", 8192))
+    lag_init_mode = str(_get(args, "metric_lagrangian_init_mode", "mass"))
+    lag_channel_mode = str(_get(args, "metric_lagrangian_channel_mode", "resample"))
+    pts0 = _init_lagrangian_points_jax(
+        s0["A"],
+        n_particles=lag_n,
+        init_mode=lag_init_mode,
+        border=str(getattr(rt, "border", "wall")),
+        sigma=float(getattr(rt, "sigma", 0.0)),
+        key=k_pts,
+    )
+    if lag_channel_mode in ("fixed", "resample"):
+        ch0 = rt.sample_point_channels(pts0, s0["A"], k_ch)
+    else:
+        ch0 = jnp.zeros((lag_n,), dtype=jnp.int32)
+    return {
+        "A": np.asarray(jax.device_get(s0["A"]), dtype=np.float32),
+        "P": np.asarray(jax.device_get(s0["P"]), dtype=np.float32),
+        "F": np.asarray(jax.device_get(s0["F"]), dtype=np.float32),
+        "lagrangian_xy": np.asarray(jax.device_get(pts0), dtype=np.float32),
+        "lagrangian_c": np.asarray(jax.device_get(ch0), dtype=np.int32),
+    }
+
+
 def _optimizer_batch_reference_inputs(run_dir: Path, seed_idx: int) -> dict[str, Any] | None:
     meta_path = run_dir / "selected_candidate.json"
     if not meta_path.exists():
@@ -357,6 +401,115 @@ def _optimization_lagrangian_xy_from_optimizer_batch(
     )(params_j)
     xy = xy_all[int(pop_idx), int(seed_idx)]
     return np.asarray(jax.device_get(xy), dtype=np.float32)
+
+
+def _optimization_initial_snapshot_from_optimizer_batch(
+    *,
+    opt_flat: Any,
+    params_batch: np.ndarray,
+    seed_keys: np.ndarray,
+    pop_idx: int,
+    seed_idx: int,
+) -> dict[str, np.ndarray]:
+    import jax
+    import jax.numpy as jnp
+    from flowlenia_minibang_simulate import _init_lagrangian_points_jax
+
+    args = OmegaConf.create(OmegaConf.to_container(opt_flat, resolve=True))
+    substrate = _make_substrate(args)
+    params_j = jnp.asarray(np.asarray(params_batch, dtype=np.float32))
+    seed_keys_j = jnp.asarray(np.asarray(seed_keys, dtype=np.uint32))
+
+    _ = substrate.init_state(jax.random.PRNGKey(0), params_j[0])
+    rt = substrate.RT
+
+    lag_n = int(_get(args, "metric_lagrangian_n_particles", 8192))
+    lag_init_mode = str(_get(args, "metric_lagrangian_init_mode", "mass"))
+    lag_channel_mode = str(_get(args, "metric_lagrangian_channel_mode", "resample"))
+
+    def init_one(eval_key, params):
+        rng_roll, _rng_metric = jax.random.split(eval_key, 2)
+        k_state, k_pts, k_ch, _k_scan = jax.random.split(rng_roll, 4)
+        s0 = substrate.init_state(k_state, params)
+        if "F" not in s0:
+            raise ValueError("Optimization-style replay requires Flow-Lenia state with F.")
+        pts0 = _init_lagrangian_points_jax(
+            s0["A"],
+            n_particles=lag_n,
+            init_mode=lag_init_mode,
+            border=str(getattr(rt, "border", "wall")),
+            sigma=float(getattr(rt, "sigma", 0.0)),
+            key=k_pts,
+        )
+        if lag_channel_mode in ("fixed", "resample"):
+            ch0 = rt.sample_point_channels(pts0, s0["A"], k_ch)
+        else:
+            ch0 = jnp.zeros((lag_n,), dtype=jnp.int32)
+        return {
+            "A": s0["A"],
+            "P": s0["P"],
+            "F": s0["F"],
+            "lagrangian_xy": pts0,
+            "lagrangian_c": ch0,
+        }
+
+    snap_all = jax.vmap(
+        lambda params: jax.vmap(lambda key: init_one(key, params))(seed_keys_j)
+    )(params_j)
+    snap = jax.tree.map(lambda x: x[int(pop_idx), int(seed_idx)], snap_all)
+    return {
+        "A": np.asarray(jax.device_get(snap["A"]), dtype=np.float32),
+        "P": np.asarray(jax.device_get(snap["P"]), dtype=np.float32),
+        "F": np.asarray(jax.device_get(snap["F"]), dtype=np.float32),
+        "lagrangian_xy": np.asarray(jax.device_get(snap["lagrangian_xy"]), dtype=np.float32),
+        "lagrangian_c": np.asarray(jax.device_get(snap["lagrangian_c"]), dtype=np.int32),
+    }
+
+
+def _load_first_apf_snapshot(apf_dir: Path) -> dict[str, np.ndarray]:
+    from flowlenia_minibang_common import list_apf_chunks
+
+    chunks = list_apf_chunks(apf_dir)
+    if not chunks:
+        raise FileNotFoundError(f"No APF chunks found in {apf_dir}.")
+    first_path = chunks[0][0]
+    with np.load(first_path) as data:
+        steps = np.asarray(data["steps"], dtype=np.int64)
+        if steps.size == 0:
+            raise ValueError(f"{first_path} has empty steps.")
+        idx = int(np.argmin(np.abs(steps - 0)))
+        out = {"steps": steps}
+        for key in ("A", "P", "F", "lagrangian_xy", "lagrangian_c"):
+            if key in data.files:
+                arr = np.asarray(data[key])
+                out[key] = arr[idx]
+        out["chunk_path"] = np.asarray(str(first_path))
+        return out
+
+
+def _snapshot_diff_summary(apf: dict[str, np.ndarray], ref: dict[str, np.ndarray]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key in ("A", "P", "F", "lagrangian_xy"):
+        if key not in apf or key not in ref:
+            out[f"{key}_status"] = "missing"
+            continue
+        a = np.asarray(apf[key], dtype=np.float32)
+        b = np.asarray(ref[key], dtype=np.float32)
+        if a.shape != b.shape:
+            out[f"{key}_status"] = "shape_mismatch"
+            out[f"{key}_apf_shape"] = list(a.shape)
+            out[f"{key}_ref_shape"] = list(b.shape)
+            continue
+        d = a - b
+        out[f"{key}_status"] = "ok"
+        out[f"{key}_max_abs_diff"] = float(np.nanmax(np.abs(d)))
+        out[f"{key}_mean_abs_diff"] = float(np.nanmean(np.abs(d)))
+    if "lagrangian_c" in apf and "lagrangian_c" in ref:
+        a = np.asarray(apf["lagrangian_c"], dtype=np.int32)
+        b = np.asarray(ref["lagrangian_c"], dtype=np.int32)
+        out["lagrangian_c_shape"] = list(a.shape)
+        out["lagrangian_c_mismatch_frac"] = float(np.mean(a != b)) if a.shape == b.shape else None
+    return out
 
 
 def _resolve_section(cfg: Any) -> Any:
@@ -541,6 +694,7 @@ def _run_replay_smoke(
         output_root=smoke_root,
         overwrite=True,
     )
+    apf_initial_snapshot = _load_first_apf_snapshot(smoke_root / selected_batch[0]["traj_id"] / "apf_logs")
     apf_steps, apf_xy_all = _load_lagrangian_series(smoke_root / selected_batch[0]["traj_id"] / "apf_logs")
     apf_mask = np.asarray(apf_steps) > 0
     apf_xy = np.asarray(apf_xy_all[apf_mask], dtype=np.float32)
@@ -560,10 +714,16 @@ def _run_replay_smoke(
         sample_every_steps=sample_every,
         include_initial=True,
     )
+    scalar_initial_snapshot = _optimization_initial_snapshot(
+        opt_flat=opt_flat,
+        params=params,
+        run_seed=run_seed,
+    )
     reference_mode = "scalar_selected_candidate"
     reference_details: dict[str, Any] = {}
     opt_xy = scalar_opt_xy
     opt_xy_with_initial = scalar_opt_xy_with_initial
+    reference_initial_snapshot = scalar_initial_snapshot
     batch_inputs = _optimizer_batch_reference_inputs(run_dir, int(seed_idx))
     if batch_inputs is not None:
         reference_mode = "optimizer_original_pop_batch"
@@ -594,6 +754,13 @@ def _run_replay_smoke(
             sample_every_steps=sample_every,
             include_initial=True,
         )
+        reference_initial_snapshot = _optimization_initial_snapshot_from_optimizer_batch(
+            opt_flat=opt_flat,
+            params_batch=np.asarray(batch_inputs["params_batch"], dtype=np.float32),
+            seed_keys=np.asarray(batch_inputs["seed_keys"], dtype=np.uint32),
+            pop_idx=int(batch_inputs["pop_idx"]),
+            seed_idx=int(batch_inputs["seed_idx"]),
+        )
     if apf_xy.shape != opt_xy.shape:
         raise ValueError(f"APF/optimization xy shape mismatch: apf={apf_xy.shape}, opt={opt_xy.shape}")
     diff = np.asarray(apf_xy, dtype=np.float32) - np.asarray(opt_xy, dtype=np.float32)
@@ -614,6 +781,8 @@ def _run_replay_smoke(
         "selected_checkpoint_audit": selected_audit,
         "reference_mode": reference_mode,
         "reference_details": reference_details,
+        "initial_snapshot_diff": _snapshot_diff_summary(apf_initial_snapshot, reference_initial_snapshot),
+        "scalar_initial_snapshot_diff": _snapshot_diff_summary(apf_initial_snapshot, scalar_initial_snapshot),
         "run_idx": int(run_idx),
         "seed_idx": int(seed_idx),
         "run_seed": int(run_seed),
