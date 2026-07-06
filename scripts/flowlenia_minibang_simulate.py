@@ -1502,32 +1502,45 @@ def simulate_batch(
         if use_run_seed_batch and run_seed_protocol == "optimization_metric":
             def advance(states_in, lag_xy_in, lag_ch_in, params_in, scan_chunk_keys_in, chunk_idx_in):
                 chunk_keys = scan_chunk_keys_in[:, chunk_idx_in]
-                rngs = jax.vmap(lambda key_in: jax.random.split(key_in, int(n_steps)))(chunk_keys)
-                rngs = jnp.swapaxes(rngs, 0, 1)
+                # Match main_opt_msc exactly: each trajectory runs its own
+                # lax.scan, then the whole per-trajectory scan is vmapped.
+                # scan(vmap(step)) is mathematically equivalent, but Flow-Lenia
+                # FFT/RT numerics diverge enough over a chunk to change MSPD.
+                def advance_one(key_chunk, st_i, pts_i, ch_i, params_i):
+                    rngs = jax.random.split(key_chunk, int(n_steps))
 
-                def scan_body(carry, keys_step):
-                    st, pts, ch = carry
-
-                    def one_step(key_i, st_i, pts_i, ch_i, params_i):
-                        st_next = substrate.step_state(key_i, st_i, params_i)
+                    def scan_body(carry, key_i):
+                        st, pts, ch = carry
+                        st_next = substrate.step_state(key_i, st, params_i)
                         lag_key = jax.random.fold_in(key_i, jnp.uint32(0x4C4147))
                         pts_next, ch_next = rt.advect_particles(
-                            points=pts_i,
+                            points=pts,
                             F=st_next["F"],
                             A=st_next["A"],
                             channel=lag_flow_channel,
                             reduce=lag_flow_reduce,
-                            point_channels=ch_i,
+                            point_channels=ch,
                             channel_mode=lag_channel_mode,
                             key=lag_key,
                             noise_model=lag_noise_model,
                             diffusion_scale=lag_diffusion_scale,
                         )
-                        return st_next, pts_next, ch_next
+                        return (st_next, pts_next, ch_next), None
 
-                    return jax.vmap(one_step)(keys_step, st, pts, ch, params_in), None
+                    (st_out_i, pts_out_i, ch_out_i), _ = jax.lax.scan(
+                        scan_body,
+                        (st_i, pts_i, ch_i),
+                        rngs,
+                    )
+                    return st_out_i, pts_out_i, ch_out_i
 
-                (st_out, pts_out, ch_out), _ = jax.lax.scan(scan_body, (states_in, lag_xy_in, lag_ch_in), rngs)
+                st_out, pts_out, ch_out = jax.vmap(advance_one)(
+                    chunk_keys,
+                    states_in,
+                    lag_xy_in,
+                    lag_ch_in,
+                    params_in,
+                )
                 return st_out, pts_out, ch_out, scan_chunk_keys_in, chunk_idx_in + jnp.asarray(1, dtype=jnp.int32)
         elif use_run_seed_batch:
             def advance(states_in, lag_xy_in, lag_ch_in, params_in, rng_batch_in):
