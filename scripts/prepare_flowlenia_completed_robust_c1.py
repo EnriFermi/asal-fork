@@ -11,6 +11,56 @@ from omegaconf import OmegaConf
 
 from export_flowlenia_openai_es_robust_pioneer import run as export_robust_pioneer
 
+FLOWLENIA_REPLAY_SUBSTRATE_KEYS = (
+    "substrate",
+    "grid_size",
+    "C",
+    "k",
+    "kernel_components",
+    "M",
+    "dd",
+    "dt",
+    "sigma",
+    "flow_sigma",
+    "border",
+    "mix_rule",
+    "sobel_impl",
+    "base_seed",
+    "seed_patch_size",
+    "seed_n_patches",
+    "seed_mode",
+    "p_constant_per_patch",
+    "render_mode",
+    "clip1",
+    "clip2",
+    "mutations",
+    "mutation_sz",
+    "mutation_p",
+    "mutation_scale",
+    "optimize_mutation_scale",
+    "volcano",
+    "volcano_sz",
+    "volcano_p",
+    "volcano_delta",
+    "food",
+    "food_interval",
+    "food_n",
+    "food_sz",
+    "food_amount",
+    "food_consume_rate",
+    "food_bonus",
+    "mass_decay",
+    "food_channel",
+    "food_auto_size",
+    "food_auto_scale",
+    "food_conv_mode",
+    "food_vis_scale",
+    "food_vis_color",
+    "food_diffusion_alpha",
+    "mass_clip_eps",
+    "mass_renorm",
+)
+
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
@@ -54,6 +104,69 @@ def _get_nested(cfg: Any, path: tuple[str, ...], default: Any = None) -> Any:
         except Exception:
             cur = getattr(cur, key, default)
     return cur
+
+
+def _plain_value(value: Any) -> Any:
+    if OmegaConf.is_config(value):
+        return OmegaConf.to_container(value, resolve=True)
+    return value
+
+
+def _effective_optimization_flat(run_dir: Path) -> Any:
+    cfg_path = run_dir / "optimization_config.yaml"
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"Missing optimization_config.yaml for replay substrate audit: {cfg_path}")
+    cfg = OmegaConf.load(cfg_path)
+    flat = OmegaConf.merge(
+        cfg.get("meta", {}),
+        cfg.get("substrate", {}),
+        cfg.get("evaluation", {}),
+        cfg.get("optimization", {}),
+        cfg.get("logging", {}),
+        cfg.get("metric", {}),
+    )
+    substrate_cfg = cfg.get("substrate", {})
+    if str(substrate_cfg.get("substrate", "")).strip().lower() == "lenia_flow":
+        flow_sigma = substrate_cfg.get("flow_sigma", substrate_cfg.get("sigma", None))
+        if flow_sigma is not None and flat.get("flow_sigma", None) is None:
+            # Direct main_opt_msc now protects this value, but older archived
+            # optimization_config.yaml files do not contain flow_sigma.  For
+            # exact replay of those old runs, absence of flow_sigma is
+            # intentional: their flat args used optimization.sigma as physical
+            # Flow-Lenia sigma.
+            pass
+    return flat
+
+
+def _flowlenia_replay_substrate_overrides(completed: list[dict[str, Any]]) -> dict[str, Any]:
+    overrides: dict[str, Any] = {}
+    reference_values: dict[str, Any] = {}
+    for row in completed:
+        run_dir = Path(row["run_dir"])
+        flat = _effective_optimization_flat(run_dir)
+        if str(flat.get("substrate", "")).strip().lower() != "lenia_flow":
+            continue
+        for key in FLOWLENIA_REPLAY_SUBSTRATE_KEYS:
+            if flat.get(key, None) is None:
+                continue
+            value = _plain_value(flat.get(key))
+            if key == "sigma" and flat.get("flow_sigma", None) is not None:
+                # In fixed configs, `sigma` may still be the optimizer search
+                # radius in the flat namespace.  The physical substrate value
+                # is protected by flow_sigma.
+                value = _plain_value(flat.get("flow_sigma"))
+            if key not in reference_values:
+                reference_values[key] = value
+                continue
+            if str(reference_values[key]) != str(value):
+                raise ValueError(
+                    "Completed optimization runs require different Flow-Lenia replay substrate values; "
+                    f"cannot use one APF rollout_config. key={key} first={reference_values[key]!r} "
+                    f"run_{int(row['run_idx']):03d}={value!r}"
+                )
+    for key, value in reference_values.items():
+        overrides[key] = value
+    return overrides
 
 
 def _configured_n_iters(run_dir: Path) -> int | None:
@@ -188,6 +301,7 @@ def _write_c1_config(
     num_random_baselines: int,
     batch_size: int,
     pair_seed_base: int,
+    rollout_substrate_overrides: dict[str, Any] | None = None,
 ) -> None:
     cfg = {
         "meta": {
@@ -268,6 +382,10 @@ def _write_c1_config(
             },
         },
     }
+    if rollout_substrate_overrides:
+        cfg["simulation"]["flow_lenia_arun_lagrangian_apf"]["rollout_overrides"] = {
+            "substrate": dict(rollout_substrate_overrides)
+        }
     output_config.parent.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(config=OmegaConf.create(cfg), f=str(output_config), resolve=False)
 
@@ -319,6 +437,7 @@ def main() -> int:
 
     selected_dirs: list[str] = []
     selected_rows: list[dict[str, Any]] = []
+    rollout_substrate_overrides = _flowlenia_replay_substrate_overrides(completed)
     for row in completed:
         run_idx = int(row["run_idx"])
         out_dir = selected_root / f"run_{run_idx:03d}"
@@ -362,6 +481,7 @@ def main() -> int:
         num_random_baselines=int(args.num_random_baselines),
         batch_size=int(args.batch_size),
         pair_seed_base=int(args.pair_seed_base),
+        rollout_substrate_overrides=rollout_substrate_overrides,
     )
 
     manifest_dir = output_config.parent / "generated_manifests" / output_config.stem
@@ -389,6 +509,7 @@ def main() -> int:
         },
         "selected_candidates_csv": _rel(manifest_dir / "selected_robust_candidates.csv"),
         "completed_runs_csv": _rel(manifest_dir / "completed_runs.csv"),
+        "rollout_substrate_overrides": rollout_substrate_overrides,
     }
     _write_json(manifest_dir / "summary.json", summary)
     print(json.dumps(summary, indent=2, sort_keys=True))

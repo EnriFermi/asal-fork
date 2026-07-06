@@ -143,6 +143,9 @@ def _build_run_config(paper_cfg, config_path: Path, run_idx: int):
         base_cfg.meta = OmegaConf.create()
     if base_cfg.get("logging") is None:
         base_cfg.logging = OmegaConf.create()
+    if str(base_cfg.get("substrate", {}).get("substrate", "")).strip().lower() == "lenia_flow":
+        if base_cfg.substrate.get("flow_sigma", None) is None and base_cfg.substrate.get("sigma", None) is not None:
+            base_cfg.substrate.flow_sigma = base_cfg.substrate.sigma
 
     paper_section = paper_cfg.get("paper_check", {})
     run_seed = int(paper_section.get("optimization_seed_base", 0)) + int(run_idx)
