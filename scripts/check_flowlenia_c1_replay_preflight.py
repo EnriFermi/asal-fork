@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -52,6 +53,79 @@ def _load_pickle(path: Path) -> Any:
         return pickle.load(f)
 
 
+def _array_sha256(arr: Any) -> str:
+    data = np.asarray(arr, dtype=np.float32)
+    return hashlib.sha256(np.ascontiguousarray(data).tobytes()).hexdigest()
+
+
+def _selected_checkpoint_audit(run_dir: Path, params: np.ndarray) -> dict[str, Any]:
+    meta_path = run_dir / "selected_candidate.json"
+    out: dict[str, Any] = {
+        "selected_run_dir": str(run_dir),
+        "best_params_sha256": _array_sha256(params),
+        "has_selected_candidate_json": bool(meta_path.exists()),
+    }
+    if not meta_path.exists():
+        return out
+
+    meta = json.loads(meta_path.read_text())
+    out.update(
+        {
+            "source_run_dir": str(meta.get("source_run_dir", "")),
+            "source_pop_traj": str(meta.get("source_pop_traj", "")),
+            "selected_iter": int(meta.get("iter", -1)),
+            "selected_pop_idx": int(meta.get("pop_idx", -1)),
+            "selected_score_mspd": float(meta.get("score_mspd", float("nan"))),
+            "selected_seed_scores_mspd": [float(x) for x in meta.get("seed_scores_mspd", [])],
+            "selected_tau": meta.get("tau", {}),
+            "selection_rule": str(meta.get("selection_rule", "")),
+        }
+    )
+
+    pop_path = Path(str(meta.get("source_pop_traj", "")))
+    if not pop_path.is_absolute():
+        pop_path = _REPO_ROOT / pop_path
+    out["source_pop_traj_resolved"] = str(pop_path)
+    out["source_pop_traj_exists"] = bool(pop_path.exists())
+    if not pop_path.exists():
+        return out
+
+    pop = _load_pickle(pop_path)
+    i_iter = int(meta.get("iter", -1))
+    pop_idx = int(meta.get("pop_idx", -1))
+    pop_params = np.asarray(pop.get("params"), dtype=np.float32)
+    if pop_params.ndim != 3 or i_iter < 0 or pop_idx < 0:
+        out["pop_param_check_error"] = f"bad pop params shape/index: shape={pop_params.shape}, iter={i_iter}, pop_idx={pop_idx}"
+        return out
+    if i_iter >= pop_params.shape[0] or pop_idx >= pop_params.shape[1]:
+        out["pop_param_check_error"] = f"selected index outside pop params shape={pop_params.shape}"
+        return out
+
+    expected = np.asarray(pop_params[i_iter, pop_idx], dtype=np.float32).reshape(-1)
+    diff = np.asarray(params, dtype=np.float32).reshape(-1) - expected
+    out.update(
+        {
+            "pop_params_shape": list(pop_params.shape),
+            "pop_selected_params_sha256": _array_sha256(expected),
+            "params_match_selected_pop": bool(np.nanmax(np.abs(diff)) == 0.0),
+            "params_vs_pop_max_abs_diff": float(np.nanmax(np.abs(diff))),
+            "params_vs_pop_mean_abs_diff": float(np.nanmean(np.abs(diff))),
+        }
+    )
+    for key in ("score_by_seed", "objective_score", "tau_steps"):
+        if key not in pop:
+            continue
+        arr = np.asarray(pop[key])
+        if arr.ndim >= 2 and i_iter < arr.shape[0] and pop_idx < arr.shape[1]:
+            value = arr[i_iter, pop_idx]
+            out[f"pop_selected_{key}"] = (
+                [float(x) for x in np.asarray(value).reshape(-1)]
+                if np.asarray(value).size > 1
+                else float(np.asarray(value).reshape(-1)[0])
+            )
+    return out
+
+
 def _flat_optimization_config(path: Path) -> Any:
     cfg = OmegaConf.load(path)
     return OmegaConf.merge(
@@ -84,6 +158,7 @@ def _optimization_lagrangian_xy(
     run_seed: int,
     rollout_steps: int,
     sample_every_steps: int,
+    include_initial: bool = False,
 ) -> np.ndarray:
     import jax
     import jax.numpy as jnp
@@ -150,6 +225,8 @@ def _optimization_lagrangian_xy(
         (s0, pts0, ch0),
         jax.random.split(k_scan, time_sampling),
     )
+    if include_initial:
+        xy_seq = jnp.concatenate((pts0[None, :, :], xy_seq), axis=0)
     return np.asarray(jax.device_get(xy_seq), dtype=np.float32)
 
 
@@ -270,6 +347,7 @@ def _run_replay_smoke(
     else:
         params, loss = best, float("nan")
     params = np.asarray(params, dtype=np.float32).reshape(-1)
+    selected_audit = _selected_checkpoint_audit(run_dir, params)
     opt_cfg_path = run_dir / "optimization_config.yaml"
     if not opt_cfg_path.exists():
         raise FileNotFoundError(f"Missing copied optimization_config.yaml: {opt_cfg_path}")
@@ -337,6 +415,7 @@ def _run_replay_smoke(
     apf_steps, apf_xy_all = _load_lagrangian_series(smoke_root / selected_batch[0]["traj_id"] / "apf_logs")
     apf_mask = np.asarray(apf_steps) > 0
     apf_xy = np.asarray(apf_xy_all[apf_mask], dtype=np.float32)
+    apf_xy_with_initial = np.asarray(apf_xy_all[np.asarray(apf_steps) >= 0], dtype=np.float32)
     opt_xy = _optimization_lagrangian_xy(
         opt_flat=opt_flat,
         params=params,
@@ -344,14 +423,27 @@ def _run_replay_smoke(
         rollout_steps=int(rollout_steps),
         sample_every_steps=sample_every,
     )
+    opt_xy_with_initial = _optimization_lagrangian_xy(
+        opt_flat=opt_flat,
+        params=params,
+        run_seed=run_seed,
+        rollout_steps=int(rollout_steps),
+        sample_every_steps=sample_every,
+        include_initial=True,
+    )
     if apf_xy.shape != opt_xy.shape:
         raise ValueError(f"APF/optimization xy shape mismatch: apf={apf_xy.shape}, opt={opt_xy.shape}")
     diff = np.asarray(apf_xy, dtype=np.float32) - np.asarray(opt_xy, dtype=np.float32)
     max_abs = float(np.nanmax(np.abs(diff)))
     mean_abs = float(np.nanmean(np.abs(diff)))
+    initial_diff = np.asarray(apf_xy_with_initial[0], dtype=np.float32) - np.asarray(opt_xy_with_initial[0], dtype=np.float32)
+    per_sample_max = np.nanmax(np.abs(diff).reshape((diff.shape[0], -1)), axis=1)
+    per_sample_mean = np.nanmean(np.abs(diff).reshape((diff.shape[0], -1)), axis=1)
+    first_failed = np.flatnonzero(per_sample_max > float(atol))
     ok = bool(max_abs <= float(atol))
     return {
         "status": "ok" if ok else "failed",
+        "selected_checkpoint_audit": selected_audit,
         "run_idx": int(run_idx),
         "seed_idx": int(seed_idx),
         "run_seed": int(run_seed),
@@ -359,6 +451,17 @@ def _run_replay_smoke(
         "sample_every_steps": int(sample_every),
         "n_samples_compared": int(opt_xy.shape[0]),
         "xy_shape": list(opt_xy.shape),
+        "apf_steps": [int(x) for x in np.asarray(apf_steps).reshape(-1)],
+        "initial_max_abs_xy_diff": float(np.nanmax(np.abs(initial_diff))),
+        "initial_mean_abs_xy_diff": float(np.nanmean(np.abs(initial_diff))),
+        "per_sample_max_abs_xy_diff": [float(x) for x in per_sample_max.reshape(-1)],
+        "per_sample_mean_abs_xy_diff": [float(x) for x in per_sample_mean.reshape(-1)],
+        "first_failed_sample_idx": int(first_failed[0]) if first_failed.size else None,
+        "first_failed_step": (
+            int(np.asarray(apf_steps)[np.asarray(apf_steps) > 0][int(first_failed[0])])
+            if first_failed.size
+            else None
+        ),
         "max_abs_xy_diff": max_abs,
         "mean_abs_xy_diff": mean_abs,
         "atol": float(atol),
