@@ -34,6 +34,9 @@ from flowlenia_minibang_common import (
 from paper_suite_metric_cache import chunks_input_identity, expected_metric_metadata, metadata_npz_payload
 
 
+OPTIMIZATION_METRIC_STEPPER_MODE = "vmap_scan_chunk_v2"
+
+
 def _ensure_jax() -> None:
     if "jax" not in globals():
         import jax as _jax
@@ -446,6 +449,7 @@ def _flush_run_buffers(run: dict[str, Any], args: Any) -> None:
         "resume_snapshot_interval",
         "resume_seed",
         "resume_lagrangian_seed",
+        "resume_stepper_mode",
         "state_t",
         "state_mass_cycle_start",
     ):
@@ -554,6 +558,7 @@ def _init_run_dirs(
                     resume_snapshot_interval=[],
                     resume_seed=[],
                     resume_lagrangian_seed=[],
+                    resume_stepper_mode=[],
                     state_t=[],
                     state_mass_cycle_start=[],
                 ),
@@ -1356,6 +1361,7 @@ def _capture_snapshot(
             buffers["resume_snapshot_interval"].append(np.asarray(run["resume_snapshot_interval"], dtype=np.int32))
             buffers["resume_seed"].append(np.asarray(run["resume_seed"], dtype=np.int64))
             buffers["resume_lagrangian_seed"].append(np.asarray(run["resume_lagrangian_seed"], dtype=np.int64))
+            buffers["resume_stepper_mode"].append(np.asarray(run["resume_stepper_mode"]))
             buffers["state_t"].append(np.asarray(state_t_np[i], dtype=np.int32))
             buffers["state_mass_cycle_start"].append(np.asarray(state_mass_cycle_start_np[i], dtype=np.float32))
         if len(buffers["steps"]) >= chunk_size:
@@ -1617,6 +1623,11 @@ def simulate_batch(
         run["resume_snapshot_interval"] = int(snapshot_interval)
         run["resume_seed"] = int(run_seed_i)
         run["resume_lagrangian_seed"] = int(run_seed_i if use_run_seed_batch else lagrangian_seed)
+        run["resume_stepper_mode"] = (
+            OPTIMIZATION_METRIC_STEPPER_MODE
+            if use_run_seed_batch and run_seed_protocol == "optimization_metric"
+            else "legacy_scan_vmap"
+        )
 
     rng = jax.random.PRNGKey(seed0 + 991 * (selection0 + 1))
     if use_run_seed_batch and run_seed_protocol == "optimization_metric":
