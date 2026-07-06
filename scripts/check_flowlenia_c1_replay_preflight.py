@@ -274,6 +274,50 @@ def _optimization_initial_snapshot(
     }
 
 
+def _rollout_flat_initial_snapshot(
+    *,
+    flat_args: dict[str, Any],
+    params: np.ndarray,
+    run_seed: int,
+) -> dict[str, np.ndarray]:
+    import jax
+    import jax.numpy as jnp
+    from flowlenia_minibang_simulate import _init_lagrangian_points_jax
+
+    args = OmegaConf.create(dict(flat_args))
+    substrate = _make_substrate(args)
+    params_j = jnp.asarray(np.asarray(params, dtype=np.float32))
+    rng_roll, _rng_metric = jax.random.split(jax.random.PRNGKey(int(run_seed)), 2)
+    k_state, k_pts, k_ch, _k_scan = jax.random.split(rng_roll, 4)
+    s0 = substrate.init_state(k_state, params_j)
+    if "F" not in s0:
+        raise ValueError("Rollout-flat replay requires Flow-Lenia state with F.")
+    rt = substrate.RT
+
+    lag_n = int(_get(args, "lagrangian_n_particles", _get(args, "metric_lagrangian_n_particles", 8192)))
+    lag_init_mode = str(_get(args, "lagrangian_init_mode", _get(args, "metric_lagrangian_init_mode", "mass")))
+    lag_channel_mode = str(_get(args, "lagrangian_channel_mode", _get(args, "metric_lagrangian_channel_mode", "resample")))
+    pts0 = _init_lagrangian_points_jax(
+        s0["A"],
+        n_particles=lag_n,
+        init_mode=lag_init_mode,
+        border=str(getattr(rt, "border", "wall")),
+        sigma=float(getattr(rt, "sigma", 0.0)),
+        key=k_pts,
+    )
+    if lag_channel_mode in ("fixed", "resample"):
+        ch0 = rt.sample_point_channels(pts0, s0["A"], k_ch)
+    else:
+        ch0 = jnp.zeros((lag_n,), dtype=jnp.int32)
+    return {
+        "A": np.asarray(jax.device_get(s0["A"]), dtype=np.float32),
+        "P": np.asarray(jax.device_get(s0["P"]), dtype=np.float32),
+        "F": np.asarray(jax.device_get(s0["F"]), dtype=np.float32),
+        "lagrangian_xy": np.asarray(jax.device_get(pts0), dtype=np.float32),
+        "lagrangian_c": np.asarray(jax.device_get(ch0), dtype=np.int32),
+    }
+
+
 def _optimizer_batch_reference_inputs(run_dir: Path, seed_idx: int) -> dict[str, Any] | None:
     meta_path = run_dir / "selected_candidate.json"
     if not meta_path.exists():
@@ -512,6 +556,16 @@ def _snapshot_diff_summary(apf: dict[str, np.ndarray], ref: dict[str, np.ndarray
     return out
 
 
+def _config_value_diff(left: Any, right: Any, keys: list[str]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for key in keys:
+        lv = _get(left, key, None)
+        rv = _get(right, key, None)
+        if str(lv) != str(rv):
+            out.append({"key": key, "left": None if lv is None else str(lv), "right": None if rv is None else str(rv)})
+    return out
+
+
 def _resolve_section(cfg: Any) -> Any:
     section = _get(_get(cfg, "simulation", {}), "flow_lenia_arun_lagrangian_apf", None)
     if section is None:
@@ -719,6 +773,11 @@ def _run_replay_smoke(
         params=params,
         run_seed=run_seed,
     )
+    rollout_initial_snapshot = _rollout_flat_initial_snapshot(
+        flat_args=flat_dict,
+        params=params,
+        run_seed=run_seed,
+    )
     reference_mode = "scalar_selected_candidate"
     reference_details: dict[str, Any] = {}
     opt_xy = scalar_opt_xy
@@ -783,6 +842,63 @@ def _run_replay_smoke(
         "reference_details": reference_details,
         "initial_snapshot_diff": _snapshot_diff_summary(apf_initial_snapshot, reference_initial_snapshot),
         "scalar_initial_snapshot_diff": _snapshot_diff_summary(apf_initial_snapshot, scalar_initial_snapshot),
+        "apf_vs_rollout_config_initial_snapshot_diff": _snapshot_diff_summary(apf_initial_snapshot, rollout_initial_snapshot),
+        "rollout_config_vs_optimization_initial_snapshot_diff": _snapshot_diff_summary(
+            rollout_initial_snapshot,
+            reference_initial_snapshot,
+        ),
+        "rollout_vs_optimization_config_diffs": _config_value_diff(
+            OmegaConf.create(flat_dict),
+            opt_flat,
+            [
+                "substrate",
+                "grid_size",
+                "C",
+                "k",
+                "kernel_components",
+                "M",
+                "dd",
+                "dt",
+                "sigma",
+                "border",
+                "mix_rule",
+                "sobel_impl",
+                "base_seed",
+                "seed_patch_size",
+                "seed_n_patches",
+                "seed_mode",
+                "p_constant_per_patch",
+                "render_mode",
+                "clip1",
+                "clip2",
+                "mutations",
+                "mutation_sz",
+                "mutation_p",
+                "mutation_scale",
+                "optimize_mutation_scale",
+                "volcano",
+                "volcano_sz",
+                "volcano_p",
+                "volcano_delta",
+                "food",
+                "food_interval",
+                "food_n",
+                "food_sz",
+                "food_amount",
+                "food_consume_rate",
+                "food_bonus",
+                "mass_decay",
+                "food_channel",
+                "food_auto_size",
+                "food_auto_scale",
+                "food_conv_mode",
+                "food_vis_scale",
+                "food_vis_color",
+                "food_diffusion_alpha",
+                "mass_clip_eps",
+                "mass_renorm",
+            ],
+        ),
         "run_idx": int(run_idx),
         "seed_idx": int(seed_idx),
         "run_seed": int(run_seed),
