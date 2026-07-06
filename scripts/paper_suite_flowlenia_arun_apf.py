@@ -62,6 +62,8 @@ def _output_paths(output_root: Path, traj_id: str) -> dict[str, Path]:
 def _expected_rollout_signature(rollout_config: Path, flat: Any) -> dict[str, Any]:
     keys = (
         "grid_size",
+        "sigma",
+        "flow_sigma",
         "seed_n_patches",
         "seed_patch_size",
         "rollout_steps",
@@ -112,6 +114,21 @@ def _apply_section_rollout_overrides(rollout_cfg: Any, rollout_flat: Any, sectio
     flat_out = OmegaConf.create(OmegaConf.to_container(rollout_flat, resolve=False))
     if cfg_out.get("minibang", None) is None:
         cfg_out.minibang = OmegaConf.create()
+    section_names = {"meta", "substrate", "simulation", "logging", "metric", "minibang"}
+    rollout_overrides = _get(section, "rollout_overrides", None)
+    if rollout_overrides is not None:
+        for section_name, values in rollout_overrides.items():
+            name = str(section_name)
+            if name not in section_names:
+                raise ValueError(
+                    "flow_lenia_arun_lagrangian_apf.rollout_overrides keys must be one of "
+                    f"{sorted(section_names)}, got {name!r}."
+                )
+            if cfg_out.get(name, None) is None:
+                cfg_out[name] = OmegaConf.create()
+            cfg_out[name] = OmegaConf.merge(cfg_out.get(name, {}), values)
+            if values is not None:
+                flat_out = OmegaConf.merge(flat_out, values)
     for key in passthrough_keys:
         value = _get(section, key, None)
         if value is None:

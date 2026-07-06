@@ -796,14 +796,22 @@ def load_config():
     if not OmegaConf.has_resolver("env"):
         OmegaConf.register_new_resolver("env", lambda k, default=None: os.getenv(k, default))
     cfg = OmegaConf.load(sys.argv[1])
+    substrate_cfg = cfg.get("substrate", {})
     flat = OmegaConf.merge(
         cfg.get("meta", {}),
-        cfg.get("substrate", {}),
+        substrate_cfg,
         cfg.get("evaluation", {}),
         cfg.get("optimization", {}),
         cfg.get("logging", {}),
         cfg.get("metric", {}),
     )
+    if str(substrate_cfg.get("substrate", "")).strip().lower() == "lenia_flow":
+        # `optimization.sigma` is the optimizer search radius, while
+        # Flow-Lenia also has a physical substrate sigma.  Keep the physical
+        # value under `flow_sigma` so the flat namespace cannot collide.
+        flow_sigma = substrate_cfg.get("flow_sigma", substrate_cfg.get("sigma", None))
+        if flow_sigma is not None and flat.get("flow_sigma", None) is None:
+            flat.flow_sigma = flow_sigma
     return cfg, flat
 
 
