@@ -169,7 +169,7 @@ def _optimization_lagrangian_xy(
     args.sample_every_steps = int(sample_every_steps)
     substrate = _make_substrate(args)
     params_j = jnp.asarray(np.asarray(params, dtype=np.float32))
-    rng_roll, _rng_metric = jax.random.split(jax.random.PRNGKey(int(run_seed)), 2)
+    rng_roll = _metric_roll_key(args, jax.random.PRNGKey(int(run_seed)))
     k_state, k_pts, k_ch, k_scan = jax.random.split(rng_roll, 4)
     s0 = substrate.init_state(k_state, params_j)
     if "F" not in s0:
@@ -243,7 +243,7 @@ def _optimization_initial_snapshot(
     args = OmegaConf.create(OmegaConf.to_container(opt_flat, resolve=True))
     substrate = _make_substrate(args)
     params_j = jnp.asarray(np.asarray(params, dtype=np.float32))
-    rng_roll, _rng_metric = jax.random.split(jax.random.PRNGKey(int(run_seed)), 2)
+    rng_roll = _metric_roll_key(args, jax.random.PRNGKey(int(run_seed)))
     k_state, k_pts, k_ch, _k_scan = jax.random.split(rng_roll, 4)
     s0 = substrate.init_state(k_state, params_j)
     if "F" not in s0:
@@ -287,7 +287,7 @@ def _rollout_flat_initial_snapshot(
     args = OmegaConf.create(dict(flat_args))
     substrate = _make_substrate(args)
     params_j = jnp.asarray(np.asarray(params, dtype=np.float32))
-    rng_roll, _rng_metric = jax.random.split(jax.random.PRNGKey(int(run_seed)), 2)
+    rng_roll = _metric_roll_key(args, jax.random.PRNGKey(int(run_seed)))
     k_state, k_pts, k_ch, _k_scan = jax.random.split(rng_roll, 4)
     s0 = substrate.init_state(k_state, params_j)
     if "F" not in s0:
@@ -387,7 +387,7 @@ def _optimization_lagrangian_xy_from_optimizer_batch(
     lag_diffusion_scale = float(_get(args, "metric_lagrangian_diffusion_scale", 1.0))
 
     def rollout_one(eval_key, params):
-        rng_roll, _rng_metric = jax.random.split(eval_key, 2)
+        rng_roll = _metric_roll_key(args, eval_key)
         k_state, k_pts, k_ch, k_scan = jax.random.split(rng_roll, 4)
         s0 = substrate.init_state(k_state, params)
         if "F" not in s0:
@@ -472,7 +472,7 @@ def _optimization_initial_snapshot_from_optimizer_batch(
     lag_channel_mode = str(_get(args, "metric_lagrangian_channel_mode", "resample"))
 
     def init_one(eval_key, params):
-        rng_roll, _rng_metric = jax.random.split(eval_key, 2)
+        rng_roll = _metric_roll_key(args, eval_key)
         k_state, k_pts, k_ch, _k_scan = jax.random.split(rng_roll, 4)
         s0 = substrate.init_state(k_state, params)
         if "F" not in s0:
@@ -584,6 +584,16 @@ def _seed_int_from_prng_key(key: Any) -> int | None:
     return None
 
 
+def _metric_roll_key(args: Any, eval_key: Any) -> Any:
+    import jax
+
+    if bool(_get(args, "log_clip_evolution", True)):
+        rng_roll, _rng_metric, _rng_clip = jax.random.split(eval_key, 3)
+    else:
+        rng_roll, _rng_metric = jax.random.split(eval_key, 2)
+    return rng_roll
+
+
 def _config_value_diff(left: Any, right: Any, keys: list[str]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for key in keys:
@@ -592,6 +602,183 @@ def _config_value_diff(left: Any, right: Any, keys: list[str]) -> list[dict[str,
         if str(lv) != str(rv):
             out.append({"key": key, "left": None if lv is None else str(lv), "right": None if rv is None else str(rv)})
     return out
+
+
+def _first_metric_step_key(rng_roll: Any, *, rollout_steps: int, sample_every_steps: int) -> Any:
+    import jax
+
+    n_chunks = int(rollout_steps) // int(sample_every_steps)
+    first_chunk_key = jax.random.split(rng_roll, n_chunks)[0]
+    return jax.random.split(first_chunk_key, int(sample_every_steps))[0]
+
+
+def _lagrangian_settings(args: Any, *, prefer_logging_names: bool) -> dict[str, Any]:
+    if prefer_logging_names:
+        return {
+            "n_particles": int(_get(args, "lagrangian_n_particles", _get(args, "metric_lagrangian_n_particles", 8192))),
+            "init_mode": str(_get(args, "lagrangian_init_mode", _get(args, "metric_lagrangian_init_mode", "mass"))),
+            "flow_channel": int(_get(args, "lagrangian_flow_channel", _get(args, "metric_lagrangian_flow_channel", -1))),
+            "flow_reduce": str(_get(args, "lagrangian_flow_reduce", _get(args, "metric_lagrangian_flow_reduce", "mass_weighted"))),
+            "channel_mode": str(_get(args, "lagrangian_channel_mode", _get(args, "metric_lagrangian_channel_mode", "resample"))),
+            "noise_model": str(_get(args, "lagrangian_noise_model", _get(args, "metric_lagrangian_noise_model", "rt_box"))),
+            "diffusion_scale": float(
+                _get(args, "lagrangian_diffusion_scale", _get(args, "metric_lagrangian_diffusion_scale", 1.0))
+            ),
+        }
+    return {
+        "n_particles": int(_get(args, "metric_lagrangian_n_particles", 8192)),
+        "init_mode": str(_get(args, "metric_lagrangian_init_mode", "mass")),
+        "flow_channel": int(_get(args, "metric_lagrangian_flow_channel", -1)),
+        "flow_reduce": str(_get(args, "metric_lagrangian_flow_reduce", "mass_weighted")),
+        "channel_mode": str(_get(args, "metric_lagrangian_channel_mode", "resample")),
+        "noise_model": str(_get(args, "metric_lagrangian_noise_model", "rt_box")),
+        "diffusion_scale": float(_get(args, "metric_lagrangian_diffusion_scale", 1.0)),
+    }
+
+
+def _one_step_diagnostic(
+    *,
+    opt_flat: Any,
+    rollout_flat: dict[str, Any],
+    params: np.ndarray,
+    run_seed: int,
+    rollout_steps: int,
+    sample_every_steps: int,
+) -> dict[str, Any]:
+    import jax
+    import jax.numpy as jnp
+    from flowlenia_minibang_simulate import _init_lagrangian_points_jax
+
+    params_j = jnp.asarray(np.asarray(params, dtype=np.float32))
+    opt_args = OmegaConf.create(OmegaConf.to_container(opt_flat, resolve=True))
+    opt_args.rollout_steps = int(rollout_steps)
+    opt_args.sample_every_steps = int(sample_every_steps)
+    rollout_args = OmegaConf.create(dict(rollout_flat))
+    rollout_args.rollout_steps = int(rollout_steps)
+    rollout_args.sample_every_steps = int(sample_every_steps)
+
+    opt_substrate = _make_substrate(opt_args)
+    rollout_substrate = _make_substrate(rollout_args)
+    eval_key = jax.random.PRNGKey(int(run_seed))
+    opt_rng_roll = _metric_roll_key(opt_args, eval_key)
+    # This mirrors flowlenia_minibang_simulate.py. Missing log_clip_evolution keeps
+    # the historical APF behavior: two-way split.
+    if bool(_get(rollout_args, "log_clip_evolution", False)):
+        rollout_rng_roll = jax.random.split(eval_key, 3)[0]
+    else:
+        rollout_rng_roll = jax.random.split(eval_key, 2)[0]
+
+    opt_k_state, opt_k_pts, opt_k_ch, opt_k_scan = jax.random.split(opt_rng_roll, 4)
+    roll_k_state, roll_k_pts, roll_k_ch, roll_k_scan = jax.random.split(rollout_rng_roll, 4)
+    opt_step_key = _first_metric_step_key(
+        opt_k_scan,
+        rollout_steps=int(rollout_steps),
+        sample_every_steps=int(sample_every_steps),
+    )
+    roll_step_key = _first_metric_step_key(
+        roll_k_scan,
+        rollout_steps=int(rollout_steps),
+        sample_every_steps=int(sample_every_steps),
+    )
+
+    opt_settings = _lagrangian_settings(opt_args, prefer_logging_names=False)
+    roll_settings = _lagrangian_settings(rollout_args, prefer_logging_names=True)
+
+    def init_bundle(substrate, settings, k_state, k_pts, k_ch):
+        state0 = substrate.init_state(k_state, params_j)
+        rt = substrate.RT
+        pts0 = _init_lagrangian_points_jax(
+            state0["A"],
+            n_particles=int(settings["n_particles"]),
+            init_mode=str(settings["init_mode"]),
+            border=str(getattr(rt, "border", "wall")),
+            sigma=float(getattr(rt, "sigma", 0.0)),
+            key=k_pts,
+        )
+        if str(settings["channel_mode"]) in ("fixed", "resample"):
+            ch0 = rt.sample_point_channels(pts0, state0["A"], k_ch)
+        else:
+            ch0 = jnp.zeros((int(settings["n_particles"]),), dtype=jnp.int32)
+        return state0, pts0, ch0
+
+    def advance_one(substrate, settings, state0, pts0, ch0, key_step):
+        state1 = substrate.step_state(key_step, state0, params_j)
+        lag_key = jax.random.fold_in(key_step, jnp.uint32(0x4C4147))
+        pts1, ch1 = substrate.RT.advect_particles(
+            points=pts0,
+            F=state1["F"],
+            A=state1["A"],
+            channel=int(settings["flow_channel"]),
+            reduce=str(settings["flow_reduce"]),
+            point_channels=ch0,
+            channel_mode=str(settings["channel_mode"]),
+            key=lag_key,
+            noise_model=str(settings["noise_model"]),
+            diffusion_scale=float(settings["diffusion_scale"]),
+        )
+        return state1, pts1, ch1
+
+    opt_state0, opt_pts0, opt_ch0 = init_bundle(opt_substrate, opt_settings, opt_k_state, opt_k_pts, opt_k_ch)
+    roll_state0, roll_pts0, roll_ch0 = init_bundle(
+        rollout_substrate,
+        roll_settings,
+        roll_k_state,
+        roll_k_pts,
+        roll_k_ch,
+    )
+    opt_state1, opt_pts1, opt_ch1 = advance_one(
+        opt_substrate,
+        opt_settings,
+        opt_state0,
+        opt_pts0,
+        opt_ch0,
+        opt_step_key,
+    )
+    roll_state1, roll_pts1, roll_ch1 = advance_one(
+        rollout_substrate,
+        roll_settings,
+        roll_state0,
+        roll_pts0,
+        roll_ch0,
+        roll_step_key,
+    )
+
+    opt_initial = {
+        "A": np.asarray(jax.device_get(opt_state0["A"]), dtype=np.float32),
+        "P": np.asarray(jax.device_get(opt_state0["P"]), dtype=np.float32),
+        "F": np.asarray(jax.device_get(opt_state0["F"]), dtype=np.float32),
+        "lagrangian_xy": np.asarray(jax.device_get(opt_pts0), dtype=np.float32),
+        "lagrangian_c": np.asarray(jax.device_get(opt_ch0), dtype=np.int32),
+    }
+    roll_initial = {
+        "A": np.asarray(jax.device_get(roll_state0["A"]), dtype=np.float32),
+        "P": np.asarray(jax.device_get(roll_state0["P"]), dtype=np.float32),
+        "F": np.asarray(jax.device_get(roll_state0["F"]), dtype=np.float32),
+        "lagrangian_xy": np.asarray(jax.device_get(roll_pts0), dtype=np.float32),
+        "lagrangian_c": np.asarray(jax.device_get(roll_ch0), dtype=np.int32),
+    }
+    opt_step = {
+        "A": np.asarray(jax.device_get(opt_state1["A"]), dtype=np.float32),
+        "P": np.asarray(jax.device_get(opt_state1["P"]), dtype=np.float32),
+        "F": np.asarray(jax.device_get(opt_state1["F"]), dtype=np.float32),
+        "lagrangian_xy": np.asarray(jax.device_get(opt_pts1), dtype=np.float32),
+        "lagrangian_c": np.asarray(jax.device_get(opt_ch1), dtype=np.int32),
+    }
+    roll_step = {
+        "A": np.asarray(jax.device_get(roll_state1["A"]), dtype=np.float32),
+        "P": np.asarray(jax.device_get(roll_state1["P"]), dtype=np.float32),
+        "F": np.asarray(jax.device_get(roll_state1["F"]), dtype=np.float32),
+        "lagrangian_xy": np.asarray(jax.device_get(roll_pts1), dtype=np.float32),
+        "lagrangian_c": np.asarray(jax.device_get(roll_ch1), dtype=np.int32),
+    }
+    return {
+        "opt_log_clip_evolution": bool(_get(opt_args, "log_clip_evolution", True)),
+        "apf_log_clip_evolution": bool(_get(rollout_args, "log_clip_evolution", False)),
+        "opt_lagrangian_settings": opt_settings,
+        "apf_lagrangian_settings": roll_settings,
+        "initial_diff": _snapshot_diff_summary(roll_initial, opt_initial),
+        "after_one_step_diff": _snapshot_diff_summary(roll_step, opt_step),
+    }
 
 
 def _resolve_section(cfg: Any) -> Any:
@@ -771,6 +958,7 @@ def _run_replay_smoke(
             "compute_clusters": False,
         }
     )
+    flat_dict["log_clip_evolution"] = bool(_get(opt_flat, "log_clip_evolution", True))
     if int(flat_dict.get("jit_microbatch", sample_every)) < sample_every:
         flat_dict["jit_microbatch"] = sample_every
     rollout_cfg_i = OmegaConf.create(OmegaConf.to_container(rollout_cfg, resolve=True))
@@ -830,6 +1018,14 @@ def _run_replay_smoke(
         flat_args=flat_dict,
         params=params,
         run_seed=run_seed,
+    )
+    one_step = _one_step_diagnostic(
+        opt_flat=opt_flat,
+        rollout_flat=flat_dict,
+        params=params,
+        run_seed=run_seed,
+        rollout_steps=int(rollout_steps),
+        sample_every_steps=sample_every,
     )
     reference_mode = "scalar_selected_candidate"
     reference_details: dict[str, Any] = {}
@@ -999,6 +1195,7 @@ def _run_replay_smoke(
         "reference_mode": reference_mode,
         "reference_details": reference_details,
         "optimizer_context_apf": optimizer_context_apf,
+        "one_step_diagnostic": one_step,
         "initial_snapshot_diff": _snapshot_diff_summary(apf_initial_snapshot, reference_initial_snapshot),
         "scalar_initial_snapshot_diff": _snapshot_diff_summary(apf_initial_snapshot, scalar_initial_snapshot),
         "apf_vs_rollout_config_initial_snapshot_diff": _snapshot_diff_summary(apf_initial_snapshot, rollout_initial_snapshot),
