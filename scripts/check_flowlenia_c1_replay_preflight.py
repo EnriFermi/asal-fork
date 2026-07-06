@@ -230,6 +230,135 @@ def _optimization_lagrangian_xy(
     return np.asarray(jax.device_get(xy_seq), dtype=np.float32)
 
 
+def _optimizer_batch_reference_inputs(run_dir: Path, seed_idx: int) -> dict[str, Any] | None:
+    meta_path = run_dir / "selected_candidate.json"
+    if not meta_path.exists():
+        return None
+    meta = json.loads(meta_path.read_text())
+    pop_path = Path(str(meta.get("source_pop_traj", "")))
+    if not pop_path.is_absolute():
+        pop_path = _REPO_ROOT / pop_path
+    if not pop_path.exists():
+        return None
+    pop = _load_pickle(pop_path)
+    if "params" not in pop or "seed_keys" not in pop:
+        return None
+    i_iter = int(meta.get("iter", -1))
+    pop_idx = int(meta.get("pop_idx", -1))
+    params = np.asarray(pop["params"], dtype=np.float32)
+    seed_keys = np.asarray(pop["seed_keys"], dtype=np.uint32)
+    if params.ndim != 3 or seed_keys.ndim != 3:
+        return None
+    if i_iter < 0 or i_iter >= params.shape[0] or pop_idx < 0 or pop_idx >= params.shape[1]:
+        return None
+    if int(seed_idx) < 0 or int(seed_idx) >= seed_keys.shape[1]:
+        return None
+    return {
+        "iter": i_iter,
+        "pop_idx": pop_idx,
+        "seed_idx": int(seed_idx),
+        "params_batch": np.asarray(params[i_iter], dtype=np.float32),
+        "seed_keys": np.asarray(seed_keys[i_iter], dtype=np.uint32),
+        "selected_seed_key": [int(x) for x in np.asarray(seed_keys[i_iter, int(seed_idx)]).reshape(-1)],
+    }
+
+
+def _optimization_lagrangian_xy_from_optimizer_batch(
+    *,
+    opt_flat: Any,
+    params_batch: np.ndarray,
+    seed_keys: np.ndarray,
+    pop_idx: int,
+    seed_idx: int,
+    rollout_steps: int,
+    sample_every_steps: int,
+    include_initial: bool = False,
+) -> np.ndarray:
+    import jax
+    import jax.numpy as jnp
+    from flowlenia_minibang_simulate import _init_lagrangian_points_jax
+
+    args = OmegaConf.create(OmegaConf.to_container(opt_flat, resolve=True))
+    args.rollout_steps = int(rollout_steps)
+    args.sample_every_steps = int(sample_every_steps)
+    substrate = _make_substrate(args)
+    params_j = jnp.asarray(np.asarray(params_batch, dtype=np.float32))
+    seed_keys_j = jnp.asarray(np.asarray(seed_keys, dtype=np.uint32))
+
+    # Force RT construction before the vmapped rollout closes over it, matching
+    # the batched APF runner and avoiding accidental dependence on trace order.
+    _ = substrate.init_state(jax.random.PRNGKey(0), params_j[0])
+    rt = substrate.RT
+
+    lag_n = int(_get(args, "metric_lagrangian_n_particles", 8192))
+    lag_init_mode = str(_get(args, "metric_lagrangian_init_mode", "mass"))
+    lag_flow_channel = int(_get(args, "metric_lagrangian_flow_channel", -1))
+    lag_flow_reduce = str(_get(args, "metric_lagrangian_flow_reduce", "mass_weighted"))
+    lag_channel_mode = str(_get(args, "metric_lagrangian_channel_mode", "resample"))
+    lag_noise_model = str(_get(args, "metric_lagrangian_noise_model", "rt_box"))
+    lag_diffusion_scale = float(_get(args, "metric_lagrangian_diffusion_scale", 1.0))
+
+    def rollout_one(eval_key, params):
+        rng_roll, _rng_metric = jax.random.split(eval_key, 2)
+        k_state, k_pts, k_ch, k_scan = jax.random.split(rng_roll, 4)
+        s0 = substrate.init_state(k_state, params)
+        if "F" not in s0:
+            raise ValueError("Optimization-style replay requires Flow-Lenia state with F.")
+
+        pts0 = _init_lagrangian_points_jax(
+            s0["A"],
+            n_particles=lag_n,
+            init_mode=lag_init_mode,
+            border=str(getattr(rt, "border", "wall")),
+            sigma=float(getattr(rt, "sigma", 0.0)),
+            key=k_pts,
+        )
+        if lag_channel_mode in ("fixed", "resample"):
+            ch0 = rt.sample_point_channels(pts0, s0["A"], k_ch)
+        else:
+            ch0 = jnp.zeros((lag_n,), dtype=jnp.int32)
+
+        def step_fn(state, key_step):
+            st, pts, ch = state
+            st = substrate.step_state(key_step, st, params)
+            lag_key = jax.random.fold_in(key_step, jnp.uint32(0x4C4147))
+            pts, ch = rt.advect_particles(
+                points=pts,
+                F=st["F"],
+                A=st["A"],
+                channel=lag_flow_channel,
+                reduce=lag_flow_reduce,
+                point_channels=ch,
+                channel_mode=lag_channel_mode,
+                key=lag_key,
+                noise_model=lag_noise_model,
+                diffusion_scale=lag_diffusion_scale,
+            )
+            return (st, pts, ch), None
+
+        def chunk_fn(state, key_chunk):
+            state_next, _ = jax.lax.scan(step_fn, state, jax.random.split(key_chunk, int(sample_every_steps)))
+            return state_next, state_next[1]
+
+        time_sampling = int(rollout_steps) // int(sample_every_steps)
+        (_, _, _), xy_seq = jax.lax.scan(
+            chunk_fn,
+            (s0, pts0, ch0),
+            jax.random.split(k_scan, time_sampling),
+        )
+        if include_initial:
+            xy_seq = jnp.concatenate((pts0[None, :, :], xy_seq), axis=0)
+        return xy_seq
+
+    # This matches main_opt_msc.calc_loss_vv:
+    # vmap(vmap(calc_loss, in_axes=(0, None)), in_axes=(None, 0)).
+    xy_all = jax.vmap(
+        lambda params: jax.vmap(lambda key: rollout_one(key, params))(seed_keys_j)
+    )(params_j)
+    xy = xy_all[int(pop_idx), int(seed_idx)]
+    return np.asarray(jax.device_get(xy), dtype=np.float32)
+
+
 def _resolve_section(cfg: Any) -> Any:
     section = _get(_get(cfg, "simulation", {}), "flow_lenia_arun_lagrangian_apf", None)
     if section is None:
@@ -416,14 +545,14 @@ def _run_replay_smoke(
     apf_mask = np.asarray(apf_steps) > 0
     apf_xy = np.asarray(apf_xy_all[apf_mask], dtype=np.float32)
     apf_xy_with_initial = np.asarray(apf_xy_all[np.asarray(apf_steps) >= 0], dtype=np.float32)
-    opt_xy = _optimization_lagrangian_xy(
+    scalar_opt_xy = _optimization_lagrangian_xy(
         opt_flat=opt_flat,
         params=params,
         run_seed=run_seed,
         rollout_steps=int(rollout_steps),
         sample_every_steps=sample_every,
     )
-    opt_xy_with_initial = _optimization_lagrangian_xy(
+    scalar_opt_xy_with_initial = _optimization_lagrangian_xy(
         opt_flat=opt_flat,
         params=params,
         run_seed=run_seed,
@@ -431,9 +560,48 @@ def _run_replay_smoke(
         sample_every_steps=sample_every,
         include_initial=True,
     )
+    reference_mode = "scalar_selected_candidate"
+    reference_details: dict[str, Any] = {}
+    opt_xy = scalar_opt_xy
+    opt_xy_with_initial = scalar_opt_xy_with_initial
+    batch_inputs = _optimizer_batch_reference_inputs(run_dir, int(seed_idx))
+    if batch_inputs is not None:
+        reference_mode = "optimizer_original_pop_batch"
+        reference_details = {
+            "iter": int(batch_inputs["iter"]),
+            "pop_idx": int(batch_inputs["pop_idx"]),
+            "seed_idx": int(batch_inputs["seed_idx"]),
+            "params_batch_shape": list(np.asarray(batch_inputs["params_batch"]).shape),
+            "seed_keys_shape": list(np.asarray(batch_inputs["seed_keys"]).shape),
+            "selected_seed_key": batch_inputs["selected_seed_key"],
+        }
+        opt_xy = _optimization_lagrangian_xy_from_optimizer_batch(
+            opt_flat=opt_flat,
+            params_batch=np.asarray(batch_inputs["params_batch"], dtype=np.float32),
+            seed_keys=np.asarray(batch_inputs["seed_keys"], dtype=np.uint32),
+            pop_idx=int(batch_inputs["pop_idx"]),
+            seed_idx=int(batch_inputs["seed_idx"]),
+            rollout_steps=int(rollout_steps),
+            sample_every_steps=sample_every,
+        )
+        opt_xy_with_initial = _optimization_lagrangian_xy_from_optimizer_batch(
+            opt_flat=opt_flat,
+            params_batch=np.asarray(batch_inputs["params_batch"], dtype=np.float32),
+            seed_keys=np.asarray(batch_inputs["seed_keys"], dtype=np.uint32),
+            pop_idx=int(batch_inputs["pop_idx"]),
+            seed_idx=int(batch_inputs["seed_idx"]),
+            rollout_steps=int(rollout_steps),
+            sample_every_steps=sample_every,
+            include_initial=True,
+        )
     if apf_xy.shape != opt_xy.shape:
         raise ValueError(f"APF/optimization xy shape mismatch: apf={apf_xy.shape}, opt={opt_xy.shape}")
     diff = np.asarray(apf_xy, dtype=np.float32) - np.asarray(opt_xy, dtype=np.float32)
+    scalar_diff = np.asarray(apf_xy, dtype=np.float32) - np.asarray(scalar_opt_xy, dtype=np.float32)
+    scalar_initial_diff = (
+        np.asarray(apf_xy_with_initial[0], dtype=np.float32)
+        - np.asarray(scalar_opt_xy_with_initial[0], dtype=np.float32)
+    )
     max_abs = float(np.nanmax(np.abs(diff)))
     mean_abs = float(np.nanmean(np.abs(diff)))
     initial_diff = np.asarray(apf_xy_with_initial[0], dtype=np.float32) - np.asarray(opt_xy_with_initial[0], dtype=np.float32)
@@ -444,6 +612,8 @@ def _run_replay_smoke(
     return {
         "status": "ok" if ok else "failed",
         "selected_checkpoint_audit": selected_audit,
+        "reference_mode": reference_mode,
+        "reference_details": reference_details,
         "run_idx": int(run_idx),
         "seed_idx": int(seed_idx),
         "run_seed": int(run_seed),
@@ -454,6 +624,10 @@ def _run_replay_smoke(
         "apf_steps": [int(x) for x in np.asarray(apf_steps).reshape(-1)],
         "initial_max_abs_xy_diff": float(np.nanmax(np.abs(initial_diff))),
         "initial_mean_abs_xy_diff": float(np.nanmean(np.abs(initial_diff))),
+        "scalar_reference_initial_max_abs_xy_diff": float(np.nanmax(np.abs(scalar_initial_diff))),
+        "scalar_reference_initial_mean_abs_xy_diff": float(np.nanmean(np.abs(scalar_initial_diff))),
+        "scalar_reference_max_abs_xy_diff": float(np.nanmax(np.abs(scalar_diff))),
+        "scalar_reference_mean_abs_xy_diff": float(np.nanmean(np.abs(scalar_diff))),
         "per_sample_max_abs_xy_diff": [float(x) for x in per_sample_max.reshape(-1)],
         "per_sample_mean_abs_xy_diff": [float(x) for x in per_sample_mean.reshape(-1)],
         "first_failed_sample_idx": int(first_failed[0]) if first_failed.size else None,
