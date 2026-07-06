@@ -603,6 +603,30 @@ def _audit_generated_config(config_path: Path) -> dict[str, Any]:
     return out
 
 
+def _apply_section_rollout_overrides_for_preflight(rollout_cfg: Any, rollout_flat: Any, section: Any) -> tuple[Any, Any]:
+    cfg_out = OmegaConf.create(OmegaConf.to_container(rollout_cfg, resolve=False))
+    flat_out = OmegaConf.create(OmegaConf.to_container(rollout_flat, resolve=False))
+    overrides = _get(section, "rollout_overrides", None)
+    if overrides is not None:
+        allowed = {"meta", "substrate", "simulation", "logging", "metric", "minibang"}
+        for section_name, values in overrides.items():
+            name = str(section_name)
+            if name not in allowed:
+                raise ValueError(f"Unknown rollout_overrides section {name!r}; expected one of {sorted(allowed)}.")
+            if cfg_out.get(name, None) is None:
+                cfg_out[name] = OmegaConf.create()
+            cfg_out[name] = OmegaConf.merge(cfg_out.get(name, {}), values)
+            if values is not None:
+                flat_out = OmegaConf.merge(flat_out, values)
+    run_seed_protocol = _get(section, "run_seed_protocol", None)
+    if run_seed_protocol is not None:
+        if cfg_out.get("minibang", None) is None:
+            cfg_out.minibang = OmegaConf.create()
+        cfg_out.minibang.run_seed_protocol = run_seed_protocol
+        flat_out.run_seed_protocol = run_seed_protocol
+    return cfg_out, flat_out
+
+
 def _optimization_eval_seed_count(run_dir: Path) -> int | None:
     cfg_path = Path(run_dir) / "optimization_config.yaml"
     if not cfg_path.exists():
@@ -693,6 +717,7 @@ def _run_replay_smoke(
     if rollout_config is None or not rollout_config.exists():
         raise FileNotFoundError(f"rollout_config not found: {rollout_config}")
     rollout_cfg, rollout_flat = load_rollout_config(rollout_config, [])
+    rollout_cfg, rollout_flat = _apply_section_rollout_overrides_for_preflight(rollout_cfg, rollout_flat, section)
     sample_every = int(_get(rollout_flat, "sample_every_steps", _get(rollout_flat, "snapshot_interval", 50)))
     snapshot_interval = int(_get(rollout_flat, "snapshot_interval", sample_every))
     if sample_every != snapshot_interval:
