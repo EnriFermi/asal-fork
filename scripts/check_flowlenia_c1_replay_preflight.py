@@ -684,6 +684,43 @@ def _xy_diff_summary(apf_xy: np.ndarray, ref_xy: np.ndarray, *, atol: float) -> 
     }
 
 
+def _xy_pairwise_matrix(arrays: dict[str, np.ndarray], *, atol: float) -> dict[str, Any]:
+    names = [name for name, arr in arrays.items() if arr is not None]
+    pairs: dict[str, Any] = {}
+    closest: dict[str, list[dict[str, Any]]] = {}
+    for left_name in names:
+        left_rows: list[dict[str, Any]] = []
+        for right_name in names:
+            if left_name == right_name:
+                continue
+            summary = _xy_diff_summary(arrays[left_name], arrays[right_name], atol=atol)
+            key = f"{left_name}__vs__{right_name}"
+            pairs[key] = summary
+            if summary.get("status") != "shape_mismatch":
+                left_rows.append(
+                    {
+                        "name": right_name,
+                        "status": summary.get("status"),
+                        "max_abs_xy_diff": summary.get("max_abs_xy_diff"),
+                        "mean_abs_xy_diff": summary.get("mean_abs_xy_diff"),
+                    }
+                )
+        left_rows.sort(key=lambda row: (float(row.get("mean_abs_xy_diff", float("inf"))), float(row.get("max_abs_xy_diff", float("inf")))))
+        closest[left_name] = left_rows[:5]
+    return {
+        "array_names": names,
+        "pairs": pairs,
+        "closest_by_mean_abs": closest,
+    }
+
+
+def _array_shapes(arrays: dict[str, np.ndarray | None]) -> dict[str, list[int] | None]:
+    return {
+        name: (None if arr is None else [int(x) for x in np.asarray(arr).shape])
+        for name, arr in arrays.items()
+    }
+
+
 def _seed_int_from_prng_key(key: Any) -> int | None:
     arr = np.asarray(key, dtype=np.uint32).reshape(-1)
     if arr.size == 2 and int(arr[0]) == 0:
@@ -708,6 +745,61 @@ def _config_value_diff(left: Any, right: Any, keys: list[str]) -> list[dict[str,
         rv = _get(right, key, None)
         if str(lv) != str(rv):
             out.append({"key": key, "left": None if lv is None else str(lv), "right": None if rv is None else str(rv)})
+    return out
+
+
+def _file_sha256(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return None
+
+
+def _runtime_source_audit() -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "python": sys.version.split()[0],
+        "repo_root": str(_REPO_ROOT),
+    }
+    try:
+        import jax
+        import jaxlib
+
+        out.update(
+            {
+                "jax_version": getattr(jax, "__version__", "unknown"),
+                "jaxlib_version": getattr(jaxlib, "__version__", "unknown"),
+                "jax_backend": jax.default_backend(),
+                "jax_devices": [str(device) for device in jax.devices()],
+            }
+        )
+    except Exception as exc:
+        out["jax_audit_error"] = repr(exc)
+    try:
+        import flowlenia_minibang_simulate as minibang_sim
+
+        out["flowlenia_minibang_simulate_file"] = str(Path(minibang_sim.__file__).resolve())
+        out["flowlenia_minibang_simulate_stepper_mode"] = str(
+            getattr(minibang_sim, "OPTIMIZATION_METRIC_STEPPER_MODE", "missing")
+        )
+    except Exception as exc:
+        out["flowlenia_minibang_simulate_import_error"] = repr(exc)
+
+    files = [
+        Path(__file__).resolve(),
+        _REPO_ROOT / "scripts" / "flowlenia_minibang_simulate.py",
+        _REPO_ROOT / "scripts" / "main_opt_msc.py",
+        _REPO_ROOT / "substrates" / "lenia_flow" / "lenia_flow.py",
+        _REPO_ROOT / "substrates" / "lenia_flow" / "reintegration_tracking.py",
+    ]
+    source_sha256 = {}
+    for path in files:
+        resolved = Path(path).resolve()
+        try:
+            label = str(resolved.relative_to(_REPO_ROOT))
+        except ValueError:
+            label = str(resolved)
+        source_sha256[label] = _file_sha256(resolved)
+    out["source_sha256"] = source_sha256
     return out
 
 
@@ -885,6 +977,294 @@ def _one_step_diagnostic(
         "apf_lagrangian_settings": roll_settings,
         "initial_diff": _snapshot_diff_summary(roll_initial, opt_initial),
         "after_one_step_diff": _snapshot_diff_summary(roll_step, opt_step),
+    }
+
+
+def _apf_style_first_chunk_variants(
+    *,
+    rollout_flat: dict[str, Any],
+    params: np.ndarray,
+    run_seed: int,
+    rollout_steps: int,
+    sample_every_steps: int,
+) -> dict[str, np.ndarray]:
+    import jax
+    import jax.numpy as jnp
+    from flowlenia_minibang_simulate import _init_lagrangian_points_jax
+
+    args = OmegaConf.create(dict(rollout_flat))
+    args.rollout_steps = int(rollout_steps)
+    args.max_steps = int(rollout_steps)
+    args.sample_every_steps = int(sample_every_steps)
+    args.snapshot_interval = int(sample_every_steps)
+    substrate = _make_substrate(args)
+    params_batch = jnp.asarray(np.asarray(params, dtype=np.float32).reshape((1, -1)))
+
+    eval_key = jax.random.PRNGKey(int(run_seed))
+    if bool(_get(args, "log_clip_evolution", False)):
+        rng_roll = jax.random.split(eval_key, 3)[0]
+    else:
+        rng_roll = jax.random.split(eval_key, 2)[0]
+    k_state, k_pts, k_ch, k_scan = jax.random.split(rng_roll, 4)
+    init_keys = jnp.stack([k_state], axis=0)
+    lag_keys = jnp.stack([k_pts], axis=0)
+    ch_keys = jnp.stack([k_ch], axis=0)
+    n_scan_chunks = int(rollout_steps) // int(sample_every_steps)
+    scan_chunk_keys = jnp.stack([jax.random.split(k_scan, n_scan_chunks)], axis=0)
+
+    _ = substrate.init_state(jax.random.PRNGKey(0), params_batch[0])
+    rt = substrate.RT
+    states0 = jax.jit(lambda keys, p: jax.vmap(substrate.init_state)(keys, p))(init_keys, params_batch)
+
+    lag_settings = _lagrangian_settings(args, prefer_logging_names=True)
+
+    def init_lag_one(A0, key_pts, key_ch):
+        pts = _init_lagrangian_points_jax(
+            A0,
+            n_particles=int(lag_settings["n_particles"]),
+            init_mode=str(lag_settings["init_mode"]),
+            border=str(getattr(rt, "border", "wall")),
+            sigma=float(getattr(rt, "sigma", 0.0)),
+            key=key_pts,
+        )
+        if str(lag_settings["channel_mode"]) in ("fixed", "resample"):
+            ch = rt.sample_point_channels(pts, A0, key_ch)
+        else:
+            ch = jnp.zeros((int(lag_settings["n_particles"]),), dtype=jnp.int32)
+        return pts, ch
+
+    lag_xy0, lag_ch0 = jax.jit(lambda A0, kp, kc: jax.vmap(init_lag_one)(A0, kp, kc))(
+        states0["A"],
+        lag_keys,
+        ch_keys,
+    )
+
+    def capture_like_apf(states_in, params_in, lag_xy_in, lag_ch_in):
+        img_size = int(_get(args, "img_size", _get(args, "video_img_size", 224)))
+        rgb = jax.vmap(lambda st, p: substrate.render_state(st, p, img_size=img_size))(states_in, params_in)
+        return (
+            states_in["P"],
+            states_in["A"],
+            states_in["F"],
+            rgb,
+            lag_xy_in,
+            lag_ch_in,
+            states_in["t"],
+            states_in["mass_cycle_start"],
+        )
+
+    capture_jit = jax.jit(capture_like_apf)
+
+    def advance(states_in, lag_xy_in, lag_ch_in, params_in, scan_chunk_keys_in):
+        chunk_keys = scan_chunk_keys_in[:, 0]
+
+        def advance_one(key_chunk, st_i, pts_i, ch_i, params_i):
+            rngs = jax.random.split(key_chunk, int(sample_every_steps))
+
+            def scan_body(carry, key_i):
+                st, pts, ch = carry
+                st_next = substrate.step_state(key_i, st, params_i)
+                lag_key = jax.random.fold_in(key_i, jnp.uint32(0x4C4147))
+                pts_next, ch_next = rt.advect_particles(
+                    points=pts,
+                    F=st_next["F"],
+                    A=st_next["A"],
+                    channel=int(lag_settings["flow_channel"]),
+                    reduce=str(lag_settings["flow_reduce"]),
+                    point_channels=ch,
+                    channel_mode=str(lag_settings["channel_mode"]),
+                    key=lag_key,
+                    noise_model=str(lag_settings["noise_model"]),
+                    diffusion_scale=float(lag_settings["diffusion_scale"]),
+                )
+                return (st_next, pts_next, ch_next), None
+
+            (st_out_i, pts_out_i, ch_out_i), _ = jax.lax.scan(scan_body, (st_i, pts_i, ch_i), rngs)
+            return st_out_i, pts_out_i, ch_out_i
+
+        return jax.vmap(advance_one)(chunk_keys, states_in, lag_xy_in, lag_ch_in, params_in)
+
+    advance_jit = jax.jit(advance)
+    states1, lag_xy1, lag_ch1 = advance_jit(states0, lag_xy0, lag_ch0, params_batch, scan_chunk_keys)
+    _ = jax.device_get(capture_jit(states0, params_batch, lag_xy0, lag_ch0))
+    states1_after_capture, lag_xy1_after_capture, lag_ch1_after_capture = advance_jit(
+        states0,
+        lag_xy0,
+        lag_ch0,
+        params_batch,
+        scan_chunk_keys,
+    )
+
+    return {
+        "no_capture_xy": np.asarray(jax.device_get(lag_xy1[0]), dtype=np.float32)[None, :, :],
+        "with_capture_xy": np.asarray(jax.device_get(lag_xy1_after_capture[0]), dtype=np.float32)[None, :, :],
+        "no_capture_A": np.asarray(jax.device_get(states1["A"][0]), dtype=np.float32),
+        "with_capture_A": np.asarray(jax.device_get(states1_after_capture["A"][0]), dtype=np.float32),
+        "no_capture_ch": np.asarray(jax.device_get(lag_ch1[0]), dtype=np.int32),
+        "with_capture_ch": np.asarray(jax.device_get(lag_ch1_after_capture[0]), dtype=np.int32),
+    }
+
+
+def _trace_diff_summary(left: np.ndarray, right: np.ndarray, *, atol: float) -> dict[str, Any]:
+    if np.asarray(left).shape != np.asarray(right).shape:
+        return {
+            "status": "shape_mismatch",
+            "left_shape": list(np.asarray(left).shape),
+            "right_shape": list(np.asarray(right).shape),
+        }
+    diff = np.asarray(left, dtype=np.float32) - np.asarray(right, dtype=np.float32)
+    flat = np.abs(diff).reshape((diff.shape[0], -1))
+    per_step_max = np.nanmax(flat, axis=1)
+    per_step_mean = np.nanmean(flat, axis=1)
+    failed = np.flatnonzero(per_step_max > float(atol))
+    probe_idx = sorted({0, min(1, diff.shape[0] - 1), min(4, diff.shape[0] - 1), min(9, diff.shape[0] - 1), min(24, diff.shape[0] - 1), diff.shape[0] - 1})
+    return {
+        "status": "ok" if not failed.size else "failed",
+        "n_internal_steps": int(diff.shape[0]),
+        "first_failed_internal_step": int(failed[0] + 1) if failed.size else None,
+        "final_max_abs_xy_diff": float(per_step_max[-1]),
+        "final_mean_abs_xy_diff": float(per_step_mean[-1]),
+        "max_over_trace": float(np.nanmax(per_step_max)),
+        "mean_over_trace": float(np.nanmean(per_step_mean)),
+        "probe_steps": [
+            {
+                "internal_step": int(i + 1),
+                "max_abs_xy_diff": float(per_step_max[i]),
+                "mean_abs_xy_diff": float(per_step_mean[i]),
+            }
+            for i in probe_idx
+        ],
+    }
+
+
+def _first_chunk_trace_diagnostic(
+    *,
+    rollout_flat: dict[str, Any],
+    params: np.ndarray,
+    run_seed: int,
+    sample_every_steps: int,
+    atol: float,
+) -> dict[str, Any]:
+    import jax
+    import jax.numpy as jnp
+    from flowlenia_minibang_simulate import _init_lagrangian_points_jax
+
+    args = OmegaConf.create(dict(rollout_flat))
+    args.rollout_steps = int(sample_every_steps)
+    args.max_steps = int(sample_every_steps)
+    args.sample_every_steps = int(sample_every_steps)
+    args.snapshot_interval = int(sample_every_steps)
+    params_1 = jnp.asarray(np.asarray(params, dtype=np.float32))
+    params_b = params_1[None, :]
+    substrate = _make_substrate(args)
+    _ = substrate.init_state(jax.random.PRNGKey(0), params_1)
+    rt = substrate.RT
+    settings = _lagrangian_settings(args, prefer_logging_names=True)
+
+    eval_key = jax.random.PRNGKey(int(run_seed))
+    if bool(_get(args, "log_clip_evolution", False)):
+        rng_roll = jax.random.split(eval_key, 3)[0]
+    else:
+        rng_roll = jax.random.split(eval_key, 2)[0]
+    k_state, k_pts, k_ch, k_scan = jax.random.split(rng_roll, 4)
+    chunk_key = jax.random.split(k_scan, 1)[0]
+    step_keys = jax.random.split(chunk_key, int(sample_every_steps))
+
+    def init_one(params_i):
+        state0 = substrate.init_state(k_state, params_i)
+        pts0 = _init_lagrangian_points_jax(
+            state0["A"],
+            n_particles=int(settings["n_particles"]),
+            init_mode=str(settings["init_mode"]),
+            border=str(getattr(rt, "border", "wall")),
+            sigma=float(getattr(rt, "sigma", 0.0)),
+            key=k_pts,
+        )
+        if str(settings["channel_mode"]) in ("fixed", "resample"):
+            ch0 = rt.sample_point_channels(pts0, state0["A"], k_ch)
+        else:
+            ch0 = jnp.zeros((int(settings["n_particles"]),), dtype=jnp.int32)
+        return state0, pts0, ch0
+
+    def step_one(params_i, carry, key_i):
+        st, pts, ch = carry
+        st_next = substrate.step_state(key_i, st, params_i)
+        lag_key = jax.random.fold_in(key_i, jnp.uint32(0x4C4147))
+        pts_next, ch_next = rt.advect_particles(
+            points=pts,
+            F=st_next["F"],
+            A=st_next["A"],
+            channel=int(settings["flow_channel"]),
+            reduce=str(settings["flow_reduce"]),
+            point_channels=ch,
+            channel_mode=str(settings["channel_mode"]),
+            key=lag_key,
+            noise_model=str(settings["noise_model"]),
+            diffusion_scale=float(settings["diffusion_scale"]),
+        )
+        return (st_next, pts_next, ch_next), pts_next
+
+    def whole_trace(params_i):
+        state0, pts0, ch0 = init_one(params_i)
+        (_, _, _), pts_seq = jax.lax.scan(lambda carry, key_i: step_one(params_i, carry, key_i), (state0, pts0, ch0), step_keys)
+        return pts_seq
+
+    whole_jit = np.asarray(jax.device_get(jax.jit(whole_trace)(params_1)), dtype=np.float32)
+
+    init_jit = jax.jit(lambda p: init_one(p))
+    state0, pts0, ch0 = init_jit(params_1)
+
+    def capture_like_apf(st, pts, ch, params_i):
+        img_size = int(_get(args, "img_size", _get(args, "video_img_size", 224)))
+        rgb = substrate.render_state(st, params_i, img_size=img_size)
+        return st["P"], st["A"], st["F"], rgb, pts, ch, st["t"], st["mass_cycle_start"]
+
+    def separate_trace(st, pts, ch, params_i):
+        (_, _, _), pts_seq = jax.lax.scan(lambda carry, key_i: step_one(params_i, carry, key_i), (st, pts, ch), step_keys)
+        return pts_seq
+
+    separate_jit_fn = jax.jit(separate_trace)
+    separate_jit = np.asarray(jax.device_get(separate_jit_fn(state0, pts0, ch0, params_1)), dtype=np.float32)
+    _ = jax.device_get(jax.jit(capture_like_apf)(state0, pts0, ch0, params_1))
+    separate_after_capture_jit = np.asarray(jax.device_get(separate_jit_fn(state0, pts0, ch0, params_1)), dtype=np.float32)
+
+    # Legacy APF shape: scan over time outside, vmap over batch inside. For B=1
+    # it should be close, but keeping it here guards against accidental path use.
+    state_b, pts_b, ch_b = jax.jit(lambda p: jax.vmap(init_one)(p))(params_b)
+
+    def legacy_scan_vmap_trace(states_in, pts_in, ch_in, params_in):
+        def scan_body(carry, key_i):
+            st_b, pts_bi, ch_bi = carry
+
+            def one(params_i, st_i, pts_i, ch_i):
+                (st_next, pts_next, ch_next), out = step_one(params_i, (st_i, pts_i, ch_i), key_i)
+                return st_next, pts_next, ch_next, out
+
+            st_next, pts_next, ch_next, out = jax.vmap(one)(params_in, st_b, pts_bi, ch_bi)
+            return (st_next, pts_next, ch_next), out[0]
+
+        (_, _, _), pts_seq = jax.lax.scan(scan_body, (states_in, pts_in, ch_in), step_keys)
+        return pts_seq
+
+    legacy_jit = np.asarray(jax.device_get(jax.jit(legacy_scan_vmap_trace)(state_b, pts_b, ch_b, params_b)), dtype=np.float32)
+
+    traces = {
+        "whole_jit": whole_jit,
+        "separate_jit": separate_jit,
+        "separate_after_capture_jit": separate_after_capture_jit,
+        "legacy_scan_vmap_jit": legacy_jit,
+    }
+    pairs = {}
+    names = list(traces)
+    for i, left in enumerate(names):
+        for right in names[i + 1:]:
+            pairs[f"{left}__vs__{right}"] = _trace_diff_summary(traces[left], traces[right], atol=atol)
+    finals = {name: traces[name][-1][None, :, :] for name in names}
+    return {
+        "settings": settings,
+        "trace_names": names,
+        "pairwise_trace": pairs,
+        "final_pairwise": _xy_pairwise_matrix(finals, atol=atol),
     }
 
 
@@ -1135,6 +1515,13 @@ def _run_replay_smoke(
         rollout_steps=int(rollout_steps),
         sample_every_steps=sample_every,
     )
+    apf_style_variants = _apf_style_first_chunk_variants(
+        rollout_flat=flat_dict,
+        params=params,
+        run_seed=run_seed,
+        rollout_steps=int(rollout_steps),
+        sample_every_steps=sample_every,
+    )
     reference_mode = "scalar_selected_candidate"
     reference_details: dict[str, Any] = {}
     opt_xy = scalar_opt_xy
@@ -1349,6 +1736,75 @@ def _run_replay_smoke(
             "flat_jit_vs_single_selected_apf": _xy_diff_summary(flat_pair_jit_xy, apf_xy, atol=atol),
             "flat_jit_vs_nested_jit": _xy_diff_summary(flat_pair_jit_xy, nested_jit_xy, atol=atol),
         }
+    apf_style_chunk_reference = {
+        "no_capture_vs_single_selected_apf": _xy_diff_summary(apf_style_variants["no_capture_xy"], apf_xy, atol=atol),
+        "with_capture_vs_single_selected_apf": _xy_diff_summary(apf_style_variants["with_capture_xy"], apf_xy, atol=atol),
+        "no_capture_vs_with_capture": _xy_diff_summary(
+            apf_style_variants["no_capture_xy"],
+            apf_style_variants["with_capture_xy"],
+            atol=atol,
+        ),
+        "no_capture_vs_eager_reference": _xy_diff_summary(apf_style_variants["no_capture_xy"], opt_xy, atol=atol),
+        "with_capture_vs_eager_reference": _xy_diff_summary(apf_style_variants["with_capture_xy"], opt_xy, atol=atol),
+    }
+    if flat_pair_jit_xy is not None:
+        apf_style_chunk_reference["no_capture_vs_flat_jit_reference"] = _xy_diff_summary(
+            apf_style_variants["no_capture_xy"],
+            flat_pair_jit_xy,
+            atol=atol,
+        )
+        apf_style_chunk_reference["with_capture_vs_flat_jit_reference"] = _xy_diff_summary(
+            apf_style_variants["with_capture_xy"],
+            flat_pair_jit_xy,
+            atol=atol,
+        )
+    first_chunk_trace: dict[str, Any]
+    try:
+        first_chunk_trace = _first_chunk_trace_diagnostic(
+            rollout_flat=flat_dict,
+            params=params,
+            run_seed=run_seed,
+            sample_every_steps=sample_every,
+            atol=atol,
+        )
+        first_chunk_trace["status"] = "ok"
+    except Exception as exc:
+        first_chunk_trace = {"status": "error", "error": repr(exc)}
+
+    full_rollout_arrays: dict[str, np.ndarray | None] = {
+        "single_selected_apf": apf_xy,
+        "scalar_eager_reference": scalar_opt_xy,
+        "active_reference": opt_xy,
+        "optimizer_nested_jit": nested_jit_xy,
+        "optimizer_flat_eager": flat_pair_vmap_xy,
+        "optimizer_flat_jit": flat_pair_jit_xy,
+    }
+    first_chunk_arrays: dict[str, np.ndarray | None] = {
+        "single_selected_apf_first_chunk": apf_xy[:1],
+        "scalar_eager_reference_first_chunk": scalar_opt_xy[:1],
+        "active_reference_first_chunk": opt_xy[:1],
+        "optimizer_nested_jit_first_chunk": None if nested_jit_xy is None else nested_jit_xy[:1],
+        "optimizer_flat_eager_first_chunk": None if flat_pair_vmap_xy is None else flat_pair_vmap_xy[:1],
+        "optimizer_flat_jit_first_chunk": None if flat_pair_jit_xy is None else flat_pair_jit_xy[:1],
+        "apf_style_no_capture_first_chunk": apf_style_variants["no_capture_xy"],
+        "apf_style_with_capture_first_chunk": apf_style_variants["with_capture_xy"],
+    }
+    diagnostic_pack = {
+        "runtime_source_audit": _runtime_source_audit(),
+        "variant_shapes": {
+            "full_rollout": _array_shapes(full_rollout_arrays),
+            "first_chunk": _array_shapes(first_chunk_arrays),
+        },
+        "full_rollout_pairwise_xy": _xy_pairwise_matrix(full_rollout_arrays, atol=atol),
+        "first_chunk_pairwise_xy": _xy_pairwise_matrix(first_chunk_arrays, atol=atol),
+        "first_chunk_trace": first_chunk_trace,
+        "interpretation_hints": [
+            "If first_chunk_trace variants disagree before internal_step=50, the mismatch is inside JIT/scan/vmap execution, not MSPD.",
+            "If apf_style_* matches single_selected_apf but optimizer_flat_jit does not, APF replay and optimizer replay use different compiled rollout structure.",
+            "If optimizer_flat_jit matches single_selected_apf but scalar_eager/nested_eager do not, eager references are not valid for this archived run.",
+            "If one_step_diagnostic is zero but first_chunk_trace diverges later, keys/config/init are aligned and the divergence is caused by multi-step numerical execution.",
+        ],
+    }
     return {
         "status": "ok" if ok else "failed",
         "selected_checkpoint_audit": selected_audit,
@@ -1358,6 +1814,8 @@ def _run_replay_smoke(
         "reference_details": reference_details,
         "flat_pair_vmap_reference": flat_pair_vmap_reference,
         "jit_reference": jit_reference,
+        "apf_style_chunk_reference": apf_style_chunk_reference,
+        "diagnostic_pack": diagnostic_pack,
         "optimizer_context_apf": optimizer_context_apf,
         "one_step_diagnostic": one_step,
         "initial_snapshot_diff": _snapshot_diff_summary(apf_initial_snapshot, reference_initial_snapshot),
