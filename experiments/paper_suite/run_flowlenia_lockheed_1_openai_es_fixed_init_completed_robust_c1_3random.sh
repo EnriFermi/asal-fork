@@ -10,14 +10,17 @@ python_bin="${PYTHON_BIN:-python}"
 source_optimization_root="experiments/paper_check_flow_lenia/checkpoints_lockheed_1_openai_es_fixed_init_9opt/optimization"
 selected_optimization_root="experiments/paper_check_flow_lenia/checkpoints_lockheed_1_openai_es_fixed_init_9opt_completed_robust_c1_3random/optimization"
 generated_cfg="experiments/paper_suite/config_flowlenia_lockheed_1_openai_es_fixed_init_9opt_completed_robust_c1_3random.yaml"
-result_root="analysis/results/paper_suite_flowlenia_lockheed_1_openai_es_fixed_init_9opt_completed_robust_c1_3random"
-apf_root="experiments/paper_check_flow_lenia/checkpoints_lockheed_1_openai_es_fixed_init_9opt_completed_robust_c1_3random/c1_lagrangian_apf_300k_train50_4seeds"
+result_root="${RESULT_ROOT:-analysis/results/paper_suite_flowlenia_lockheed_1_openai_es_fixed_init_9opt_completed_robust_c1_3random}"
+apf_root="experiments/paper_check_flow_lenia/checkpoints_lockheed_1_openai_es_fixed_init_9opt_completed_robust_c1_3random/c1_lagrangian_apf_300k_train50_4seeds_replay_fixed"
 random_checkpoint_root="experiments/paper_check_flow_lenia/checkpoints_lockheed_1/frustration_simulation/random_params"
 run_id="${PAPER_SUITE_RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 log_dir="${PAPER_SUITE_LOG_DIR:-${result_root}/logs}"
 master_log="${PAPER_SUITE_MASTER_LOG:-${log_dir}/${run_id}_master.log}"
 
 force_prep_export="${FORCE_PREP_EXPORT:-0}"
+run_preflight="${RUN_PREFLIGHT:-1}"
+preflight_rollout_steps="${PREFLIGHT_ROLLOUT_STEPS:-200}"
+c1_rollout_seeds="${C1_ROLLOUT_SEEDS:-4}"
 force_apf="${FORCE_APF:-0}"
 force_metrics="${FORCE_METRICS:-1}"
 force_visualization="${FORCE_VISUALIZATION:-1}"
@@ -113,6 +116,14 @@ require_dir() {
 require_dir "${source_optimization_root}"
 require_dir "${random_checkpoint_root}"
 
+case "${apf_root}" in
+  *replay_fixed*) ;;
+  *)
+    echo "Refusing to run: apf_root must be an isolated replay_fixed root, got ${apf_root}" >&2
+    exit 2
+    ;;
+esac
+
 prep_force_arg=""
 if [ "${force_prep_export}" = "1" ]; then
   prep_force_arg="--force-export"
@@ -143,16 +154,17 @@ echo "  random_checkpoint_root=${random_checkpoint_root}"
 echo "  random_checkpoint_selection=per_source_group"
 echo "  anti_noise=robust_pioneer_lcb_in_top_trend"
 echo "  lcb_z=2.0 trend_quantile=90 ewma_beta=0.85 trim_frac=0.125"
-echo "  c1_rollout_seeds=4"
+echo "  c1_rollout_seeds=${c1_rollout_seeds}"
 echo "  random_baselines_per_opt=3"
 echo "  conda_env=${conda_env}"
 echo "  run_id=${run_id}"
 echo "  log_dir=${log_dir}"
 echo "  master_log=${master_log}"
 echo "  force_prep_export=${force_prep_export} force_apf=${force_apf} force_metrics=${force_metrics} force_visualization=${force_visualization}"
+echo "  run_preflight=${run_preflight} preflight_rollout_steps=${preflight_rollout_steps}"
 
 echo
-echo "[1/4] Discover completed runs, export robust candidates, write C1 config"
+echo "[1/8] Discover completed runs, export robust candidates, write C1 config"
 run_py scripts/prepare_flowlenia_completed_robust_c1.py \
   --source-optimization-root "${source_optimization_root}" \
   --selected-optimization-root "${selected_optimization_root}" \
@@ -161,7 +173,7 @@ run_py scripts/prepare_flowlenia_completed_robust_c1.py \
   --apf-root "${apf_root}" \
   --random-checkpoint-root "${random_checkpoint_root}" \
   --random-checkpoint-selection per_source_group \
-  --n-rollout-seeds 4 \
+  --n-rollout-seeds "${c1_rollout_seeds}" \
   --num-random-baselines 3 \
   --batch-size 8 \
   --pair-seed-base 400003 \
@@ -172,15 +184,61 @@ run_py scripts/prepare_flowlenia_completed_robust_c1.py \
   ${prep_force_arg}
 
 echo
-echo "[2/4] Flow-Lenia C1 APF/Lagrangian trajectories"
+echo "[2/8] Static fail-fast guard: config, selected candidates, seeds, random checkpoints"
+run_py scripts/check_flowlenia_c1_replay_preflight.py \
+  --config "${generated_cfg}" \
+  --selected-root "${selected_optimization_root}" \
+  --source-optimization-root "${source_optimization_root}" \
+  --skip-smoke \
+  --skip-existing-results \
+  --require-apf-root-contains "replay_fixed" \
+  --summary-json "${result_root}/logs/${run_id}_preflight_static_guard.json"
+
+echo
+echo "[3/8] APF dry-run guard: validate trajectory plan without heavy simulation"
+run_py scripts/paper_suite_flowlenia_arun_apf.py "${generated_cfg}" --section-key flow_lenia_arun_lagrangian_apf --dry-run
+
+echo
+echo "[4/8] Short replay smoke before heavy APF"
+if [ "${run_preflight}" = "1" ]; then
+  run_py scripts/check_flowlenia_c1_replay_preflight.py \
+    --config "${generated_cfg}" \
+    --selected-root "${selected_optimization_root}" \
+    --source-optimization-root "${source_optimization_root}" \
+    --skip-existing-results \
+    --rollout-steps "${preflight_rollout_steps}" \
+    --output-root "${result_root}/preflight_smoke/${run_id}" \
+    --require-apf-root-contains "replay_fixed" \
+    --summary-json "${result_root}/logs/${run_id}_preflight_smoke_before_apf.json"
+else
+  echo "  skipped because RUN_PREFLIGHT=${run_preflight}"
+fi
+
+echo
+echo "[5/8] Flow-Lenia C1 APF/Lagrangian trajectories"
 run_py scripts/paper_suite_flowlenia_arun_apf.py "${generated_cfg}" --section-key flow_lenia_arun_lagrangian_apf ${apf_force_arg}
 
 echo
-echo "[3/4] Flow-Lenia C1 metrics"
+echo "[6/8] Flow-Lenia C1 metrics"
 run_py scripts/run_paper_suite.py "${generated_cfg}" --layer metrics --task c1 ${metric_force_arg}
 
 echo
-echo "[4/4] Flow-Lenia C1 visualization"
+echo "[7/8] Post-metrics guard: table protocol audit"
+if [ "${run_preflight}" = "1" ]; then
+  run_py scripts/check_flowlenia_c1_replay_preflight.py \
+    --config "${generated_cfg}" \
+    --selected-root "${selected_optimization_root}" \
+    --source-optimization-root "${source_optimization_root}" \
+    --scores-csv "${result_root}/flow_lenia/checkpoint_scores.csv" \
+    --skip-smoke \
+    --require-apf-root-contains "replay_fixed" \
+    --summary-json "${result_root}/logs/${run_id}_preflight_after_metrics.json"
+else
+  echo "  skipped because RUN_PREFLIGHT=${run_preflight}"
+fi
+
+echo
+echo "[8/8] Flow-Lenia C1 visualization"
 run_py scripts/run_paper_suite.py "${generated_cfg}" --layer visualization --task c1 ${vis_force_arg}
 
 echo
