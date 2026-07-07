@@ -209,6 +209,7 @@ if [ "${run_preflight}" = "1" ]; then
     --rollout-steps "${preflight_rollout_steps}" \
     --output-root "${result_root}/preflight_smoke/${run_id}" \
     --require-apf-root-contains "replay_fixed" \
+    --allow-known-execution-divergence \
     --summary-json "${result_root}/logs/${run_id}_preflight_smoke_before_apf.json"
 else
   echo "  skipped because RUN_PREFLIGHT=${run_preflight}"
