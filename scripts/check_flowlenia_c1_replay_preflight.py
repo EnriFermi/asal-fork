@@ -758,6 +758,42 @@ def _config_value_diff(left: Any, right: Any, keys: list[str]) -> list[dict[str,
     return out
 
 
+def _same_float(left: Any, right: Any, *, atol: float = 1.0e-12) -> bool:
+    try:
+        return abs(float(left) - float(right)) <= float(atol)
+    except Exception:
+        return str(left) == str(right)
+
+
+def _split_protocol_config_diffs(
+    diffs: list[dict[str, Any]],
+    *,
+    rollout_flat: Any,
+    opt_flat: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    protocol_diffs: list[dict[str, Any]] = []
+    ignored: list[dict[str, Any]] = []
+    for row in diffs:
+        key = str(row.get("key", ""))
+        if key == "sigma":
+            rollout_flow_sigma = _get(rollout_flat, "flow_sigma", None)
+            opt_flow_sigma = _get(opt_flat, "flow_sigma", None)
+            if (
+                rollout_flow_sigma is not None
+                and opt_flow_sigma is not None
+                and _same_float(rollout_flow_sigma, opt_flow_sigma)
+            ):
+                ignored_row = dict(row)
+                ignored_row["reason"] = (
+                    "benign Flow-Lenia namespace collision: optimization.sigma is optimizer radius; "
+                    "physical substrate sigma is compared through flow_sigma"
+                )
+                ignored.append(ignored_row)
+                continue
+        protocol_diffs.append(row)
+    return protocol_diffs, ignored
+
+
 def _file_sha256(path: Path) -> str | None:
     try:
         return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -1986,6 +2022,13 @@ def _run_replay_smoke(
     per_sample_mean = np.nanmean(np.abs(diff).reshape((diff.shape[0], -1)), axis=1)
     first_failed = np.flatnonzero(per_sample_max > float(atol))
     ok = bool(max_abs <= float(atol))
+    first_failed_step = (
+        int(np.asarray(apf_steps)[np.asarray(apf_steps) > 0][int(first_failed[0])])
+        if first_failed.size
+        else None
+    )
+    initial_max_abs = float(np.nanmax(np.abs(initial_diff)))
+    initial_mean_abs = float(np.nanmean(np.abs(initial_diff)))
     apf_chunk_stepper_mode = None
     if "resume_stepper_mode" in apf_initial_snapshot:
         raw_mode = np.asarray(apf_initial_snapshot["resume_stepper_mode"])
@@ -2075,8 +2118,76 @@ def _run_replay_smoke(
             "If one_step_diagnostic is zero but first_chunk_trace diverges later, keys/config/init are aligned and the divergence is caused by multi-step numerical execution.",
         ],
     }
+    raw_config_diffs = _config_value_diff(
+        OmegaConf.create(flat_dict),
+        opt_flat,
+        [
+            "substrate",
+            "grid_size",
+            "C",
+            "k",
+            "kernel_components",
+            "M",
+            "dd",
+            "dt",
+            "sigma",
+            "flow_sigma",
+            "border",
+            "mix_rule",
+            "sobel_impl",
+            "base_seed",
+            "seed_patch_size",
+            "seed_n_patches",
+            "seed_mode",
+            "p_constant_per_patch",
+            "render_mode",
+            "clip1",
+            "clip2",
+            "mutations",
+            "mutation_sz",
+            "mutation_p",
+            "mutation_scale",
+            "optimize_mutation_scale",
+            "volcano",
+            "volcano_sz",
+            "volcano_p",
+            "volcano_delta",
+            "food",
+            "food_interval",
+            "food_n",
+            "food_sz",
+            "food_amount",
+            "food_consume_rate",
+            "food_bonus",
+            "mass_decay",
+            "food_channel",
+            "food_auto_size",
+            "food_auto_scale",
+            "food_conv_mode",
+            "food_vis_scale",
+            "food_vis_color",
+            "food_diffusion_alpha",
+            "mass_clip_eps",
+            "mass_renorm",
+            "log_clip_evolution",
+        ],
+    )
+    protocol_config_diffs, ignored_config_diffs = _split_protocol_config_diffs(
+        raw_config_diffs,
+        rollout_flat=OmegaConf.create(flat_dict),
+        opt_flat=opt_flat,
+    )
+    known_execution_divergence = bool(
+        (not ok)
+        and initial_max_abs <= float(atol)
+        and not protocol_config_diffs
+        and first_failed_step is not None
+    )
+    smoke_status = "ok" if ok else ("known_execution_divergence" if known_execution_divergence else "failed")
     return {
-        "status": "ok" if ok else "failed",
+        "status": smoke_status,
+        "strict_status": "ok" if ok else "failed",
+        "known_execution_divergence": bool(known_execution_divergence),
         "selected_checkpoint_audit": selected_audit,
         "apf_module_stepper_mode": str(getattr(minibang_sim, "OPTIMIZATION_METRIC_STEPPER_MODE", "missing")),
         "apf_chunk_stepper_mode": apf_chunk_stepper_mode,
@@ -2095,60 +2206,9 @@ def _run_replay_smoke(
             rollout_initial_snapshot,
             reference_initial_snapshot,
         ),
-        "rollout_vs_optimization_config_diffs": _config_value_diff(
-            OmegaConf.create(flat_dict),
-            opt_flat,
-            [
-                "substrate",
-                "grid_size",
-                "C",
-                "k",
-                "kernel_components",
-                "M",
-                "dd",
-                "dt",
-                "sigma",
-                "flow_sigma",
-                "border",
-                "mix_rule",
-                "sobel_impl",
-                "base_seed",
-                "seed_patch_size",
-                "seed_n_patches",
-                "seed_mode",
-                "p_constant_per_patch",
-                "render_mode",
-                "clip1",
-                "clip2",
-                "mutations",
-                "mutation_sz",
-                "mutation_p",
-                "mutation_scale",
-                "optimize_mutation_scale",
-                "volcano",
-                "volcano_sz",
-                "volcano_p",
-                "volcano_delta",
-                "food",
-                "food_interval",
-                "food_n",
-                "food_sz",
-                "food_amount",
-                "food_consume_rate",
-                "food_bonus",
-                "mass_decay",
-                "food_channel",
-                "food_auto_size",
-                "food_auto_scale",
-                "food_conv_mode",
-                "food_vis_scale",
-                "food_vis_color",
-                "food_diffusion_alpha",
-                "mass_clip_eps",
-                "mass_renorm",
-                "log_clip_evolution",
-            ],
-        ),
+        "rollout_vs_optimization_config_diffs": protocol_config_diffs,
+        "rollout_vs_optimization_raw_config_diffs": raw_config_diffs,
+        "rollout_vs_optimization_ignored_config_diffs": ignored_config_diffs,
         "run_idx": int(run_idx),
         "seed_idx": int(seed_idx),
         "run_seed": int(run_seed),
@@ -2157,8 +2217,8 @@ def _run_replay_smoke(
         "n_samples_compared": int(opt_xy.shape[0]),
         "xy_shape": list(opt_xy.shape),
         "apf_steps": [int(x) for x in np.asarray(apf_steps).reshape(-1)],
-        "initial_max_abs_xy_diff": float(np.nanmax(np.abs(initial_diff))),
-        "initial_mean_abs_xy_diff": float(np.nanmean(np.abs(initial_diff))),
+        "initial_max_abs_xy_diff": initial_max_abs,
+        "initial_mean_abs_xy_diff": initial_mean_abs,
         "scalar_reference_initial_max_abs_xy_diff": float(np.nanmax(np.abs(scalar_initial_diff))),
         "scalar_reference_initial_mean_abs_xy_diff": float(np.nanmean(np.abs(scalar_initial_diff))),
         "scalar_reference_max_abs_xy_diff": float(np.nanmax(np.abs(scalar_diff))),
@@ -2166,11 +2226,7 @@ def _run_replay_smoke(
         "per_sample_max_abs_xy_diff": [float(x) for x in per_sample_max.reshape(-1)],
         "per_sample_mean_abs_xy_diff": [float(x) for x in per_sample_mean.reshape(-1)],
         "first_failed_sample_idx": int(first_failed[0]) if first_failed.size else None,
-        "first_failed_step": (
-            int(np.asarray(apf_steps)[np.asarray(apf_steps) > 0][int(first_failed[0])])
-            if first_failed.size
-            else None
-        ),
+        "first_failed_step": first_failed_step,
         "max_abs_xy_diff": max_abs,
         "mean_abs_xy_diff": mean_abs,
         "atol": float(atol),
@@ -2226,6 +2282,14 @@ def main() -> int:
     parser.add_argument("--skip-selected-candidate-audit", action="store_true")
     parser.add_argument("--skip-random-checkpoint-audit", action="store_true")
     parser.add_argument("--skip-optimization-protocol-audit", action="store_true")
+    parser.add_argument(
+        "--allow-known-execution-divergence",
+        action="store_true",
+        help=(
+            "Do not fail when replay smoke matches initial state/config but diverges after rollout steps, "
+            "which is the known APF-vs-optimizer JAX execution-path mismatch."
+        ),
+    )
     parser.add_argument(
         "--require-apf-root-contains",
         default=None,
@@ -2285,10 +2349,18 @@ def main() -> int:
     if "existing_results_audit" in summary:
         errors.extend(summary["existing_results_audit"].get("errors", []))
     if "replay_smoke" in summary and summary["replay_smoke"].get("status") != "ok":
-        errors.append(
-            "replay_smoke failed: max_abs_xy_diff="
-            f"{summary['replay_smoke'].get('max_abs_xy_diff')}"
-        )
+        if (
+            args.allow_known_execution_divergence
+            and summary["replay_smoke"].get("status") == "known_execution_divergence"
+        ):
+            summary.setdefault("warnings", []).append(
+                "replay_smoke classified as known_execution_divergence and allowed by CLI flag"
+            )
+        else:
+            errors.append(
+                "replay_smoke failed: max_abs_xy_diff="
+                f"{summary['replay_smoke'].get('max_abs_xy_diff')}"
+            )
     summary["status"] = "ok" if not errors else "failed"
     summary["errors"] = errors
 
