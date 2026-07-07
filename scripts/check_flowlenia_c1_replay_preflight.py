@@ -361,6 +361,7 @@ def _optimization_lagrangian_xy_from_optimizer_batch(
     rollout_steps: int,
     sample_every_steps: int,
     include_initial: bool = False,
+    jit_compile: bool = False,
 ) -> np.ndarray:
     import jax
     import jax.numpy as jnp
@@ -440,9 +441,15 @@ def _optimization_lagrangian_xy_from_optimizer_batch(
 
     # This matches main_opt_msc.calc_loss_vv:
     # vmap(vmap(calc_loss, in_axes=(0, None)), in_axes=(None, 0)).
-    xy_all = jax.vmap(
-        lambda params: jax.vmap(lambda key: rollout_one(key, params))(seed_keys_j)
-    )(params_j)
+    def rollout_all(seed_keys_in, params_in):
+        return jax.vmap(
+            lambda params: jax.vmap(lambda key: rollout_one(key, params))(seed_keys_in)
+        )(params_in)
+
+    if jit_compile:
+        xy_all = jax.jit(rollout_all)(seed_keys_j, params_j)
+    else:
+        xy_all = rollout_all(seed_keys_j, params_j)
     xy = xy_all[int(pop_idx), int(seed_idx)]
     return np.asarray(jax.device_get(xy), dtype=np.float32)
 
@@ -456,6 +463,7 @@ def _optimization_lagrangian_xy_from_flat_pair_batch(
     seed_idx: int,
     rollout_steps: int,
     sample_every_steps: int,
+    jit_compile: bool = False,
 ) -> np.ndarray:
     import jax
     import jax.numpy as jnp
@@ -534,7 +542,13 @@ def _optimization_lagrangian_xy_from_flat_pair_batch(
         )
         return xy_seq
 
-    xy_all = jax.vmap(rollout_one)(seed_keys_j, params_j)
+    def rollout_all(seed_keys_in, params_in):
+        return jax.vmap(rollout_one)(seed_keys_in, params_in)
+
+    if jit_compile:
+        xy_all = jax.jit(rollout_all)(seed_keys_j, params_j)
+    else:
+        xy_all = rollout_all(seed_keys_j, params_j)
     flat_idx = int(pop_idx) * n_seed + int(seed_idx)
     xy = xy_all[flat_idx]
     return np.asarray(jax.device_get(xy), dtype=np.float32)
@@ -1128,6 +1142,8 @@ def _run_replay_smoke(
     reference_initial_snapshot = scalar_initial_snapshot
     batch_inputs = _optimizer_batch_reference_inputs(run_dir, int(seed_idx))
     flat_pair_vmap_xy: np.ndarray | None = None
+    flat_pair_jit_xy: np.ndarray | None = None
+    nested_jit_xy: np.ndarray | None = None
     if batch_inputs is not None:
         reference_mode = "optimizer_original_pop_batch"
         reference_details = {
@@ -1147,6 +1163,16 @@ def _run_replay_smoke(
             rollout_steps=int(rollout_steps),
             sample_every_steps=sample_every,
         )
+        nested_jit_xy = _optimization_lagrangian_xy_from_optimizer_batch(
+            opt_flat=opt_flat,
+            params_batch=np.asarray(batch_inputs["params_batch"], dtype=np.float32),
+            seed_keys=np.asarray(batch_inputs["seed_keys"], dtype=np.uint32),
+            pop_idx=int(batch_inputs["pop_idx"]),
+            seed_idx=int(batch_inputs["seed_idx"]),
+            rollout_steps=int(rollout_steps),
+            sample_every_steps=sample_every,
+            jit_compile=True,
+        )
         opt_xy_with_initial = _optimization_lagrangian_xy_from_optimizer_batch(
             opt_flat=opt_flat,
             params_batch=np.asarray(batch_inputs["params_batch"], dtype=np.float32),
@@ -1165,6 +1191,16 @@ def _run_replay_smoke(
             seed_idx=int(batch_inputs["seed_idx"]),
             rollout_steps=int(rollout_steps),
             sample_every_steps=sample_every,
+        )
+        flat_pair_jit_xy = _optimization_lagrangian_xy_from_flat_pair_batch(
+            opt_flat=opt_flat,
+            params_batch=np.asarray(batch_inputs["params_batch"], dtype=np.float32),
+            seed_keys=np.asarray(batch_inputs["seed_keys"], dtype=np.uint32),
+            pop_idx=int(batch_inputs["pop_idx"]),
+            seed_idx=int(batch_inputs["seed_idx"]),
+            rollout_steps=int(rollout_steps),
+            sample_every_steps=sample_every,
+            jit_compile=True,
         )
         reference_initial_snapshot = _optimization_initial_snapshot_from_optimizer_batch(
             opt_flat=opt_flat,
@@ -1304,6 +1340,15 @@ def _run_replay_smoke(
             "diff_vs_single_selected_apf": _xy_diff_summary(flat_pair_vmap_xy, apf_xy, atol=atol),
             "diff_vs_scalar_reference": _xy_diff_summary(flat_pair_vmap_xy, scalar_opt_xy, atol=atol),
         }
+    jit_reference = None
+    if nested_jit_xy is not None and flat_pair_jit_xy is not None:
+        jit_reference = {
+            "nested_jit_vs_nested_eager": _xy_diff_summary(nested_jit_xy, opt_xy, atol=atol),
+            "nested_jit_vs_single_selected_apf": _xy_diff_summary(nested_jit_xy, apf_xy, atol=atol),
+            "flat_jit_vs_flat_eager": _xy_diff_summary(flat_pair_jit_xy, flat_pair_vmap_xy, atol=atol),
+            "flat_jit_vs_single_selected_apf": _xy_diff_summary(flat_pair_jit_xy, apf_xy, atol=atol),
+            "flat_jit_vs_nested_jit": _xy_diff_summary(flat_pair_jit_xy, nested_jit_xy, atol=atol),
+        }
     return {
         "status": "ok" if ok else "failed",
         "selected_checkpoint_audit": selected_audit,
@@ -1312,6 +1357,7 @@ def _run_replay_smoke(
         "reference_mode": reference_mode,
         "reference_details": reference_details,
         "flat_pair_vmap_reference": flat_pair_vmap_reference,
+        "jit_reference": jit_reference,
         "optimizer_context_apf": optimizer_context_apf,
         "one_step_diagnostic": one_step,
         "initial_snapshot_diff": _snapshot_diff_summary(apf_initial_snapshot, reference_initial_snapshot),
