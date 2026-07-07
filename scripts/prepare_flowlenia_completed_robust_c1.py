@@ -128,13 +128,12 @@ def _effective_optimization_flat(run_dir: Path) -> Any:
     substrate_cfg = cfg.get("substrate", {})
     if str(substrate_cfg.get("substrate", "")).strip().lower() == "lenia_flow":
         flow_sigma = substrate_cfg.get("flow_sigma", substrate_cfg.get("sigma", None))
-        if flow_sigma is not None and flat.get("flow_sigma", None) is None:
-            # Direct main_opt_msc now protects this value, but older archived
-            # optimization_config.yaml files do not contain flow_sigma.  For
-            # exact replay of those old runs, absence of flow_sigma is
-            # intentional: their flat args used optimization.sigma as physical
-            # Flow-Lenia sigma.
-            pass
+        if flow_sigma is not None:
+            # `optimization.sigma` and Flow-Lenia's physical `substrate.sigma`
+            # collide in the flat namespace.  C1 replay must use the physical
+            # substrate value, even for archived configs that predate
+            # `substrate.flow_sigma`.
+            flat.flow_sigma = flow_sigma
     return flat
 
 
@@ -167,6 +166,26 @@ def _flowlenia_replay_substrate_overrides(completed: list[dict[str, Any]]) -> di
     for key, value in reference_values.items():
         overrides[key] = value
     return overrides
+
+
+def _flowlenia_replay_logging_overrides(completed: list[dict[str, Any]]) -> dict[str, Any]:
+    reference: bool | None = None
+    for row in completed:
+        run_dir = Path(row["run_dir"])
+        flat = _effective_optimization_flat(run_dir)
+        if str(flat.get("substrate", "")).strip().lower() != "lenia_flow":
+            continue
+        value = bool(flat.get("log_clip_evolution", True))
+        if reference is None:
+            reference = value
+            continue
+        if bool(reference) != value:
+            raise ValueError(
+                "Completed optimization runs require different log_clip_evolution values; "
+                f"cannot use one C1 replay rollout config. first={reference!r} "
+                f"run_{int(row['run_idx']):03d}={value!r}"
+            )
+    return {} if reference is None else {"log_clip_evolution": bool(reference)}
 
 
 def _configured_n_iters(run_dir: Path) -> int | None:
@@ -302,7 +321,9 @@ def _write_c1_config(
     batch_size: int,
     pair_seed_base: int,
     rollout_substrate_overrides: dict[str, Any] | None = None,
+    rollout_logging_overrides: dict[str, Any] | None = None,
 ) -> None:
+    metric_log_clip_evolution = bool((rollout_logging_overrides or {}).get("log_clip_evolution", False))
     cfg = {
         "meta": {
             "output_root": result_root,
@@ -320,6 +341,7 @@ def _write_c1_config(
                     "expected_window_start_steps": 50000,
                     "expected_window_end_steps": 300000,
                     "metric_seed_protocol": "optimization_metric",
+                    "metric_log_clip_evolution": metric_log_clip_evolution,
                     "metric": {
                         "metric_tau_mode": "max_grid",
                         "metric_tau_grid_steps": [
@@ -382,10 +404,13 @@ def _write_c1_config(
             },
         },
     }
+    rollout_overrides: dict[str, Any] = {}
     if rollout_substrate_overrides:
-        cfg["simulation"]["flow_lenia_arun_lagrangian_apf"]["rollout_overrides"] = {
-            "substrate": dict(rollout_substrate_overrides)
-        }
+        rollout_overrides["substrate"] = dict(rollout_substrate_overrides)
+    if rollout_logging_overrides:
+        rollout_overrides["logging"] = dict(rollout_logging_overrides)
+    if rollout_overrides:
+        cfg["simulation"]["flow_lenia_arun_lagrangian_apf"]["rollout_overrides"] = rollout_overrides
     output_config.parent.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(config=OmegaConf.create(cfg), f=str(output_config), resolve=False)
 
@@ -438,6 +463,7 @@ def main() -> int:
     selected_dirs: list[str] = []
     selected_rows: list[dict[str, Any]] = []
     rollout_substrate_overrides = _flowlenia_replay_substrate_overrides(completed)
+    rollout_logging_overrides = _flowlenia_replay_logging_overrides(completed)
     for row in completed:
         run_idx = int(row["run_idx"])
         out_dir = selected_root / f"run_{run_idx:03d}"
@@ -482,6 +508,7 @@ def main() -> int:
         batch_size=int(args.batch_size),
         pair_seed_base=int(args.pair_seed_base),
         rollout_substrate_overrides=rollout_substrate_overrides,
+        rollout_logging_overrides=rollout_logging_overrides,
     )
 
     manifest_dir = output_config.parent / "generated_manifests" / output_config.stem
@@ -510,6 +537,7 @@ def main() -> int:
         "selected_candidates_csv": _rel(manifest_dir / "selected_robust_candidates.csv"),
         "completed_runs_csv": _rel(manifest_dir / "completed_runs.csv"),
         "rollout_substrate_overrides": rollout_substrate_overrides,
+        "rollout_logging_overrides": rollout_logging_overrides,
     }
     _write_json(manifest_dir / "summary.json", summary)
     print(json.dumps(summary, indent=2, sort_keys=True))

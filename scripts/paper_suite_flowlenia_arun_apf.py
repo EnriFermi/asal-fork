@@ -80,6 +80,7 @@ def _expected_rollout_signature(rollout_config: Path, flat: Any) -> dict[str, An
         "lagrangian_channel_mode",
         "lagrangian_noise_model",
         "lagrangian_diffusion_scale",
+        "log_clip_evolution",
         "run_seed_protocol",
     )
     out = {"rollout_config": str(rollout_config)}
