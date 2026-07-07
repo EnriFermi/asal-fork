@@ -1487,13 +1487,24 @@ def _audit_selected_candidates(selected_root: Path, source_optimization_root: Pa
 def _audit_optimization_protocol(config_audit: dict[str, Any], selected_root: Path) -> dict[str, Any]:
     requested_seeds = int(config_audit.get("n_rollout_seeds_per_checkpoint", -1))
     expected_seed_base = int(config_audit.get("run_seed_base", -1))
+    run_seed_mode = str(config_audit.get("run_seed_mode", "")).strip().lower()
     expected_log_clip = config_audit.get("rollout_log_clip_evolution", None)
     expected_flow_sigma = config_audit.get("rollout_flow_sigma", None)
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
-    for run_dir in sorted(Path(selected_root).glob("run_*")):
+    for suite_idx, run_dir in enumerate(sorted(Path(selected_root).glob("run_*"))):
         if not run_dir.is_dir():
             continue
+        try:
+            run_idx = int(run_dir.name.split("_", 1)[1])
+        except Exception:
+            run_idx = -1
+        if run_seed_mode == "source_run_idx" and run_idx >= 0:
+            expected_fixed_eval_seed_base = int(expected_seed_base + 2 * run_idx)
+        elif run_seed_mode == "suite_index":
+            expected_fixed_eval_seed_base = int(expected_seed_base + 2 * suite_idx)
+        else:
+            expected_fixed_eval_seed_base = int(expected_seed_base)
         cfg_path = run_dir / "optimization_config.yaml"
         row: dict[str, Any] = {"run": run_dir.name, "optimization_config": str(cfg_path)}
         rows.append(row)
@@ -1518,6 +1529,7 @@ def _audit_optimization_protocol(config_audit: dict[str, Any], selected_root: Pa
                     "eval_seed_mode": eval_seed_mode,
                     "openai_es_n_seeds": None if openai_es_n_seeds is None else int(openai_es_n_seeds),
                     "fixed_eval_seed_base": None if fixed_eval_seed_base is None else int(fixed_eval_seed_base),
+                    "expected_fixed_eval_seed_base": int(expected_fixed_eval_seed_base),
                     "log_clip_evolution": log_clip,
                     "substrate_sigma": None if substrate_sigma is None else float(substrate_sigma),
                     "flat_flow_sigma": None if flow_sigma is None else float(flow_sigma),
@@ -1539,10 +1551,11 @@ def _audit_optimization_protocol(config_audit: dict[str, Any], selected_root: Pa
                     f"{run_dir.name}: openai_es_n_seeds={openai_es_n_seeds}, "
                     f"C1 rollout seeds={requested_seeds}"
                 )
-            if fixed_eval_seed_base is None or int(fixed_eval_seed_base) != expected_seed_base:
+            if fixed_eval_seed_base is None or int(fixed_eval_seed_base) != expected_fixed_eval_seed_base:
                 errors.append(
                     f"{run_dir.name}: fixed_eval_seed_base={fixed_eval_seed_base}, "
-                    f"run_seed_base={expected_seed_base}"
+                    f"expected={expected_fixed_eval_seed_base} "
+                    f"(run_seed_base={expected_seed_base}, run_seed_mode={run_seed_mode})"
                 )
             if expected_log_clip is None:
                 errors.append(f"{run_dir.name}: generated config has no rollout_log_clip_evolution")
