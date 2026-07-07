@@ -388,9 +388,21 @@ def _c1_metric_seed(c1_cfg: Any, item: dict[str, Any], idx: int) -> tuple[Any, s
             raise ValueError(
                 f"C1 metric_seed_protocol='optimization_metric' requires run_seed in manifest item {item.get('traj_id')!r}."
             )
-        _rng_roll, rng_metric = jax.random.split(jax.random.PRNGKey(int(run_seed)), 2)
+        log_clip_evolution = bool(
+            cfg_get(
+                c1_cfg,
+                "metric_log_clip_evolution",
+                cfg_get(c1_cfg, "log_clip_evolution", False),
+            )
+        )
+        if log_clip_evolution:
+            _rng_roll, rng_metric, _rng_clip = jax.random.split(jax.random.PRNGKey(int(run_seed)), 3)
+            split_label = "split3"
+        else:
+            _rng_roll, rng_metric = jax.random.split(jax.random.PRNGKey(int(run_seed)), 2)
+            split_label = "split2"
         key_np = np.asarray(rng_metric, dtype=np.uint32)
-        return rng_metric, f"optimization_metric:{int(key_np[0])},{int(key_np[1])}"
+        return rng_metric, f"optimization_metric:{split_label}:{int(key_np[0])},{int(key_np[1])}"
     metric_seed = 10_000_000 + int(item.get("selection_idx", idx - 1))
     return int(metric_seed), f"posthoc_index:{metric_seed}"
 

@@ -128,7 +128,7 @@ def _selected_checkpoint_audit(run_dir: Path, params: np.ndarray) -> dict[str, A
 
 def _flat_optimization_config(path: Path) -> Any:
     cfg = OmegaConf.load(path)
-    return OmegaConf.merge(
+    flat = OmegaConf.merge(
         cfg.get("meta", {}),
         cfg.get("substrate", {}),
         cfg.get("evaluation", {}),
@@ -136,6 +136,16 @@ def _flat_optimization_config(path: Path) -> Any:
         cfg.get("logging", {}),
         cfg.get("metric", {}),
     )
+    substrate_cfg = cfg.get("substrate", {})
+    if str(substrate_cfg.get("substrate", "")).strip().lower() == "lenia_flow":
+        flow_sigma = substrate_cfg.get("flow_sigma", substrate_cfg.get("sigma", None))
+        if flow_sigma is not None:
+            # main_opt_msc reconstructs this in memory so the optimizer search
+            # radius (`optimization.sigma`) cannot become Flow-Lenia's physical
+            # reintegration sigma.  Archived optimization_config.yaml files may
+            # not contain flow_sigma, so the preflight must reconstruct it too.
+            flat.flow_sigma = flow_sigma
+    return flat
 
 
 def _make_substrate(args: Any):
@@ -1279,12 +1289,23 @@ def _audit_generated_config(config_path: Path) -> dict[str, Any]:
     cfg, _flat = load_config(config_path)
     section = _resolve_section(cfg)
     c1 = _get(_get(_get(cfg, "datasets", {}), "flow_lenia", {}), "c1", {})
+    rollout_overrides = _get(section, "rollout_overrides", {})
+    rollout_logging = _get(rollout_overrides, "logging", {})
+    rollout_substrate = _get(rollout_overrides, "substrate", {})
     run_seed_protocol = str(_get(section, "run_seed_protocol", ""))
     metric_seed_protocol = str(_get(c1, "metric_seed_protocol", ""))
+    metric_log_clip = _get(c1, "metric_log_clip_evolution", None)
+    rollout_log_clip = _get(rollout_logging, "log_clip_evolution", None)
+    rollout_sigma = _get(rollout_substrate, "sigma", None)
+    rollout_flow_sigma = _get(rollout_substrate, "flow_sigma", None)
     out = {
         "config": str(config_path),
         "run_seed_protocol": run_seed_protocol,
         "metric_seed_protocol": metric_seed_protocol,
+        "metric_log_clip_evolution": None if metric_log_clip is None else bool(metric_log_clip),
+        "rollout_log_clip_evolution": None if rollout_log_clip is None else bool(rollout_log_clip),
+        "rollout_sigma": None if rollout_sigma is None else float(rollout_sigma),
+        "rollout_flow_sigma": None if rollout_flow_sigma is None else float(rollout_flow_sigma),
         "apf_root": str(_get(section, "output_root", "")),
         "rollout_config": str(_get(section, "rollout_config", "")),
         "run_seed_base": int(_get(section, "run_seed_base", -1)),
@@ -1297,6 +1318,22 @@ def _audit_generated_config(config_path: Path) -> dict[str, Any]:
         errors.append(f"run_seed_protocol={run_seed_protocol!r}, expected 'optimization_metric'")
     if metric_seed_protocol != "optimization_metric":
         errors.append(f"metric_seed_protocol={metric_seed_protocol!r}, expected 'optimization_metric'")
+    if metric_log_clip is None:
+        errors.append("missing datasets.flow_lenia.c1.metric_log_clip_evolution")
+    if rollout_log_clip is None:
+        errors.append("missing simulation.flow_lenia_arun_lagrangian_apf.rollout_overrides.logging.log_clip_evolution")
+    if metric_log_clip is not None and rollout_log_clip is not None and bool(metric_log_clip) != bool(rollout_log_clip):
+        errors.append(
+            "metric_log_clip_evolution and rollout log_clip_evolution disagree: "
+            f"{bool(metric_log_clip)!r} vs {bool(rollout_log_clip)!r}"
+        )
+    if rollout_flow_sigma is None:
+        errors.append("missing simulation.flow_lenia_arun_lagrangian_apf.rollout_overrides.substrate.flow_sigma")
+    if rollout_sigma is not None and rollout_flow_sigma is not None and float(rollout_sigma) != float(rollout_flow_sigma):
+        errors.append(
+            "rollout substrate sigma and flow_sigma disagree: "
+            f"{float(rollout_sigma)!r} vs {float(rollout_flow_sigma)!r}"
+        )
     if out["run_seed_mode"] != "source_run_idx":
         errors.append(f"run_seed_mode={out['run_seed_mode']!r}, expected 'source_run_idx'")
     if out["run_seed_rep_stride"] != 1:
@@ -1367,6 +1404,226 @@ def _audit_seed_count(config_audit: dict[str, Any], selected_root: Path) -> dict
     if not rows:
         errors.append(f"no run_* directories found under {selected_root}")
     return {"status": "ok" if not errors else "failed", "rows": rows, "errors": errors}
+
+
+def _as_repo_path(path_raw: Any) -> Path:
+    path = Path(str(path_raw))
+    return path if path.is_absolute() else _REPO_ROOT / path
+
+
+def _load_best_params(run_dir: Path) -> np.ndarray:
+    best_path = run_dir / "best.pkl"
+    best = _load_pickle(best_path)
+    params = best[0] if isinstance(best, (tuple, list)) else best
+    return np.asarray(params, dtype=np.float32).reshape(-1)
+
+
+def _audit_selected_candidates(selected_root: Path, source_optimization_root: Path | None = None) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for run_dir in sorted(Path(selected_root).glob("run_*")):
+        if not run_dir.is_dir():
+            continue
+        row: dict[str, Any] = {"run": run_dir.name, "run_dir": str(run_dir)}
+        rows.append(row)
+        for name in ("best.pkl", "params.npy", "optimization_config.yaml", "selected_candidate.json"):
+            exists = bool((run_dir / name).exists())
+            row[f"has_{name.replace('.', '_')}"] = exists
+            if not exists:
+                errors.append(f"{run_dir}: missing {name}")
+        if not (run_dir / "best.pkl").exists() or not (run_dir / "selected_candidate.json").exists():
+            continue
+
+        try:
+            params = _load_best_params(run_dir)
+            meta = json.loads((run_dir / "selected_candidate.json").read_text())
+            source_pop = _as_repo_path(meta.get("source_pop_traj", ""))
+            if not source_pop.exists() and source_optimization_root is not None:
+                try:
+                    run_idx = int(run_dir.name.split("_", 1)[1])
+                    fallback_pop = source_optimization_root / f"run_{run_idx:03d}" / "pop_traj.pkl"
+                    if fallback_pop.exists():
+                        source_pop = fallback_pop
+                        row["source_pop_traj_fallback_used"] = True
+                except Exception:
+                    pass
+            row["source_pop_traj"] = str(source_pop)
+            row["source_pop_traj_exists"] = bool(source_pop.exists())
+            if not source_pop.exists():
+                errors.append(f"{run_dir}: source_pop_traj does not exist: {source_pop}")
+                continue
+            pop = _load_pickle(source_pop)
+            pop_params = np.asarray(pop.get("params"), dtype=np.float32)
+            i_iter = int(meta.get("iter", -1))
+            pop_idx = int(meta.get("pop_idx", -1))
+            row["selected_iter"] = i_iter
+            row["selected_pop_idx"] = pop_idx
+            row["pop_params_shape"] = list(pop_params.shape)
+            if pop_params.ndim != 3:
+                errors.append(f"{run_dir}: pop_traj['params'] has shape {pop_params.shape}, expected 3D")
+                continue
+            if i_iter < 0 or i_iter >= pop_params.shape[0] or pop_idx < 0 or pop_idx >= pop_params.shape[1]:
+                errors.append(f"{run_dir}: selected iter/pop_idx outside pop params shape {pop_params.shape}")
+                continue
+            expected = np.asarray(pop_params[i_iter, pop_idx], dtype=np.float32).reshape(-1)
+            diff = np.asarray(params, dtype=np.float32).reshape(-1) - expected
+            row["params_vs_selected_pop_max_abs_diff"] = float(np.nanmax(np.abs(diff)))
+            if float(row["params_vs_selected_pop_max_abs_diff"]) != 0.0:
+                errors.append(
+                    f"{run_dir}: best.pkl params differ from source pop selected candidate "
+                    f"max_abs_diff={row['params_vs_selected_pop_max_abs_diff']}"
+                )
+            for key in ("score_by_seed", "seed_keys"):
+                if key in pop:
+                    arr = np.asarray(pop[key])
+                    row[f"pop_{key}_shape"] = list(arr.shape)
+        except Exception as exc:
+            errors.append(f"{run_dir}: selected candidate audit failed: {exc!r}")
+    if not rows:
+        errors.append(f"no run_* directories found under {selected_root}")
+    return {"status": "ok" if not errors else "failed", "rows": rows, "errors": errors}
+
+
+def _audit_optimization_protocol(config_audit: dict[str, Any], selected_root: Path) -> dict[str, Any]:
+    requested_seeds = int(config_audit.get("n_rollout_seeds_per_checkpoint", -1))
+    expected_seed_base = int(config_audit.get("run_seed_base", -1))
+    expected_log_clip = config_audit.get("rollout_log_clip_evolution", None)
+    expected_flow_sigma = config_audit.get("rollout_flow_sigma", None)
+    rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for run_dir in sorted(Path(selected_root).glob("run_*")):
+        if not run_dir.is_dir():
+            continue
+        cfg_path = run_dir / "optimization_config.yaml"
+        row: dict[str, Any] = {"run": run_dir.name, "optimization_config": str(cfg_path)}
+        rows.append(row)
+        if not cfg_path.exists():
+            errors.append(f"{run_dir}: missing optimization_config.yaml")
+            continue
+        try:
+            cfg = OmegaConf.load(cfg_path)
+            opt = cfg.get("optimization", {})
+            substrate = cfg.get("substrate", {})
+            flat = _flat_optimization_config(cfg_path)
+            algorithm = str(opt.get("optimizer_algorithm", opt.get("optimization_algorithm", ""))).strip().lower()
+            eval_seed_mode = str(opt.get("eval_seed_mode", "")).strip().lower()
+            openai_es_n_seeds = opt.get("openai_es_n_seeds", None)
+            fixed_eval_seed_base = opt.get("fixed_eval_seed_base", None)
+            log_clip = bool(_get(flat, "log_clip_evolution", True))
+            substrate_sigma = substrate.get("sigma", None)
+            flow_sigma = _get(flat, "flow_sigma", None)
+            row.update(
+                {
+                    "optimizer_algorithm": algorithm,
+                    "eval_seed_mode": eval_seed_mode,
+                    "openai_es_n_seeds": None if openai_es_n_seeds is None else int(openai_es_n_seeds),
+                    "fixed_eval_seed_base": None if fixed_eval_seed_base is None else int(fixed_eval_seed_base),
+                    "log_clip_evolution": log_clip,
+                    "substrate_sigma": None if substrate_sigma is None else float(substrate_sigma),
+                    "flat_flow_sigma": None if flow_sigma is None else float(flow_sigma),
+                }
+            )
+            if algorithm not in {
+                "mirrored_openai_es",
+                "mirrored_batch_openai_es",
+                "openai_es",
+                "batch_openai_es",
+                "mirrored_es",
+                "antithetic_openai_es",
+            }:
+                errors.append(f"{run_dir.name}: optimizer_algorithm={algorithm!r}, expected OpenAI-ES")
+            if eval_seed_mode != "fixed":
+                errors.append(f"{run_dir.name}: eval_seed_mode={eval_seed_mode!r}, expected 'fixed'")
+            if openai_es_n_seeds is None or int(openai_es_n_seeds) != requested_seeds:
+                errors.append(
+                    f"{run_dir.name}: openai_es_n_seeds={openai_es_n_seeds}, "
+                    f"C1 rollout seeds={requested_seeds}"
+                )
+            if fixed_eval_seed_base is None or int(fixed_eval_seed_base) != expected_seed_base:
+                errors.append(
+                    f"{run_dir.name}: fixed_eval_seed_base={fixed_eval_seed_base}, "
+                    f"run_seed_base={expected_seed_base}"
+                )
+            if expected_log_clip is None:
+                errors.append(f"{run_dir.name}: generated config has no rollout_log_clip_evolution")
+            elif bool(log_clip) != bool(expected_log_clip):
+                errors.append(
+                    f"{run_dir.name}: optimization log_clip_evolution={log_clip}, "
+                    f"generated rollout_log_clip_evolution={expected_log_clip}"
+                )
+            if expected_flow_sigma is None:
+                errors.append(f"{run_dir.name}: generated config has no rollout_flow_sigma")
+            elif flow_sigma is None or float(flow_sigma) != float(expected_flow_sigma):
+                errors.append(
+                    f"{run_dir.name}: optimization flow_sigma={flow_sigma}, "
+                    f"generated rollout_flow_sigma={expected_flow_sigma}"
+                )
+        except Exception as exc:
+            errors.append(f"{run_dir}: optimization protocol audit failed: {exc!r}")
+    if not rows:
+        errors.append(f"no run_* directories found under {selected_root}")
+    return {"status": "ok" if not errors else "failed", "rows": rows, "errors": errors}
+
+
+def _audit_random_checkpoints(config_path: Path, selected_root: Path) -> dict[str, Any]:
+    cfg, _flat = load_config(config_path)
+    section = _resolve_section(cfg)
+    mode = str(_get(section, "random_checkpoint_selection", "per_source_group")).strip().lower()
+    n_random = int(_get(section, "num_random_baselines", 0))
+    random_root_raw = _get(section, "random_checkpoint_root", "")
+    random_root = _as_repo_path(random_root_raw)
+    rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+    if n_random <= 0:
+        return {"status": "ok", "mode": mode, "n_random": n_random, "rows": rows, "errors": []}
+    if not random_root.exists():
+        errors.append(f"random checkpoint root does not exist: {random_root}")
+    if mode not in {"per_source_group", "all_groups_flat", "global_flat", "flat"}:
+        errors.append(f"unknown random_checkpoint_selection={mode!r}")
+
+    if mode == "per_source_group":
+        for run_dir in sorted(Path(selected_root).glob("run_*")):
+            if not run_dir.is_dir():
+                continue
+            try:
+                run_idx = int(run_dir.name.split("_", 1)[1])
+            except Exception:
+                errors.append(f"cannot parse run index from {run_dir.name}")
+                continue
+            meta_path = run_dir / "selected_candidate.json"
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text())
+                    source_run_dir = Path(str(meta.get("source_run_dir", "")))
+                    if source_run_dir.name.startswith("run_"):
+                        run_idx = int(source_run_dir.name.split("_", 1)[1])
+                except Exception:
+                    pass
+            for random_idx in range(n_random):
+                best_path = random_root / f"group_{run_idx:03d}" / f"random_{random_idx:03d}" / "best.pkl"
+                row = {
+                    "run": run_dir.name,
+                    "source_run_idx": int(run_idx),
+                    "random_idx": int(random_idx),
+                    "best_path": str(best_path),
+                    "exists": bool(best_path.exists()),
+                }
+                rows.append(row)
+                if not best_path.exists():
+                    errors.append(f"missing random checkpoint: {best_path}")
+    else:
+        found = sorted(random_root.glob("group_*/random_*/best.pkl"))
+        rows.append({"mode": mode, "required": int(n_random), "found": int(len(found)), "random_root": str(random_root)})
+        if len(found) < n_random:
+            errors.append(f"need {n_random} random checkpoints under {random_root}, found {len(found)}")
+    return {
+        "status": "ok" if not errors else "failed",
+        "mode": mode,
+        "n_random": n_random,
+        "random_root": str(random_root),
+        "rows": rows,
+        "errors": errors,
+    }
 
 
 def _find_run(selected_root: Path, requested: str | None) -> tuple[int, Path]:
@@ -1838,6 +2095,7 @@ def _run_replay_smoke(
                 "dd",
                 "dt",
                 "sigma",
+                "flow_sigma",
                 "border",
                 "mix_rule",
                 "sobel_impl",
@@ -1875,6 +2133,7 @@ def _run_replay_smoke(
                 "food_diffusion_alpha",
                 "mass_clip_eps",
                 "mass_renorm",
+                "log_clip_evolution",
             ],
         ),
         "run_idx": int(run_idx),
@@ -1942,6 +2201,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Fast preflight for Flow-Lenia fixed-init C1 replay protocol.")
     parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--selected-root", default=DEFAULT_SELECTED_ROOT)
+    parser.add_argument("--source-optimization-root", default=None)
     parser.add_argument("--scores-csv", default=DEFAULT_SCORES_CSV)
     parser.add_argument("--run", default=None, help="Run index or run_XXX. Defaults to first selected run.")
     parser.add_argument("--seed-idx", type=int, default=0)
@@ -1950,16 +2210,43 @@ def main() -> int:
     parser.add_argument("--atol", type=float, default=1.0e-5)
     parser.add_argument("--skip-smoke", action="store_true")
     parser.add_argument("--skip-existing-results", action="store_true")
+    parser.add_argument("--skip-selected-candidate-audit", action="store_true")
+    parser.add_argument("--skip-random-checkpoint-audit", action="store_true")
+    parser.add_argument("--skip-optimization-protocol-audit", action="store_true")
+    parser.add_argument(
+        "--require-apf-root-contains",
+        default=None,
+        help="Fail config audit unless generated APF root contains this substring.",
+    )
     parser.add_argument("--summary-json", default=None)
     args = parser.parse_args()
 
     config_path = Path(args.config)
     selected_root = Path(args.selected_root)
+    source_optimization_root = None if args.source_optimization_root is None else _as_repo_path(args.source_optimization_root)
     scores_csv = Path(args.scores_csv)
     summary: dict[str, Any] = {
         "config_audit": _audit_generated_config(config_path),
     }
+    if args.require_apf_root_contains:
+        apf_root = str(summary["config_audit"].get("apf_root", ""))
+        if str(args.require_apf_root_contains) not in apf_root:
+            summary["config_audit"].setdefault("errors", []).append(
+                f"apf_root={apf_root!r} does not contain required substring {args.require_apf_root_contains!r}"
+            )
     summary["seed_count_audit"] = _audit_seed_count(summary["config_audit"], selected_root)
+    if not args.skip_selected_candidate_audit:
+        summary["selected_candidate_audit"] = _audit_selected_candidates(
+            selected_root,
+            source_optimization_root=source_optimization_root,
+        )
+    if not args.skip_optimization_protocol_audit:
+        summary["optimization_protocol_audit"] = _audit_optimization_protocol(
+            summary["config_audit"],
+            selected_root,
+        )
+    if not args.skip_random_checkpoint_audit:
+        summary["random_checkpoint_audit"] = _audit_random_checkpoints(config_path, selected_root)
     if not args.skip_existing_results:
         summary["existing_results_audit"] = _audit_existing_results(scores_csv)
     if not args.skip_smoke:
@@ -1976,6 +2263,12 @@ def main() -> int:
     errors: list[str] = []
     errors.extend(summary["config_audit"].get("errors", []))
     errors.extend(summary["seed_count_audit"].get("errors", []))
+    if "selected_candidate_audit" in summary:
+        errors.extend(summary["selected_candidate_audit"].get("errors", []))
+    if "optimization_protocol_audit" in summary:
+        errors.extend(summary["optimization_protocol_audit"].get("errors", []))
+    if "random_checkpoint_audit" in summary:
+        errors.extend(summary["random_checkpoint_audit"].get("errors", []))
     if "existing_results_audit" in summary:
         errors.extend(summary["existing_results_audit"].get("errors", []))
     if "replay_smoke" in summary and summary["replay_smoke"].get("status") != "ok":
