@@ -42,6 +42,29 @@ def _print_heading(title: str) -> None:
     print("-" * len(title))
 
 
+def _iter_closest_rows(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        return [row for row in value if isinstance(row, dict)]
+    if isinstance(value, dict):
+        rows: list[dict[str, Any]] = []
+        for anchor, anchor_rows in value.items():
+            if not isinstance(anchor_rows, list):
+                continue
+            for row in anchor_rows:
+                if isinstance(row, dict):
+                    rows.append({"anchor": anchor, **row})
+        rows.sort(
+            key=lambda row: (
+                float(row.get("mean_abs_xy_diff", float("inf"))),
+                float(row.get("max_abs_xy_diff", float("inf"))),
+                str(row.get("anchor", "")),
+                str(row.get("name", "")),
+            )
+        )
+        return rows
+    return []
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Summarize Flow-Lenia C1 replay preflight diagnostics.")
     parser.add_argument("json_path", help="Path to *_preflight_smoke_before_apf.json.")
@@ -80,11 +103,11 @@ def main() -> int:
         print(_pair_status({"x": item}, "x").replace("x:", f"{name}:"))
 
     _print_heading("Full Rollout Closest Pairs")
-    for row in _get(smoke, "diagnostic_pack.full_rollout_pairwise_xy.closest_by_mean_abs", [])[:12]:
+    for row in _iter_closest_rows(_get(smoke, "diagnostic_pack.full_rollout_pairwise_xy.closest_by_mean_abs", []))[:12]:
         print(row)
 
     _print_heading("First Chunk Closest Pairs")
-    for row in _get(smoke, "diagnostic_pack.first_chunk_pairwise_xy.closest_by_mean_abs", [])[:12]:
+    for row in _iter_closest_rows(_get(smoke, "diagnostic_pack.first_chunk_pairwise_xy.closest_by_mean_abs", []))[:12]:
         print(row)
 
     _print_heading("APF Style Chunk")

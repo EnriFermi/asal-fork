@@ -11,8 +11,9 @@ source_optimization_root="experiments/paper_check_flow_lenia/checkpoints_lockhee
 selected_optimization_root="experiments/paper_check_flow_lenia/checkpoints_lockheed_1_openai_es_fixed_init_9opt_completed_robust_c1_3random/optimization"
 generated_cfg="experiments/paper_suite/config_flowlenia_lockheed_1_openai_es_fixed_init_9opt_completed_robust_c1_3random.yaml"
 result_root="${RESULT_ROOT:-analysis/results/paper_suite_flowlenia_lockheed_1_openai_es_fixed_init_9opt_completed_robust_c1_3random}"
-apf_root="experiments/paper_check_flow_lenia/checkpoints_lockheed_1_openai_es_fixed_init_9opt_completed_robust_c1_3random/c1_lagrangian_apf_300k_train50_4seeds_replay_fixed"
+apf_root="experiments/paper_check_flow_lenia/checkpoints_lockheed_1_openai_es_fixed_init_9opt_completed_robust_c1_3random/c1_lagrangian_apf_300k_train50_4seeds_replay_fixed_opt_native"
 random_checkpoint_root="experiments/paper_check_flow_lenia/checkpoints_lockheed_1/frustration_simulation/random_params"
+random_checkpoint_selection="optimization_iter0"
 run_id="${PAPER_SUITE_RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 log_dir="${PAPER_SUITE_LOG_DIR:-${result_root}/logs}"
 master_log="${PAPER_SUITE_MASTER_LOG:-${log_dir}/${run_id}_master.log}"
@@ -21,7 +22,7 @@ force_prep_export="${FORCE_PREP_EXPORT:-0}"
 run_preflight="${RUN_PREFLIGHT:-1}"
 preflight_rollout_steps="${PREFLIGHT_ROLLOUT_STEPS:-200}"
 c1_rollout_seeds="${C1_ROLLOUT_SEEDS:-4}"
-force_apf="${FORCE_APF:-0}"
+force_apf="${FORCE_APF:-1}"
 force_metrics="${FORCE_METRICS:-1}"
 force_visualization="${FORCE_VISUALIZATION:-1}"
 conda_no_capture_output="${CONDA_NO_CAPTURE_OUTPUT:-1}"
@@ -114,7 +115,9 @@ require_dir() {
 }
 
 require_dir "${source_optimization_root}"
-require_dir "${random_checkpoint_root}"
+if [ "${random_checkpoint_selection}" != "optimization_iter0" ]; then
+  require_dir "${random_checkpoint_root}"
+fi
 
 case "${apf_root}" in
   *replay_fixed*) ;;
@@ -151,7 +154,7 @@ echo "  generated_cfg=${generated_cfg}"
 echo "  result_root=${result_root}"
 echo "  apf_root=${apf_root}"
 echo "  random_checkpoint_root=${random_checkpoint_root}"
-echo "  random_checkpoint_selection=per_source_group"
+echo "  random_checkpoint_selection=${random_checkpoint_selection}"
 echo "  anti_noise=robust_pioneer_lcb_in_top_trend"
 echo "  lcb_z=2.0 trend_quantile=90 ewma_beta=0.85 trim_frac=0.125"
 echo "  c1_rollout_seeds=${c1_rollout_seeds}"
@@ -172,7 +175,7 @@ run_py scripts/prepare_flowlenia_completed_robust_c1.py \
   --result-root "${result_root}" \
   --apf-root "${apf_root}" \
   --random-checkpoint-root "${random_checkpoint_root}" \
-  --random-checkpoint-selection per_source_group \
+  --random-checkpoint-selection "${random_checkpoint_selection}" \
   --n-rollout-seeds "${c1_rollout_seeds}" \
   --num-random-baselines 3 \
   --batch-size 8 \
@@ -181,6 +184,8 @@ run_py scripts/prepare_flowlenia_completed_robust_c1.py \
   --trend-quantile 90 \
   --ewma-beta 0.85 \
   --trim-frac 0.125 \
+  --exclude-source-run 8 \
+  --legacy-optimization-sigma-collision \
   ${prep_force_arg}
 
 echo

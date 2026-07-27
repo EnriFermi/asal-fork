@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import pickle
 import subprocess
 import sys
 from pathlib import Path
@@ -96,6 +97,148 @@ def _group_pair_seeds(paper_cfg, group_idx: int) -> tuple[int, int]:
 def _metric_seed(paper_cfg, trial_idx: int) -> int:
     base = int(paper_cfg.get("paper_check", {}).get("metric_seed_base", 2_000_000))
     return base + int(trial_idx)
+
+
+def _resolve_manifest_path(root: Path, raw) -> Path:
+    path = Path(str(raw))
+    return path if path.is_absolute() else root / path
+
+
+def _load_training_references(manifest_path: Path) -> dict[tuple[int, str, int, int], dict]:
+    payload = json.loads(manifest_path.read_text())
+    root = manifest_path.parent
+    references: dict[tuple[int, str, int, int], dict] = {}
+    for row in payload.get("trajectories", []):
+        source_run_idx = int(row.get("source_run_idx", row.get("suite_run_idx", -1)))
+        candidate_kind = str(row.get("candidate_kind", "optimized")).strip().lower()
+        candidate_idx = int(row.get("candidate_idx", 0))
+        run_seed = int(row.get("run_seed", -1))
+        key = (source_run_idx, candidate_kind, candidate_idx, run_seed)
+        if key in references:
+            raise ValueError(f"Duplicate C5 training reference key {key} in {manifest_path}.")
+        references[key] = {
+            **dict(row),
+            "apf_dir": str(_resolve_manifest_path(root, row["apf_dir"])),
+            "params_path": str(_resolve_manifest_path(root, row["params_path"])),
+        }
+    return references
+
+
+def _training_reference(
+    references: dict[tuple[int, str, int, int], dict],
+    *,
+    group_idx: int,
+    candidate_kind: str,
+    candidate_idx: int,
+    run_seed: int,
+) -> dict:
+    key = (int(group_idx), str(candidate_kind).strip().lower(), int(candidate_idx), int(run_seed))
+    if key not in references:
+        raise KeyError(f"Missing C5 training reference {key}.")
+    return references[key]
+
+
+def _optimizer_native_resume_metadata(reference: dict, *, step: int) -> dict[str, int | str]:
+    apf_dir = Path(str(reference["apf_dir"]))
+    for path in sorted(apf_dir.glob("P_steps_*.npz")):
+        with np.load(path, allow_pickle=False) as data:
+            steps = np.asarray(data["steps"], dtype=np.int64)
+            matches = np.flatnonzero(steps == int(step))
+            if matches.size != 1:
+                continue
+            idx = int(matches[0])
+            batch_size = int(np.asarray(data["resume_batch_size"])[idx])
+            batch_index = int(np.asarray(data["resume_batch_index"])[idx])
+            seed_count = int(reference.get("rollout_seed_count", 0))
+            if seed_count < 1 or batch_size % seed_count != 0:
+                raise ValueError(
+                    f"Invalid optimizer-native batch metadata in {path}: "
+                    f"batch_size={batch_size}, seed_count={seed_count}."
+                )
+            return {
+                "reference_apf_file": str(path),
+                "batch_size": batch_size,
+                "batch_index": batch_index,
+                "population_size": int(batch_size // seed_count),
+                "seed_count": seed_count,
+                "execution_pop_idx": int(batch_index // seed_count),
+                "seed_idx": int(batch_index % seed_count),
+            }
+    raise FileNotFoundError(
+        f"No optimizer-native resume metadata for step={step} under {apf_dir}."
+    )
+
+
+def _optimizer_native_init_identity(reference: dict) -> tuple[Path, int, int]:
+    raw_pop_path = reference.get("optimizer_native_source_pop_traj", None)
+    if raw_pop_path in (None, ""):
+        raise ValueError(
+            f"Training reference {reference.get('traj_id')} has no optimizer_native_source_pop_traj."
+        )
+    pop_path = Path(str(raw_pop_path)).resolve()
+    optimizer_iter = int(reference.get("optimizer_native_iter", -1))
+    optimizer_pop_idx = int(reference.get("optimizer_native_pop_idx", -1))
+    if optimizer_iter < 0 or optimizer_pop_idx < 0:
+        raise ValueError(
+            f"Training reference {reference.get('traj_id')} has invalid optimizer-native "
+            f"iter/pop_idx={optimizer_iter}/{optimizer_pop_idx}."
+        )
+    return pop_path, optimizer_iter, optimizer_pop_idx
+
+
+def _materialize_optimizer_native_init_params(
+    *,
+    control_a_reference: dict,
+    control_b_reference: dict,
+    trial_artifact_dir: Path,
+    cache: dict[tuple[Path, int, int], np.ndarray],
+) -> Path:
+    identity_a = _optimizer_native_init_identity(control_a_reference)
+    identity_b = _optimizer_native_init_identity(control_b_reference)
+    if identity_a != identity_b:
+        raise ValueError(
+            "Control A/B references disagree on optimizer-native init identity: "
+            f"{identity_a} != {identity_b}."
+        )
+    pop_path, optimizer_iter, optimizer_pop_idx = identity_a
+    if not pop_path.exists():
+        raise FileNotFoundError(f"Optimizer-native source pop_traj not found: {pop_path}.")
+    if identity_a not in cache:
+        with pop_path.open("rb") as f:
+            pop = pickle.load(f)
+        params = np.asarray(pop["params"], dtype=np.float32)
+        if optimizer_iter >= params.shape[0] or optimizer_pop_idx >= params.shape[1]:
+            raise IndexError(
+                f"Optimizer-native init index [{optimizer_iter}, {optimizer_pop_idx}] "
+                f"is outside params shape {params.shape} in {pop_path}."
+            )
+        cache[identity_a] = np.asarray(
+            params[optimizer_iter, optimizer_pop_idx],
+            dtype=np.float32,
+        ).copy()
+
+    init_params = cache[identity_a]
+    init_params_path = trial_artifact_dir / "optimizer_native_init_params.npy"
+    if init_params_path.exists():
+        existing = np.asarray(np.load(init_params_path), dtype=np.float32)
+        if not np.array_equal(existing, init_params):
+            raise RuntimeError(
+                f"Existing optimizer-native init params disagree with source: {init_params_path}."
+            )
+    else:
+        np.save(init_params_path, init_params)
+    _write_json(
+        trial_artifact_dir / "optimizer_native_init_params_provenance.json",
+        {
+            "source_pop_traj": str(pop_path),
+            "optimizer_iter": int(optimizer_iter),
+            "optimizer_pop_idx": int(optimizer_pop_idx),
+            "control_a_reference": str(control_a_reference.get("traj_id", "")),
+            "control_b_reference": str(control_b_reference.get("traj_id", "")),
+            "n_params": int(init_params.size),
+        },
+    )
+    return init_params_path
 
 
 def _canonicalize_random_mean_init(name) -> str:
@@ -233,9 +376,13 @@ def _build_job_config(
     candidate_kind: str,
     candidate_idx: int,
     candidate_label: str,
+    init_params_path: Path,
     seed_x: int,
     seed_x1: int,
     metric_seed: int,
+    control_a_reference: dict | None = None,
+    control_b_reference: dict | None = None,
+    training_reference_step: int | None = None,
     random_param_seed: int | None = None,
     random_member_idx: int | None = None,
 ):
@@ -262,13 +409,41 @@ def _build_job_config(
     cfg.source.checkpoint_dir = str(param_checkpoint_rel)
     cfg.source.params_name = "best"
     cfg.source.params_path = None
+    cfg.source.init_params_path = str(init_params_path)
 
     cfg.evaluation.resume = bool(stage_cfg.get("resume", True))
     cfg.evaluation.checkpoint_every_steps = int(stage_cfg.get("checkpoint_every_steps", 5_000))
     cfg.evaluation.full_embedding_sample_every_steps = int(
         stage_cfg.get("full_embedding_sample_every_steps", cfg.get("metric", {}).get("sample_every_steps", 1_000))
     )
+    cfg.evaluation.continuation_full_embedding_sample_every_steps = int(
+        stage_cfg.get(
+            "continuation_full_embedding_sample_every_steps",
+            cfg.evaluation.full_embedding_sample_every_steps,
+        )
+    )
     cfg.evaluation.log_full_embeddings_for_b = bool(stage_cfg.get("log_full_embeddings_for_b", False))
+    cfg.evaluation.run_seed_protocol = str(stage_cfg.get("run_seed_protocol", "legacy"))
+    cfg.evaluation.training_horizon_steps = int(
+        stage_cfg.get("training_horizon_steps", training_reference_step or 0)
+    )
+    cfg.evaluation.require_training_reference_match = bool(
+        stage_cfg.get("require_training_reference_match", False)
+    )
+    cfg.evaluation.training_reference_only = bool(
+        stage_cfg.get("training_reference_only", False)
+    )
+    bootstrap_cache_root = stage_cfg.get("bootstrap_cache_root", None)
+    if bootstrap_cache_root is not None:
+        cfg.evaluation.bootstrap_cache_root = str(bootstrap_cache_root)
+    cfg.evaluation.wall_video_enabled = bool(stage_cfg.get("wall_video_enabled", False))
+    cfg.evaluation.wall_video_sample_every_steps = int(
+        stage_cfg.get("wall_video_sample_every_steps", 5_000)
+    )
+    cfg.evaluation.wall_video_img_size = int(stage_cfg.get("wall_video_img_size", 256))
+    cfg.evaluation.wall_video_fps = float(stage_cfg.get("wall_video_fps", 24.0))
+    cfg.evaluation.wall_video_codec = str(stage_cfg.get("wall_video_codec", "libx264"))
+    cfg.evaluation.wall_video_keep_frames = bool(stage_cfg.get("wall_video_keep_frames", False))
 
     wandb_project = paper_cfg.get("meta", {}).get("wandb_project", None)
     if wandb_project is not None:
@@ -280,6 +455,50 @@ def _build_job_config(
     cfg.job.seed_x = int(seed_x)
     cfg.job.seed_x1 = int(seed_x1)
     cfg.job.metric_seed = int(metric_seed)
+    if control_a_reference is not None:
+        cfg.job.control_a_reference_apf_dir = str(control_a_reference["apf_dir"])
+        cfg.job.control_a_reference_params_path = str(control_a_reference["params_path"])
+    if control_b_reference is not None:
+        cfg.job.control_b_reference_apf_dir = str(control_b_reference["apf_dir"])
+        cfg.job.control_b_reference_params_path = str(control_b_reference["params_path"])
+    if training_reference_step is not None:
+        cfg.job.training_reference_step = int(training_reference_step)
+    if control_a_reference is not None and control_b_reference is not None and training_reference_step is not None:
+        resume_a = _optimizer_native_resume_metadata(
+            control_a_reference,
+            step=training_reference_step,
+        )
+        resume_b = _optimizer_native_resume_metadata(
+            control_b_reference,
+            step=training_reference_step,
+        )
+        identity_a = _optimizer_native_init_identity(control_a_reference)
+        identity_b = _optimizer_native_init_identity(control_b_reference)
+        if identity_a != identity_b:
+            raise ValueError(
+                f"Control references disagree on optimizer-native source identity: "
+                f"{identity_a} != {identity_b}."
+            )
+        if (
+            int(resume_a["population_size"]) != int(resume_b["population_size"])
+            or int(resume_a["seed_count"]) != int(resume_b["seed_count"])
+            or int(resume_a["execution_pop_idx"]) != int(resume_b["execution_pop_idx"])
+        ):
+            raise ValueError(
+                "Control references disagree on optimizer-native execution context: "
+                f"A={resume_a}, B={resume_b}."
+            )
+        cfg.job.optimizer_native_source_pop_traj = str(identity_a[0])
+        cfg.job.optimizer_native_iter = int(identity_a[1])
+        cfg.job.optimizer_native_source_pop_idx = int(identity_a[2])
+        cfg.job.optimizer_native_use_row_params = bool(
+            control_a_reference.get("optimizer_native_use_row_params", False)
+        )
+        cfg.job.optimizer_native_population_size = int(resume_a["population_size"])
+        cfg.job.optimizer_native_seed_count = int(resume_a["seed_count"])
+        cfg.job.optimizer_native_execution_pop_idx = int(resume_a["execution_pop_idx"])
+        cfg.job.control_a_optimizer_native_seed_idx = int(resume_a["seed_idx"])
+        cfg.job.control_b_optimizer_native_seed_idx = int(resume_b["seed_idx"])
     if random_param_seed is not None:
         cfg.job.random_param_seed = int(random_param_seed)
     if random_member_idx is not None:
@@ -334,13 +553,30 @@ def main() -> int:
         **util.substrate_kwargs_from_args(opt_args),
     )
     substrate = substrates.FlattenSubstrateParameters(substrate)
-    random_root = ensure_dir(save_root_abs / "random_params")
+    external_random_root_raw = stage_cfg.get("random_checkpoint_root", None)
+    if external_random_root_raw is None:
+        random_root = ensure_dir(save_root_abs / "random_params")
+    else:
+        random_root = resolve_path(external_random_root_raw, repo)
+        if random_root is None or not random_root.exists():
+            raise FileNotFoundError(f"Configured random_checkpoint_root does not exist: {random_root}.")
+    require_existing_random = bool(stage_cfg.get("require_existing_random_checkpoints", False))
+    training_manifest_raw = stage_cfg.get("training_reference_manifest", None)
+    training_references: dict[tuple[int, str, int, int], dict] = {}
+    training_reference_step = None
+    if training_manifest_raw is not None:
+        training_manifest_path = resolve_path(training_manifest_raw, repo)
+        if training_manifest_path is None or not training_manifest_path.exists():
+            raise FileNotFoundError(f"Configured training_reference_manifest does not exist: {training_manifest_path}.")
+        training_references = _load_training_references(training_manifest_path)
+        training_reference_step = int(stage_cfg.get("training_reference_step", 300_000))
     random_seed_base = int(paper_section.get("random_param_seed_base", 500_000))
     opt_pop_size = int(getattr(opt_args, "pop_size"))
     opt_sigma = float(getattr(opt_args, "sigma"))
     opt_params_init = _canonicalize_random_mean_init(getattr(opt_args, "params_init", "strategy_default"))
 
     pending_job_cfgs: list[Path] = []
+    init_params_cache: dict[tuple[Path, int, int], np.ndarray] = {}
     for group_idx in assigned_groups:
         seed_x, seed_x1 = _group_pair_seeds(paper_cfg, group_idx)
         optimized_checkpoint_rel = opt_save_root_rel / f"run_{int(group_idx):03d}"
@@ -348,6 +584,12 @@ def main() -> int:
         if optimized_checkpoint_abs is None or not (optimized_checkpoint_abs / "best.pkl").exists():
             raise FileNotFoundError(
                 f"Optimized checkpoint missing for group {group_idx}: expected {optimized_checkpoint_abs / 'best.pkl'}."
+            )
+        fallback_init_params_path = optimized_checkpoint_abs / "params.npy"
+        if not fallback_init_params_path.exists():
+            raise FileNotFoundError(
+                "Fallback initialization params missing for group "
+                f"{group_idx}: {fallback_init_params_path}."
             )
 
         candidate_specs = [
@@ -368,17 +610,23 @@ def main() -> int:
             member_idx = int(random_idx % opt_pop_size)
             param_seed = int(random_seed_base + group_idx * 10_000 + pop_round)
             random_dir_abs = group_random_root / f"random_{int(random_idx):03d}"
-            _ensure_random_checkpoint(
-                random_dir=random_dir_abs,
-                substrate=substrate,
-                sigma_init=opt_sigma,
-                pop_size=opt_pop_size,
-                param_seed=param_seed,
-                member_idx=member_idx,
-                group_idx=group_idx,
-                random_idx=random_idx,
-                mean_init_mode=opt_params_init,
-            )
+            if require_existing_random:
+                if not (random_dir_abs / "best.pkl").exists():
+                    raise FileNotFoundError(
+                        f"Required existing random checkpoint missing: {random_dir_abs / 'best.pkl'}."
+                    )
+            else:
+                _ensure_random_checkpoint(
+                    random_dir=random_dir_abs,
+                    substrate=substrate,
+                    sigma_init=opt_sigma,
+                    pop_size=opt_pop_size,
+                    param_seed=param_seed,
+                    member_idx=member_idx,
+                    group_idx=group_idx,
+                    random_idx=random_idx,
+                    mean_init_mode=opt_params_init,
+                )
             checkpoint_rel = Path(str(random_dir_abs.relative_to(repo)))
             candidate_specs.append(
                 dict(
@@ -408,6 +656,34 @@ def main() -> int:
                     )
                 print(f"[paper_check/frustration] skipping completed trial_idx={spec['trial_idx']}")
                 continue
+            control_a_reference = None
+            control_b_reference = None
+            if training_references:
+                control_a_reference = _training_reference(
+                    training_references,
+                    group_idx=group_idx,
+                    candidate_kind=str(spec["candidate_kind"]),
+                    candidate_idx=int(spec["candidate_idx"]),
+                    run_seed=seed_x,
+                )
+                control_b_reference = _training_reference(
+                    training_references,
+                    group_idx=group_idx,
+                    candidate_kind=str(spec["candidate_kind"]),
+                    candidate_idx=int(spec["candidate_idx"]),
+                    run_seed=seed_x1,
+                )
+                init_params_path = _materialize_optimizer_native_init_params(
+                    control_a_reference=control_a_reference,
+                    control_b_reference=control_b_reference,
+                    trial_artifact_dir=_build_trial_artifact_dir(
+                        save_root_abs,
+                        int(spec["trial_idx"]),
+                    ),
+                    cache=init_params_cache,
+                )
+            else:
+                init_params_path = fallback_init_params_path
             resolved_job_cfg = _build_job_config(
                 paper_cfg=paper_cfg,
                 config_path=config_path,
@@ -419,9 +695,13 @@ def main() -> int:
                 candidate_kind=str(spec["candidate_kind"]),
                 candidate_idx=int(spec["candidate_idx"]),
                 candidate_label=str(spec["candidate_label"]),
+                init_params_path=init_params_path,
                 seed_x=int(seed_x),
                 seed_x1=int(seed_x1),
                 metric_seed=_metric_seed(paper_cfg, int(spec["trial_idx"])),
+                control_a_reference=control_a_reference,
+                control_b_reference=control_b_reference,
+                training_reference_step=training_reference_step,
                 random_param_seed=spec["random_param_seed"],
                 random_member_idx=spec["random_member_idx"],
             )

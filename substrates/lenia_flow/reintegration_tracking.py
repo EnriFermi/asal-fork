@@ -298,7 +298,16 @@ class ReintegrationTracking:
 
     #-------------------------------------------------------------------
 
-    def _apply_without_hidden(self, A: jax.Array, F: jax.Array)->jax.Array:
+    def _apply_without_hidden(
+        self,
+        A: jax.Array,
+        F: jax.Array,
+        categorical_gumbel: jax.Array | None = None,
+    )->jax.Array:
+        if categorical_gumbel is not None:
+            raise ValueError(
+                "categorical_gumbel requires hidden-state reintegration"
+            )
 
         x, y = jnp.arange(self.SX), jnp.arange(self.SY)
         X, Y = jnp.meshgrid(x, y)
@@ -340,7 +349,13 @@ class ReintegrationTracking:
 
     #-------------------------------------------------------------------
 
-    def _apply_with_hidden(self, A: jax.Array, H: jax.Array, F: jax.Array):
+    def _apply_with_hidden(
+        self,
+        A: jax.Array,
+        H: jax.Array,
+        F: jax.Array,
+        categorical_gumbel: jax.Array | None = None,
+    ):
 
         x, y = jnp.arange(self.SX), jnp.arange(self.SY)
         X, Y = jnp.meshgrid(x, y)
@@ -393,10 +408,23 @@ class ReintegrationTracking:
             nH = jnp.sum(nH * expnA, axis = 0) / (expnA.sum(axis = 0)+1e-10) #avg rule
 
         elif self.mix == "stoch":
-            categorical=jax.random.categorical(
-              jax.random.PRNGKey(42), 
-              jnp.log(nA.sum(axis=-1, keepdims=True)), 
-              axis=0)
+            logits = jnp.log(nA.sum(axis=-1, keepdims=True))
+            if categorical_gumbel is None:
+                categorical = jax.random.categorical(
+                    jax.random.PRNGKey(42),
+                    logits,
+                    axis=0,
+                )
+            else:
+                if categorical_gumbel.shape != logits.shape:
+                    raise ValueError(
+                        "categorical_gumbel shape must match stochastic RT "
+                        f"logits: {categorical_gumbel.shape} != {logits.shape}"
+                    )
+                categorical = jnp.argmax(
+                    categorical_gumbel + logits,
+                    axis=0,
+                )
             mask=jax.nn.one_hot(categorical,num_classes=(2*self.dd+1)**2,axis=-1)
             mask=jnp.transpose(mask,(3,0,1,2)) 
             nH = jnp.sum(nH * mask, axis = 0)

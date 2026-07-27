@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import json
+import hashlib
 import os
+import pickle
+import shutil
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
@@ -32,6 +37,7 @@ from evaluate_frustration_history_dependence import (
     _load_params,
     _merge_blocks_into_global_state,
     _patch_wandb_pandas_check,
+    _prepare_block_template_state,
     _resolve_window,
     _save_npz_atomic,
     _scalarize_dict,
@@ -140,6 +146,66 @@ def _make_step_keys_batch(chunk_keys: jax.Array, steps: int) -> jax.Array:
     return jax.vmap(lambda key: jax.random.split(key, steps))(chunk_keys)
 
 
+def _optimizer_metric_roll_key(run_seed: int, *, log_clip_evolution: bool) -> jax.Array:
+    eval_key = jax.random.PRNGKey(int(run_seed))
+    return jax.random.split(eval_key, 3 if log_clip_evolution else 2)[0]
+
+
+def _optimizer_metric_parts(run_seed: int, *, log_clip_evolution: bool) -> tuple[jax.Array, ...]:
+    return tuple(jax.random.split(_optimizer_metric_roll_key(run_seed, log_clip_evolution=log_clip_evolution), 4))
+
+
+def _optimizer_metric_key_schedule(
+    *,
+    run_seed: int,
+    total_steps: int,
+    training_horizon_steps: int,
+    chunk_steps: int,
+    log_clip_evolution: bool,
+) -> jax.Array:
+    if training_horizon_steps <= 0 or training_horizon_steps > total_steps:
+        raise ValueError(
+            "optimization_metric requires 0 < training_horizon_steps <= total_steps; "
+            f"got training_horizon_steps={training_horizon_steps}, total_steps={total_steps}."
+        )
+    if training_horizon_steps % chunk_steps != 0 or total_steps % chunk_steps != 0:
+        raise ValueError(
+            "optimization_metric key schedule requires training and total horizons divisible by "
+            f"chunk_steps={chunk_steps}; got {training_horizon_steps} and {total_steps}."
+        )
+    scan_key = _optimizer_metric_parts(
+        run_seed,
+        log_clip_evolution=log_clip_evolution,
+    )[3]
+    n_train = int(training_horizon_steps // chunk_steps)
+    n_total = int(total_steps // chunk_steps)
+    training_keys = jax.random.split(scan_key, n_train)
+    if n_total == n_train:
+        return training_keys
+    extension_key = jax.random.fold_in(scan_key, jnp.uint32(training_horizon_steps))
+    extension_keys = jax.random.split(extension_key, n_total - n_train)
+    return jnp.concatenate((training_keys, extension_keys), axis=0)
+
+
+def _next_lane_chunk_keys(
+    lanes: list[dict],
+    group_indices: list[int],
+    *,
+    current_step: int,
+    chunk_steps: int,
+) -> tuple[jax.Array, jax.Array]:
+    protocols = {str(lanes[idx].get("run_seed_protocol", "legacy")) for idx in group_indices}
+    if len(protocols) != 1:
+        raise ValueError(f"Mixed run_seed_protocol values in one lane group: {protocols}.")
+    protocol = next(iter(protocols))
+    if protocol == "optimization_metric":
+        chunk_idx = int(current_step // chunk_steps)
+        chunk_keys = jnp.stack([lanes[idx]["rng_schedule"][chunk_idx] for idx in group_indices], axis=0)
+        return chunk_keys, chunk_keys
+    rng_batch = jnp.stack([lanes[idx]["state"]["rng"] for idx in group_indices], axis=0)
+    return _split_rng_batch(rng_batch)
+
+
 def _build_batched_state_chunk_stepper(substrate, chunk_steps: int):
     single = _build_state_chunk_stepper(substrate)(chunk_steps)
 
@@ -150,8 +216,44 @@ def _build_batched_state_chunk_stepper(substrate, chunk_steps: int):
     return step
 
 
-def _build_batched_block_chunk_stepper(block_substrate, *, n_blocks: int, chunk_steps: int):
-    single = _build_block_warmupper(block_substrate, n_blocks, chunk_steps)
+def _mask_block_spatial_state(state, valid_mask: jax.Array):
+    if not isinstance(state, dict):
+        raise TypeError("Flow-Lenia block state must be a dict.")
+
+    def mask_leaf(key: str, value):
+        if key not in {"A", "P", "F", "Food"}:
+            return value
+        if value.ndim >= 3 and tuple(value.shape[:3]) == tuple(valid_mask.shape):
+            mask = valid_mask.reshape(valid_mask.shape + (1,) * (value.ndim - 3))
+            return jnp.where(mask, value, jnp.zeros((), dtype=value.dtype))
+        return value
+
+    return {key: mask_leaf(str(key), value) for key, value in state.items()}
+
+
+def _build_batched_block_chunk_stepper(
+    block_substrate,
+    *,
+    n_blocks: int,
+    chunk_steps: int,
+    valid_mask: jax.Array | None = None,
+):
+    if valid_mask is None:
+        single = _build_block_warmupper(block_substrate, n_blocks, chunk_steps)
+    else:
+        valid_mask = jnp.asarray(valid_mask, dtype=bool)
+
+        def single(rng_key, state0, params_in):
+            def block_step(state, keys):
+                next_state = jax.vmap(
+                    lambda st, key: block_substrate.step_state(key, st, params_in)
+                )(state, keys)
+                return _mask_block_spatial_state(next_state, valid_mask), None
+
+            step_keys = jax.random.split(rng_key, chunk_steps)
+            block_keys = jax.vmap(lambda key: jax.random.split(key, n_blocks))(step_keys)
+            state_final, _ = jax.lax.scan(block_step, state0, block_keys)
+            return state_final
 
     @jax.jit
     def step(chunk_keys_batch, block_state_batch, params_batch):
@@ -363,6 +465,8 @@ def _build_batch_embedders(
     split_n: int,
     block_size: int,
     pad: int,
+    global_size: int,
+    global_crop_start: int,
 ):
     embed_batch = _build_image_embedder(fm)
 
@@ -389,7 +493,25 @@ def _build_batch_embedders(
     @jax.jit
     def embed_blocks_from_global_state_batch(state_batch, params_batch):
         def render_trial(state, pr):
-            blocks = _split_global_render_blocks(state, split_n=split_n, block_size=block_size)
+            padded_size = int(split_n * block_size)
+            pad_before = int(global_crop_start)
+            pad_after_y = int(padded_size - state["A"].shape[0] - pad_before)
+            pad_after_x = int(padded_size - state["A"].shape[1] - pad_before)
+            padded = dict(state)
+            padded["A"] = jnp.pad(
+                state["A"],
+                ((pad_before, pad_after_y), (pad_before, pad_after_x), (0, 0)),
+            )
+            padded["P"] = jnp.pad(
+                state["P"],
+                ((pad_before, pad_after_y), (pad_before, pad_after_x), (0, 0)),
+            )
+            if "Food" in state:
+                padded["Food"] = jnp.pad(
+                    state["Food"],
+                    ((pad_before, pad_after_y), (pad_before, pad_after_x)),
+                )
+            blocks = _split_global_render_blocks(padded, split_n=split_n, block_size=block_size)
             return jax.vmap(lambda st: substrate.render_state(st, pr, img_size=clip_img_size))(blocks)
 
         imgs = jax.vmap(render_trial, in_axes=(0, 0))(state_batch, params_batch)
@@ -416,18 +538,27 @@ def _build_batch_embedders(
 
             A_grid = A_blocks.reshape((split_n, split_n, block_size, block_size, C))
             A_grid = jnp.transpose(A_grid, (0, 2, 1, 3, 4))
-            A_full = A_grid.reshape((H, H, C))
+            A_full = A_grid.reshape((H, H, C))[
+                global_crop_start:global_crop_start + global_size,
+                global_crop_start:global_crop_start + global_size,
+            ]
 
             P_grid = P_blocks.reshape((split_n, split_n, block_size, block_size, K))
             P_grid = jnp.transpose(P_grid, (0, 2, 1, 3, 4))
-            P_full = P_grid.reshape((H, H, K))
+            P_full = P_grid.reshape((H, H, K))[
+                global_crop_start:global_crop_start + global_size,
+                global_crop_start:global_crop_start + global_size,
+            ]
 
             if Food_blocks is None:
-                Food_full = jnp.zeros((H, H), dtype=A_full.dtype)
+                Food_full = jnp.zeros((global_size, global_size), dtype=A_full.dtype)
             else:
                 F_grid = Food_blocks.reshape((split_n, split_n, block_size, block_size))
                 F_grid = jnp.transpose(F_grid, (0, 2, 1, 3))
-                Food_full = F_grid.reshape((H, H))
+                Food_full = F_grid.reshape((H, H))[
+                    global_crop_start:global_crop_start + global_size,
+                    global_crop_start:global_crop_start + global_size,
+                ]
             return substrate.render_state({"A": A_full, "P": P_full, "Food": Food_full}, pr, img_size=clip_img_size)
 
         imgs = jax.vmap(render_trial, in_axes=(0, 0))(block_state_batch, params_batch)
@@ -439,6 +570,144 @@ def _build_batch_embedders(
         embed_blocks_from_global_state_batch,
         embed_concat_from_block_state_batch,
     )
+
+
+def _build_wall_video_renderers(
+    *,
+    substrate,
+    img_size: int,
+    split_n: int,
+    block_size: int,
+    pad: int,
+    global_size: int,
+    global_crop_start: int,
+):
+    @jax.jit
+    def render_global_batch(state_batch, params_batch):
+        return jax.vmap(
+            lambda st, pr: substrate.render_state(_extract_render_state(st), pr, img_size=img_size),
+            in_axes=(0, 0),
+        )(state_batch, params_batch)
+
+    @jax.jit
+    def render_blocks_batch(block_state_batch, params_batch):
+        def render_trial(block_state, pr):
+            A = block_state["A"][:, pad:pad + block_size, pad:pad + block_size]
+            P = block_state["P"][:, pad:pad + block_size, pad:pad + block_size]
+            C = int(A.shape[-1])
+            K = int(P.shape[-1])
+            H = int(split_n * block_size)
+            A = jnp.transpose(
+                A.reshape((split_n, split_n, block_size, block_size, C)),
+                (0, 2, 1, 3, 4),
+            ).reshape((H, H, C))[
+                global_crop_start:global_crop_start + global_size,
+                global_crop_start:global_crop_start + global_size,
+            ]
+            P = jnp.transpose(
+                P.reshape((split_n, split_n, block_size, block_size, K)),
+                (0, 2, 1, 3, 4),
+            ).reshape((H, H, K))[
+                global_crop_start:global_crop_start + global_size,
+                global_crop_start:global_crop_start + global_size,
+            ]
+            return substrate.render_state({"A": A, "P": P}, pr, img_size=img_size)
+
+        return jax.vmap(render_trial, in_axes=(0, 0))(block_state_batch, params_batch)
+
+    return render_global_batch, render_blocks_batch
+
+
+def _block_valid_mask(
+    *,
+    grid_size: int,
+    split_n: int,
+    block_size: int,
+    pad: int,
+    global_crop_start: int,
+) -> np.ndarray:
+    block_sim_size = int(block_size + 2 * pad)
+    mask = np.ones((split_n * split_n, block_sim_size, block_sim_size), dtype=bool)
+    for block_idx in range(split_n * split_n):
+        row = block_idx // split_n
+        col = block_idx % split_n
+        block_y0 = row * block_size
+        block_x0 = col * block_size
+        valid_global_y0 = int(global_crop_start)
+        valid_global_x0 = int(global_crop_start)
+        valid_global_y1 = int(global_crop_start + grid_size)
+        valid_global_x1 = int(global_crop_start + grid_size)
+        overlap_y0 = max(block_y0, valid_global_y0)
+        overlap_x0 = max(block_x0, valid_global_x0)
+        overlap_y1 = min(block_y0 + block_size, valid_global_y1)
+        overlap_x1 = min(block_x0 + block_size, valid_global_x1)
+        mask[
+            block_idx,
+            pad:pad + block_size,
+            pad:pad + block_size,
+        ] = False
+        if overlap_y1 > overlap_y0 and overlap_x1 > overlap_x0:
+            local_y0 = int(overlap_y0 - block_y0)
+            local_x0 = int(overlap_x0 - block_x0)
+            local_y1 = int(overlap_y1 - block_y0)
+            local_x1 = int(overlap_x1 - block_x0)
+            mask[
+                block_idx,
+                pad + local_y0:pad + local_y1,
+                pad + local_x0:pad + local_x1,
+            ] = True
+    return mask
+
+
+def _save_wall_video_frame(
+    lane: dict,
+    frame: np.ndarray,
+    *,
+    step: int,
+    warmup_steps: int,
+    split_n: int,
+) -> None:
+    import imageio.v3 as iio
+
+    frame_u8 = np.clip(np.asarray(frame, dtype=np.float32) * 255.0, 0.0, 255.0).astype(np.uint8)
+    if int(step) <= int(warmup_steps):
+        height, width = frame_u8.shape[:2]
+        thickness = max(1, int(round(min(height, width) / 128)))
+        for split_idx in range(1, int(split_n)):
+            y = int(round(split_idx * height / split_n))
+            x = int(round(split_idx * width / split_n))
+            frame_u8[max(0, y - thickness):min(height, y + thickness + 1), :, :] = 0
+            frame_u8[:, max(0, x - thickness):min(width, x + thickness + 1), :] = 0
+    frame_dir = lane["video_frame_dir"]
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    iio.imwrite(frame_dir / f"frame_{int(step):07d}.jpg", frame_u8, quality=90)
+
+
+def _encode_wall_video(lane: dict, *, fps: float, codec: str, keep_frames: bool) -> dict[str, object]:
+    if not lane.get("wall_video_enabled", False):
+        return {}
+    import imageio
+    import imageio.v3 as iio
+
+    frame_dir = lane["video_frame_dir"]
+    frame_paths = sorted(frame_dir.glob("frame_*.jpg"))
+    if not frame_paths:
+        raise RuntimeError(f"No wall-video frames found for {lane['trial']['trial_idx']}: {frame_dir}.")
+    output = lane["video_path"]
+    output.parent.mkdir(parents=True, exist_ok=True)
+    writer = imageio.get_writer(str(output), fps=float(fps), codec=str(codec), macro_block_size=1)
+    try:
+        for frame_path in frame_paths:
+            writer.append_data(iio.imread(frame_path))
+    finally:
+        writer.close()
+    if not keep_frames:
+        shutil.rmtree(frame_dir)
+    return {
+        "walls_video_path": str(output),
+        "walls_video_frames": int(len(frame_paths)),
+        "walls_video_fps": float(fps),
+    }
 
 
 def _load_trials(job_config_paths: list[str | Path]):
@@ -546,6 +815,656 @@ def _stack_or_empty(seq: list[np.ndarray], *, dtype=np.float32, trailing_shape: 
     return np.stack([np.asarray(x, dtype=dtype) for x in seq], axis=0)
 
 
+def _load_init_params(args: Any, repo: Path) -> jax.Array:
+    raw = getattr(args, "init_params_path", None)
+    if raw is None or str(raw).strip() == "":
+        raise ValueError("Flow-Lenia fixed-init frustration requires source.init_params_path.")
+    path = Path(str(raw))
+    if not path.is_absolute():
+        path = repo / path
+    if not path.exists():
+        raise FileNotFoundError(f"Initialization params not found: {path}.")
+    return jnp.asarray(np.asarray(np.load(path), dtype=np.float32))
+
+
+def _flow_initial_global_state(
+    *,
+    substrate,
+    params: jax.Array,
+    init_params: jax.Array,
+    run_seed: int,
+    run_seed_protocol: str,
+    log_clip_evolution: bool,
+):
+    if run_seed_protocol != "optimization_metric":
+        rng = jax.random.PRNGKey(int(run_seed))
+        _, init_key = jax.random.split(rng)
+        return substrate.init_state(init_key, params)
+
+    state_key = _optimizer_metric_parts(
+        run_seed,
+        log_clip_evolution=log_clip_evolution,
+    )[0]
+    state = substrate.init_state(state_key, params)
+    init_state = substrate.init_state(state_key, init_params)
+    state = dict(state)
+    for key in ("A", "P", "Food", "t", "F"):
+        if key in init_state:
+            state[key] = init_state[key]
+    return state
+
+
+def _pad_flow_spatial_state(
+    state: dict[str, jax.Array],
+    *,
+    pad_before: int,
+    pad_after: int,
+) -> dict[str, jax.Array]:
+    if pad_before == 0 and pad_after == 0:
+        return dict(state)
+    height = int(state["A"].shape[0])
+    width = int(state["A"].shape[1])
+    out = dict(state)
+    for key, value in state.items():
+        if key not in {"A", "P", "F", "Food"}:
+            continue
+        arr = jnp.asarray(value)
+        if arr.ndim < 2 or tuple(arr.shape[:2]) != (height, width):
+            continue
+        padding = (
+            (int(pad_before), int(pad_after)),
+            (int(pad_before), int(pad_after)),
+        ) + ((0, 0),) * (arr.ndim - 2)
+        out[key] = jnp.pad(arr, padding)
+    return out
+
+
+def _init_flow_lane_state(
+    *,
+    wall_mode: bool,
+    run_seed: int,
+    substrate,
+    block_template,
+    params: jax.Array,
+    init_params: jax.Array,
+    split_n: int,
+    block_size: int,
+    pad: int,
+    wall_global_pad_before: int,
+    wall_global_pad_after: int,
+    run_seed_protocol: str,
+    log_clip_evolution: bool,
+    initial_state_override: dict[str, jax.Array] | None = None,
+):
+    if run_seed_protocol != "optimization_metric":
+        return _init_run_checkpoint(
+            wall_mode=wall_mode,
+            run_seed=run_seed,
+            substrate=substrate,
+            block_template=block_template,
+            params=params,
+            split_n=split_n,
+            block_size=block_size,
+            pad=pad,
+        )
+
+    initial_state = (
+        initial_state_override
+        if initial_state_override is not None
+        else _flow_initial_global_state(
+            substrate=substrate,
+            params=params,
+            init_params=init_params,
+            run_seed=run_seed,
+            run_seed_protocol=run_seed_protocol,
+            log_clip_evolution=log_clip_evolution,
+        )
+    )
+    common = dict(
+        current_step=0,
+        rng=jax.random.PRNGKey(int(run_seed)),
+        full_steps=[],
+        late_steps=[],
+        z_late_steps=[],
+        xy_late_steps=[],
+        z_full=[],
+        z_full_blocks=[],
+        z_late=[],
+        xy_late=[],
+    )
+    if not wall_mode:
+        return {"mode": "global", "global_state": initial_state, **common}
+
+    initial_state = _pad_flow_spatial_state(
+        initial_state,
+        pad_before=wall_global_pad_before,
+        pad_after=wall_global_pad_after,
+    )
+    blocks = _prepare_block_template_state(
+        initial_state=initial_state,
+        block_template=block_template,
+        split_n=split_n,
+        block_size=block_size,
+        pad=pad,
+        C=int(initial_state["A"].shape[-1]),
+        k=int(initial_state["P"].shape[-1]),
+    )
+    return {"mode": "block", "block_state": blocks, **common}
+
+
+def _reference_snapshot(apf_dir: Path, step: int) -> tuple[Path, dict[str, np.ndarray]]:
+    for path in sorted(apf_dir.glob("P_steps_*.npz")):
+        with np.load(path, allow_pickle=False) as data:
+            steps = np.asarray(data["steps"], dtype=np.int64)
+            matches = np.flatnonzero(steps == int(step))
+            if matches.size != 1:
+                continue
+            idx = int(matches[0])
+            payload = {
+                key: np.asarray(data[key][idx])
+                for key in ("A", "P", "F", "state_t", "state_mass_cycle_start")
+                if key in data.files
+            }
+            return path, payload
+    raise FileNotFoundError(f"No exact step={step} snapshot found under {apf_dir}.")
+
+
+def _assert_training_reference(lane: dict, state: dict[str, jax.Array], *, step: int) -> None:
+    reference_step = lane.get("training_reference_step")
+    if reference_step is None or int(step) != int(reference_step):
+        return
+    apf_dir = lane.get("reference_apf_dir")
+    if apf_dir is None:
+        if lane.get("require_training_reference_match", False):
+            raise ValueError(f"{lane['variant']} is missing a required training reference APF directory.")
+        return
+
+    source_path, reference = _reference_snapshot(Path(apf_dir), int(step))
+    state_np = jax.device_get(state)
+    checks: dict[str, dict[str, float | bool | str]] = {}
+    all_exact = True
+    for key in ("A", "P", "F"):
+        if key not in reference or key not in state_np:
+            checks[key] = {"exact_after_reference_cast": False, "reason": "missing"}
+            all_exact = False
+            continue
+        expected = np.asarray(reference[key])
+        actual = np.asarray(state_np[key])
+        actual_cast = actual.astype(expected.dtype)
+        exact = bool(np.array_equal(actual_cast, expected))
+        max_abs = float(np.max(np.abs(actual.astype(np.float32) - expected.astype(np.float32))))
+        checks[key] = {
+            "exact_after_reference_cast": exact,
+            "reference_dtype": str(expected.dtype),
+            "max_abs_vs_reference_values": max_abs,
+        }
+        all_exact = all_exact and exact
+
+    if "state_t" in reference:
+        actual_t = int(np.asarray(state_np.get("t", -1)).item())
+        expected_t = int(np.asarray(reference["state_t"]).item())
+        exact_t = actual_t == expected_t
+        checks["state_t"] = {"exact": exact_t, "actual": actual_t, "expected": expected_t}
+        all_exact = all_exact and exact_t
+    if "state_mass_cycle_start" in reference:
+        actual_mass = float(np.asarray(state_np.get("mass_cycle_start", np.nan)).item())
+        expected_mass = float(np.asarray(reference["state_mass_cycle_start"]).item())
+        exact_mass = bool(np.asarray(actual_mass, dtype=np.float32) == np.asarray(expected_mass, dtype=np.float32))
+        checks["state_mass_cycle_start"] = {
+            "exact_float32": exact_mass,
+            "actual": actual_mass,
+            "expected": expected_mass,
+        }
+        all_exact = all_exact and exact_mass
+
+    proof = {
+        "status": "exact" if all_exact else "mismatch",
+        "variant": str(lane["variant"]),
+        "run_seed": int(lane["run_seed"]),
+        "step": int(step),
+        "reference_apf_file": str(source_path),
+        "checks": checks,
+    }
+    proof_path = lane["trial"]["trial_paths"]["trial_artifact_dir"] / f"{lane['variant']}_training_reference_check.json"
+    _write_json(proof_path, proof)
+    lane["training_reference_proof"] = proof
+    if not all_exact:
+        raise RuntimeError(
+            f"{lane['variant']} diverged from optimizer-native training trajectory at step={step}; "
+            f"details={proof_path}."
+        )
+
+
+def _sha256_array(value: jax.Array | np.ndarray) -> str:
+    arr = np.ascontiguousarray(np.asarray(jax.device_get(value), dtype=np.float32))
+    return hashlib.sha256(arr.tobytes()).hexdigest()
+
+
+def _bootstrap_cache_metadata(
+    *,
+    group_idx: int,
+    group_trials: list[dict],
+    pop_path: Path,
+    optimizer_iter: int,
+    training_horizon_steps: int,
+    base_chunk_steps: int,
+    full_embedding_sample_every_steps: int,
+    log_clip_evolution: bool,
+) -> dict[str, Any]:
+    stat = pop_path.stat()
+    return {
+        "protocol": "optimizer_native_nested_vmap_state_v1",
+        "group_idx": int(group_idx),
+        "source_pop_traj": str(pop_path.resolve()),
+        "source_pop_traj_size": int(stat.st_size),
+        "source_pop_traj_mtime_ns": int(stat.st_mtime_ns),
+        "optimizer_iter": int(optimizer_iter),
+        "training_horizon_steps": int(training_horizon_steps),
+        "base_chunk_steps": int(base_chunk_steps),
+        "full_embedding_sample_every_steps": int(full_embedding_sample_every_steps),
+        "log_clip_evolution": bool(log_clip_evolution),
+        "trials": [
+            {
+                "trial_idx": int(trial["trial_idx"]),
+                "candidate_kind": str(getattr(trial["args"], "candidate_kind")),
+                "candidate_idx": int(getattr(trial["args"], "candidate_idx", 0)),
+                "source_pop_idx": int(
+                    getattr(trial["args"], "optimizer_native_source_pop_idx")
+                ),
+                "execution_pop_idx": int(
+                    getattr(trial["args"], "optimizer_native_execution_pop_idx")
+                ),
+                "control_a_seed_idx": int(
+                    getattr(trial["args"], "control_a_optimizer_native_seed_idx")
+                ),
+                "control_b_seed_idx": int(
+                    getattr(trial["args"], "control_b_optimizer_native_seed_idx")
+                ),
+                "use_row_params": bool(
+                    getattr(trial["args"], "optimizer_native_use_row_params")
+                ),
+                "params_sha256": _sha256_array(trial["params"]),
+            }
+            for trial in sorted(group_trials, key=lambda item: int(item["trial_idx"]))
+        ],
+    }
+
+
+def _put_state_payload(
+    payload: dict[str, np.ndarray],
+    *,
+    prefix: str,
+    state: dict[str, jax.Array],
+) -> list[str]:
+    keys = []
+    for key, value in sorted(state.items()):
+        payload[f"{prefix}__{key}"] = np.asarray(jax.device_get(value))
+        keys.append(str(key))
+    return keys
+
+
+def _state_from_payload(
+    data: np.lib.npyio.NpzFile,
+    *,
+    prefix: str,
+    keys: list[str],
+) -> dict[str, np.ndarray]:
+    return {key: np.asarray(data[f"{prefix}__{key}"]) for key in keys}
+
+
+def _load_optimizer_native_bootstrap_cache(
+    cache_path: Path,
+    *,
+    expected_metadata: dict[str, Any],
+) -> dict[int, dict[str, Any]] | None:
+    if not cache_path.exists():
+        return None
+    with np.load(cache_path, allow_pickle=False) as data:
+        metadata = json.loads(str(np.asarray(data["metadata_json"]).item()))
+        metadata_common = {
+            key: value for key, value in metadata.items() if key != "trials"
+        }
+        expected_common = {
+            key: value for key, value in expected_metadata.items() if key != "trials"
+        }
+        cached_trials = {
+            int(row["trial_idx"]): row for row in metadata.get("trials", [])
+        }
+        expected_trials = {
+            int(row["trial_idx"]): row
+            for row in expected_metadata.get("trials", [])
+        }
+        mismatched_trials = [
+            trial_idx
+            for trial_idx, expected_row in expected_trials.items()
+            if cached_trials.get(trial_idx) != expected_row
+        ]
+        if metadata_common != expected_common or mismatched_trials:
+            raise RuntimeError(
+                "Refusing stale optimizer-native bootstrap cache: "
+                f"{cache_path}; mismatched_trials={mismatched_trials}."
+            )
+        outputs: dict[int, dict[str, Any]] = {}
+        for trial_meta in expected_metadata["trials"]:
+            trial_idx = int(trial_meta["trial_idx"])
+            prefix = f"trial_{trial_idx:05d}"
+            state_keys = json.loads(str(np.asarray(data[f"{prefix}__state_keys_json"]).item()))
+            outputs[trial_idx] = {
+                "initial_state": _state_from_payload(
+                    data,
+                    prefix=f"{prefix}__initial",
+                    keys=state_keys,
+                ),
+                "control_a_state": _state_from_payload(
+                    data,
+                    prefix=f"{prefix}__control_a",
+                    keys=state_keys,
+                ),
+                "control_b_state": _state_from_payload(
+                    data,
+                    prefix=f"{prefix}__control_b",
+                    keys=state_keys,
+                ),
+                "full_steps": np.asarray(data[f"{prefix}__full_steps"], dtype=np.int32),
+                "z_full": np.asarray(data[f"{prefix}__z_full"], dtype=np.float32),
+            }
+    return outputs
+
+
+def _save_optimizer_native_bootstrap_cache(
+    cache_path: Path,
+    *,
+    metadata: dict[str, Any],
+    outputs: dict[int, dict[str, Any]],
+) -> None:
+    payload: dict[str, np.ndarray] = {
+        "metadata_json": np.asarray(json.dumps(metadata, sort_keys=True)),
+    }
+    for trial_idx, output in sorted(outputs.items()):
+        prefix = f"trial_{int(trial_idx):05d}"
+        state_keys = _put_state_payload(
+            payload,
+            prefix=f"{prefix}__initial",
+            state=output["initial_state"],
+        )
+        _put_state_payload(
+            payload,
+            prefix=f"{prefix}__control_a",
+            state=output["control_a_state"],
+        )
+        _put_state_payload(
+            payload,
+            prefix=f"{prefix}__control_b",
+            state=output["control_b_state"],
+        )
+        payload[f"{prefix}__state_keys_json"] = np.asarray(json.dumps(state_keys))
+        payload[f"{prefix}__full_steps"] = np.asarray(output["full_steps"], dtype=np.int32)
+        payload[f"{prefix}__z_full"] = np.asarray(output["z_full"], dtype=np.float32)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    _save_npz_atomic(cache_path, **payload)
+
+
+def _optimizer_native_bootstrap(
+    *,
+    trials: list[dict],
+    substrate,
+    root_save_dir: Path,
+    training_horizon_steps: int,
+    base_chunk_steps: int,
+    full_embedding_sample_every_steps: int,
+    log_clip_evolution: bool,
+    enable_clip: bool,
+    embed_global_batch,
+) -> dict[int, dict[str, Any]]:
+    if training_horizon_steps % base_chunk_steps != 0:
+        raise ValueError(
+            "Optimizer-native bootstrap horizon must be divisible by base_chunk_steps."
+        )
+    if enable_clip and full_embedding_sample_every_steps % base_chunk_steps != 0:
+        raise ValueError(
+            "Optimizer-native bootstrap full embedding cadence must be divisible by base_chunk_steps."
+        )
+
+    grouped: dict[int, list[dict]] = {}
+    for trial in trials:
+        grouped.setdefault(
+            int(getattr(trial["args"], "optimized_run_idx")),
+            [],
+        ).append(trial)
+
+    def init_one(eval_key, params, init_params):
+        rng_roll = jax.random.split(
+            eval_key,
+            3 if log_clip_evolution else 2,
+        )[0]
+        k_state, _k_pts, _k_ch, k_scan = jax.random.split(rng_roll, 4)
+        state = substrate.init_state(k_state, params)
+        init_state = substrate.init_state(k_state, init_params)
+        state = dict(state)
+        for key in ("A", "P", "Food", "t", "F"):
+            if key in init_state:
+                state[key] = init_state[key]
+        return state, k_scan
+
+    @jax.jit
+    def init_all(params_grid, init_params_grid, seed_keys):
+        def init_for_params(params, init_params):
+            return jax.vmap(
+                lambda eval_key: init_one(eval_key, params, init_params)
+            )(seed_keys)
+
+        states, scan_keys = jax.vmap(init_for_params)(
+            params_grid,
+            init_params_grid,
+        )
+        return states, scan_keys[0]
+
+    @jax.jit
+    def advance_chunk(states, params_grid, chunk_keys):
+        def advance_for_params(seed_states, params):
+            def advance_one_seed(chunk_key, state):
+                step_keys = jax.random.split(chunk_key, base_chunk_steps)
+
+                def body(carry, step_key):
+                    return substrate.step_state(step_key, carry, params), None
+
+                return jax.lax.scan(body, state, step_keys)[0]
+
+            return jax.vmap(advance_one_seed)(chunk_keys, seed_states)
+
+        return jax.vmap(advance_for_params)(states, params_grid)
+
+    all_outputs: dict[int, dict[str, Any]] = {}
+    n_chunks = int(training_horizon_steps // base_chunk_steps)
+    for group_idx, group_trials in sorted(grouped.items()):
+        first_args = group_trials[0]["args"]
+        pop_path = Path(str(getattr(first_args, "optimizer_native_source_pop_traj"))).resolve()
+        optimizer_iter = int(getattr(first_args, "optimizer_native_iter"))
+        metadata = _bootstrap_cache_metadata(
+            group_idx=group_idx,
+            group_trials=group_trials,
+            pop_path=pop_path,
+            optimizer_iter=optimizer_iter,
+            training_horizon_steps=training_horizon_steps,
+            base_chunk_steps=base_chunk_steps,
+            full_embedding_sample_every_steps=full_embedding_sample_every_steps,
+            log_clip_evolution=log_clip_evolution,
+        )
+        cache_path = (
+            root_save_dir
+            / "optimizer_native_bootstrap"
+            / f"group_{group_idx:03d}_step_{training_horizon_steps:07d}.npz"
+        )
+        cached = _load_optimizer_native_bootstrap_cache(
+            cache_path,
+            expected_metadata=metadata,
+        )
+        if cached is not None:
+            print(
+                f"[paper_check/frustration/bootstrap] reused group={group_idx} "
+                f"cache={cache_path}"
+            )
+            all_outputs.update(cached)
+            continue
+
+        with pop_path.open("rb") as f:
+            pop = pickle.load(f)
+        pop_params = np.asarray(pop["params"], dtype=np.float32)
+        pop_seed_keys = np.asarray(pop["seed_keys"], dtype=np.uint32)
+        if optimizer_iter < 0 or optimizer_iter >= pop_params.shape[0]:
+            raise IndexError(
+                f"optimizer_iter={optimizer_iter} outside params shape={pop_params.shape}."
+            )
+        params_grid_np = np.asarray(pop_params[optimizer_iter], dtype=np.float32).copy()
+        init_params_grid_np = np.asarray(params_grid_np, dtype=np.float32).copy()
+        seed_keys_np = np.asarray(pop_seed_keys[optimizer_iter], dtype=np.uint32)
+        expected_population = int(getattr(first_args, "optimizer_native_population_size"))
+        expected_seed_count = int(getattr(first_args, "optimizer_native_seed_count"))
+        if params_grid_np.shape[0] != expected_population or seed_keys_np.shape[0] != expected_seed_count:
+            raise ValueError(
+                f"Optimizer-native context shape mismatch for group={group_idx}: "
+                f"params={params_grid_np.shape}, seed_keys={seed_keys_np.shape}, "
+                f"expected={expected_population}x{expected_seed_count}."
+            )
+
+        occupied: dict[int, str] = {}
+        for trial in group_trials:
+            args = trial["args"]
+            exec_idx = int(getattr(args, "optimizer_native_execution_pop_idx"))
+            source_idx = int(getattr(args, "optimizer_native_source_pop_idx"))
+            candidate_params = np.asarray(jax.device_get(trial["params"]), dtype=np.float32)
+            label = str(getattr(args, "candidate_label"))
+            previous = occupied.get(exec_idx)
+            if previous is not None and previous != label:
+                raise ValueError(
+                    f"Execution population lane collision for group={group_idx}, lane={exec_idx}: "
+                    f"{previous} vs {label}."
+                )
+            occupied[exec_idx] = label
+            if bool(getattr(args, "optimizer_native_use_row_params")):
+                params_grid_np[exec_idx] = candidate_params
+                init_params_grid_np[exec_idx] = pop_params[optimizer_iter, source_idx]
+            else:
+                source_params = np.asarray(
+                    pop_params[optimizer_iter, source_idx],
+                    dtype=np.float32,
+                )
+                if exec_idx != source_idx or not np.array_equal(candidate_params, source_params):
+                    raise RuntimeError(
+                        f"Direct optimizer-native candidate mismatch for group={group_idx}, "
+                        f"trial={trial['trial_idx']}."
+                    )
+
+        params_grid = jnp.asarray(params_grid_np, dtype=jnp.float32)
+        init_params_grid = jnp.asarray(init_params_grid_np, dtype=jnp.float32)
+        seed_keys = jnp.asarray(seed_keys_np, dtype=jnp.uint32)
+        states, scan_keys = init_all(params_grid, init_params_grid, seed_keys)
+        scan_chunk_keys = jax.jit(
+            lambda keys: jax.vmap(lambda key: jax.random.split(key, n_chunks))(keys)
+        )(scan_keys)
+
+        group_outputs: dict[int, dict[str, Any]] = {}
+        for trial in group_trials:
+            args = trial["args"]
+            exec_idx = int(getattr(args, "optimizer_native_execution_pop_idx"))
+            seed_a_idx = int(getattr(args, "control_a_optimizer_native_seed_idx"))
+            initial_state = jax.tree_util.tree_map(
+                lambda value, e=exec_idx, s=seed_a_idx: value[e, s],
+                states,
+            )
+            group_outputs[int(trial["trial_idx"])] = {
+                "initial_state": initial_state,
+                "full_steps": [],
+                "z_full": [],
+            }
+
+        pbar = _make_progress_bar(
+            total=training_horizon_steps,
+            desc=f"optimizer-native bootstrap group={group_idx:03d}",
+        )
+        for chunk_idx in range(n_chunks):
+            states = advance_chunk(
+                states,
+                params_grid,
+                scan_chunk_keys[:, chunk_idx],
+            )
+            step = int((chunk_idx + 1) * base_chunk_steps)
+            if (
+                enable_clip
+                and step % int(full_embedding_sample_every_steps) == 0
+            ):
+                selected_states = []
+                selected_params = []
+                selected_trial_ids = []
+                for trial in group_trials:
+                    args = trial["args"]
+                    exec_idx = int(getattr(args, "optimizer_native_execution_pop_idx"))
+                    seed_a_idx = int(getattr(args, "control_a_optimizer_native_seed_idx"))
+                    selected_states.append(
+                        jax.tree_util.tree_map(
+                            lambda value, e=exec_idx, s=seed_a_idx: value[e, s],
+                            states,
+                        )
+                    )
+                    selected_params.append(trial["params"])
+                    selected_trial_ids.append(int(trial["trial_idx"]))
+                z_host = np.asarray(
+                    jax.device_get(
+                        embed_global_batch(
+                            _stack_trees(selected_states),
+                            jnp.stack(selected_params, axis=0),
+                        )
+                    ),
+                    dtype=np.float32,
+                )
+                for local_idx, trial_idx in enumerate(selected_trial_ids):
+                    group_outputs[trial_idx]["full_steps"].append(step)
+                    group_outputs[trial_idx]["z_full"].append(z_host[local_idx])
+            pbar.update(base_chunk_steps)
+        pbar.close()
+
+        for trial in group_trials:
+            args = trial["args"]
+            trial_idx = int(trial["trial_idx"])
+            exec_idx = int(getattr(args, "optimizer_native_execution_pop_idx"))
+            seed_a_idx = int(getattr(args, "control_a_optimizer_native_seed_idx"))
+            seed_b_idx = int(getattr(args, "control_b_optimizer_native_seed_idx"))
+            group_outputs[trial_idx]["control_a_state"] = jax.tree_util.tree_map(
+                lambda value, e=exec_idx, s=seed_a_idx: value[e, s],
+                states,
+            )
+            group_outputs[trial_idx]["control_b_state"] = jax.tree_util.tree_map(
+                lambda value, e=exec_idx, s=seed_b_idx: value[e, s],
+                states,
+            )
+            group_outputs[trial_idx]["full_steps"] = np.asarray(
+                group_outputs[trial_idx]["full_steps"],
+                dtype=np.int32,
+            )
+            group_outputs[trial_idx]["z_full"] = _stack_or_empty(
+                group_outputs[trial_idx]["z_full"],
+                dtype=np.float32,
+            )
+
+        _save_optimizer_native_bootstrap_cache(
+            cache_path,
+            metadata=metadata,
+            outputs=group_outputs,
+        )
+        for output in group_outputs.values():
+            for state_key in ("initial_state", "control_a_state", "control_b_state"):
+                output[state_key] = jax.tree_util.tree_map(
+                    lambda value: np.asarray(jax.device_get(value)),
+                    output[state_key],
+                )
+        print(
+            f"[paper_check/frustration/bootstrap] completed group={group_idx} "
+            f"cache={cache_path}"
+        )
+        all_outputs.update(group_outputs)
+    return all_outputs
+
+
 def _load_or_init_lane(
     lane: dict,
     *,
@@ -555,18 +1474,74 @@ def _load_or_init_lane(
     split_n: int,
     block_size: int,
     pad: int,
+    wall_global_pad_before: int,
+    wall_global_pad_after: int,
 ):
     state = _load_run_checkpoint(lane["checkpoint_path"]) if resume else None
     if state is None:
-        state = _init_run_checkpoint(
-            wall_mode=bool(lane["wall_mode"]),
+        bootstrap_state = lane.get("bootstrap_terminal_state")
+        if bootstrap_state is not None and not bool(lane["wall_mode"]):
+            state = {
+                "mode": "global",
+                "global_state": bootstrap_state,
+                "current_step": int(lane["training_horizon_steps"]),
+                "rng": jax.random.PRNGKey(int(lane["run_seed"])),
+                "full_steps": [
+                    int(value) for value in np.asarray(
+                        lane.get("bootstrap_full_steps", []),
+                        dtype=np.int32,
+                    )
+                ],
+                "late_steps": [],
+                "z_late_steps": [],
+                "xy_late_steps": [],
+                "z_full": [
+                    np.asarray(value, dtype=np.float32)
+                    for value in np.asarray(
+                        lane.get("bootstrap_z_full", []),
+                        dtype=np.float32,
+                    )
+                ],
+                "z_full_blocks": [],
+                "z_late": [],
+                "xy_late": [],
+            }
+        else:
+            state = _init_flow_lane_state(
+                wall_mode=bool(lane["wall_mode"]),
+                run_seed=int(lane["run_seed"]),
+                substrate=substrate,
+                block_template=block_template,
+                params=lane["params"],
+                init_params=lane["init_params"],
+                split_n=split_n,
+                block_size=block_size,
+                pad=pad,
+                wall_global_pad_before=wall_global_pad_before,
+                wall_global_pad_after=wall_global_pad_after,
+                run_seed_protocol=str(lane.get("run_seed_protocol", "legacy")),
+                log_clip_evolution=bool(lane.get("log_clip_evolution", False)),
+                initial_state_override=lane.get("bootstrap_initial_state"),
+            )
+    if str(lane.get("run_seed_protocol", "legacy")) == "optimization_metric":
+        lane["rng_schedule"] = _optimizer_metric_key_schedule(
             run_seed=int(lane["run_seed"]),
-            substrate=substrate,
-            block_template=block_template,
-            params=lane["params"],
-            split_n=split_n,
-            block_size=block_size,
-            pad=pad,
+            total_steps=int(lane["total_steps"]),
+            training_horizon_steps=int(lane["training_horizon_steps"]),
+            chunk_steps=int(lane["base_chunk_steps"]),
+            log_clip_evolution=bool(lane.get("log_clip_evolution", False)),
+        )
+    reference_step = lane.get("training_reference_step")
+    proof_path = lane["trial"]["trial_paths"]["trial_artifact_dir"] / f"{lane['variant']}_training_reference_check.json"
+    if (
+        lane.get("require_training_reference_match", False)
+        and reference_step is not None
+        and int(state["current_step"]) > int(reference_step)
+        and not proof_path.exists()
+    ):
+        raise RuntimeError(
+            f"Cannot resume {lane['variant']} beyond training reference step={reference_step} "
+            f"without proof file {proof_path}."
         )
     lane["state"] = state
 
@@ -770,6 +1745,7 @@ def _run_control_lanes(
     late_start: int,
     late_end: int,
     base_chunk_steps: int,
+    clip_sample_every_steps: int,
     checkpoint_every_steps: int,
     full_embedding_sample_every_steps: int,
     enable_clip: bool,
@@ -797,8 +1773,12 @@ def _run_control_lanes(
             mode = str(lanes[group_indices[0]]["state"]["mode"])
             current_step = int(lanes[group_indices[0]]["state"]["current_step"])
             params_batch = jnp.stack([lanes[idx]["params"] for idx in group_indices], axis=0)
-            rng_batch = jnp.stack([lanes[idx]["state"]["rng"] for idx in group_indices], axis=0)
-            rng_next, chunk_keys = _split_rng_batch(rng_batch)
+            rng_next, chunk_keys = _next_lane_chunk_keys(
+                lanes,
+                group_indices,
+                current_step=current_step,
+                chunk_steps=base_chunk_steps,
+            )
             next_step = int(current_step + base_chunk_steps)
 
             if mode == "global":
@@ -808,7 +1788,11 @@ def _run_control_lanes(
                 global_states = _unstack_tree(global_batch)
 
                 need_full = bool(enable_clip and next_step % int(full_embedding_sample_every_steps) == 0)
-                need_late = bool((not enable_msc) and int(late_start) < next_step <= int(late_end))
+                need_late = bool(
+                    (not enable_msc)
+                    and int(late_start) < next_step <= int(late_end)
+                    and (next_step - int(late_start)) % int(clip_sample_every_steps) == 0
+                )
                 z_all_host = None
                 if enable_clip and need_late:
                     z_all_host = np.asarray(jax.device_get(embed_global_batch(global_batch, params_batch)), dtype=np.float32)
@@ -829,6 +1813,7 @@ def _run_control_lanes(
                 for local_idx, lane_idx in enumerate(group_indices):
                     lane = lanes[lane_idx]
                     state = lane["state"]
+                    _assert_training_reference(lane, global_states[local_idx], step=next_step)
                     state["rng"] = rng_next[local_idx]
                     state["current_step"] = next_step
                     if enable_msc and next_step == int(late_start):
@@ -862,10 +1847,15 @@ def _run_control_lanes(
                 global_states = _unstack_tree(global_batch)
                 lag_carries = _unstack_tree(lag_batch)
 
-                need_late = bool(next_step <= int(late_end))
+                need_late_xy = bool(next_step <= int(late_end))
+                need_late_z = bool(
+                    enable_clip
+                    and next_step <= int(late_end)
+                    and (next_step - int(late_start)) % int(clip_sample_every_steps) == 0
+                )
                 need_full = bool(enable_clip and next_step % int(full_embedding_sample_every_steps) == 0)
                 z_all_host = None
-                if enable_clip and need_late:
+                if need_late_z:
                     z_all_host = np.asarray(jax.device_get(embed_global_batch(global_batch, params_batch)), dtype=np.float32)
                 elif enable_clip and need_full:
                     full_locals = [local for local, lane_idx in enumerate(group_indices) if lanes[lane_idx]["full_embeddings_enabled"]]
@@ -881,7 +1871,7 @@ def _run_control_lanes(
                             lane["state"]["full_steps"].append(next_step)
                             lane["state"]["z_full"].append(np.asarray(z_full_host[arr_local], dtype=np.float32))
 
-                xy_host = np.asarray(jax.device_get(xy_batch), dtype=np.float32) if next_step <= int(late_end) else None
+                xy_host = np.asarray(jax.device_get(xy_batch), dtype=np.float32) if need_late_xy else None
 
                 for local_idx, lane_idx in enumerate(group_indices):
                     lane = lanes[lane_idx]
@@ -934,6 +1924,7 @@ def _run_walls_lanes(
     late_start: int,
     late_end: int,
     base_chunk_steps: int,
+    clip_sample_every_steps: int,
     checkpoint_every_steps: int,
     full_embedding_sample_every_steps: int,
     enable_clip: bool,
@@ -951,6 +1942,9 @@ def _run_walls_lanes(
     embed_blocks_from_block_state_batch,
     embed_blocks_from_global_state_batch,
     embed_concat_from_block_state_batch,
+    render_global_video_batch,
+    render_blocks_video_batch,
+    wall_video_sample_every_steps: int,
 ):
     if not lanes:
         return
@@ -968,8 +1962,12 @@ def _run_walls_lanes(
             mode = str(lanes[group_indices[0]]["state"]["mode"])
             current_step = int(lanes[group_indices[0]]["state"]["current_step"])
             params_batch = jnp.stack([lanes[idx]["params"] for idx in group_indices], axis=0)
-            rng_batch = jnp.stack([lanes[idx]["state"]["rng"] for idx in group_indices], axis=0)
-            rng_next, chunk_keys = _split_rng_batch(rng_batch)
+            rng_next, chunk_keys = _next_lane_chunk_keys(
+                lanes,
+                group_indices,
+                current_step=current_step,
+                chunk_steps=base_chunk_steps,
+            )
             next_step = int(current_step + base_chunk_steps)
 
             if mode == "block":
@@ -989,10 +1987,30 @@ def _run_walls_lanes(
                 else:
                     z_full_host = None
                     z_blocks_host = None
+                need_video = bool(
+                    render_blocks_video_batch is not None
+                    and next_step % int(wall_video_sample_every_steps) == 0
+                )
+                video_host = (
+                    np.asarray(
+                        jax.device_get(render_blocks_video_batch(block_batch, params_batch)),
+                        dtype=np.float32,
+                    )
+                    if need_video
+                    else None
+                )
 
                 for local_idx, lane_idx in enumerate(group_indices):
                     lane = lanes[lane_idx]
                     state = lane["state"]
+                    if video_host is not None and lane.get("wall_video_enabled", False):
+                        _save_wall_video_frame(
+                            lane,
+                            video_host[local_idx],
+                            step=next_step,
+                            warmup_steps=warmup_steps,
+                            split_n=split_n,
+                        )
                     state["rng"] = rng_next[local_idx]
                     state["current_step"] = next_step
                     if z_full_host is not None:
@@ -1032,7 +2050,11 @@ def _run_walls_lanes(
                 global_states = _unstack_tree(global_batch)
 
                 need_full = bool(enable_clip and next_step % int(full_embedding_sample_every_steps) == 0)
-                need_late = bool((not enable_msc) and int(late_start) < next_step <= int(late_end))
+                need_late = bool(
+                    (not enable_msc)
+                    and int(late_start) < next_step <= int(late_end)
+                    and (next_step - int(late_start)) % int(clip_sample_every_steps) == 0
+                )
 
                 if enable_clip and (need_full or need_late):
                     z_all_host = np.asarray(jax.device_get(embed_global_batch(global_batch, params_batch)), dtype=np.float32)
@@ -1046,10 +2068,30 @@ def _run_walls_lanes(
                     )
                 else:
                     z_blocks_host = None
+                need_video = bool(
+                    render_global_video_batch is not None
+                    and next_step % int(wall_video_sample_every_steps) == 0
+                )
+                video_host = (
+                    np.asarray(
+                        jax.device_get(render_global_video_batch(global_batch, params_batch)),
+                        dtype=np.float32,
+                    )
+                    if need_video
+                    else None
+                )
 
                 for local_idx, lane_idx in enumerate(group_indices):
                     lane = lanes[lane_idx]
                     state = lane["state"]
+                    if video_host is not None and lane.get("wall_video_enabled", False):
+                        _save_wall_video_frame(
+                            lane,
+                            video_host[local_idx],
+                            step=next_step,
+                            warmup_steps=warmup_steps,
+                            split_n=split_n,
+                        )
                     state["rng"] = rng_next[local_idx]
                     state["current_step"] = next_step
                     if need_full:
@@ -1085,9 +2127,14 @@ def _run_walls_lanes(
                 global_states = _unstack_tree(global_batch)
                 lag_carries = _unstack_tree(lag_batch)
 
-                need_late = bool(next_step <= int(late_end))
+                need_late_xy = bool(next_step <= int(late_end))
+                need_late_z = bool(
+                    enable_clip
+                    and next_step <= int(late_end)
+                    and (next_step - int(late_start)) % int(clip_sample_every_steps) == 0
+                )
                 need_full = bool(enable_clip and next_step % int(full_embedding_sample_every_steps) == 0)
-                if enable_clip and (need_late or need_full):
+                if need_late_z or need_full:
                     z_all_host = np.asarray(jax.device_get(embed_global_batch(global_batch, params_batch)), dtype=np.float32)
                 else:
                     z_all_host = None
@@ -1098,19 +2145,42 @@ def _run_walls_lanes(
                     )
                 else:
                     z_blocks_host = None
+                need_video = bool(
+                    render_global_video_batch is not None
+                    and next_step % int(wall_video_sample_every_steps) == 0
+                )
+                video_host = (
+                    np.asarray(
+                        jax.device_get(render_global_video_batch(global_batch, params_batch)),
+                        dtype=np.float32,
+                    )
+                    if need_video
+                    else None
+                )
 
-                xy_host = np.asarray(jax.device_get(xy_batch), dtype=np.float32) if need_late else None
+                xy_host = np.asarray(jax.device_get(xy_batch), dtype=np.float32) if need_late_xy else None
 
                 for local_idx, lane_idx in enumerate(group_indices):
-                    state = lanes[lane_idx]["state"]
+                    lane = lanes[lane_idx]
+                    state = lane["state"]
+                    if video_host is not None and lane.get("wall_video_enabled", False):
+                        _save_wall_video_frame(
+                            lane,
+                            video_host[local_idx],
+                            step=next_step,
+                            warmup_steps=warmup_steps,
+                            split_n=split_n,
+                        )
                     state["rng"] = rng_next[local_idx]
                     state["current_step"] = next_step
-                    if need_late:
+                    if need_late_xy or need_late_z:
                         state["late_steps"].append(next_step)
-                        state.setdefault("z_late_steps", []).append(next_step)
-                        state["z_late"].append(np.asarray(z_all_host[local_idx], dtype=np.float32))
-                        state.setdefault("xy_late_steps", []).append(next_step)
-                        state["xy_late"].append(np.asarray(xy_host[local_idx], dtype=np.float32))
+                        if need_late_z:
+                            state.setdefault("z_late_steps", []).append(next_step)
+                            state["z_late"].append(np.asarray(z_all_host[local_idx], dtype=np.float32))
+                        if need_late_xy:
+                            state.setdefault("xy_late_steps", []).append(next_step)
+                            state["xy_late"].append(np.asarray(xy_host[local_idx], dtype=np.float32))
                     if need_full:
                         state["full_steps"].append(next_step)
                         state["z_full"].append(np.asarray(z_all_host[local_idx], dtype=np.float32))
@@ -1531,7 +2601,32 @@ def run_batch(job_config_paths: list[str | Path]) -> int:
         base_chunk_steps = int(getattr(common_args, "sample_every_steps"))
         checkpoint_every_steps = int(getattr(common_args, "checkpoint_every_steps", base_chunk_steps))
         full_embedding_sample_every_steps = int(getattr(common_args, "full_embedding_sample_every_steps", base_chunk_steps))
+        continuation_full_embedding_sample_every_steps = int(
+            getattr(
+                common_args,
+                "continuation_full_embedding_sample_every_steps",
+                full_embedding_sample_every_steps,
+            )
+        )
         clip_sample_every_steps = int(getattr(common_args, "clip_sample_every_steps", base_chunk_steps))
+        run_seed_protocol = str(getattr(common_args, "run_seed_protocol", "legacy"))
+        training_horizon_steps = int(getattr(common_args, "training_horizon_steps", total_steps))
+        training_reference_step = int(getattr(common_args, "training_reference_step", training_horizon_steps))
+        require_training_reference_match = bool(
+            getattr(common_args, "require_training_reference_match", False)
+        )
+        training_reference_only = bool(
+            getattr(common_args, "training_reference_only", False)
+        )
+        log_clip_evolution = bool(getattr(common_args, "log_clip_evolution", False))
+        wall_video_enabled = bool(getattr(common_args, "wall_video_enabled", False))
+        wall_video_sample_every_steps = int(
+            getattr(common_args, "wall_video_sample_every_steps", full_embedding_sample_every_steps)
+        )
+        wall_video_img_size = int(getattr(common_args, "wall_video_img_size", 256))
+        wall_video_fps = float(getattr(common_args, "wall_video_fps", 24.0))
+        wall_video_codec = str(getattr(common_args, "wall_video_codec", "libx264"))
+        wall_video_keep_frames = bool(getattr(common_args, "wall_video_keep_frames", False))
         _validate_divisibility(
             total_steps=total_steps,
             warmup_steps=warmup_steps,
@@ -1541,6 +2636,16 @@ def run_batch(job_config_paths: list[str | Path]) -> int:
             checkpoint_every_steps=checkpoint_every_steps,
             full_embedding_sample_every_steps=full_embedding_sample_every_steps,
         )
+        if continuation_full_embedding_sample_every_steps < base_chunk_steps:
+            raise ValueError(
+                "continuation_full_embedding_sample_every_steps must be at least "
+                f"metric.sample_every_steps={base_chunk_steps}."
+            )
+        if continuation_full_embedding_sample_every_steps % base_chunk_steps != 0:
+            raise ValueError(
+                "continuation_full_embedding_sample_every_steps must be divisible by "
+                f"metric.sample_every_steps={base_chunk_steps}."
+            )
         if clip_sample_every_steps < 1:
             raise ValueError("evaluation.clip_sample_every_steps must be >= 1.")
         if clip_sample_every_steps % base_chunk_steps != 0:
@@ -1554,8 +2659,38 @@ def run_batch(job_config_paths: list[str | Path]) -> int:
                 f"got clip_sample_every_steps={clip_sample_every_steps}, "
                 f"late_window_steps={int(late_end - late_start)}."
             )
+        if run_seed_protocol not in {"legacy", "optimization_metric"}:
+            raise ValueError(
+                "evaluation.run_seed_protocol must be one of ['legacy', 'optimization_metric'], "
+                f"got {run_seed_protocol!r}."
+            )
+        if run_seed_protocol == "optimization_metric":
+            if training_reference_step != training_horizon_steps:
+                raise ValueError(
+                    "The exact optimizer-native preflight currently requires "
+                    "training_reference_step == training_horizon_steps."
+                )
+            if training_horizon_steps > total_steps:
+                raise ValueError(
+                    f"training_horizon_steps={training_horizon_steps} exceeds total_steps={total_steps}."
+                )
+        if wall_video_enabled:
+            if wall_video_sample_every_steps < base_chunk_steps:
+                raise ValueError(
+                    "wall_video_sample_every_steps must be at least metric.sample_every_steps."
+                )
+            if wall_video_sample_every_steps % base_chunk_steps != 0:
+                raise ValueError(
+                    "wall_video_sample_every_steps must be divisible by "
+                    f"metric.sample_every_steps={base_chunk_steps}."
+                )
+            if wall_video_img_size < 16 or wall_video_fps <= 0:
+                raise ValueError("Wall video requires img_size >= 16 and fps > 0.")
 
-        substrate = _create_substrate(common_args, enable_msc=enable_msc)
+        substrate = _create_substrate(
+            common_args,
+            enable_msc=bool(enable_msc or require_training_reference_match),
+        )
         if str(common_args.substrate) != "lenia_flow":
             _run_generic_state_perturbation_trials(
                 trials=trials,
@@ -1579,33 +2714,75 @@ def run_batch(job_config_paths: list[str | Path]) -> int:
 
         split_n = int(getattr(common_args, "grid_split"))
         grid_size = int(getattr(common_args, "grid_size"))
-        if grid_size % split_n != 0:
-            raise ValueError(f"grid_size {grid_size} must be divisible by grid_split {split_n}.")
-        block_size = grid_size // split_n
+        if split_n < 1:
+            raise ValueError(f"grid_split must be >= 1, got {split_n}.")
         pad = int(getattr(common_args, "wall_pad", int(common_args.dd)))
+        block_size = (grid_size + split_n - 1) // split_n
+        if (block_size + 2 * pad) % 2 != 0:
+            block_size += 1
+        padded_grid_size = int(block_size * split_n)
+        partition_padding = int(padded_grid_size - grid_size)
+        wall_global_pad_before = int(partition_padding // 2)
+        wall_global_pad_after = int(partition_padding - wall_global_pad_before)
         block_sim_size = block_size + 2 * pad
+        valid_mask = _block_valid_mask(
+            grid_size=grid_size,
+            split_n=split_n,
+            block_size=block_size,
+            pad=pad,
+            global_crop_start=wall_global_pad_before,
+        )
 
         params_list = []
         for trial in trials:
             params = _load_params(trial["args"], repo)
+            init_params = _load_init_params(trial["args"], repo)
             trial["params"] = params
+            trial["init_params"] = init_params
             trial["late_start"] = late_start
             trial["late_end"] = late_end
             _write_text(trial["trial_paths"]["trial_artifact_dir"] / "resolved_config.yaml", OmegaConf.to_yaml(trial["cfg"], resolve=True))
             params_list.append(params)
+
+            for variant in ("control_a", "control_b"):
+                raw_reference_params = getattr(
+                    trial["args"],
+                    f"{variant}_reference_params_path",
+                    None,
+                )
+                if raw_reference_params is None:
+                    if require_training_reference_match:
+                        raise ValueError(
+                            f"Missing required source.{variant}_reference_params_path for "
+                            f"trial_idx={trial['trial_idx']}."
+                        )
+                    continue
+                reference_params_path = Path(str(raw_reference_params))
+                if not reference_params_path.is_absolute():
+                    reference_params_path = repo / reference_params_path
+                reference_params = np.asarray(np.load(reference_params_path), dtype=np.float32)
+                candidate_params = np.asarray(jax.device_get(params), dtype=np.float32)
+                if not np.array_equal(candidate_params, reference_params):
+                    raise RuntimeError(
+                        f"Candidate params do not exactly match {variant} C1 reference params: "
+                        f"{reference_params_path}."
+                    )
+
+        # Cache-only bootstrap reuse skips init_state, whose seed_state side effect creates RT.
+        _ = substrate.seed_state(jax.random.PRNGKey(0), params_list[0])
 
         block_kwargs = util.flow_lenia_kwargs_from_args(common_args)
         block_kwargs["grid_size"] = block_sim_size
         block_substrate = substrates.FlattenSubstrateParameters(
             substrates.create_substrate("lenia_flow", **block_kwargs)
         )
-        block_template = block_substrate.init_state(jax.random.PRNGKey(0), params_list[0])
 
         batched_state_chunk_stepper = _build_batched_state_chunk_stepper(substrate, base_chunk_steps)
         batched_block_chunk_stepper = _build_batched_block_chunk_stepper(
             block_substrate,
             n_blocks=split_n * split_n,
             chunk_steps=base_chunk_steps,
+            valid_mask=jnp.asarray(valid_mask),
         )
 
         clip_img_size = int(getattr(common_args, "clip_img_size", 224))
@@ -1631,6 +2808,21 @@ def run_batch(job_config_paths: list[str | Path]) -> int:
                 split_n=split_n,
                 block_size=block_size,
                 pad=pad,
+                global_size=grid_size,
+                global_crop_start=wall_global_pad_before,
+            )
+
+        render_global_video_batch = None
+        render_blocks_video_batch = None
+        if wall_video_enabled:
+            render_global_video_batch, render_blocks_video_batch = _build_wall_video_renderers(
+                substrate=substrate,
+                img_size=wall_video_img_size,
+                split_n=split_n,
+                block_size=block_size,
+                pad=pad,
+                global_size=grid_size,
+                global_crop_start=wall_global_pad_before,
             )
 
         metric_cfg = None
@@ -1681,13 +2873,65 @@ def run_batch(job_config_paths: list[str | Path]) -> int:
                 lag_diffusion_scale=lag_diffusion_scale,
             )
 
+        bootstrap_outputs: dict[int, dict[str, Any]] = {}
+        if run_seed_protocol == "optimization_metric":
+            bootstrap_root_raw = getattr(common_args, "bootstrap_cache_root", None)
+            bootstrap_root = (
+                root_save_dir
+                if bootstrap_root_raw in (None, "")
+                else (
+                    Path(str(bootstrap_root_raw))
+                    if Path(str(bootstrap_root_raw)).is_absolute()
+                    else repo / Path(str(bootstrap_root_raw))
+                )
+            )
+            bootstrap_outputs = _optimizer_native_bootstrap(
+                trials=trials,
+                substrate=substrate,
+                root_save_dir=bootstrap_root,
+                training_horizon_steps=training_horizon_steps,
+                base_chunk_steps=base_chunk_steps,
+                full_embedding_sample_every_steps=full_embedding_sample_every_steps,
+                log_clip_evolution=log_clip_evolution,
+                enable_clip=enable_clip,
+                embed_global_batch=embed_global_batch,
+            )
+
+        block_init_key = jax.random.PRNGKey(0)
+        block_templates = jax.jit(
+            jax.vmap(
+                lambda params: block_substrate.init_state(block_init_key, params)
+            )
+        )(jnp.stack(params_list, axis=0))
+        for trial_idx, trial in enumerate(trials):
+            trial["block_template"] = jax.tree_util.tree_map(
+                lambda value, idx=trial_idx: value[idx],
+                block_templates,
+            )
+
         resume = bool(getattr(common_args, "resume", True))
         control_lanes = []
         walls_lanes = []
         for trial in trials:
             params = trial["params"]
+            init_params = trial["init_params"]
+            bootstrap = bootstrap_outputs.get(int(trial["trial_idx"]))
+            if run_seed_protocol == "optimization_metric" and bootstrap is None:
+                raise RuntimeError(
+                    f"Missing optimizer-native bootstrap for trial_idx={trial['trial_idx']}."
+                )
             seed_x = int(getattr(trial["args"], "seed_x"))
             seed_x1 = int(getattr(trial["args"], "seed_x1"))
+            lane_common = {
+                "init_params": init_params,
+                "run_seed_protocol": run_seed_protocol,
+                "log_clip_evolution": log_clip_evolution,
+                "total_steps": total_steps,
+                "training_horizon_steps": training_horizon_steps,
+                "base_chunk_steps": base_chunk_steps,
+                "training_reference_step": training_reference_step,
+                "require_training_reference_match": require_training_reference_match,
+            }
 
             control_a = {
                 "trial": trial,
@@ -1699,6 +2943,19 @@ def run_batch(job_config_paths: list[str | Path]) -> int:
                 "full_embeddings_enabled": bool(enable_clip),
                 "block_embeddings_enabled": False,
                 "substrate": substrate,
+                "reference_apf_dir": getattr(
+                    trial["args"], "control_a_reference_apf_dir", None
+                ),
+                "bootstrap_terminal_state": (
+                    None if bootstrap is None else bootstrap["control_a_state"]
+                ),
+                "bootstrap_full_steps": (
+                    [] if bootstrap is None else bootstrap["full_steps"]
+                ),
+                "bootstrap_z_full": (
+                    [] if bootstrap is None else bootstrap["z_full"]
+                ),
+                **lane_common,
             }
             control_b = {
                 "trial": trial,
@@ -1710,6 +2967,15 @@ def run_batch(job_config_paths: list[str | Path]) -> int:
                 "full_embeddings_enabled": bool(log_full_embeddings_for_b and enable_clip),
                 "block_embeddings_enabled": False,
                 "substrate": substrate,
+                "reference_apf_dir": getattr(
+                    trial["args"], "control_b_reference_apf_dir", None
+                ),
+                "bootstrap_terminal_state": (
+                    None if bootstrap is None else bootstrap["control_b_state"]
+                ),
+                "bootstrap_full_steps": [],
+                "bootstrap_z_full": [],
+                **lane_common,
             }
             walls = {
                 "trial": trial,
@@ -1721,8 +2987,32 @@ def run_batch(job_config_paths: list[str | Path]) -> int:
                 "full_embeddings_enabled": bool(enable_clip),
                 "block_embeddings_enabled": bool(enable_clip),
                 "substrate": substrate,
-                "initial_global_state": substrate.init_state(jax.random.split(jax.random.PRNGKey(seed_x), 2)[1], params),
+                "initial_global_state": (
+                    bootstrap["initial_state"]
+                    if bootstrap is not None
+                    else _flow_initial_global_state(
+                        substrate=substrate,
+                        params=params,
+                        init_params=init_params,
+                        run_seed=seed_x,
+                        run_seed_protocol=run_seed_protocol,
+                        log_clip_evolution=log_clip_evolution,
+                    )
+                ),
+                "bootstrap_initial_state": (
+                    None if bootstrap is None else bootstrap["initial_state"]
+                ),
+                "training_reference_step": None,
+                "require_training_reference_match": False,
+                "wall_video_enabled": wall_video_enabled,
+                "video_frame_dir": (
+                    trial["trial_paths"]["trial_artifact_dir"] / "walls_video_frames"
+                ),
+                "video_path": trial["trial_paths"]["trial_artifact_dir"] / "walls.mp4",
+                **lane_common,
             }
+            walls["training_reference_step"] = None
+            walls["require_training_reference_match"] = False
             trial["control_a_lane"] = control_a
             trial["control_b_lane"] = control_b
             trial["walls_lane"] = walls
@@ -1730,14 +3020,44 @@ def run_batch(job_config_paths: list[str | Path]) -> int:
             walls_lanes.append(walls)
 
         for lane in walls_lanes:
-            def _merge_fn(initial_state, blocks_state, *, split_n=split_n, block_size=block_size, pad=pad):
-                return _merge_blocks_into_global_state(
+            def _merge_fn(
+                initial_state,
+                blocks_state,
+                *,
+                split_n=split_n,
+                block_size=block_size,
+                pad=pad,
+                pad_before=wall_global_pad_before,
+                pad_after=wall_global_pad_after,
+                grid_size=grid_size,
+            ):
+                padded_initial = _pad_flow_spatial_state(
                     initial_state,
+                    pad_before=pad_before,
+                    pad_after=pad_after,
+                )
+                merged_padded = _merge_blocks_into_global_state(
+                    padded_initial,
                     blocks_state,
                     split_n=split_n,
                     block_size=block_size,
                     pad=pad,
                 )
+                merged = dict(initial_state)
+                for key, value in merged_padded.items():
+                    arr = jnp.asarray(value)
+                    if arr.ndim >= 2 and tuple(arr.shape[:2]) == (
+                        grid_size + pad_before + pad_after,
+                        grid_size + pad_before + pad_after,
+                    ):
+                        merged[key] = arr[
+                            pad_before:pad_before + grid_size,
+                            pad_before:pad_before + grid_size,
+                        ]
+                    elif key in {"t", "mass_cycle_start"}:
+                        merged[key] = value
+                merged["mass_cycle_start"] = jnp.sum(merged["A"])
+                return merged
 
             lane["merge_blocks"] = _merge_fn
 
@@ -1746,10 +3066,40 @@ def run_batch(job_config_paths: list[str | Path]) -> int:
                 lane,
                 resume=resume,
                 substrate=substrate,
-                block_template=block_template,
+                block_template=lane["trial"]["block_template"],
                 split_n=split_n,
                 block_size=block_size,
                 pad=pad,
+                wall_global_pad_before=wall_global_pad_before,
+                wall_global_pad_after=wall_global_pad_after,
+            )
+
+        for lane in control_lanes:
+            if (
+                lane.get("training_reference_step") is not None
+                and int(lane["state"]["current_step"]) == int(lane["training_reference_step"])
+            ):
+                _assert_training_reference(
+                    lane,
+                    lane["state"]["global_state"],
+                    step=int(lane["training_reference_step"]),
+                )
+        for lane in walls_lanes:
+            initial_proof_lane = {
+                **lane,
+                "variant": "walls_initial",
+                "training_reference_step": 0,
+                "reference_apf_dir": getattr(
+                    lane["trial"]["args"],
+                    "control_a_reference_apf_dir",
+                    None,
+                ),
+                "require_training_reference_match": require_training_reference_match,
+            }
+            _assert_training_reference(
+                initial_proof_lane,
+                lane["initial_global_state"],
+                step=0,
             )
 
         _run_control_lanes(
@@ -1758,8 +3108,9 @@ def run_batch(job_config_paths: list[str | Path]) -> int:
             late_start=late_start,
             late_end=late_end,
             base_chunk_steps=base_chunk_steps,
+            clip_sample_every_steps=clip_sample_every_steps,
             checkpoint_every_steps=checkpoint_every_steps,
-            full_embedding_sample_every_steps=full_embedding_sample_every_steps,
+            full_embedding_sample_every_steps=continuation_full_embedding_sample_every_steps,
             enable_clip=enable_clip,
             enable_msc=enable_msc,
             lag_n_particles=lag_n_particles,
@@ -1769,6 +3120,38 @@ def run_batch(job_config_paths: list[str | Path]) -> int:
             batched_lagrangian_chunk_stepper=batched_lagrangian_chunk_stepper,
             embed_global_batch=embed_global_batch,
         )
+        if training_reference_only:
+            proof_rows = []
+            for lane in control_lanes:
+                proof_path = (
+                    lane["trial"]["trial_paths"]["trial_artifact_dir"]
+                    / f"{lane['variant']}_training_reference_check.json"
+                )
+                if not proof_path.exists():
+                    raise RuntimeError(
+                        f"Training-reference preflight produced no proof for {lane['variant']}: "
+                        f"{proof_path}."
+                    )
+                proof = json.loads(proof_path.read_text())
+                if str(proof.get("status")) != "exact":
+                    raise RuntimeError(
+                        f"Training-reference preflight is not exact: {proof_path}."
+                    )
+                proof_rows.append(proof)
+            _write_json(
+                root_save_dir / "training_reference_preflight_summary.json",
+                {
+                    "status": "exact",
+                    "n_control_lanes": len(proof_rows),
+                    "training_reference_step": training_reference_step,
+                    "proofs": proof_rows,
+                },
+            )
+            print(
+                "[paper_check/frustration/batch] training-reference preflight exact "
+                f"for {len(proof_rows)} control lanes"
+            )
+            return 0
         _run_walls_lanes(
             lanes=walls_lanes,
             total_steps=total_steps,
@@ -1776,8 +3159,9 @@ def run_batch(job_config_paths: list[str | Path]) -> int:
             late_start=late_start,
             late_end=late_end,
             base_chunk_steps=base_chunk_steps,
+            clip_sample_every_steps=clip_sample_every_steps,
             checkpoint_every_steps=checkpoint_every_steps,
-            full_embedding_sample_every_steps=full_embedding_sample_every_steps,
+            full_embedding_sample_every_steps=continuation_full_embedding_sample_every_steps,
             enable_clip=enable_clip,
             enable_msc=enable_msc,
             lag_n_particles=lag_n_particles,
@@ -1793,6 +3177,9 @@ def run_batch(job_config_paths: list[str | Path]) -> int:
             embed_blocks_from_block_state_batch=embed_blocks_from_block_state_batch,
             embed_blocks_from_global_state_batch=embed_blocks_from_global_state_batch,
             embed_concat_from_block_state_batch=embed_concat_from_block_state_batch,
+            render_global_video_batch=render_global_video_batch,
+            render_blocks_video_batch=render_blocks_video_batch,
+            wall_video_sample_every_steps=wall_video_sample_every_steps,
         )
 
         completed_rows = []
@@ -1813,6 +3200,27 @@ def run_batch(job_config_paths: list[str | Path]) -> int:
                 metric_info=metric_info,
                 metric_eval=metric_eval,
             )
+            row.update(
+                {
+                    "run_seed_protocol": run_seed_protocol,
+                    "training_horizon_steps": training_horizon_steps,
+                    "training_reference_step": training_reference_step,
+                    "grid_split": split_n,
+                    "wall_partition_padded_grid_size": padded_grid_size,
+                    "wall_partition_padding_cells": partition_padding,
+                    "wall_partition_padding_before": wall_global_pad_before,
+                    "wall_partition_padding_after": wall_global_pad_after,
+                }
+            )
+            row.update(
+                _encode_wall_video(
+                    trial["walls_lane"],
+                    fps=wall_video_fps,
+                    codec=wall_video_codec,
+                    keep_frames=wall_video_keep_frames,
+                )
+            )
+            _write_json(trial["trial_paths"]["trial_row_json"], row)
             completed_rows.append(row)
             print(f"Completed trial {trial['trial_idx']:05d}")
 

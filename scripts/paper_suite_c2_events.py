@@ -102,7 +102,12 @@ def run(config_path: str | Path, *, smoke: bool = False) -> dict[str, Any]:
     cfg, _ = load_config(config_path, smoke=smoke)
     output_root = ensure_dir(resolve_path(cfg.get("meta", {}).get("output_root", "analysis/results/paper_suite")) or Path("analysis/results/paper_suite"))
     c2_cfg = cfg.get("c2", {})
-    root = _write_smoke_minibang(output_root) if smoke else _trajectory_root(c2_cfg)
+    if smoke:
+        root = _write_smoke_minibang(output_root)
+    else:
+        branching_cfg = _get(c2_cfg, "branching", {})
+        branching_root = _get(branching_cfg, "trajectory_root", None)
+        root = resolve_path(branching_root) if branching_root is not None else _trajectory_root(c2_cfg)
     log_event(f"C2 events start smoke={smoke} root={root}", component="c2-events")
     if root is None or not root.exists():
         required = bool(_get(c2_cfg, "required", False))

@@ -1,0 +1,48 @@
+meta:
+  machine_idx: ${env:PAPER_MACHINE_IDX,0}
+  num_machines: ${env:PAPER_NUM_MACHINES,1}
+  wandb_project: asal
+  wandb_mode: online
+  output_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1_openai_es_fixed_init_9opt
+
+paper_check:
+  num_optimizations: 9
+  run_indices: [3]
+  num_random_baselines: 3
+  optimization_seed_base: 1003
+  random_param_seed_base: 200003
+  pair_seed_base: 400003
+  metric_seed_base: 800003
+
+optimization:
+  base_config: optimization/config_longrun_check_fix.yaml
+  save_root: ${meta.output_root}/optimization
+  resume: true
+  save_every: 1
+  fixed_eval_seed_base_from_pair_seed_base: true
+  overrides:
+    substrate:
+      # Reproduce the effective physical sigma used by the historical runs
+      # before optimizer sigma and Flow-Lenia sigma were namespaced separately.
+      flow_sigma: 0.2
+    optimization:
+      optimizer_algorithm: mirrored_openai_es
+      selection_protocol: mean_loss
+      eval_seed_mode: fixed
+      openai_es_n_pairs: 4
+      openai_es_n_seeds: 4
+      openai_es_sigma: 0.2
+      openai_es_lr: 0.2
+      openai_es_adam_beta1: 0.9
+      openai_es_adam_beta2: 0.999
+      openai_es_adam_eps: 1.0e-8
+
+frustration_simulation:
+  base_config: frustration_simulation/config.yaml
+  save_root: ${meta.output_root}/frustration_simulation
+  resume: true
+  trial_batch_size: 4
+  checkpoint_every_steps: 5000
+  full_embedding_sample_every_steps: 1000
+  log_full_embeddings_for_b: false
+  overrides: {}

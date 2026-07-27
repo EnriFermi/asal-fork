@@ -34,11 +34,12 @@ from paper_suite_common import (
     write_json,
 )
 from paper_suite_c2_flowlenia_metrics import _flat_metric_args as _c2_flat_metric_args
+from paper_suite_c2_flowlenia_metrics import _filter_trajectories as _c2_filter_trajectories
 from paper_suite_c2_flowlenia_metrics import _rollout_config as _c2_rollout_config
 from paper_suite_metric_cache import compare_metrics_npz_metadata, sha256_text, stable_json
 
 
-BRANCH_PLAN_VERSION = "c2_branch_plan_v6_mid_stratum"
+BRANCH_PLAN_VERSION = "c2_branch_plan_v8_metric_equivalent_retention"
 
 
 def _get(cfg: Any, key: str, default: Any = None) -> Any:
@@ -85,7 +86,7 @@ def _manifest_path(root: Path, raw: Any, *, default: Path) -> Path:
     return default.parent / path
 
 
-def _iter_metric_items(root: Path) -> list[dict[str, Any]]:
+def _iter_metric_items(root: Path, c2_cfg: Any) -> list[dict[str, Any]]:
     manifest = root / "manifest.json"
     items: list[dict[str, Any]] = []
     if manifest.exists():
@@ -104,6 +105,14 @@ def _iter_metric_items(root: Path) -> list[dict[str, Any]]:
                         "metrics_path": path,
                         "traj_dir": traj_dir,
                         "apf_dir": apf_dir,
+                        "run_idx": int(row.get("suite_run_idx", row.get("run_idx", -1))),
+                        "source_run_idx": int(
+                            row.get("source_run_idx", row.get("suite_run_idx", row.get("run_idx", -1)))
+                        ),
+                        "candidate_kind": str(row.get("candidate_kind", "optimized")),
+                        "candidate_idx": int(row.get("candidate_idx", 0)),
+                        "rollout_seed_idx": int(row.get("rollout_seed_idx", 0)),
+                        "manifest_row": row,
                     }
                 )
             traj_id = row.get("traj_id")
@@ -116,6 +125,14 @@ def _iter_metric_items(root: Path) -> list[dict[str, Any]]:
                             "metrics_path": candidate,
                             "traj_dir": candidate.parent,
                             "apf_dir": candidate.parent / "apf_logs",
+                            "run_idx": int(row.get("suite_run_idx", row.get("run_idx", -1))),
+                            "source_run_idx": int(
+                                row.get("source_run_idx", row.get("suite_run_idx", row.get("run_idx", -1)))
+                            ),
+                            "candidate_kind": str(row.get("candidate_kind", "optimized")),
+                            "candidate_idx": int(row.get("candidate_idx", 0)),
+                            "rollout_seed_idx": int(row.get("rollout_seed_idx", 0)),
+                            "manifest_row": row,
                         }
                     )
     if not items:
@@ -123,7 +140,7 @@ def _iter_metric_items(root: Path) -> list[dict[str, Any]]:
             {"traj_id": path.parent.name, "metrics_path": path, "traj_dir": path.parent, "apf_dir": path.parent / "apf_logs"}
             for path in sorted(root.glob("traj_*/metrics.npz"))
         ]
-    return items
+    return _c2_filter_trajectories(items, c2_cfg)
 
 
 def _safe_arr(data: np.lib.npyio.NpzFile, key: str, default=None):
@@ -670,6 +687,8 @@ def _select_ranked_high_low_points(
     trajectory_end_step: int | None,
     seed: int,
     min_step: int = 0,
+    refractory_steps: int = 0,
+    require_exact_counts: bool = False,
     energy_meta: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     c = np.asarray(centers, dtype=np.float64).reshape(-1)
@@ -718,16 +737,36 @@ def _select_ranked_high_low_points(
     mid_pool = np.flatnonzero(finite & (qrank >= q_mid_low) & (qrank <= q_mid_high))
     low_pool = np.flatnonzero(finite & (e <= low_threshold))
     rng = np.random.default_rng(int(seed))
+    selected_indices: list[int] = []
+    refractory_steps = max(0, int(refractory_steps))
 
-    def _draw(pool: np.ndarray, count: int) -> np.ndarray:
+    def _draw(pool: np.ndarray, count: int, *, condition: str) -> np.ndarray:
         if pool.size == 0 or int(count) <= 0:
-            return np.asarray([], dtype=np.int64)
-        k = min(int(pool.size), int(count))
-        return rng.choice(pool, size=k, replace=False).astype(np.int64)
+            selected = np.asarray([], dtype=np.int64)
+        else:
+            selected_list: list[int] = []
+            for candidate in rng.permutation(pool).astype(np.int64).tolist():
+                if refractory_steps > 0 and any(
+                    abs(float(c[candidate]) - float(c[other])) < float(refractory_steps)
+                    for other in selected_indices
+                ):
+                    continue
+                selected_list.append(int(candidate))
+                selected_indices.append(int(candidate))
+                if len(selected_list) == int(count):
+                    break
+            selected = np.asarray(selected_list, dtype=np.int64)
+        if require_exact_counts and selected.size != int(count):
+            raise ValueError(
+                "C2 ranked branch selection could not satisfy the published count: "
+                f"condition={condition}, selected={selected.size}, requested={int(count)}, "
+                f"pool={pool.size}, refractory_steps={refractory_steps}."
+            )
+        return selected
 
-    selected_high = _draw(high_pool, int(n_high))
-    selected_mid = _draw(mid_pool, int(n_mid))
-    selected_low = _draw(low_pool, int(n_low))
+    selected_high = _draw(high_pool, int(n_high), condition="high")
+    selected_mid = _draw(mid_pool, int(n_mid), condition="mid")
+    selected_low = _draw(low_pool, int(n_low), condition="low")
     cov_full = covariates or {}
     cov = {
         key: np.asarray(value, dtype=np.float64).reshape(-1)[:n]
@@ -752,6 +791,7 @@ def _select_ranked_high_low_points(
         "n_mid_selected": int(selected_mid.size),
         "n_low_selected": int(selected_low.size),
         "min_branch_step": int(min_step),
+        "refractory_steps": int(refractory_steps),
         "trajectory_end_step": "" if trajectory_end_step is None else int(trajectory_end_step),
     }
     if energy_meta:
@@ -787,7 +827,7 @@ def _expected_resume_metadata_from_plan_row(row: dict[str, Any]) -> dict[str, An
     try:
         step = int(float(row["step"]))
         horizon = int(float(row["horizon_steps"]))
-        return {
+        expected = {
             "start_step": step,
             "end_step": step + horizon,
             "branch_seed": int(float(row["branch_seed"])),
@@ -795,6 +835,10 @@ def _expected_resume_metadata_from_plan_row(row: dict[str, Any]) -> dict[str, An
             "perturb_p_std": float(row["perturb_p_std"]),
             "perturb_lagrangian_xy_std": float(row["perturb_lagrangian_xy_std"]),
         }
+        retained = str(row.get("output_max_snapshots_per_chunk", "")).strip()
+        if retained:
+            expected["output_max_snapshots_per_chunk"] = int(float(retained))
+        return expected
     except (TypeError, ValueError):
         return None
 
@@ -1008,14 +1052,19 @@ def simulation(
         return {"status": "ok", "n_branches": len(read_csv(plan)), "plan": str(plan)}
 
     c2_cfg = cfg.get("c2", {})
-    trajectory_root = _trajectory_root(c2_cfg)
+    trajectory_root_raw = _get(bcfg, "trajectory_root", None)
+    trajectory_root = (
+        resolve_path(trajectory_root_raw)
+        if trajectory_root_raw is not None
+        else _trajectory_root(c2_cfg)
+    )
     if trajectory_root is None or not trajectory_root.exists():
         summary = {"status": "skipped", "reason": f"missing trajectory root {trajectory_root}"}
         write_json(output_root / "c2_branching_simulation_summary.json", summary)
         log_event(f"C2 branching simulation skipped missing trajectory_root={trajectory_root}", component="c2-branch")
         return summary
 
-    metric_items = _iter_metric_items(trajectory_root)
+    metric_items = _iter_metric_items(trajectory_root, c2_cfg)
     if not metric_items:
         summary = {
             "status": "skipped",
@@ -1036,6 +1085,16 @@ def simulation(
     point_quantile_max = float(_get(bcfg, "point_quantile_max", 0.95))
     branches_per_time = int(_get(bcfg, "branches_per_time", 3))
     resume_batch_size = int(_get(bcfg, "resume_batch_size", 1))
+    reuse_jit_across_output_paths = bool(
+        _get(bcfg, "reuse_jit_across_output_paths", False)
+    )
+    output_max_snapshots_raw = _get(bcfg, "output_max_snapshots_per_chunk", None)
+    output_max_snapshots = None if output_max_snapshots_raw is None else int(output_max_snapshots_raw)
+    if output_max_snapshots is not None and output_max_snapshots < 1:
+        raise ValueError(
+            "c2.branching.output_max_snapshots_per_chunk must be >= 1 when set, "
+            f"got {output_max_snapshots}."
+        )
     refractory_steps = int(_get(bcfg, "refractory_steps", 5000))
     high_quantile = float(_get(bcfg, "high_quantile", 0.8))
     low_quantile = float(_get(bcfg, "low_quantile", 0.2))
@@ -1115,6 +1174,10 @@ def simulation(
             "perturb_p_std": float(perturb_p_std),
             "perturb_lagrangian_xy_std": float(perturb_lag_xy_std),
         }
+        if output_max_snapshots is not None:
+            expected_metadata["output_max_snapshots_per_chunk"] = int(
+                output_max_snapshots
+            )
         branch_ready = _branch_output_ok(branch_dir, expected_metadata=expected_metadata)
         overwrite_incomplete = branch_dir.exists() and not branch_ready
         cmd = _make_resume_command(
@@ -1164,6 +1227,10 @@ def simulation(
             "perturb_a_std": float(perturb_a_std),
             "perturb_p_std": float(perturb_p_std),
             "perturb_lagrangian_xy_std": float(perturb_lag_xy_std),
+            "output_max_snapshots_per_chunk": (
+                "" if output_max_snapshots is None else int(output_max_snapshots)
+            ),
+            "reuse_jit_across_output_paths": reuse_jit_across_output_paths,
             "source_metrics_path": str(metrics_path),
             "source_traj_dir": str(source_traj_dir),
             "source_apf_dir": str(source_apf_dir),
@@ -1188,6 +1255,10 @@ def simulation(
                         "perturb_a_std": float(perturb_a_std),
                         "perturb_p_std": float(perturb_p_std),
                         "perturb_lagrangian_xy_std": float(perturb_lag_xy_std),
+                        "output_max_snapshots_per_chunk": output_max_snapshots,
+                        "ignore_output_paths_in_simulation_signature": (
+                            reuse_jit_across_output_paths
+                        ),
                     },
                 )
             )
@@ -1214,8 +1285,27 @@ def simulation(
                 trajectory_end_step=trajectory_end,
                 seed=selection_seed + 10007 * traj_order,
                 min_step=min_branch_step,
+                refractory_steps=refractory_steps,
+                require_exact_counts=True,
                 energy_meta=selection_meta,
             )
+            expected_points = int(n_high + n_mid + n_low)
+            if len(points) != expected_points:
+                raise RuntimeError(
+                    f"C2 branching selected {len(points)} states for {traj_id}; "
+                    f"expected exactly {expected_points}."
+                )
+            snapped_steps = [
+                _nearest_apf_step(source_apf_dir, int(point["step"]), cache=saved_steps_cache)
+                for point in points
+            ]
+            for left_idx, left_step in enumerate(snapped_steps):
+                for right_step in snapped_steps[left_idx + 1 :]:
+                    if abs(int(left_step) - int(right_step)) < int(refractory_steps):
+                        raise RuntimeError(
+                            f"C2 branching snapped states violate refractory={refractory_steps} "
+                            f"for {traj_id}: {left_step} vs {right_step}."
+                        )
             log_event(
                 f"C2 branching simulation traj={traj_id} selected_high={select_summary.get('n_high_selected', 0)} "
                 f"selected_mid={select_summary.get('n_mid_selected', 0)} selected_low={select_summary.get('n_low_selected', 0)} "
@@ -1385,9 +1475,25 @@ def simulation(
                 "perturb_p_std": float(job["perturb_p_std"]),
                 "perturb_lagrangian_xy_std": float(job["perturb_lagrangian_xy_std"]),
             }
+            if job.get("output_max_snapshots_per_chunk") is not None:
+                expected_metadata["output_max_snapshots_per_chunk"] = int(
+                    job["output_max_snapshots_per_chunk"]
+                )
             rows[row_idx]["command"] = command_to_str(batch_cmd)
             rows[row_idx]["status"] = "dry_run" if dry_run else (
                 "exists" if _branch_output_ok(branch_dir, expected_metadata=expected_metadata) else "missing"
+            )
+
+    if not smoke and _is_ranked_high_low_mode(selection_mode):
+        expected_plan_rows = (
+            min(int(max_trajectories), len(ranked))
+            * int(n_high + n_mid + n_low)
+            * int(branches_per_time)
+        )
+        if len(rows) != expected_plan_rows:
+            raise RuntimeError(
+                "C2 branch plan does not satisfy the published sampling contract: "
+                f"rows={len(rows)}, expected={expected_plan_rows}."
             )
 
     plan_path = out_dir / "branch_plan.csv"
@@ -1602,6 +1708,7 @@ def _branch_field_series(
     *,
     weights: dict[str, float],
     max_chunks: int,
+    max_snapshots_per_chunk: int,
     max_frames: int,
 ) -> dict[str, np.ndarray]:
     apf_dir = branch_dir / "apf_logs"
@@ -1618,6 +1725,13 @@ def _branch_field_series(
                 arr = np.asarray(data[key], dtype=np.float32)
                 if arr.ndim < 3 or arr.shape[0] < 1:
                     continue
+                if max_snapshots_per_chunk > 0 and arr.shape[0] > max_snapshots_per_chunk:
+                    idxs = np.linspace(
+                        0,
+                        arr.shape[0] - 1,
+                        int(max_snapshots_per_chunk),
+                    ).astype(int)
+                    arr = arr[idxs]
                 series[key].append(arr)
     out: dict[str, np.ndarray] = {}
     for key, parts in series.items():
@@ -1639,6 +1753,7 @@ def _pairwise_future_field_divergence(
     weights: dict[str, float],
     scales: list[int],
     max_chunks: int,
+    max_snapshots_per_chunk: int,
     max_frames: int,
 ) -> tuple[float, dict[str, Any]]:
     fields = []
@@ -1650,12 +1765,13 @@ def _pairwise_future_field_divergence(
                     branch_dir,
                     weights=weights,
                     max_chunks=max_chunks,
+                    max_snapshots_per_chunk=max_snapshots_per_chunk,
                     max_frames=max_frames,
                 )
             )
             used_dirs.append(branch_dir)
-        except Exception:
-            continue
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load complete C2 branch future: {branch_dir}") from exc
     if len(fields) < 2:
         return float("nan"), {"metric": "future_apf_multiscale_l2", "n_branches": len(fields), "n_pairs": 0}
     pair_vals = []
@@ -1683,7 +1799,7 @@ def _pairwise_future_field_divergence(
                     **component_vals,
                 }
             )
-    score = float(np.mean(pair_vals)) if pair_vals else float("nan")
+    score = float(np.median(pair_vals)) if pair_vals else float("nan")
     detail: dict[str, Any] = {
         "metric": "future_apf_multiscale_l2",
         "n_branches": len(fields),
@@ -1691,10 +1807,11 @@ def _pairwise_future_field_divergence(
         "field_keys": ",".join(key for key in weights if key_vals.get(key)),
         "scales": ",".join(str(int(s)) for s in scales),
         "max_future_frames": int(max_frames),
+        "max_snapshots_per_chunk": int(max_snapshots_per_chunk),
     }
     for key, vals in key_vals.items():
         if vals:
-            detail[f"{key}_divergence"] = float(np.mean(vals))
+            detail[f"{key}_divergence"] = float(np.median(vals))
     detail["_pair_records"] = pair_records
     return score, detail
 
@@ -1739,6 +1856,7 @@ def _clip_embedding_cache_path(
     cache_dir: Path,
     foundation_model: str,
     max_chunks: int,
+    max_snapshots_per_chunk: int,
     max_frames: int,
 ) -> Path:
     payload = stable_json(
@@ -1746,8 +1864,9 @@ def _clip_embedding_cache_path(
             "branch_dir": str(branch_dir.resolve()),
             "foundation_model": str(foundation_model),
             "max_chunks": int(max_chunks),
+            "max_snapshots_per_chunk": int(max_snapshots_per_chunk),
             "max_frames": int(max_frames),
-            "version": "c2_branch_clip_embeddings_v1",
+            "version": "c2_branch_clip_embeddings_v2_per_chunk_sampling",
         }
     )
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
@@ -1762,6 +1881,7 @@ def _load_or_compute_branch_clip_embeddings(
     cache_dir: Path,
     foundation_model: str,
     max_chunks: int,
+    max_snapshots_per_chunk: int,
     max_frames: int,
     force: bool,
 ) -> tuple[np.ndarray, Path]:
@@ -1771,6 +1891,7 @@ def _load_or_compute_branch_clip_embeddings(
         cache_dir=cache_dir,
         foundation_model=foundation_model,
         max_chunks=max_chunks,
+        max_snapshots_per_chunk=max_snapshots_per_chunk,
         max_frames=max_frames,
     )
     if cache_path.exists() and not force:
@@ -1783,6 +1904,7 @@ def _load_or_compute_branch_clip_embeddings(
         branch_dir,
         weights={"A": 1.0, "P": 1.0},
         max_chunks=max_chunks,
+        max_snapshots_per_chunk=max_snapshots_per_chunk,
         max_frames=max_frames,
     )
     frames = _render_apf_rgb(fields)
@@ -1797,6 +1919,10 @@ def _load_or_compute_branch_clip_embeddings(
         branch_dir=np.asarray(str(branch_dir)),
         foundation_model=np.asarray(str(foundation_model)),
         max_chunks=np.asarray(int(max_chunks), dtype=np.int32),
+        max_snapshots_per_chunk=np.asarray(
+            int(max_snapshots_per_chunk),
+            dtype=np.int32,
+        ),
         max_frames=np.asarray(int(max_frames), dtype=np.int32),
     )
     return z_arr, cache_path
@@ -1809,6 +1935,7 @@ def _pairwise_future_clip_chamfer_divergence(
     cache_dir: Path,
     foundation_model: str,
     max_chunks: int,
+    max_snapshots_per_chunk: int,
     max_frames: int,
     force_cache: bool,
 ) -> tuple[float, dict[str, Any]]:
@@ -1823,14 +1950,15 @@ def _pairwise_future_clip_chamfer_divergence(
                 cache_dir=cache_dir,
                 foundation_model=foundation_model,
                 max_chunks=max_chunks,
+                max_snapshots_per_chunk=max_snapshots_per_chunk,
                 max_frames=max_frames,
                 force=force_cache,
             )
             embeddings.append(z)
             cache_paths.append(str(cache_path))
             used_dirs.append(branch_dir)
-        except Exception:
-            continue
+        except Exception as exc:
+            raise RuntimeError(f"Failed to embed complete C2 branch future: {branch_dir}") from exc
     if len(embeddings) < 2:
         return float("nan"), {"metric": "future_clip_chamfer_cosine", "n_branches": len(embeddings), "n_pairs": 0}
     pair_vals = []
@@ -1846,13 +1974,14 @@ def _pairwise_future_clip_chamfer_divergence(
                     "pairwise_branching_score": float(d),
                 }
             )
-    score = float(np.mean(pair_vals)) if pair_vals else float("nan")
+    score = float(np.median(pair_vals)) if pair_vals else float("nan")
     return score, {
         "metric": "future_clip_chamfer_cosine",
         "n_branches": len(embeddings),
         "n_pairs": len(pair_vals),
         "foundation_model": str(foundation_model),
         "max_future_frames": int(max_frames),
+        "max_snapshots_per_chunk": int(max_snapshots_per_chunk),
         "clip_embedding_cache_n": len(cache_paths),
         "_pair_records": pair_records,
     }
@@ -1887,7 +2016,7 @@ def _pearson_corr(x: np.ndarray, y: np.ndarray) -> float:
     return float(np.corrcoef(xx, yy)[0, 1])
 
 
-def _bootstrap_mean_ci(values: list[float] | np.ndarray, *, n_boot: int = 2000, seed: int = 9173) -> tuple[float, float]:
+def _bootstrap_median_ci(values: list[float] | np.ndarray, *, n_boot: int = 2000, seed: int = 9173) -> tuple[float, float]:
     arr = np.asarray(values, dtype=np.float64).reshape(-1)
     arr = arr[np.isfinite(arr)]
     if arr.size == 0:
@@ -1897,7 +2026,7 @@ def _bootstrap_mean_ci(values: list[float] | np.ndarray, *, n_boot: int = 2000, 
         return value, value
     rng = np.random.default_rng(int(seed))
     idx = rng.integers(0, arr.size, size=(int(n_boot), arr.size))
-    stats = np.mean(arr[idx], axis=1)
+    stats = np.median(arr[idx], axis=1)
     return float(np.nanpercentile(stats, 2.5)), float(np.nanpercentile(stats, 97.5))
 
 
@@ -1925,6 +2054,46 @@ def _branching_correlation_summary(score_rows: list[dict[str, Any]]) -> dict[str
         "delta_h_max": float(np.nanmax(xx)) if xx.size else float("nan"),
         "branching_score_min": float(np.nanmin(yy)) if yy.size else float("nan"),
         "branching_score_max": float(np.nanmax(yy)) if yy.size else float("nan"),
+    }
+
+
+def _within_trajectory_correlations(score_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in score_rows:
+        grouped.setdefault(str(row.get("traj_id", "")), []).append(row)
+    out: list[dict[str, Any]] = []
+    for traj_id, rows in sorted(grouped.items()):
+        x = np.asarray([float(row.get("delta_h", "nan")) for row in rows], dtype=np.float64)
+        y = np.asarray([float(row.get("branching_score", "nan")) for row in rows], dtype=np.float64)
+        finite = np.isfinite(x) & np.isfinite(y)
+        x = x[finite]
+        y = y[finite]
+        out.append(
+            {
+                "traj_id": traj_id,
+                "n_branch_states": int(x.size),
+                "pearson_r": _pearson_corr(x, y),
+                "spearman_r": (
+                    _pearson_corr(_average_ranks(x), _average_ranks(y))
+                    if x.size >= 2
+                    else float("nan")
+                ),
+            }
+        )
+    return out
+
+
+def _correlation_distribution_summary(
+    rows: list[dict[str, Any]],
+    key: str,
+) -> dict[str, Any]:
+    values = np.asarray([float(row.get(key, "nan")) for row in rows], dtype=np.float64)
+    values = values[np.isfinite(values)]
+    return {
+        "n": int(values.size),
+        "n_positive": int(np.sum(values > 0.0)),
+        "median": float(np.nanmedian(values)) if values.size else float("nan"),
+        "mean": float(np.nanmean(values)) if values.size else float("nan"),
     }
 
 
@@ -1983,20 +2152,31 @@ def metrics(
     score_rows: list[dict[str, Any]] = []
     pair_detail_rows: list[dict[str, Any]] = []
     group_items = sorted(groups.items())
+    expected_branches = int(_get(bcfg, "branches_per_time", 3))
     for group_idx, ((traj_id, pair_id, condition), rows) in enumerate(group_items, start=1):
         if group_idx == 1 or group_idx == len(group_items) or group_idx % 5 == 0:
             log_event(
                 f"C2 branching metrics group {group_idx}/{len(group_items)} traj={traj_id} pair={pair_id} condition={condition}",
                 component="c2-branch",
         )
-        valid_rows = [
-            row
-            for row in rows
-            if _branch_output_ok(
-                Path(str(row["branch_dir"])),
-                expected_metadata=_expected_resume_metadata_from_plan_row(row),
+        valid_rows = (
+            list(rows)
+            if smoke
+            else [
+                row
+                for row in rows
+                if _branch_output_ok(
+                    Path(str(row["branch_dir"])),
+                    expected_metadata=_expected_resume_metadata_from_plan_row(row),
+                )
+            ]
+        )
+        if len(rows) != expected_branches or len(valid_rows) != expected_branches:
+            raise RuntimeError(
+                "C2 metrics require every published branch state to have all continuations: "
+                f"traj={traj_id}, pair={pair_id}, condition={condition}, "
+                f"planned={len(rows)}, valid={len(valid_rows)}, expected={expected_branches}."
             )
-        ]
         branch_dirs = [Path(str(row["branch_dir"])) for row in valid_rows]
         if metric_mode == "clip_chamfer":
             if clip_fm is None:
@@ -2007,6 +2187,7 @@ def metrics(
                 cache_dir=clip_cache_dir,
                 foundation_model=clip_foundation_model,
                 max_chunks=max_chunks,
+                max_snapshots_per_chunk=max_snapshots,
                 max_frames=max_future_frames,
                 force_cache=force_clip_cache,
             )
@@ -2016,6 +2197,7 @@ def metrics(
                 weights=weights,
                 scales=field_scales,
                 max_chunks=max_chunks,
+                max_snapshots_per_chunk=max_snapshots,
                 max_frames=max_future_frames,
             )
         used = list(valid_rows)
@@ -2046,7 +2228,14 @@ def metrics(
             for record in pair_records
             if np.isfinite(float(record.get("pairwise_branching_score", "nan")))
         ]
-        ci_low, ci_high = _bootstrap_mean_ci(pair_values)
+        expected_pairs = expected_branches * (expected_branches - 1) // 2
+        if len(pair_values) != expected_pairs:
+            raise RuntimeError(
+                "C2 metrics require every pairwise continuation distance: "
+                f"traj={traj_id}, pair={pair_id}, condition={condition}, "
+                f"found={len(pair_values)}, expected={expected_pairs}."
+            )
+        ci_low, ci_high = _bootstrap_median_ci(pair_values)
         delta_h_vals = [float(row.get("delta_h", "nan")) for row in used]
         step_vals = [float(row.get("step", "nan")) for row in used]
         delta_h_value = float(np.nanmedian(delta_h_vals))
@@ -2115,11 +2304,37 @@ def metrics(
     pair_details_path = out_dir / f"branching_pair_details{suffix}.csv"
     contrasts_path = out_dir / f"branching_pair_contrasts{suffix}.csv"
     correlation_path = out_dir / f"branching_delta_h_correlation{suffix}.csv"
+    within_path = out_dir / f"branching_within_trajectory_correlations{suffix}.csv"
     correlation_summary = _branching_correlation_summary(score_rows)
+    within_rows = _within_trajectory_correlations(score_rows)
+    selection_mode = str(_get(bcfg, "selection_mode", "")).strip().lower()
+    if not smoke and _is_ranked_high_low_mode(selection_mode):
+        expected_states = (
+            int(_get(bcfg, "n_high", 0))
+            + int(_get(bcfg, "n_mid", 0))
+            + int(_get(bcfg, "n_low", 0))
+        )
+        bad_counts = {
+            str(row["traj_id"]): int(row["n_branch_states"])
+            for row in within_rows
+            if int(row["n_branch_states"]) != expected_states
+        }
+        if bad_counts:
+            raise RuntimeError(
+                "C2 within-trajectory table does not have the published number of "
+                f"branch states per trajectory ({expected_states}): {bad_counts}."
+            )
+        expected_trajectories = int(_get(bcfg, "max_trajectories", len(within_rows)))
+        if len(within_rows) != expected_trajectories:
+            raise RuntimeError(
+                "C2 within-trajectory table has the wrong number of source trajectories: "
+                f"found={len(within_rows)}, expected={expected_trajectories}."
+            )
     write_csv(scores_path, score_rows)
     write_csv(pair_details_path, pair_detail_rows)
     write_csv(contrasts_path, contrast_rows)
     write_csv(correlation_path, [correlation_summary])
+    write_csv(within_path, within_rows)
     summary = {
         "status": "ok",
         "branching_metric_mode": metric_mode,
@@ -2127,10 +2342,13 @@ def metrics(
         "n_pairs": len(contrast_rows),
         "branching_sign_test": sign_test_greater(row["delta_branching_score"] for row in contrast_rows),
         "branching_delta_h_correlation": correlation_summary,
+        "within_trajectory_pearson": _correlation_distribution_summary(within_rows, "pearson_r"),
+        "within_trajectory_spearman": _correlation_distribution_summary(within_rows, "spearman_r"),
         "scores": str(scores_path),
         "pair_details": str(pair_details_path),
         "contrasts": str(contrasts_path),
         "correlation": str(correlation_path),
+        "within_trajectory_correlations": str(within_path),
     }
     summary_path = output_root / f"c2_branching_metrics_summary{suffix}.json"
     write_json(summary_path, summary)

@@ -165,6 +165,21 @@ class FlattenSubstrateParameters():
     def step_state(self, rng, state, params):
         params = self.param_reshaper.reshape_single(params)
         return self.substrate.step_state(rng, state, params)
+
+    def step_state_with_reintegration_gumbel(
+        self,
+        rng,
+        state,
+        params,
+        reintegration_gumbel,
+    ):
+        params = self.param_reshaper.reshape_single(params)
+        return self.substrate.step_state(
+            rng,
+            state,
+            params,
+            reintegration_gumbel=reintegration_gumbel,
+        )
     
     def render_state(self, state, params, img_size=None):
         params = self.param_reshaper.reshape_single(params)

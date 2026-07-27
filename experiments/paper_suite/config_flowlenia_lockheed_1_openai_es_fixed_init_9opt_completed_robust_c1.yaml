@@ -1,0 +1,74 @@
+meta:
+  output_root: analysis/results/paper_suite_flowlenia_lockheed_1_openai_es_fixed_init_9opt_completed_robust_c1
+  conda_env: torchjax
+  wandb_mode: disabled
+datasets:
+  flow_lenia:
+    enabled: true
+    required: true
+    c1:
+      source: apf_lagrangian_split
+      apf_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1_openai_es_fixed_init_9opt_completed_robust_c1/c1_lagrangian_apf_300k_train50_4seeds
+      require_random: true
+      expected_window_start_steps: 50000
+      expected_window_end_steps: 300000
+      metric:
+        metric_tau_mode: max_grid
+        metric_tau_grid_steps:
+        - 1000
+        - 2000
+        - 3000
+        - 4000
+        - 5000
+        - 6000
+        - 7000
+        - 8000
+        - 9000
+        - 10000
+        metric_tau_steps: 3000
+        metric_window_size_steps: 20000
+        metric_window_step_steps: 5000
+        metric_range_start_steps: 0
+        metric_m_samples: 48
+        metric_m_min: 4
+        metric_n_proj: 16
+        metric_null_reps: 6
+        metric_particle_samples: 64
+        metric_periodic: false
+        metric_domain_y: 128.0
+        metric_domain_x: 128.0
+        metric_delta_h_floor: 0.0
+        metric_msc_floor: 0.01
+        metric_msc_term: floor_reconstruction_error
+        metric_msc_normalize_by_weight_sum: true
+  plife_plus:
+    enabled: false
+    required: false
+  boids:
+    enabled: false
+    required: false
+simulation:
+  reuse_existing: true
+  allow_optimization_rerun: false
+  flow_lenia_arun_lagrangian_apf:
+    enabled: true
+    required: true
+    rollout_config: experiments/paper_suite/flowlenia_arun_apf_300k_train50_grid128.yaml
+    output_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1_openai_es_fixed_init_9opt_completed_robust_c1/c1_lagrangian_apf_300k_train50_4seeds
+    rollout_steps: 300000
+    n_trajectories_per_checkpoint: 1
+    n_rollout_seeds_per_checkpoint: 4
+    run_seed_rep_stride: 1
+    include_random_baselines: true
+    num_random_baselines: 27
+    random_checkpoint_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1/frustration_simulation/random_params
+    random_checkpoint_selection: all_groups_flat
+    run_seed_base: 400003
+    run_seed_mode: source_run_idx
+    batch_size: 7
+    optimized_checkpoint_dirs:
+    - experiments/paper_check_flow_lenia/checkpoints_lockheed_1_openai_es_fixed_init_9opt_completed_robust_c1/optimization/run_000
+    - experiments/paper_check_flow_lenia/checkpoints_lockheed_1_openai_es_fixed_init_9opt_completed_robust_c1/optimization/run_001
+    - experiments/paper_check_flow_lenia/checkpoints_lockheed_1_openai_es_fixed_init_9opt_completed_robust_c1/optimization/run_002
+    dedupe_by_run_idx: false
+    max_checkpoints: null

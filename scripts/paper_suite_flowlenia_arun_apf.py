@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import pickle
 import re
 import sys
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from omegaconf import OmegaConf
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -15,7 +19,7 @@ for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "scripts")):
 
 from flowlenia_minibang_common import list_apf_chunks
 from flowlenia_minibang_common import load_config as load_rollout_config
-from flowlenia_minibang_simulate import select_params, simulate_batch
+from flowlenia_minibang_simulate import select_params, simulate_batch, simulate_optimizer_native_selected_batch
 from paper_suite_c2_flowlenia_highres import (
     REQUIRED_APF_KEYS,
     _apf_status as _base_apf_status,
@@ -228,6 +232,157 @@ def _rollout_traj_id(base_traj_id: str, *, rollout_seed_idx: int, n_rollout_seed
     return f"{base_traj_id}_seed_{int(rollout_seed_idx):03d}"
 
 
+def _random_selection_mode(section: Any) -> str:
+    return str(_get(section, "random_checkpoint_selection", "per_source_group")).strip().lower()
+
+
+def _uses_optimizer_iter0_random(section: Any) -> bool:
+    return _random_selection_mode(section) in {
+        "optimization_iter0",
+        "optimizer_iter0",
+        "pop_traj_iter0",
+        "source_pop_traj_iter0",
+    }
+
+
+def _uses_random_theta_optimizer_context(section: Any) -> bool:
+    return _random_selection_mode(section) in {
+        "per_source_group_optimizer_context",
+        "per_source_group_optimizer_init",
+        "random_params_optimizer_context",
+        "random_params_optimizer_init",
+    }
+
+
+def _params_hash(params: Any) -> str:
+    arr = np.asarray(params, dtype=np.float32).reshape(-1)
+    return hashlib.sha1(arr.tobytes()).hexdigest()
+
+
+def _optimizer_native_random_pop_indices(section: Any, n_random: int) -> list[int]:
+    raw = _get(section, "random_optimizer_native_pop_indices", None)
+    if raw not in (None, ""):
+        values = OmegaConf.to_container(raw, resolve=True) if OmegaConf.is_config(raw) else raw
+        out = [int(x) for x in values]
+    else:
+        out = list(range(int(n_random)))
+    if len(out) < int(n_random):
+        raise ValueError(
+            f"Need at least {int(n_random)} random_optimizer_native_pop_indices, got {out}."
+        )
+    return out[: int(n_random)]
+
+
+def _mapping_get_bool(raw: Any, key: int, default: bool) -> bool:
+    if raw in (None, ""):
+        return bool(default)
+    values = OmegaConf.to_container(raw, resolve=True) if OmegaConf.is_config(raw) else raw
+    if not isinstance(values, dict):
+        return bool(default)
+    keys = (key, str(key), f"run_{int(key):03d}", f"{int(key):03d}")
+    for candidate in keys:
+        if candidate in values:
+            return bool(values[candidate])
+    return bool(default)
+
+
+def _optimizer_native_legacy_sigma_collision_for_row(section: Any, row: dict[str, Any]) -> bool:
+    default = bool(_get(section, "optimized_native_legacy_sigma_collision", False))
+    mapping = _get(section, "optimizer_native_legacy_sigma_collision_by_source_run_idx", None)
+    run_idx = int(row.get("source_run_idx", row.get("run_idx", -1)))
+    if run_idx < 0:
+        return bool(default)
+    return _mapping_get_bool(mapping, run_idx, default)
+
+
+def _optimizer_source_from_selected_checkpoint(checkpoint_dir: Path) -> tuple[Path, Path]:
+    selected_path = checkpoint_dir / "selected_candidate.json"
+    if not selected_path.exists():
+        raise FileNotFoundError(f"optimization_iter0 random controls require {selected_path}")
+    selected = json.loads(selected_path.read_text())
+    pop_path = Path(str(selected.get("source_pop_traj", "")))
+    if not pop_path.is_absolute():
+        pop_path = (Path.cwd() / pop_path).resolve()
+    source_run_dir = Path(str(selected.get("source_run_dir", pop_path.parent)))
+    if not source_run_dir.is_absolute():
+        source_run_dir = (Path.cwd() / source_run_dir).resolve()
+    if not pop_path.exists():
+        raise FileNotFoundError(f"source_pop_traj not found: {pop_path}")
+    if not (source_run_dir / "optimization_config.yaml").exists():
+        raise FileNotFoundError(f"optimization_config.yaml not found under {source_run_dir}")
+    return pop_path, source_run_dir
+
+
+def _attach_selected_checkpoint_tau_metadata(item: dict[str, Any], checkpoint_dir: Path) -> dict[str, Any]:
+    selected_path = checkpoint_dir / "selected_candidate.json"
+    if not selected_path.exists():
+        return item
+    try:
+        selected = json.loads(selected_path.read_text())
+    except Exception:
+        return item
+    tau = selected.get("tau", {})
+    if not isinstance(tau, dict):
+        tau = {}
+
+    def get_tau_value(key: str) -> Any:
+        if key in tau:
+            return tau[key]
+        return selected.get(key)
+
+    mappings = (
+        ("optimizer_native_tau_idx", "tau_idx", int),
+        ("optimizer_native_tau_steps", "tau_steps", int),
+        ("optimizer_native_tau_frames", "tau_frames", int),
+        ("optimizer_native_tau_selector_raw", "tau_selector_raw", float),
+    )
+    for out_key, source_key, cast in mappings:
+        value = get_tau_value(source_key)
+        if value in (None, ""):
+            continue
+        if out_key not in item:
+            item[out_key] = cast(value)
+    return item
+
+
+def _common_selected_metadata(
+    item: dict[str, Any],
+    *,
+    row: dict[str, Any],
+    section: Any,
+    suite_idx: int,
+    selection_idx: int,
+    checkpoint_dir: Path,
+    traj_id: str,
+    candidate_kind: str,
+    candidate_idx: int,
+    candidate_label: str,
+    rollout_seed_idx: int,
+    n_rollout_seeds: int,
+) -> dict[str, Any]:
+    item["traj_id"] = str(traj_id)
+    item["selection_idx"] = int(selection_idx)
+    item["source"] = "paper_check_flow_lenia_control_a"
+    item["source_checkpoint_dir"] = str(checkpoint_dir)
+    item["source_root"] = str(row["source_root"])
+    item["source_root_rank"] = int(row["source_root_rank"])
+    item["source_run_idx"] = int(row.get("source_run_idx", -1))
+    item["suite_run_idx"] = int(row.get("run_idx", suite_idx))
+    base_seed = _paper_check_control_a_seed(section, row, suite_idx)
+    item["base_run_seed"] = int(base_seed)
+    item["run_seed"] = _rollout_run_seed(section, base_seed, rollout_seed_idx)
+    item["rollout_seed_idx"] = int(rollout_seed_idx)
+    item["rollout_seed_count"] = int(n_rollout_seeds)
+    item["candidate_kind"] = str(candidate_kind)
+    item["candidate_idx"] = int(candidate_idx)
+    item["candidate_label"] = str(candidate_label)
+    item["optimizer_native_legacy_sigma_collision"] = _optimizer_native_legacy_sigma_collision_for_row(
+        section,
+        row,
+    )
+    return item
+
+
 def _random_checkpoint_dir(section: Any, row: dict[str, Any], random_idx: int) -> Path:
     source_run_idx = int(row.get("source_run_idx", -1))
     if source_run_idx < 0:
@@ -296,23 +451,144 @@ def _select_one_checkpoint(
     if not selected:
         raise FileNotFoundError(f"No selectable params found in {checkpoint_dir}.")
     item = dict(selected[0])
-    item["traj_id"] = str(traj_id)
-    item["selection_idx"] = int(selection_idx)
-    item["source"] = "paper_check_flow_lenia_control_a"
-    item["source_checkpoint_dir"] = str(checkpoint_dir)
-    item["source_root"] = str(row["source_root"])
-    item["source_root_rank"] = int(row["source_root_rank"])
-    item["source_run_idx"] = int(row.get("source_run_idx", -1))
-    item["suite_run_idx"] = int(row.get("run_idx", suite_idx))
-    base_seed = _paper_check_control_a_seed(section, row, suite_idx)
-    item["base_run_seed"] = int(base_seed)
-    item["run_seed"] = _rollout_run_seed(section, base_seed, rollout_seed_idx)
-    item["rollout_seed_idx"] = int(rollout_seed_idx)
-    item["rollout_seed_count"] = int(n_rollout_seeds)
-    item["candidate_kind"] = str(candidate_kind)
-    item["candidate_idx"] = int(candidate_idx)
-    item["candidate_label"] = str(candidate_label)
+    item = _common_selected_metadata(
+        item,
+        row=row,
+        section=section,
+        suite_idx=suite_idx,
+        selection_idx=selection_idx,
+        checkpoint_dir=checkpoint_dir,
+        traj_id=traj_id,
+        candidate_kind=candidate_kind,
+        candidate_idx=candidate_idx,
+        candidate_label=candidate_label,
+        rollout_seed_idx=rollout_seed_idx,
+        n_rollout_seeds=n_rollout_seeds,
+    )
+    return _attach_selected_checkpoint_tau_metadata(item, checkpoint_dir)
+
+
+def _attach_optimizer_native_context(
+    item: dict[str, Any],
+    *,
+    checkpoint_dir: Path,
+    use_row_params: bool = False,
+    params_source: str = "optimizer_native",
+    theta_source_checkpoint: Path | None = None,
+) -> dict[str, Any]:
+    pop_path, source_run_dir = _optimizer_source_from_selected_checkpoint(checkpoint_dir)
+    selected_path = checkpoint_dir / "selected_candidate.json"
+    selected = json.loads(selected_path.read_text())
+    optimizer_iter = int(selected.get("iter", -1))
+    optimizer_pop_idx = int(selected.get("pop_idx", -1))
+    item["optimizer_native_source_pop_traj"] = str(pop_path)
+    item["optimizer_native_source_run_dir"] = str(source_run_dir)
+    item["optimizer_native_iter"] = int(optimizer_iter)
+    item["optimizer_native_pop_idx"] = int(optimizer_pop_idx)
+    item["optimizer_native_params_source"] = str(params_source)
+    item["optimizer_native_use_row_params"] = bool(use_row_params)
+    if theta_source_checkpoint is not None:
+        item["theta_source_checkpoint"] = str(theta_source_checkpoint)
+
+    with pop_path.open("rb") as f:
+        pop = pickle.load(f)
+    if optimizer_iter < 0 or optimizer_pop_idx < 0:
+        return item
+    if "objective_score" in pop:
+        objective_score = np.asarray(pop["objective_score"], dtype=np.float32)
+        item["optimizer_native_score_mspd"] = float(objective_score[optimizer_iter, optimizer_pop_idx])
+        if not use_row_params:
+            item["fitness"] = float(objective_score[optimizer_iter, optimizer_pop_idx])
+    if "score_by_seed" in pop:
+        score_by_seed = np.asarray(pop["score_by_seed"], dtype=np.float32)
+        item["optimizer_native_score_by_seed_mspd"] = [
+            float(x) for x in score_by_seed[optimizer_iter, optimizer_pop_idx].reshape(-1)
+        ]
+    if "tau_idx" in pop:
+        item["optimizer_native_tau_idx"] = int(np.asarray(pop["tau_idx"])[optimizer_iter, optimizer_pop_idx])
+    if "tau_steps" in pop:
+        item["optimizer_native_tau_steps"] = int(np.asarray(pop["tau_steps"])[optimizer_iter, optimizer_pop_idx])
+    if "tau_frames" in pop:
+        item["optimizer_native_tau_frames"] = int(np.asarray(pop["tau_frames"])[optimizer_iter, optimizer_pop_idx])
+    if "tau_selector_raw" in pop:
+        item["optimizer_native_tau_selector_raw"] = float(
+            np.asarray(pop["tau_selector_raw"], dtype=np.float32)[optimizer_iter, optimizer_pop_idx]
+        )
     return item
+
+
+def _select_optimizer_native_pop_candidate(
+    *,
+    row: dict[str, Any],
+    section: Any,
+    suite_idx: int,
+    selection_idx: int,
+    traj_id: str,
+    candidate_kind: str,
+    candidate_idx: int,
+    candidate_label: str,
+    rollout_seed_idx: int,
+    n_rollout_seeds: int,
+    optimizer_iter: int,
+    optimizer_pop_idx: int,
+) -> dict[str, Any]:
+    checkpoint_dir = Path(row["checkpoint_dir"])
+    pop_path, source_run_dir = _optimizer_source_from_selected_checkpoint(checkpoint_dir)
+    with pop_path.open("rb") as f:
+        pop = pickle.load(f)
+    params = np.asarray(pop["params"], dtype=np.float32)
+    if params.ndim != 3:
+        raise ValueError(f"invalid pop_traj params shape in {pop_path}: {params.shape}")
+    optimizer_iter = int(optimizer_iter)
+    optimizer_pop_idx = int(optimizer_pop_idx)
+    if optimizer_iter < 0 or optimizer_iter >= params.shape[0]:
+        raise ValueError(f"optimizer_iter={optimizer_iter} out of range for {pop_path} shape={params.shape}")
+    if optimizer_pop_idx < 0 or optimizer_pop_idx >= params.shape[1]:
+        raise ValueError(f"optimizer_pop_idx={optimizer_pop_idx} out of range for {pop_path} shape={params.shape}")
+
+    item: dict[str, Any] = {
+        "params": np.asarray(params[optimizer_iter, optimizer_pop_idx], dtype=np.float32),
+        "fitness": 0.0,
+        "iter": int(optimizer_iter),
+        "optimizer_native_source_pop_traj": str(pop_path),
+        "optimizer_native_source_run_dir": str(source_run_dir),
+        "optimizer_native_iter": int(optimizer_iter),
+        "optimizer_native_pop_idx": int(optimizer_pop_idx),
+    }
+    if "objective_score" in pop:
+        objective_score = np.asarray(pop["objective_score"], dtype=np.float32)
+        item["optimizer_native_score_mspd"] = float(objective_score[optimizer_iter, optimizer_pop_idx])
+        item["fitness"] = float(objective_score[optimizer_iter, optimizer_pop_idx])
+    if "score_by_seed" in pop:
+        score_by_seed = np.asarray(pop["score_by_seed"], dtype=np.float32)
+        item["optimizer_native_score_by_seed_mspd"] = [
+            float(x) for x in score_by_seed[optimizer_iter, optimizer_pop_idx].reshape(-1)
+        ]
+    if "tau_idx" in pop:
+        item["optimizer_native_tau_idx"] = int(np.asarray(pop["tau_idx"])[optimizer_iter, optimizer_pop_idx])
+    if "tau_steps" in pop:
+        item["optimizer_native_tau_steps"] = int(np.asarray(pop["tau_steps"])[optimizer_iter, optimizer_pop_idx])
+    if "tau_frames" in pop:
+        item["optimizer_native_tau_frames"] = int(np.asarray(pop["tau_frames"])[optimizer_iter, optimizer_pop_idx])
+    if "tau_selector_raw" in pop:
+        item["optimizer_native_tau_selector_raw"] = float(
+            np.asarray(pop["tau_selector_raw"], dtype=np.float32)[optimizer_iter, optimizer_pop_idx]
+        )
+
+    return _common_selected_metadata(
+        item,
+        row=row,
+        section=section,
+        suite_idx=suite_idx,
+        selection_idx=selection_idx,
+        checkpoint_dir=source_run_dir,
+        traj_id=traj_id,
+        candidate_kind=candidate_kind,
+        candidate_idx=candidate_idx,
+        candidate_label=candidate_label,
+        rollout_seed_idx=rollout_seed_idx,
+        n_rollout_seeds=n_rollout_seeds,
+    )
 
 
 def _write_manifest(
@@ -360,6 +636,26 @@ def _write_manifest(
                 "apf_ready": bool(apf_ready),
                 "ready": bool(apf_ready),
                 "apf_status": apf_message,
+                **{
+                    key: to_plain(row[key])
+                    for key in (
+                        "optimizer_native_source_pop_traj",
+                        "optimizer_native_source_run_dir",
+                        "optimizer_native_iter",
+                        "optimizer_native_pop_idx",
+                        "optimizer_native_tau_idx",
+                        "optimizer_native_tau_steps",
+                        "optimizer_native_tau_frames",
+                        "optimizer_native_tau_selector_raw",
+                        "optimizer_native_score_mspd",
+                        "optimizer_native_score_by_seed_mspd",
+                        "optimizer_native_legacy_sigma_collision",
+                        "optimizer_native_params_source",
+                        "optimizer_native_use_row_params",
+                        "theta_source_checkpoint",
+                    )
+                    if key in row
+                },
             }
         )
     write_json(
@@ -412,6 +708,16 @@ def run(
     rollout_flat.n_trajectories = 1
     batch_size = max(1, int(_get(section, "batch_size", _get(rollout_flat, "batch_size", 1))))
     rollout_flat.batch_size = int(batch_size)
+    optimized_apf_source = str(_get(section, "optimized_apf_source", "minibang")).strip().lower()
+    use_optimizer_native_optimized = optimized_apf_source in {
+        "optimizer_native",
+        "optimization_native",
+        "optimizer_nested_jit",
+        "native",
+    }
+    optimized_native_legacy_sigma_collision = bool(
+        _get(section, "optimized_native_legacy_sigma_collision", False)
+    )
 
     checkpoints = _discover_checkpoints(section)
     log_event(
@@ -432,40 +738,72 @@ def run(
     selected: list[dict[str, Any]] = []
     include_random = bool(_get(section, "include_random_baselines", True))
     n_random = int(_get(section, "num_random_baselines", 3)) if include_random else 0
+    use_optimizer_iter0_random = bool(include_random and _uses_optimizer_iter0_random(section))
+    use_random_theta_optimizer_context = bool(include_random and _uses_random_theta_optimizer_context(section))
+    random_optimizer_iter = int(_get(section, "random_optimizer_native_iter", 0))
+    random_optimizer_pop_indices = _optimizer_native_random_pop_indices(section, n_random) if use_optimizer_iter0_random else []
     for suite_idx, row in enumerate(checkpoints):
         optimized_base_traj_id = _candidate_traj_id(row, candidate_kind="optimized", candidate_idx=0)
         for rollout_seed_idx in range(n_rollout_seeds):
-            selected.append(
-                _select_one_checkpoint(
-                    row=row,
-                    section=section,
-                    rollout_flat=rollout_flat,
-                    suite_idx=suite_idx,
-                    selection_idx=len(selected),
-                    checkpoint_dir=Path(row["checkpoint_dir"]),
-                    traj_id=_rollout_traj_id(
-                        optimized_base_traj_id,
-                        rollout_seed_idx=rollout_seed_idx,
-                        n_rollout_seeds=n_rollout_seeds,
-                    ),
-                    candidate_kind="optimized",
-                    candidate_idx=0,
-                    candidate_label="optimized",
+            optimized_item = _select_one_checkpoint(
+                row=row,
+                section=section,
+                rollout_flat=rollout_flat,
+                suite_idx=suite_idx,
+                selection_idx=len(selected),
+                checkpoint_dir=Path(row["checkpoint_dir"]),
+                traj_id=_rollout_traj_id(
+                    optimized_base_traj_id,
                     rollout_seed_idx=rollout_seed_idx,
                     n_rollout_seeds=n_rollout_seeds,
-                )
+                ),
+                candidate_kind="optimized",
+                candidate_idx=0,
+                candidate_label="optimized",
+                rollout_seed_idx=rollout_seed_idx,
+                n_rollout_seeds=n_rollout_seeds,
             )
-        for random_idx, random_dir in enumerate(_random_checkpoint_dirs(section, row, n_random)):
-            if not (random_dir / "best.pkl").exists():
-                raise FileNotFoundError(
-                    "Missing random baseline checkpoint for Flow-Lenia A-run APF. "
-                    f"Expected {random_dir / 'best.pkl'} for suite_group={suite_idx}, "
-                    f"source_run_idx={int(row.get('source_run_idx', -1))}, random_idx={random_idx}."
+            if use_optimizer_native_optimized:
+                optimized_item = _attach_optimizer_native_context(
+                    optimized_item,
+                    checkpoint_dir=Path(row["checkpoint_dir"]),
                 )
-            random_base_traj_id = _candidate_traj_id(row, candidate_kind="random", candidate_idx=random_idx)
-            for rollout_seed_idx in range(n_rollout_seeds):
-                selected.append(
-                    _select_one_checkpoint(
+            selected.append(optimized_item)
+        if use_optimizer_iter0_random:
+            for random_idx, pop_idx in enumerate(random_optimizer_pop_indices):
+                random_base_traj_id = _candidate_traj_id(row, candidate_kind="random", candidate_idx=random_idx)
+                for rollout_seed_idx in range(n_rollout_seeds):
+                    selected.append(
+                        _select_optimizer_native_pop_candidate(
+                            row=row,
+                            section=section,
+                            suite_idx=suite_idx,
+                            selection_idx=len(selected),
+                            traj_id=_rollout_traj_id(
+                                random_base_traj_id,
+                                rollout_seed_idx=rollout_seed_idx,
+                                n_rollout_seeds=n_rollout_seeds,
+                            ),
+                            candidate_kind="random",
+                            candidate_idx=random_idx,
+                            candidate_label=f"random_{random_idx:03d}_iter{random_optimizer_iter:03d}_pop{int(pop_idx):03d}",
+                            rollout_seed_idx=rollout_seed_idx,
+                            n_rollout_seeds=n_rollout_seeds,
+                            optimizer_iter=random_optimizer_iter,
+                            optimizer_pop_idx=int(pop_idx),
+                        )
+                    )
+        else:
+            for random_idx, random_dir in enumerate(_random_checkpoint_dirs(section, row, n_random)):
+                if not (random_dir / "best.pkl").exists():
+                    raise FileNotFoundError(
+                        "Missing random baseline checkpoint for Flow-Lenia A-run APF. "
+                        f"Expected {random_dir / 'best.pkl'} for suite_group={suite_idx}, "
+                        f"source_run_idx={int(row.get('source_run_idx', -1))}, random_idx={random_idx}."
+                    )
+                random_base_traj_id = _candidate_traj_id(row, candidate_kind="random", candidate_idx=random_idx)
+                for rollout_seed_idx in range(n_rollout_seeds):
+                    random_item = _select_one_checkpoint(
                         row=row,
                         section=section,
                         rollout_flat=rollout_flat,
@@ -483,7 +821,15 @@ def run(
                         rollout_seed_idx=rollout_seed_idx,
                         n_rollout_seeds=n_rollout_seeds,
                     )
-                )
+                    if use_random_theta_optimizer_context:
+                        random_item = _attach_optimizer_native_context(
+                            random_item,
+                            checkpoint_dir=Path(row["checkpoint_dir"]),
+                            use_row_params=True,
+                            params_source="external_random_checkpoint",
+                            theta_source_checkpoint=random_dir,
+                        )
+                    selected.append(random_item)
 
     ready_by_traj: dict[str, tuple[bool, str]] = {}
     for row in selected:
@@ -498,9 +844,63 @@ def run(
         for row in selected
         if force or not ready_by_traj[str(row["traj_id"])][0]
     ]
-    batches_to_run = [pending[start : start + batch_size] for start in range(0, len(pending), batch_size)]
+    batches_to_run: list[dict[str, Any]] = []
+    if use_optimizer_native_optimized:
+        native_pending = [
+            row
+            for row in pending
+            if str(row.get("candidate_kind", "optimized")) == "optimized"
+            or row.get("optimizer_native_source_pop_traj", None) not in (None, "")
+        ]
+        minibang_pending = [
+            row
+            for row in pending
+            if str(row.get("candidate_kind", "optimized")) != "optimized"
+            and row.get("optimizer_native_source_pop_traj", None) in (None, "")
+        ]
+        by_checkpoint: dict[str, list[dict[str, Any]]] = {}
+        for row in native_pending:
+            row_legacy = bool(row.get("optimizer_native_legacy_sigma_collision", optimized_native_legacy_sigma_collision))
+            if row.get("optimizer_native_source_pop_traj", None) not in (None, ""):
+                key = "|".join(
+                    (
+                        str(Path(str(row["optimizer_native_source_pop_traj"])).resolve()),
+                        str(int(row.get("optimizer_native_iter", -1))),
+                        f"legacy={int(row_legacy)}",
+                    )
+                )
+            else:
+                key = "|".join(
+                    (
+                        str(Path(row["source_checkpoint_dir"]).resolve()),
+                        f"legacy={int(row_legacy)}",
+                    )
+                )
+            by_checkpoint.setdefault(key, []).append(row)
+        for rows in by_checkpoint.values():
+            rows.sort(key=lambda r: int(r.get("rollout_seed_idx", 0)))
+            legacy_values = {
+                bool(row.get("optimizer_native_legacy_sigma_collision", optimized_native_legacy_sigma_collision))
+                for row in rows
+            }
+            if len(legacy_values) != 1:
+                raise ValueError(f"optimizer-native batch has mixed sigma protocols: {legacy_values}")
+            batches_to_run.append(
+                {
+                    "kind": "optimizer_native",
+                    "rows": rows,
+                    "legacy_sigma_collision": bool(next(iter(legacy_values))),
+                }
+            )
+        for start in range(0, len(minibang_pending), batch_size):
+            batches_to_run.append({"kind": "minibang", "rows": minibang_pending[start : start + batch_size]})
+    else:
+        batches_to_run = [
+            {"kind": "minibang", "rows": pending[start : start + batch_size]}
+            for start in range(0, len(pending), batch_size)
+        ]
 
-    run_traj_ids = {str(row["traj_id"]) for batch in batches_to_run for row in batch}
+    run_traj_ids = {str(row["traj_id"]) for batch in batches_to_run for row in batch["rows"]}
     command_rows: list[dict[str, Any]] = []
     for idx, row in enumerate(selected, start=1):
         paths = _output_paths(output_root, str(row["traj_id"]))
@@ -571,7 +971,9 @@ def run(
         return summary
 
     flat_dict = OmegaConf.to_container(rollout_flat, resolve=True)
-    for batch_idx, batch in enumerate(batches_to_run, start=1):
+    for batch_idx, batch_info in enumerate(batches_to_run, start=1):
+        batch = batch_info["rows"]
+        batch_kind = str(batch_info["kind"])
         batch_ids = [str(row["traj_id"]) for row in batch]
         # Every selected row carries an explicit run_seed, so missing random
         # candidates can be filled without re-running already ready optimized
@@ -595,16 +997,29 @@ def run(
         overwrite = bool(force or existing)
         log_event(
             f"Flow-Lenia A-run APF running batch {batch_idx}/{len(batches_to_run)} "
-            f"batch_size={len(batch)} overwrite={overwrite} traj_ids={batch_ids}",
+            f"kind={batch_kind} batch_size={len(batch)} overwrite={overwrite} traj_ids={batch_ids}",
             component="arun-apf",
         )
-        simulate_batch(
-            selected_batch=batch,
-            cfg=rollout_cfg,
-            flat_args=dict(flat_dict),
-            output_root=output_root,
-            overwrite=overwrite,
-        )
+        if batch_kind == "optimizer_native":
+            batch_legacy_sigma_collision = bool(
+                batch_info.get("legacy_sigma_collision", optimized_native_legacy_sigma_collision)
+            )
+            simulate_optimizer_native_selected_batch(
+                selected_batch=batch,
+                cfg=rollout_cfg,
+                flat_args=dict(flat_dict),
+                output_root=output_root,
+                overwrite=overwrite,
+                legacy_sigma_collision=batch_legacy_sigma_collision,
+            )
+        else:
+            simulate_batch(
+                selected_batch=batch,
+                cfg=rollout_cfg,
+                flat_args=dict(flat_dict),
+                output_root=output_root,
+                overwrite=overwrite,
+            )
         for row in command_rows:
             if row["traj_id"] in batch_ids:
                 paths = _output_paths(output_root, str(row["traj_id"]))

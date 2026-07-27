@@ -387,7 +387,13 @@ class FlowLenia:
         # Step once to avoid trivial zero image, like Lenia
         return self.step_state(rng, state, params)
 
-    def step_state(self, rng, state, params):
+    def step_state(
+        self,
+        rng,
+        state,
+        params,
+        reintegration_gumbel=None,
+    ):
         # params are unused (Lenia-style), dynamics are embedded in state
         A, P, fK = state["A"], state["P"], state["fK"]
         m, s = state["m"], state["s"]
@@ -415,7 +421,12 @@ class FlowLenia:
         mag = self.cfg.dd - self.cfg.sigma
         F = jnp.clip(F * (1 - alpha) - C_grad * alpha, -mag, mag)
 
-        nA, nP = self.RT(A, P, F)
+        nA, nP = self.RT(
+            A,
+            P,
+            F,
+            categorical_gumbel=reintegration_gumbel,
+        )
 
         # Optional explicit per-channel mass renormalization for long-rollout stability.
         # Disabled by default for backward compatibility with older runs.

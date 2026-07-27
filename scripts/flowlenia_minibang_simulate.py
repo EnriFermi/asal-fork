@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import json
 import os
 import pickle
 import shutil
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -103,6 +105,34 @@ def _load_pkl_if_exists(path: Path) -> Any | None:
         return None
     with path.open("rb") as f:
         return pickle.load(f)
+
+
+def _path_from_repo(raw: Any) -> Path:
+    path = Path(str(raw))
+    if not path.is_absolute():
+        path = _REPO_ROOT / path
+    return path
+
+
+def _flat_optimization_config(path: Path, *, legacy_sigma_collision: bool = False) -> Any:
+    cfg = OmegaConf.load(path)
+    substrate_cfg = cfg.get("substrate", {})
+    flat = OmegaConf.merge(
+        cfg.get("meta", {}),
+        substrate_cfg,
+        cfg.get("evaluation", {}),
+        cfg.get("optimization", {}),
+        cfg.get("logging", {}),
+        cfg.get("metric", {}),
+    )
+    if legacy_sigma_collision:
+        if flat.get("flow_sigma", None) is not None:
+            flat.flow_sigma = None
+    else:
+        flow_sigma = substrate_cfg.get("flow_sigma", substrate_cfg.get("sigma", None))
+        if flow_sigma is not None and flat.get("flow_sigma", None) is None:
+            flat.flow_sigma = flow_sigma
+    return flat
 
 
 def _param_hash(params: np.ndarray) -> str:
@@ -478,6 +508,19 @@ def _flush_run_buffers(run: dict[str, Any], args: Any) -> None:
     )
     for key in buffers:
         buffers[key] = []
+
+
+def _flush_runs(runs: list[dict[str, Any]], args: Any) -> None:
+    pending = [run for run in runs if run["buffers"]["steps"]]
+    if not pending:
+        return
+    max_workers = max(1, min(len(pending), int(_get(args, "apf_flush_workers", 1))))
+    if max_workers == 1:
+        for run in pending:
+            _flush_run_buffers(run, args)
+        return
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="apf-save") as executor:
+        list(executor.map(lambda run: _flush_run_buffers(run, args), pending))
 
 
 def _init_run_dirs(
@@ -1260,7 +1303,8 @@ def compute_metrics_for_run(run: dict[str, Any], flat_args: dict[str, Any]) -> N
     metrics["optimization_iter"] = np.asarray(run["selection"].get("iter", -1), dtype=np.int32)
     metrics["saturation_T"] = np.asarray(run["selection"].get("saturation_T", np.nan), dtype=np.float32)
 
-    out_path = run["traj_dir"] / "metrics.npz"
+    out_path = Path(run.get("metrics_path", run["traj_dir"] / "metrics.npz"))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(out_path, **metrics)
 
     summary = {
@@ -1277,7 +1321,9 @@ def compute_metrics_for_run(run: dict[str, Any], flat_args: dict[str, Any]) -> N
         tv = np.asarray(metrics["cluster_tv_lag"], dtype=np.float64)
         summary["cluster_tv_lag_max"] = float(np.nanmax(tv)) if tv.size else None
         summary["cluster_tv_lag_mean"] = float(np.nanmean(tv)) if tv.size else None
-    write_json(run["traj_dir"] / "metrics_summary.json", summary)
+    summary_path = Path(run.get("metrics_summary_path", out_path.with_name("metrics_summary.json")))
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(summary_path, summary)
 
 
 def _capture_snapshot(
@@ -1364,8 +1410,10 @@ def _capture_snapshot(
             buffers["resume_stepper_mode"].append(np.asarray(run["resume_stepper_mode"]))
             buffers["state_t"].append(np.asarray(state_t_np[i], dtype=np.int32))
             buffers["state_mass_cycle_start"].append(np.asarray(state_mass_cycle_start_np[i], dtype=np.float32))
-        if len(buffers["steps"]) >= chunk_size:
-            _flush_run_buffers(run, args)
+    _flush_runs(
+        [run for run in runs if len(run["buffers"]["steps"]) >= chunk_size],
+        args,
+    )
 
 
 def simulate_batch(
@@ -1402,6 +1450,7 @@ def simulate_batch(
         total_steps_raw = _get(args, "max_steps", substrate.rollout_steps)
     if total_steps_raw is None:
         total_steps_raw = substrate.rollout_steps
+    key_schedule_steps = int(total_steps_raw)
     total_steps = int(total_steps_raw)
     max_steps = _get(args, "max_steps", None)
     if max_steps is not None:
@@ -1416,6 +1465,12 @@ def simulate_batch(
                 "run_seed_protocol='optimization_metric' requires sample_every_steps == snapshot_interval "
                 f"to reproduce main_opt_msc metric rollout keys exactly; got sample_every_steps={sample_every_steps}, "
                 f"snapshot_interval={snapshot_interval}."
+            )
+        if key_schedule_steps % snapshot_interval != 0:
+            raise ValueError(
+                "run_seed_protocol='optimization_metric' requires rollout_steps divisible by snapshot_interval for "
+                "the train-time RNG chunk schedule; "
+                f"got rollout_steps={key_schedule_steps}, snapshot_interval={snapshot_interval}."
             )
         if total_steps % snapshot_interval != 0:
             raise ValueError(
@@ -1445,7 +1500,7 @@ def simulate_batch(
             lag_keys = roll_parts[:, 1]
             ch_keys = roll_parts[:, 2]
             scan_keys = roll_parts[:, 3]
-            n_scan_chunks = int(total_steps // snapshot_interval)
+            n_scan_chunks = int(key_schedule_steps // snapshot_interval)
             rng_batch = jax.vmap(lambda key: jax.random.split(key, n_scan_chunks))(scan_keys)
             rng_chunk_idx = jnp.asarray(0, dtype=jnp.int32)
         else:
@@ -1621,6 +1676,7 @@ def simulate_batch(
         run["resume_selection0"] = int(selection0)
         run["resume_jit_microbatch"] = int(jit_microbatch)
         run["resume_snapshot_interval"] = int(snapshot_interval)
+        run["resume_key_schedule_steps"] = int(key_schedule_steps)
         run["resume_seed"] = int(run_seed_i)
         run["resume_lagrangian_seed"] = int(run_seed_i if use_run_seed_batch else lagrangian_seed)
         run["resume_stepper_mode"] = (
@@ -1689,13 +1745,453 @@ def simulate_batch(
             )
     finally:
         pbar.close()
-        for run in runs:
-            _flush_run_buffers(run, args)
+        _flush_runs(runs, args)
         _close_runs(runs)
 
     flat_plain = dict(flat_args)
     for run in runs:
         if _as_bool(_get(args, "compute_metrics", True), True):
+            compute_metrics_for_run(run, flat_plain)
+    return runs
+
+
+def _metric_roll_key(args: Any, eval_key: Any) -> Any:
+    _ensure_jax()
+    if _as_bool(_get(args, "log_clip_evolution", False), False):
+        return jax.random.split(eval_key, 3)[0]
+    return jax.random.split(eval_key, 2)[0]
+
+
+def _seed_idx_for_run_seed(seed_keys: np.ndarray, run_seed: int) -> int:
+    _ensure_jax()
+    wanted = np.asarray(jax.random.PRNGKey(int(run_seed)), dtype=np.uint32).reshape(2)
+    keys = np.asarray(seed_keys, dtype=np.uint32).reshape((-1, 2))
+    matches = np.flatnonzero(np.all(keys == wanted[None, :], axis=1))
+    if matches.size != 1:
+        raise ValueError(
+            f"run_seed={run_seed} does not match exactly one optimizer seed key; "
+            f"matches={matches.tolist()} seed_keys={keys.tolist()}"
+        )
+    return int(matches[0])
+
+
+def _optimizer_native_context(
+    selected_batch: list[dict[str, Any]],
+    *,
+    legacy_sigma_collision: bool,
+) -> dict[str, Any]:
+    if not selected_batch:
+        raise ValueError("optimizer-native APF requires a non-empty selected_batch.")
+    first = selected_batch[0]
+    explicit_pop = first.get("optimizer_native_source_pop_traj", "")
+    if explicit_pop not in (None, ""):
+        pop_path = _path_from_repo(explicit_pop)
+        source_run_dir = _path_from_repo(first.get("optimizer_native_source_run_dir", pop_path.parent))
+        selected = {
+            "source_pop_traj": str(pop_path),
+            "source_run_dir": str(source_run_dir),
+            "iter": int(first.get("optimizer_native_iter", -1)),
+            "pop_idx": int(first.get("optimizer_native_pop_idx", -1)),
+        }
+        for row in selected_batch:
+            row_pop = _path_from_repo(row.get("optimizer_native_source_pop_traj", ""))
+            row_run = _path_from_repo(row.get("optimizer_native_source_run_dir", row_pop.parent))
+            if row_pop != pop_path or row_run != source_run_dir:
+                raise ValueError(
+                    "optimizer-native APF batch rows must share one source_pop_traj/source_run_dir; "
+                    f"got {pop_path} and {row_pop}."
+                )
+            if int(row.get("optimizer_native_iter", -1)) != int(selected["iter"]):
+                raise ValueError("optimizer-native APF batch rows must share one optimizer_native_iter.")
+        checkpoint_dir = source_run_dir
+    else:
+        checkpoint_dirs = {str(_path_from_repo(row.get("source_checkpoint_dir", ""))) for row in selected_batch}
+        if len(checkpoint_dirs) != 1:
+            raise ValueError(f"optimizer-native APF batch must contain exactly one checkpoint dir, got {checkpoint_dirs}")
+        for row in selected_batch:
+            if str(row.get("candidate_kind", "")).strip().lower() != "optimized":
+                raise ValueError(
+                    "optimizer-native APF non-optimized rows must carry optimizer_native_source_pop_traj, "
+                    f"got candidate_kind={row.get('candidate_kind')!r}."
+                )
+
+        checkpoint_dir = Path(next(iter(checkpoint_dirs)))
+        selected_path = checkpoint_dir / "selected_candidate.json"
+        if not selected_path.exists():
+            raise FileNotFoundError(f"optimizer-native APF requires {selected_path}")
+        selected = json.loads(selected_path.read_text())
+        pop_path = _path_from_repo(selected.get("source_pop_traj", ""))
+        source_run_dir = _path_from_repo(selected.get("source_run_dir", pop_path.parent))
+    if not pop_path.exists():
+        raise FileNotFoundError(f"source_pop_traj not found: {pop_path}")
+    opt_config_path = source_run_dir / "optimization_config.yaml"
+    if not opt_config_path.exists():
+        raise FileNotFoundError(f"optimization_config.yaml not found: {opt_config_path}")
+
+    with pop_path.open("rb") as f:
+        pop = pickle.load(f)
+    params = np.asarray(pop["params"], dtype=np.float32)
+    seed_keys = np.asarray(pop["seed_keys"], dtype=np.uint32)
+    i_iter = int(selected.get("iter", -1))
+    pop_idx = int(selected.get("pop_idx", -1))
+    if params.ndim != 3 or seed_keys.ndim != 3:
+        raise ValueError(f"invalid pop_traj shapes params={params.shape} seed_keys={seed_keys.shape}")
+    if i_iter < 0 or i_iter >= params.shape[0] or pop_idx < 0 or pop_idx >= params.shape[1]:
+        raise ValueError(f"selected iter/pop_idx out of range: iter={i_iter} pop_idx={pop_idx}")
+
+    init_params_batch = np.asarray(params[i_iter], dtype=np.float32).copy()
+    params_batch = np.asarray(init_params_batch, dtype=np.float32).copy()
+    seed_key_batch = np.asarray(seed_keys[i_iter], dtype=np.uint32)
+    use_row_params = [
+        _as_bool(row.get("optimizer_native_use_row_params", False), False)
+        for row in selected_batch
+    ]
+    direct_lanes = {
+        int(row.get("optimizer_native_pop_idx", pop_idx))
+        for row, use_override in zip(selected_batch, use_row_params)
+        if not use_override
+    }
+    candidate_lanes: dict[tuple[str, int, str], int] = {}
+    available_override_lanes = [idx for idx in range(params_batch.shape[0]) if idx not in direct_lanes]
+    seed_indices: list[int] = []
+    execution_pop_indices: list[int] = []
+    source_pop_indices: list[int] = []
+    for row, use_override in zip(selected_batch, use_row_params):
+        source_pop_idx = int(row.get("optimizer_native_pop_idx", pop_idx))
+        if source_pop_idx < 0 or source_pop_idx >= params_batch.shape[0]:
+            raise ValueError(f"optimizer_native_pop_idx={source_pop_idx} out of range for {pop_path}.")
+        row_params = np.asarray(row["params"], dtype=np.float32).reshape(-1)
+        source_params = np.asarray(params[i_iter, source_pop_idx], dtype=np.float32).reshape(-1)
+        if row_params.shape != source_params.shape:
+            raise ValueError(
+                f"{row.get('traj_id')}: row params shape {row_params.shape} does not match optimizer params "
+                f"shape {source_params.shape}."
+            )
+        candidate_key = (
+            str(row.get("candidate_kind", "optimized")),
+            int(row.get("candidate_idx", 0)),
+            hashlib.sha1(row_params.tobytes()).hexdigest(),
+        )
+        if candidate_key in candidate_lanes:
+            execution_pop_idx = int(candidate_lanes[candidate_key])
+        elif use_override:
+            if not available_override_lanes:
+                raise ValueError(
+                    "Not enough free optimizer population lanes for random controls; "
+                    f"population={params_batch.shape[0]} direct_lanes={sorted(direct_lanes)}."
+                )
+            execution_pop_idx = int(available_override_lanes.pop(0))
+            candidate_lanes[candidate_key] = execution_pop_idx
+            params_batch[execution_pop_idx] = row_params
+            # Random theta is evaluated from exactly the optimized candidate's initial state.
+            init_params_batch[execution_pop_idx] = source_params
+        else:
+            execution_pop_idx = source_pop_idx
+            candidate_lanes[candidate_key] = execution_pop_idx
+            if float(np.max(np.abs(row_params - source_params))) != 0.0:
+                raise ValueError(
+                    f"{row.get('traj_id')}: direct optimizer-native params do not match pop_traj exactly."
+                )
+        seed_idx = _seed_idx_for_run_seed(seed_key_batch, int(row["run_seed"]))
+        seed_indices.append(seed_idx)
+        execution_pop_indices.append(execution_pop_idx)
+        source_pop_indices.append(source_pop_idx)
+        expected = np.asarray(params_batch[execution_pop_idx], dtype=np.float32).reshape(-1)
+        if row_params.shape != expected.shape or float(np.max(np.abs(row_params - expected))) != 0.0:
+            raise ValueError(
+                f"{row.get('traj_id')}: row params do not match execution population lane exactly."
+            )
+
+    return {
+        "checkpoint_dir": checkpoint_dir,
+        "selected": selected,
+        "source_pop_traj": pop_path,
+        "source_run_dir": source_run_dir,
+        "optimization_config": opt_config_path,
+        "opt_flat": _flat_optimization_config(opt_config_path, legacy_sigma_collision=legacy_sigma_collision),
+        "iter": i_iter,
+        "pop_idx": pop_idx,
+        "pop_indices": np.asarray(execution_pop_indices, dtype=np.int32),
+        "source_pop_indices": np.asarray(source_pop_indices, dtype=np.int32),
+        "params_batch": params_batch,
+        "init_params_batch": init_params_batch,
+        "seed_keys": seed_key_batch,
+        "seed_indices": np.asarray(seed_indices, dtype=np.int32),
+        "legacy_sigma_collision": bool(legacy_sigma_collision),
+        "row_params_override": bool(any(use_row_params)),
+    }
+
+
+def simulate_optimizer_native_selected_batch(
+    *,
+    selected_batch: list[dict[str, Any]],
+    cfg: Any,
+    flat_args: dict[str, Any],
+    output_root: Path,
+    overwrite: bool,
+    legacy_sigma_collision: bool = False,
+) -> list[dict[str, Any]]:
+    """Write APF files for optimized rows in the original optimizer eval context."""
+    _ensure_jax()
+    context = _optimizer_native_context(
+        selected_batch,
+        legacy_sigma_collision=bool(legacy_sigma_collision),
+    )
+    sim_args = SimpleNamespace(**flat_args)
+    snapshot_interval = max(1, int(_get(sim_args, "snapshot_interval", 50)))
+    total_steps_raw = _get(sim_args, "rollout_steps", None)
+    if total_steps_raw is None:
+        total_steps_raw = _get(sim_args, "max_steps", None)
+    if total_steps_raw is None:
+        raise ValueError("optimizer-native APF requires rollout_steps or max_steps.")
+    key_schedule_steps = int(total_steps_raw)
+    total_steps = int(total_steps_raw)
+    max_steps = _get(sim_args, "max_steps", None)
+    if max_steps is not None:
+        total_steps = min(total_steps, int(max_steps))
+    if key_schedule_steps % snapshot_interval != 0:
+        raise ValueError(
+            f"optimizer-native APF requires rollout_steps divisible by snapshot_interval for the train-time "
+            f"RNG chunk schedule; got rollout_steps={key_schedule_steps}, snapshot_interval={snapshot_interval}."
+        )
+    if total_steps % snapshot_interval != 0:
+        raise ValueError(
+            f"optimizer-native APF requires rollout_steps divisible by snapshot_interval; "
+            f"got rollout_steps={total_steps}, snapshot_interval={snapshot_interval}."
+        )
+
+    opt_args = OmegaConf.create(OmegaConf.to_container(context["opt_flat"], resolve=True))
+    opt_args.rollout_steps = int(key_schedule_steps)
+    opt_args.sample_every_steps = int(snapshot_interval)
+    substrate = _make_substrate(opt_args)
+
+    params_batch_np = np.asarray(context["params_batch"], dtype=np.float32)
+    init_params_batch_np = np.asarray(context.get("init_params_batch", params_batch_np), dtype=np.float32)
+    expected = int(substrate.n_params)
+    if params_batch_np.shape[1] != expected:
+        raise ValueError(f"pop_traj params have dim {params_batch_np.shape[1]}, substrate expects {expected}.")
+    seed_keys_np = np.asarray(context["seed_keys"], dtype=np.uint32)
+    seed_indices_np = np.asarray(context["seed_indices"], dtype=np.int32)
+    pop_indices_np = np.asarray(context["pop_indices"], dtype=np.int32)
+    source_pop_indices_np = np.asarray(context["source_pop_indices"], dtype=np.int32)
+
+    _ = substrate.init_state(jax.random.PRNGKey(0), jnp.asarray(params_batch_np[0]))
+    rt = substrate.RT
+
+    runs = _init_run_dirs(selected_batch, output_root=output_root, cfg=cfg, args=sim_args, overwrite=overwrite)
+    params_grid = jnp.asarray(params_batch_np, dtype=jnp.float32)
+    seed_keys = jnp.asarray(seed_keys_np, dtype=jnp.uint32)
+    seed_indices = jnp.asarray(seed_indices_np, dtype=jnp.int32)
+    params_selected = jnp.asarray(
+        np.stack([np.asarray(row["params"], dtype=np.float32) for row in selected_batch], axis=0),
+        dtype=jnp.float32,
+    )
+
+    lag_n = int(_get(opt_args, "metric_lagrangian_n_particles", _get(sim_args, "lagrangian_n_particles", 8192)))
+    lag_init_mode = str(_get(opt_args, "metric_lagrangian_init_mode", _get(sim_args, "lagrangian_init_mode", "mass")))
+    lag_flow_channel = int(_get(opt_args, "metric_lagrangian_flow_channel", _get(sim_args, "lagrangian_flow_channel", -1)))
+    lag_flow_reduce = str(
+        _get(opt_args, "metric_lagrangian_flow_reduce", _get(sim_args, "lagrangian_flow_reduce", "mass_weighted"))
+    )
+    lag_channel_mode = str(
+        _get(opt_args, "metric_lagrangian_channel_mode", _get(sim_args, "lagrangian_channel_mode", "resample"))
+    )
+    lag_noise_model = str(_get(opt_args, "metric_lagrangian_noise_model", _get(sim_args, "lagrangian_noise_model", "rt_box")))
+    lag_diffusion_scale = float(
+        _get(opt_args, "metric_lagrangian_diffusion_scale", _get(sim_args, "lagrangian_diffusion_scale", 1.0))
+    )
+
+    def init_one(eval_key, params):
+        rng_roll = _metric_roll_key(opt_args, eval_key)
+        k_state, k_pts, k_ch, k_scan = jax.random.split(rng_roll, 4)
+        st = substrate.init_state(k_state, params)
+        pts = _init_lagrangian_points_jax(
+            st["A"],
+            n_particles=lag_n,
+            init_mode=lag_init_mode,
+            border=str(getattr(rt, "border", "wall")),
+            sigma=float(getattr(rt, "sigma", 0.0)),
+            key=k_pts,
+        )
+        if lag_channel_mode in ("fixed", "resample"):
+            ch = rt.sample_point_channels(pts, st["A"], k_ch)
+        else:
+            ch = jnp.zeros((lag_n,), dtype=jnp.int32)
+        return st, pts, ch, k_scan
+
+    def init_one_with_opt_init(eval_key, params, init_params):
+        rng_roll = _metric_roll_key(opt_args, eval_key)
+        k_state, k_pts, k_ch, k_scan = jax.random.split(rng_roll, 4)
+        st = substrate.init_state(k_state, params)
+        init_st = substrate.init_state(k_state, init_params)
+        st = dict(st)
+        for key in ("A", "P", "Food", "t", "F"):
+            if key in init_st:
+                st[key] = init_st[key]
+        pts = _init_lagrangian_points_jax(
+            st["A"],
+            n_particles=lag_n,
+            init_mode=lag_init_mode,
+            border=str(getattr(rt, "border", "wall")),
+            sigma=float(getattr(rt, "sigma", 0.0)),
+            key=k_pts,
+        )
+        if lag_channel_mode in ("fixed", "resample"):
+            ch = rt.sample_point_channels(pts, st["A"], k_ch)
+        else:
+            ch = jnp.zeros((lag_n,), dtype=jnp.int32)
+        return st, pts, ch, k_scan
+
+    if bool(context.get("row_params_override", False)):
+        def init_all(params_in, init_params_in, seed_keys_in):
+            def for_params(params, init_params):
+                return jax.vmap(lambda key: init_one_with_opt_init(key, params, init_params))(seed_keys_in)
+
+            states_out, pts_out, ch_out, scan_out = jax.vmap(for_params)(params_in, init_params_in)
+            return states_out, pts_out, ch_out, scan_out[0]
+    else:
+        def init_all(params_in, init_params_in, seed_keys_in):
+            def for_params(params):
+                return jax.vmap(lambda key: init_one(key, params))(seed_keys_in)
+
+            states_out, pts_out, ch_out, scan_out = jax.vmap(for_params)(params_in)
+            return states_out, pts_out, ch_out, scan_out[0]
+
+    init_params_grid = jnp.asarray(init_params_batch_np, dtype=jnp.float32)
+    states, lag_xy, lag_ch, scan_keys = jax.jit(init_all)(params_grid, init_params_grid, seed_keys)
+    n_scan_chunks = int(key_schedule_steps // snapshot_interval)
+    scan_chunk_keys = jax.jit(lambda keys: jax.vmap(lambda key: jax.random.split(key, n_scan_chunks))(keys))(scan_keys)
+
+    execution_pop_indices = jnp.asarray(pop_indices_np, dtype=jnp.int32)
+
+    def select_outputs(states_in, lag_xy_in, lag_ch_in):
+        states_sel = jax.tree.map(lambda x: x[execution_pop_indices, seed_indices], states_in)
+        return (
+            states_sel,
+            lag_xy_in[execution_pop_indices, seed_indices],
+            lag_ch_in[execution_pop_indices, seed_indices],
+        )
+
+    select_outputs_jit = jax.jit(select_outputs)
+
+    stepper_cache: dict[int, Any] = {}
+
+    def get_stepper(n_steps: int):
+        n_steps = int(n_steps)
+        if n_steps in stepper_cache:
+            return stepper_cache[n_steps]
+
+        def advance(states_in, lag_xy_in, lag_ch_in, params_in, scan_chunk_keys_in, chunk_idx_in):
+            chunk_keys = scan_chunk_keys_in[:, chunk_idx_in]
+
+            def advance_for_params(st_seed, pts_seed, ch_seed, params):
+                def advance_one_seed(key_chunk, st_i, pts_i, ch_i):
+                    rngs = jax.random.split(key_chunk, n_steps)
+
+                    def scan_body(carry, key_i):
+                        st, pts, ch = carry
+                        st_next = substrate.step_state(key_i, st, params)
+                        lag_key = jax.random.fold_in(key_i, jnp.uint32(0x4C4147))
+                        pts_next, ch_next = rt.advect_particles(
+                            points=pts,
+                            F=st_next["F"],
+                            A=st_next["A"],
+                            channel=lag_flow_channel,
+                            reduce=lag_flow_reduce,
+                            point_channels=ch,
+                            channel_mode=lag_channel_mode,
+                            key=lag_key,
+                            noise_model=lag_noise_model,
+                            diffusion_scale=lag_diffusion_scale,
+                        )
+                        return (st_next, pts_next, ch_next), None
+
+                    (st_out, pts_out, ch_out), _ = jax.lax.scan(scan_body, (st_i, pts_i, ch_i), rngs)
+                    return st_out, pts_out, ch_out
+
+                return jax.vmap(advance_one_seed)(chunk_keys, st_seed, pts_seed, ch_seed)
+
+            states_out, pts_out, ch_out = jax.vmap(advance_for_params)(states_in, lag_xy_in, lag_ch_in, params_in)
+            return states_out, pts_out, ch_out, scan_chunk_keys_in, chunk_idx_in + jnp.asarray(1, dtype=jnp.int32)
+
+        stepper_cache[n_steps] = jax.jit(advance)
+        return stepper_cache[n_steps]
+
+    capture_cache: dict[tuple[int, int], Any] = {}
+    selected_scan_keys = jnp.asarray(seed_keys_np[seed_indices_np], dtype=jnp.uint32)
+    for i, run in enumerate(runs):
+        seed_idx = int(seed_indices_np[i])
+        execution_pop_idx = int(pop_indices_np[i])
+        run["resume_batch_size"] = int(params_batch_np.shape[0] * seed_keys_np.shape[0])
+        run["resume_batch_index"] = int(execution_pop_idx * seed_keys_np.shape[0] + seed_idx)
+        run["resume_selection0"] = int(selected_batch[0]["selection_idx"])
+        run["resume_jit_microbatch"] = int(snapshot_interval)
+        run["resume_snapshot_interval"] = int(snapshot_interval)
+        run["resume_key_schedule_steps"] = int(key_schedule_steps)
+        run["resume_seed"] = int(selected_batch[i]["run_seed"])
+        run["resume_lagrangian_seed"] = int(selected_batch[i]["run_seed"])
+        run["resume_stepper_mode"] = "optimizer_native_nested_vmap"
+        run["resume_optimizer_native_legacy_sigma_collision"] = bool(context["legacy_sigma_collision"])
+        run["resume_optimizer_native_params_source"] = str(
+            selected_batch[i].get(
+                "optimizer_native_params_source",
+                "row_params_override" if context.get("row_params_override", False) else "pop_traj",
+            )
+        )
+        run["selection"]["optimizer_native_execution_pop_idx"] = execution_pop_idx
+        run["selection"]["optimizer_native_source_pop_idx"] = int(source_pop_indices_np[i])
+
+    selected_states, selected_xy, selected_ch = select_outputs_jit(states, lag_xy, lag_ch)
+    _capture_snapshot(
+        step=0,
+        states=selected_states,
+        lag_xy=selected_xy,
+        lag_ch=selected_ch,
+        params_batch=params_selected,
+        substrate=substrate,
+        runs=runs,
+        args=sim_args,
+        capture_fn_cache=capture_cache,
+        resume_batch_rng_key=selected_scan_keys,
+    )
+
+    chunk_idx = jnp.asarray(0, dtype=jnp.int32)
+    steps_done = 0
+    pbar = tqdm(total=total_steps, desc=f"optimizer-native {runs[0]['traj_id']}..{runs[-1]['traj_id']}")
+    try:
+        while steps_done < total_steps:
+            n = min(snapshot_interval, total_steps - steps_done)
+            states, lag_xy, lag_ch, scan_chunk_keys, chunk_idx = get_stepper(n)(
+                states,
+                lag_xy,
+                lag_ch,
+                params_grid,
+                scan_chunk_keys,
+                chunk_idx,
+            )
+            steps_done += n
+            pbar.update(n)
+            selected_states, selected_xy, selected_ch = select_outputs_jit(states, lag_xy, lag_ch)
+            _capture_snapshot(
+                step=steps_done,
+                states=selected_states,
+                lag_xy=selected_xy,
+                lag_ch=selected_ch,
+                params_batch=params_selected,
+                substrate=substrate,
+                runs=runs,
+                args=sim_args,
+                capture_fn_cache=capture_cache,
+                resume_batch_rng_key=selected_scan_keys,
+            )
+    finally:
+        pbar.close()
+        _flush_runs(runs, sim_args)
+        _close_runs(runs)
+
+    flat_plain = dict(flat_args)
+    for run in runs:
+        if _as_bool(_get(sim_args, "compute_metrics", True), True):
             compute_metrics_for_run(run, flat_plain)
     return runs
 

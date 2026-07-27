@@ -119,6 +119,7 @@ def _selected_for_item(
     q_low: float,
     horizon_steps: int,
     min_branch_step: int,
+    refractory_steps: int,
     selection_seed: int,
     energy_min_remaining_steps: int | None,
     energy_min_samples: int | None,
@@ -153,12 +154,22 @@ def _selected_for_item(
         trajectory_end_step=trajectory_end,
         seed=selection_seed + 10007 * traj_order,
         min_step=min_branch_step,
+        refractory_steps=refractory_steps,
+        require_exact_counts=True,
         energy_meta=energy_meta,
     )
     for row in points:
         requested = int(row["step"])
         row["snapped_step"] = _snapped_step(apf_dir, requested)
         row["step_snap_delta"] = int(row["snapped_step"]) - requested
+    snapped_steps = [int(row["snapped_step"]) for row in points]
+    for left_idx, left_step in enumerate(snapped_steps):
+        for right_step in snapped_steps[left_idx + 1 :]:
+            if abs(left_step - right_step) < int(refractory_steps):
+                raise RuntimeError(
+                    f"Snapped C2 preview states violate refractory={refractory_steps}: "
+                    f"{left_step} vs {right_step}."
+                )
     return centers, tau_steps, heatmap, admissible_tau_idx, points, summary
 
 
@@ -166,10 +177,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     cfg, _ = load_config(args.config, smoke=args.smoke)
     bcfg = _branch_cfg(cfg)
     c2_cfg = cfg.get("c2", {})
-    trajectory_root = _trajectory_root(c2_cfg)
+    trajectory_root_raw = _get(bcfg, "trajectory_root", None)
+    trajectory_root = (
+        Path(str(trajectory_root_raw))
+        if trajectory_root_raw is not None
+        else _trajectory_root(c2_cfg)
+    )
     if trajectory_root is None:
         raise ValueError("Could not resolve C2 trajectory root.")
-    items = _iter_metric_items(trajectory_root)
+    if not trajectory_root.is_absolute():
+        trajectory_root = _REPO_ROOT / trajectory_root
+    items = _iter_metric_items(trajectory_root, c2_cfg)
     if not items:
         raise ValueError(f"No C2 metrics.npz items found under {trajectory_root}.")
 
@@ -182,6 +200,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     q_low = float(args.q_low if args.q_low is not None else _get(bcfg, "low_quantile", 0.2))
     horizon_steps = int(args.horizon_steps if args.horizon_steps is not None else _get(bcfg, "horizon_steps", 1000))
     min_branch_step = int(args.min_branch_step if args.min_branch_step is not None else _get(bcfg, "min_branch_step", _get(bcfg, "selection_min_step", 0)))
+    refractory_steps = int(_get(bcfg, "refractory_steps", 0))
     selection_seed = int(args.selection_seed if args.selection_seed is not None else _get(bcfg, "selection_seed", 12345))
     energy_min_remaining_steps = _get(bcfg, "energy_min_remaining_steps", None)
     energy_min_samples = _get(bcfg, "energy_min_samples", None)
@@ -200,7 +219,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     max_trajectories = len(ranked) if args.max_trajectories == "all" else int(args.max_trajectories or _get(bcfg, "max_trajectories", 2))
     selected_items = ranked[:max_trajectories]
 
-    out_path = Path(args.output) if args.output else Path("analysis/results/paper_suite/c2_branching/branch_selection_preview.png")
+    default_output_root = Path(
+        str(_get(cfg.get("meta", {}), "output_root", "analysis/results/paper_suite"))
+    )
+    out_path = (
+        Path(args.output)
+        if args.output
+        else default_output_root / "figures" / "c2_branching_branch_selection_preview.png"
+    )
     if not out_path.is_absolute():
         out_path = _REPO_ROOT / out_path
     ensure_dir(out_path.parent)
@@ -208,7 +234,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     plt = _ensure_matplotlib()
     n_panels = max(1, len(selected_items))
-    n_cols = min(3, n_panels)
+    n_cols = min(4 if n_panels >= 10 else 3, n_panels)
     n_rows = int(math.ceil(n_panels / n_cols))
     fig_w = max(6.0, 5.6 * n_cols)
     fig_h = max(4.6, 4.2 * n_rows)
@@ -230,6 +256,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             q_low=q_low,
             horizon_steps=horizon_steps,
             min_branch_step=min_branch_step,
+            refractory_steps=refractory_steps,
             selection_seed=selection_seed,
             energy_min_remaining_steps=energy_min_remaining_steps,
             energy_min_samples=energy_min_samples,
@@ -291,8 +318,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         y_ticks = np.linspace(0, max(0, len(tau_steps) - 1), min(6, len(tau_steps))).astype(int) if len(tau_steps) else []
         ax.set_yticks(y_ticks)
         ax.set_yticklabels([str(int(tau_steps[i])) for i in y_ticks])
+        source_run_idx = item.get("source_run_idx")
+        panel_label = (
+            f"opt_{int(source_run_idx):03d}"
+            if source_run_idx is not None and str(source_run_idx).strip() != ""
+            else str(item["traj_id"])
+        )
         ax.set_title(
-            f"{item['traj_id']}\nH {summary.get('n_high_selected', 0)}/{summary.get('n_high_pool', 0)}; "
+            f"{panel_label}\nH {summary.get('n_high_selected', 0)}/{summary.get('n_high_pool', 0)}; "
             f"M {summary.get('n_mid_selected', 0)}/{summary.get('n_mid_pool', 0)}; "
             f"L {summary.get('n_low_selected', 0)}/{summary.get('n_low_pool', 0)}",
             fontsize=9,

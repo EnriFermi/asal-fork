@@ -1,0 +1,152 @@
+meta:
+  output_root: analysis/results/paper_suite_flowlenia_lockheed_1_openai_es_fixed_init_9opt_completed_robust_c1_3random
+  conda_env: torchjax
+  wandb_mode: disabled
+datasets:
+  flow_lenia:
+    enabled: true
+    required: true
+    c1:
+      source: apf_lagrangian_split
+      apf_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1_openai_es_fixed_init_9opt_completed_robust_c1_3random/c1_lagrangian_apf_300k_train50_4seeds_replay_fixed_opt_native
+      require_random: true
+      sample_every_steps: 50
+      optimized_replay_source: optimizer_native
+      optimized_replay_legacy_sigma_collision: true
+      optimizer_native_legacy_sigma_collision_by_source_run_idx:
+        0: true
+        1: true
+        2: true
+        4: true
+        6: true
+      expected_window_start_steps: 50000
+      expected_window_end_steps: 300000
+      metric_seed_protocol: optimization_metric
+      metric_log_clip_evolution: false
+      score_tau_source: train_tau
+      metric:
+        metric_tau_mode: max_grid
+        score_tau_source: train_tau
+        metric_tau_grid_steps:
+        - 1000
+        - 2000
+        - 3000
+        - 4000
+        - 5000
+        - 6000
+        - 7000
+        - 8000
+        - 9000
+        - 10000
+        metric_tau_steps: 3000
+        metric_window_size_steps: 20000
+        metric_window_step_steps: 5000
+        metric_range_start_steps: 0
+        metric_m_samples: 48
+        metric_m_min: 4
+        metric_n_proj: 16
+        metric_null_reps: 6
+        metric_particle_samples: 64
+        metric_periodic: false
+        metric_domain_y: 128.0
+        metric_domain_x: 128.0
+        metric_delta_h_floor: 0.0
+        metric_msc_floor: 0.01
+        metric_msc_term: floor_reconstruction_error
+        metric_msc_normalize_by_weight_sum: true
+  plife_plus:
+    enabled: false
+    required: false
+  boids:
+    enabled: false
+    required: false
+simulation:
+  reuse_existing: true
+  allow_optimization_rerun: false
+  flow_lenia_arun_lagrangian_apf:
+    enabled: true
+    required: true
+    rollout_config: experiments/paper_suite/flowlenia_arun_apf_300k_train50_grid128.yaml
+    output_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1_openai_es_fixed_init_9opt_completed_robust_c1_3random/c1_lagrangian_apf_300k_train50_4seeds_replay_fixed_opt_native
+    rollout_steps: 300000
+    n_trajectories_per_checkpoint: 1
+    n_rollout_seeds_per_checkpoint: 4
+    run_seed_rep_stride: 1
+    include_random_baselines: true
+    num_random_baselines: 3
+    random_checkpoint_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1/frustration_simulation/random_params
+    random_checkpoint_selection: optimization_iter0
+    random_optimizer_native_iter: 0
+    random_optimizer_native_pop_indices:
+    - 0
+    - 1
+    - 2
+    run_seed_base: 400003
+    run_seed_mode: source_run_idx
+    run_seed_protocol: optimization_metric
+    optimized_apf_source: optimizer_native
+    optimized_native_legacy_sigma_collision: true
+    optimizer_native_legacy_sigma_collision_by_source_run_idx:
+      0: true
+      1: true
+      2: true
+      4: true
+      6: true
+    batch_size: 8
+    optimized_checkpoint_dirs:
+    - experiments/paper_check_flow_lenia/checkpoints_lockheed_1_openai_es_fixed_init_9opt_completed_robust_c1_3random/optimization/run_000
+    - experiments/paper_check_flow_lenia/checkpoints_lockheed_1_openai_es_fixed_init_9opt_completed_robust_c1_3random/optimization/run_001
+    - experiments/paper_check_flow_lenia/checkpoints_lockheed_1_openai_es_fixed_init_9opt_completed_robust_c1_3random/optimization/run_002
+    - experiments/paper_check_flow_lenia/checkpoints_lockheed_1_openai_es_fixed_init_9opt_completed_robust_c1_3random/optimization/run_004
+    - experiments/paper_check_flow_lenia/checkpoints_lockheed_1_openai_es_fixed_init_9opt_completed_robust_c1_3random/optimization/run_006
+    dedupe_by_run_idx: false
+    max_checkpoints: null
+    rollout_overrides:
+      substrate:
+        substrate: lenia_flow
+        grid_size: 128
+        C: 3
+        k: 9
+        kernel_components: 3
+        M: 2,1,0;0,2,1;1,0,2
+        dd: 5
+        dt: 0.2
+        sigma: 0.2
+        border: wall
+        mix_rule: stoch
+        base_seed: 0
+        seed_patch_size: 20
+        seed_n_patches: 4
+        seed_mode: random_patches
+        p_constant_per_patch: 1
+        render_mode: Pcolor
+        clip1: .inf
+        clip2: .inf
+        mutations: true
+        mutation_sz: 40
+        mutation_p: 0.05
+        mutation_scale: 1.0
+        optimize_mutation_scale: false
+        volcano: false
+        volcano_sz: 30
+        volcano_p: 0.01
+        volcano_delta: 5.0
+        food: false
+        food_interval: 128
+        food_n: 3
+        food_sz: 16
+        food_amount: 1.0
+        food_consume_rate: 0.05
+        food_bonus: 1.0
+        mass_decay: 0.0
+        food_channel: 1
+        food_auto_size: false
+        food_auto_scale: 1.0
+        food_conv_mode: scalar
+        food_vis_scale: 1.0
+        food_vis_color: 0.6,0.3,0.0
+        food_diffusion_alpha: 0.0
+        mass_clip_eps: 0.0
+        flow_sigma: 0.2
+      logging:
+        log_clip_evolution: false

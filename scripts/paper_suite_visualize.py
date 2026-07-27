@@ -802,7 +802,7 @@ def _plot_c1_optimized_vs_random_delta_h_heatmaps(
     scores: pd.DataFrame,
     figures: Path,
     *,
-    max_groups: int = 8,
+    max_groups: int = 10,
 ) -> dict[str, str]:
     stale_outputs = [
         figures / f"c1_{dataset}_delta_h_eval_optimized_vs_random_median.png",
@@ -903,18 +903,23 @@ def _plot_c1_optimized_vs_random_delta_h_heatmaps(
         arrays.append(np.asarray(rec["opt"]["delta_h_eval"], dtype=np.float64))
         arrays.append(np.asarray(rec["random"]["delta_h_eval"], dtype=np.float64))
     lim = _symmetric_heatmap_limit(arrays)
-    fig, axes = plt.subplots(
-        len(selected_pairs),
-        2,
-        figsize=(9.2, max(2.8, 2.35 * len(selected_pairs))),
-        squeeze=False,
+    n_rows = len(selected_pairs)
+    fig = plt.figure(
+        figsize=(11.5, max(3.0, 2.35 * n_rows)),
+        constrained_layout=True,
     )
+    grid = fig.add_gridspec(n_rows, 3, width_ratios=(1.0, 1.0, 0.045))
+    axes = np.asarray(
+        [[fig.add_subplot(grid[row_idx, col_idx]) for col_idx in range(2)] for row_idx in range(n_rows)],
+        dtype=object,
+    )
+    colorbar_ax = fig.add_subplot(grid[:, 2])
     last_im = None
     for row_idx, rec in enumerate(selected_pairs):
         for col_idx, (label, loaded, row) in enumerate(
             (
                 ("optimized", rec["opt"], rec["opt_row"]),
-                ("random / non-optimized", rec["random"], rec["rand_row"]),
+                ("matched random", rec["random"], rec["rand_row"]),
             )
         ):
             arr = np.asarray(loaded["delta_h_eval"], dtype=np.float64)
@@ -926,16 +931,15 @@ def _plot_c1_optimized_vs_random_delta_h_heatmaps(
             score = row.get("eval_score_mspd", np.nan)
             tau_steps = np.asarray(loaded.get("tau_steps", []), dtype=np.int64)
             selected_tau = int(tau_steps[sel_idx]) if tau_steps.size and 0 <= sel_idx < tau_steps.size else -1
-            ax.set_title(f"{label}; score={float(score):.3g}; tau={selected_tau}")
+            ax.set_title(f"{label}; score={float(score):.3g}; tau={selected_tau}", fontsize=9)
             ax.set_xlabel("window")
             ax.set_ylabel(f"group {int(rec['group_idx'])}\ntau")
             _format_tau_ticks(ax, tau_steps)
     if last_im is not None:
-        fig.colorbar(last_im, ax=axes.ravel().tolist(), fraction=0.018, pad=0.015)
-    fig.suptitle(f"C1 eval Delta-H heatmaps: optimized vs matched random ({dataset})", y=0.995)
-    fig.tight_layout(rect=(0, 0, 0.98, 0.97))
+        fig.colorbar(last_im, cax=colorbar_ax, label="Delta-H")
+    fig.suptitle(f"C1 eval Delta-H heatmaps: optimized vs matched random ({dataset})")
     out = figures / f"c1_{dataset}_delta_h_eval_optimized_vs_random_grid.png"
-    fig.savefig(out, dpi=180)
+    fig.savefig(out, dpi=180, bbox_inches="tight")
     plt.close(fig)
     paths[f"c1_{dataset}_delta_h_eval_optimized_vs_random_grid"] = str(out)
     return paths
@@ -1142,8 +1146,58 @@ def _plot_c5_frustration_clean(dataset: str, ds_dir: Path, figures: Path) -> dic
     ax.text(0.01, -0.22, f"metric: {metric_label}", transform=ax.transAxes, ha="left", va="top", fontsize=8, color="#555555")
     out = figures / f"c5_{dataset}_frustration_clean.png"
     _save(fig, out)
+    paths = {f"c5_{dataset}_frustration_clean": str(out)}
+    if dataset == "flow_lenia":
+        paper_alias = figures / "flow_c5_frustration_clean.png"
+        _save(fig, paper_alias)
+        paths["flow_c5_frustration_clean"] = str(paper_alias)
     plt.close(fig)
-    return {f"c5_{dataset}_frustration_clean": str(out)}
+    return paths
+
+
+def _plot_c5_frustration_paper(dataset: str, ds_dir: Path, figures: Path) -> dict[str, str]:
+    df = _c5_raw_delta_frame(ds_dir)
+    if df.empty or "delta" not in df.columns:
+        return {}
+    y = pd.to_numeric(df["delta"], errors="coerce").to_numpy(dtype=np.float64)
+    finite = np.isfinite(y)
+    if not np.any(finite):
+        return {}
+    groups = df["group"].to_numpy() if "group" in df.columns else np.arange(len(df))
+    plt = _ensure_matplotlib()
+    fig, ax = plt.subplots(
+        figsize=(max(6.2, 0.62 * len(y) + 2.2), 3.4),
+        constrained_layout=True,
+    )
+    x = np.arange(len(y), dtype=np.float64)
+    colors = np.where(y >= 0, "#2ca02c", "#d62728")
+    ax.axhline(0.0, color="#333333", linewidth=1.0)
+    ax.bar(x[finite], y[finite], color=colors[finite], alpha=0.82, width=0.62)
+    ax.scatter(
+        x[finite],
+        y[finite],
+        color=colors[finite],
+        edgecolor="white",
+        linewidth=0.6,
+        s=44,
+        zorder=3,
+    )
+    ax.set_xticks(
+        x,
+        [str(g) for g in groups],
+        rotation=35 if len(groups) > 10 else 0,
+        ha="right" if len(groups) > 10 else "center",
+    )
+    ax.set_xlabel("matched group id")
+    ax.set_ylabel("F(opt) - median F(random)")
+    ax.grid(axis="y", color="#dddddd", linewidth=0.7, alpha=0.75)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    prefix = "flow" if dataset == "flow_lenia" else dataset.removesuffix("_plus")
+    out = figures / f"{prefix}_c5_frustration_paper.png"
+    _save(fig, out)
+    plt.close(fig)
+    return {f"{prefix}_c5_frustration_paper": str(out)}
 
 
 def _bootstrap_median_ci(values: np.ndarray, *, n_boot: int = 2000) -> tuple[float, float] | None:
@@ -1253,12 +1307,24 @@ def _plot_c2_branching_one(output_root: Path, figures: Path, *, suffix: str, lab
             y = float(pd.to_numeric(pd.Series([row["branching_score"]]), errors="coerce").iloc[0])
             if not np.isfinite(x) or not np.isfinite(y):
                 continue
+            ci_low = float(
+                pd.to_numeric(
+                    pd.Series([row.get("branching_score_ci_low", y)]),
+                    errors="coerce",
+                ).iloc[0]
+            )
+            ci_high = float(
+                pd.to_numeric(
+                    pd.Series([row.get("branching_score_ci_high", y)]),
+                    errors="coerce",
+                ).iloc[0]
+            )
             rows.append(
                 {
                     "x": x,
                     "y": y,
-                    "ci_low": y,
-                    "ci_high": y,
+                    "ci_low": y if not np.isfinite(ci_low) else ci_low,
+                    "ci_high": y if not np.isfinite(ci_high) else ci_high,
                     "condition": str(row.get("condition", "sampled")).strip().lower(),
                     "trajectory_id": _c2_trajectory_id(row),
                     "n_pairs": _c2_int_or_zero(row.get("n_branch_pairs", 0)),
@@ -1546,7 +1612,7 @@ def _plot_c2_branching_ci_one(output_root: Path, figures: Path, *, suffix: str, 
         key = tuple(str(row[col]) for col in key_cols) if key_cols else ()
         vals = detail_groups.get(key, np.asarray([], dtype=np.float64))
         if vals.size:
-            lo, hi = _bootstrap_ci(vals, statistic="mean", seed=99173 + int(idx))
+            lo, hi = _bootstrap_ci(vals, statistic="median", seed=99173 + int(idx))
         else:
             lo = float(row.get("branching_score_ci_low", y))
             hi = float(row.get("branching_score_ci_high", y))
@@ -1716,9 +1782,14 @@ def _plot_c2_clip_chamfer_association_clean(output_root: Path, figures: Path) ->
     ax.spines["right"].set_visible(False)
     ax.legend(title="Delta-H stratum", frameon=False, loc="best")
     out = figures / "c2_clip_chamfer_association_clean.png"
+    paper_alias = figures / "flow_c2_clip_chamfer_association.png"
     _save(fig, out)
+    _save(fig, paper_alias)
     plt.close(fig)
-    return {"c2_clip_chamfer_association_clean": str(out)}
+    return {
+        "c2_clip_chamfer_association_clean": str(out),
+        "flow_c2_clip_chamfer_association": str(paper_alias),
+    }
 
 
 def _plot_c2_plife_plus_branching(output_root: Path, figures: Path) -> dict[str, str]:
@@ -2039,6 +2110,7 @@ def run(config_path: str | Path, *, task: str = "all", smoke: bool = False, forc
                 paths.update(_plot_c1(dataset, ds_dir, figures))
             if task in {"all", "c5", "c6"}:
                 paths.update(_plot_c5_frustration_clean(dataset, ds_dir, figures))
+                paths.update(_plot_c5_frustration_paper(dataset, ds_dir, figures))
                 paths.update(_plot_c5(dataset, ds_dir, figures))
         paths.update(_plot_cross(output_root, figures))
     summary = {"figure_paths": paths, "skipped_plots": list(_VISUALIZATION_SKIPS)}

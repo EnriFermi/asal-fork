@@ -89,9 +89,11 @@ def _iter_trajectories(root: Path) -> list[dict[str, Any]]:
                     "traj_id": traj_id,
                     "selection_idx": int(row.get("selection_idx", idx)),
                     "run_idx": int(row.get("suite_run_idx", row.get("run_idx", -1))),
+                    "source_run_idx": int(row.get("source_run_idx", row.get("suite_run_idx", row.get("run_idx", -1)))),
                     "candidate_kind": str(row.get("candidate_kind", "optimized")),
                     "candidate_idx": int(row.get("candidate_idx", 0)),
                     "candidate_label": str(row.get("candidate_label", row.get("candidate_kind", "optimized"))),
+                    "rollout_seed_idx": int(row.get("rollout_seed_idx", 0)),
                     "traj_dir": traj_dir,
                     "apf_dir": apf_dir,
                     "metrics_path": metrics_path,
@@ -161,6 +163,58 @@ def _iter_trajectories(root: Path) -> list[dict[str, Any]]:
     return items
 
 
+def _int_set(raw: Any) -> set[int] | None:
+    if raw is None:
+        return None
+    if isinstance(raw, (str, int)):
+        raw = [raw]
+    return {int(value) for value in raw}
+
+
+def _str_set(raw: Any) -> set[str] | None:
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = [raw]
+    return {str(value).strip().lower() for value in raw}
+
+
+def _filter_trajectories(items: list[dict[str, Any]], c2_cfg: Any) -> list[dict[str, Any]]:
+    source_filter = _get(c2_cfg, "source_filter", {})
+    kinds = _str_set(_get(source_filter, "candidate_kinds", None))
+    seed_indices = _int_set(_get(source_filter, "rollout_seed_indices", None))
+    run_indices = _int_set(_get(source_filter, "source_run_indices", None))
+    filtered = []
+    for item in items:
+        if kinds is not None and str(item.get("candidate_kind", "")).strip().lower() not in kinds:
+            continue
+        if seed_indices is not None and int(item.get("rollout_seed_idx", 0)) not in seed_indices:
+            continue
+        if run_indices is not None and int(item.get("source_run_idx", item.get("run_idx", -1))) not in run_indices:
+            continue
+        filtered.append(item)
+
+    expected = _get(source_filter, "expected_trajectories", None)
+    if expected is not None and len(filtered) != int(expected):
+        raise ValueError(
+            f"C2 source_filter selected {len(filtered)} trajectories, expected {int(expected)}."
+        )
+    if bool(_get(source_filter, "require_one_per_source_run", False)):
+        counts: dict[int, int] = {}
+        for item in filtered:
+            run_idx = int(item.get("source_run_idx", item.get("run_idx", -1)))
+            counts[run_idx] = counts.get(run_idx, 0) + 1
+        bad = {run_idx: count for run_idx, count in counts.items() if count != 1}
+        expected_runs = run_indices if run_indices is not None else set(counts)
+        missing = sorted(expected_runs - set(counts))
+        if bad or missing:
+            raise ValueError(
+                "C2 source_filter requires exactly one trajectory per source run; "
+                f"bad_counts={bad}, missing_runs={missing}."
+            )
+    return filtered
+
+
 def _apf_status(apf_dir: Path) -> tuple[bool, str, int]:
     if not apf_dir.exists():
         return False, f"missing APF dir {apf_dir}", 0
@@ -178,13 +232,13 @@ def _apf_status(apf_dir: Path) -> tuple[bool, str, int]:
     return True, "", len(chunks)
 
 
-def _flat_metric_args(rollout_config: Path) -> dict[str, Any]:
+def _flat_metric_args(rollout_config: Path, *, compute_clusters: bool = True) -> dict[str, Any]:
     _cfg, flat = load_rollout_config(rollout_config)
     flat_args = OmegaConf.to_container(flat, resolve=True)
     if not isinstance(flat_args, dict):
         flat_args = dict(flat)
     flat_args["compute_delta_h"] = True
-    flat_args["compute_clusters"] = True
+    flat_args["compute_clusters"] = bool(compute_clusters)
     flat_args["metrics_strict"] = True
     return flat_args
 
@@ -204,6 +258,44 @@ def _update_manifest(root: Path, rows: list[dict[str, Any]]) -> None:
         item["metrics_status"] = str(row["status"])
         item["apf_status"] = str(row["message"])
     write_json(manifest, payload)
+
+
+def _write_derived_manifest(cache_root: Path, items: list[dict[str, Any]], rows: list[dict[str, Any]]) -> Path:
+    rows_by_id = {str(row["traj_id"]): row for row in rows}
+    trajectories = []
+    for item in items:
+        traj_id = str(item["traj_id"])
+        metric_row = rows_by_id[traj_id]
+        source_row = dict(item.get("manifest_row", {}))
+        source_row.update(
+            {
+                "traj_id": traj_id,
+                "selection_idx": int(item["selection_idx"]),
+                "suite_run_idx": int(item.get("run_idx", -1)),
+                "source_run_idx": int(item.get("source_run_idx", item.get("run_idx", -1))),
+                "candidate_kind": str(item.get("candidate_kind", "optimized")),
+                "candidate_idx": int(item.get("candidate_idx", 0)),
+                "candidate_label": str(item.get("candidate_label", item.get("candidate_kind", "optimized"))),
+                "rollout_seed_idx": int(item.get("rollout_seed_idx", 0)),
+                "traj_dir": str(Path(item["traj_dir"]).resolve()),
+                "apf_dir": str(Path(item["apf_dir"]).resolve()),
+                "metrics_path": str(Path(metric_row["metrics_path"]).resolve()),
+                "apf_ready": bool(metric_row["apf_ready"]),
+                "metrics_ready": bool(metric_row["metrics_ready"]),
+                "metrics_status": str(metric_row["status"]),
+            }
+        )
+        trajectories.append(source_row)
+    manifest = cache_root / "manifest.json"
+    write_json(
+        manifest,
+        {
+            "source": "paper_suite_c2_fixed_training_trajectory_view",
+            "n_trajectories": len(trajectories),
+            "trajectories": trajectories,
+        },
+    )
+    return manifest
 
 
 def run(config_path: str | Path, *, smoke: bool = False, force: bool = False) -> dict[str, Any]:
@@ -228,7 +320,7 @@ def run(config_path: str | Path, *, smoke: bool = False, force: bool = False) ->
         log_event(f"C2 highres metrics skipped missing root={root}", component="c2-metrics")
         return summary
 
-    items = _iter_trajectories(root)
+    items = _filter_trajectories(_iter_trajectories(root), c2_cfg)
     if not items:
         if required:
             raise FileNotFoundError(f"No C2 trajectories found under {root}")
@@ -238,11 +330,20 @@ def run(config_path: str | Path, *, smoke: bool = False, force: bool = False) ->
         return summary
 
     rollout_config = _rollout_config(c2_cfg)
-    flat_args = _flat_metric_args(rollout_config)
+    flat_args = _flat_metric_args(
+        rollout_config,
+        compute_clusters=bool(_get(c2_cfg, "compute_source_clusters", True)),
+    )
+    cache_root_raw = _get(c2_cfg, "metrics_cache_root", None)
+    cache_root = ensure_dir(resolve_path(cache_root_raw)) if cache_root_raw is not None else None
     rows: list[dict[str, Any]] = []
     log_event(f"C2 highres metrics found n_trajectories={len(items)} root={root}", component="c2-metrics")
     for idx, item in enumerate(items, start=1):
-        metrics_path = Path(item["metrics_path"])
+        metrics_path = (
+            cache_root / str(item["traj_id"]) / "metrics.npz"
+            if cache_root is not None
+            else Path(item["metrics_path"])
+        )
         apf_ready, apf_message, n_chunks = _apf_status(Path(item["apf_dir"]))
         if not apf_ready:
             status = "missing_apf"
@@ -276,6 +377,8 @@ def run(config_path: str | Path, *, smoke: bool = False, force: bool = False) ->
                 "traj_id": str(item["traj_id"]),
                 "traj_dir": Path(item["traj_dir"]),
                 "apf_dir": Path(item["apf_dir"]),
+                "metrics_path": metrics_path,
+                "metrics_summary_path": metrics_path.with_name("metrics_summary.json"),
                 "selection": {
                     "selection_idx": int(item["selection_idx"]),
                     "iter": int(item.get("run_idx", -1)),
@@ -298,9 +401,11 @@ def run(config_path: str | Path, *, smoke: bool = False, force: bool = False) ->
                 "traj_id": str(item["traj_id"]),
                 "selection_idx": int(item["selection_idx"]),
                 "run_idx": int(item.get("run_idx", -1)),
+                "source_run_idx": int(item.get("source_run_idx", item.get("run_idx", -1))),
                 "candidate_kind": str(item.get("candidate_kind", "optimized")),
                 "candidate_idx": int(item.get("candidate_idx", 0)),
                 "candidate_label": str(item.get("candidate_label", item.get("candidate_kind", "optimized"))),
+                "rollout_seed_idx": int(item.get("rollout_seed_idx", 0)),
                 "traj_dir": str(item["traj_dir"]),
                 "apf_dir": str(item["apf_dir"]),
                 "metrics_path": str(metrics_path),
@@ -312,7 +417,11 @@ def run(config_path: str | Path, *, smoke: bool = False, force: bool = False) ->
             }
         )
 
-    _update_manifest(root, rows)
+    derived_manifest = None
+    if cache_root is None:
+        _update_manifest(root, rows)
+    else:
+        derived_manifest = _write_derived_manifest(cache_root, items, rows)
     table = out_dir / "c2_highres_metrics_manifest.csv"
     write_csv(table, rows)
     n_apf_ready = sum(1 for row in rows if row["apf_ready"])
@@ -329,6 +438,7 @@ def run(config_path: str | Path, *, smoke: bool = False, force: bool = False) ->
         "n_apf_ready": int(n_apf_ready),
         "n_metrics_ready": int(n_metrics_ready),
         "table": str(table),
+        "derived_manifest": None if derived_manifest is None else str(derived_manifest),
     }
     write_json(out_dir / "c2_highres_metrics_summary.json", summary)
     log_event(

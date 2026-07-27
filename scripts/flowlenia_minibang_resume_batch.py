@@ -22,8 +22,8 @@ from tqdm import tqdm
 from flowlenia_minibang_common import load_config, resolve_path, write_json
 from flowlenia_minibang_resume import (
     _apply_resume_perturbation,
+    _as_bool,
     _find_snapshot,
-    _flush,
     _get,
     _read_snapshot,
     _reconstruct_state,
@@ -50,6 +50,8 @@ BUFFER_KEYS = (
     "state_t",
     "state_mass_cycle_start",
 )
+
+NON_SIMULATION_CONFIG_KEYS = frozenset(("save_dir", "output_dir", "output"))
 
 
 def _jsonable(value: Any) -> Any:
@@ -94,7 +96,17 @@ def _resolve_job_path(raw: dict[str, Any], key: str, base: Path | None = None) -
     return path
 
 
-def _prepare_job(raw: dict[str, Any], *, overwrite: bool) -> dict[str, Any]:
+def _prepare_job(
+    raw: dict[str, Any],
+    *,
+    overwrite: bool,
+    config_cache: dict[Path, tuple[Any, dict[str, Any], SimpleNamespace]] | None = None,
+    params_cache: dict[Path, np.ndarray] | None = None,
+    snapshot_cache: (
+        dict[tuple[Path, int | None], tuple[Path, int, int, dict[str, Any]]]
+        | None
+    ) = None,
+) -> dict[str, Any]:
     traj_dir = _resolve_job_path(raw, "source_traj_dir")
     if not traj_dir.exists():
         raise FileNotFoundError(f"source_traj_dir not found: {traj_dir}")
@@ -105,12 +117,48 @@ def _prepare_job(raw: dict[str, Any], *, overwrite: bool) -> dict[str, Any]:
     if params_path is None or not params_path.exists():
         raise FileNotFoundError(f"params not found: {params_path}")
 
-    cfg, flat = load_config(config_path)
-    flat_args = OmegaConf.to_container(flat, resolve=True)
-    args = SimpleNamespace(**flat_args)
-    apf_path, start_step, snapshot_idx = _find_snapshot(traj_dir / "apf_logs", int(raw["step"]) if raw.get("step") is not None else None)
-    snapshot = _read_snapshot(apf_path, snapshot_idx)
-    params = np.asarray(np.load(params_path), dtype=np.float32)
+    config_key = config_path.resolve()
+    cached_config = (
+        config_cache.get(config_key) if config_cache is not None else None
+    )
+    if cached_config is None:
+        cfg, flat = load_config(config_path)
+        flat_args = OmegaConf.to_container(flat, resolve=True)
+        args = SimpleNamespace(**flat_args)
+        if config_cache is not None:
+            config_cache[config_key] = (cfg, flat_args, args)
+    else:
+        cfg, flat_args, args = cached_config
+
+    requested_step = (
+        int(raw["step"]) if raw.get("step") is not None else None
+    )
+    snapshot_key = (traj_dir.resolve(), requested_step)
+    cached_snapshot = (
+        snapshot_cache.get(snapshot_key) if snapshot_cache is not None else None
+    )
+    if cached_snapshot is None:
+        apf_path, start_step, snapshot_idx = _find_snapshot(
+            traj_dir / "apf_logs",
+            requested_step,
+        )
+        snapshot = _read_snapshot(apf_path, snapshot_idx)
+        if snapshot_cache is not None:
+            snapshot_cache[snapshot_key] = (
+                apf_path,
+                start_step,
+                snapshot_idx,
+                snapshot,
+            )
+    else:
+        apf_path, start_step, snapshot_idx, snapshot = cached_snapshot
+
+    params_key = params_path.resolve()
+    params = params_cache.get(params_key) if params_cache is not None else None
+    if params is None:
+        params = np.asarray(np.load(params_path), dtype=np.float32)
+        if params_cache is not None:
+            params_cache[params_key] = params
 
     total_default = int(_get(args, "rollout_steps", _get(args, "max_steps", 0)))
     if _get(args, "max_steps", None) is not None:
@@ -150,7 +198,81 @@ def _prepare_job(raw: dict[str, Any], *, overwrite: bool) -> dict[str, Any]:
     if jit_microbatch < 1:
         raise ValueError(f"jit_microbatch must be >= 1, got {jit_microbatch}.")
     horizon_steps = int(end_step) - int(start_step)
-    config_sig = _stable_json(flat_args)
+    capture_relative_steps_raw = raw.get("capture_relative_steps")
+    capture_relative_steps: tuple[int, ...] | None = None
+    if capture_relative_steps_raw is not None:
+        if not isinstance(capture_relative_steps_raw, (list, tuple)):
+            raise ValueError(
+                "capture_relative_steps must be a list of integer offsets, "
+                f"got {type(capture_relative_steps_raw).__name__}."
+            )
+        capture_relative_steps = tuple(
+            sorted({int(value) for value in capture_relative_steps_raw})
+        )
+        if not capture_relative_steps:
+            raise ValueError("capture_relative_steps cannot be empty.")
+        if capture_relative_steps[0] != 0:
+            raise ValueError(
+                "capture_relative_steps must include the unperturbed branch "
+                "origin at relative step 0."
+            )
+        if capture_relative_steps[-1] != int(horizon_steps):
+            raise ValueError(
+                "capture_relative_steps must include the full branch horizon "
+                f"{horizon_steps}, got final step {capture_relative_steps[-1]}."
+            )
+        if any(step < 0 or step > int(horizon_steps) for step in capture_relative_steps):
+            raise ValueError(
+                f"capture_relative_steps must lie in [0, {horizon_steps}]: "
+                f"{capture_relative_steps}."
+            )
+        if any(step % int(jit_microbatch) != 0 for step in capture_relative_steps):
+            raise ValueError(
+                "capture_relative_steps must be multiples of jit_microbatch "
+                f"{jit_microbatch} to avoid extra JIT compilations: "
+                f"{capture_relative_steps}."
+            )
+    output_fields_raw = raw.get("output_fields")
+    output_fields: tuple[str, ...] | None = None
+    if output_fields_raw is not None:
+        if not isinstance(output_fields_raw, (list, tuple)):
+            raise ValueError(
+                "output_fields must be a list of APF payload names, "
+                f"got {type(output_fields_raw).__name__}."
+            )
+        output_fields = tuple(str(value) for value in output_fields_raw)
+        unknown_fields = set(output_fields).difference(BUFFER_KEYS)
+        if unknown_fields:
+            raise ValueError(
+                f"Unknown output_fields {sorted(unknown_fields)}; "
+                f"allowed fields are {BUFFER_KEYS}."
+            )
+        if "steps" not in output_fields or "P" not in output_fields:
+            raise ValueError("output_fields must include both 'steps' and 'P'.")
+    output_compress_raw = raw.get("output_compress")
+    output_compress = (
+        None if output_compress_raw is None else bool(output_compress_raw)
+    )
+    output_max_snapshots_raw = raw.get("output_max_snapshots_per_chunk")
+    output_max_snapshots = None if output_max_snapshots_raw is None else int(output_max_snapshots_raw)
+    if output_max_snapshots is not None and output_max_snapshots < 1:
+        raise ValueError(
+            "output_max_snapshots_per_chunk must be >= 1 when set, "
+            f"got {output_max_snapshots}."
+        )
+    ignore_output_paths = bool(
+        raw.get("ignore_output_paths_in_simulation_signature", False)
+    )
+    simulation_args = (
+        {
+            key: value
+            for key, value in flat_args.items()
+            if key not in NON_SIMULATION_CONFIG_KEYS
+        }
+        if ignore_output_paths
+        else flat_args
+    )
+    config_sig = _stable_json(simulation_args)
     shape_sig = {
         "params": tuple(params.shape),
         "A": tuple(np.asarray(snapshot["A"]).shape),
@@ -167,6 +289,7 @@ def _prepare_job(raw: dict[str, Any], *, overwrite: bool) -> dict[str, Any]:
         int(jit_microbatch),
         int(horizon_steps),
         int(start_step) % max(1, int(snapshot_interval)),
+        capture_relative_steps,
     )
     return {
         "raw": raw,
@@ -185,10 +308,15 @@ def _prepare_job(raw: dict[str, Any], *, overwrite: bool) -> dict[str, Any]:
         "start_step": int(start_step),
         "end_step": int(end_step),
         "horizon_steps": int(horizon_steps),
+        "capture_relative_steps": capture_relative_steps,
+        "output_fields": output_fields,
+        "output_compress": output_compress,
         "original_batch_size": int(original_batch_size),
         "original_batch_index": int(original_batch_index),
         "snapshot_interval": int(snapshot_interval),
         "jit_microbatch": int(jit_microbatch),
+        "output_max_snapshots_per_chunk": output_max_snapshots,
+        "ignore_output_paths_in_simulation_signature": ignore_output_paths,
         "group_key": group_key,
     }
 
@@ -259,6 +387,8 @@ def _new_out(job: dict[str, Any]) -> dict[str, Any]:
         "apf_dir": job["apf_out"],
         "file_idx": 0,
         "sim_fps": float(_get(job["args"], "fps", 250.0)),
+        "output_fields": job["output_fields"],
+        "output_compress": job["output_compress"],
         "buffers": {key: [] for key in BUFFER_KEYS},
     }
 
@@ -291,26 +421,100 @@ def _capture_apf_only(
     rel_step: int,
     resume_meta: list[dict[str, np.ndarray]],
 ) -> None:
-    state_np = jax.device_get(state)
-    lag_xy_np, lag_ch_np, rng_np = jax.device_get((lag_xy, lag_ch, rng))
+    if any(out["output_fields"] is None for out in outs):
+        requested_fields = set(BUFFER_KEYS)
+    else:
+        requested_fields = {
+            key
+            for out in outs
+            for key in (out["output_fields"] or ())
+        }
+    state_keys = {
+        key
+        for key in ("P", "A", "F", "t", "mass_cycle_start")
+        if key in state
+        and (
+            key in requested_fields
+            or (key == "t" and "state_t" in requested_fields)
+            or (
+                key == "mass_cycle_start"
+                and "state_mass_cycle_start" in requested_fields
+            )
+        )
+    }
+    state_np = jax.device_get({key: state[key] for key in state_keys})
+    lag_xy_np = (
+        jax.device_get(lag_xy)
+        if "lagrangian_xy" in requested_fields
+        else None
+    )
+    lag_ch_np = (
+        jax.device_get(lag_ch)
+        if "lagrangian_c" in requested_fields
+        else None
+    )
+    rng_np = (
+        jax.device_get(rng)
+        if "resume_batch_rng_key" in requested_fields
+        else None
+    )
     for i, (out, job, meta) in enumerate(zip(outs, jobs, resume_meta, strict=True)):
         b = out["buffers"]
+        output_fields = out["output_fields"]
+
+        def enabled(key: str) -> bool:
+            return output_fields is None or key in output_fields
+
         step = int(job["start_step"]) + int(rel_step)
         b["steps"].append(step)
-        b["P"].append(np.asarray(state_np["P"][i]))
-        b["A"].append(np.asarray(state_np["A"][i]))
-        b["F"].append(np.asarray(state_np["F"][i]))
-        b["lagrangian_xy"].append(np.asarray(lag_xy_np[i]))
-        b["lagrangian_c"].append(np.asarray(lag_ch_np[i]))
-        b["resume_batch_rng_key"].append(np.asarray(rng_np[i], dtype=np.uint32))
+        if enabled("P"):
+            b["P"].append(np.asarray(state_np["P"][i]))
+        if enabled("A"):
+            b["A"].append(np.asarray(state_np["A"][i]))
+        if enabled("F"):
+            b["F"].append(np.asarray(state_np["F"][i]))
+        if enabled("lagrangian_xy"):
+            assert lag_xy_np is not None
+            b["lagrangian_xy"].append(np.asarray(lag_xy_np[i]))
+        if enabled("lagrangian_c"):
+            assert lag_ch_np is not None
+            b["lagrangian_c"].append(np.asarray(lag_ch_np[i]))
+        if enabled("resume_batch_rng_key"):
+            assert rng_np is not None
+            b["resume_batch_rng_key"].append(
+                np.asarray(rng_np[i], dtype=np.uint32)
+            )
         for key, value in meta.items():
-            b[key].append(np.asarray(value))
-        state_t = np.asarray(state_np.get("t", 0))
-        mass_cycle_start = np.asarray(state_np.get("mass_cycle_start", np.sum(state_np["A"], axis=tuple(range(1, state_np["A"].ndim)))))
-        b["state_t"].append(np.asarray(state_t[i] if state_t.ndim > 0 else state_t, dtype=np.int32))
-        b["state_mass_cycle_start"].append(
-            np.asarray(mass_cycle_start[i] if mass_cycle_start.ndim > 0 else mass_cycle_start, dtype=np.float32)
-        )
+            if enabled(key):
+                b[key].append(np.asarray(value))
+        if enabled("state_t"):
+            state_t = np.asarray(state_np.get("t", 0))
+            b["state_t"].append(
+                np.asarray(
+                    state_t[i] if state_t.ndim > 0 else state_t,
+                    dtype=np.int32,
+                )
+            )
+        if enabled("state_mass_cycle_start"):
+            mass_cycle_start = np.asarray(
+                state_np.get(
+                    "mass_cycle_start",
+                    np.sum(
+                        state_np["A"],
+                        axis=tuple(range(1, state_np["A"].ndim)),
+                    ),
+                )
+            )
+            b["state_mass_cycle_start"].append(
+                np.asarray(
+                    (
+                        mass_cycle_start[i]
+                        if mass_cycle_start.ndim > 0
+                        else mass_cycle_start
+                    ),
+                    dtype=np.float32,
+                )
+            )
 
 
 def _write_metadata(job: dict[str, Any]) -> None:
@@ -329,18 +533,159 @@ def _write_metadata(job: dict[str, Any]) -> None:
         "perturb_a_std": float(raw.get("perturb_a_std", 0.0)),
         "perturb_p_std": float(raw.get("perturb_p_std", 0.0)),
         "perturb_lagrangian_xy_std": float(raw.get("perturb_lagrangian_xy_std", 0.0)),
+        "output_max_snapshots_per_chunk": job["output_max_snapshots_per_chunk"],
+        "capture_relative_steps": (
+            list(job["capture_relative_steps"])
+            if job["capture_relative_steps"] is not None
+            else None
+        ),
+        "output_fields": (
+            list(job["output_fields"])
+            if job["output_fields"] is not None
+            else None
+        ),
+        "output_compress": job["output_compress"],
+        "ignore_output_paths_in_simulation_signature": bool(
+            job["ignore_output_paths_in_simulation_signature"]
+        ),
         "batched_resume": True,
     }
     write_json(job["output_dir"] / "resume_metadata.json", metadata)
 
 
-def _process_prepared_batch(jobs: list[dict[str, Any]]) -> None:
-    if not jobs:
-        return
-    first = jobs[0]
+def _flush_metric_snapshots(out: dict[str, Any], args: Any, max_snapshots: int | None) -> None:
+    from simulate_save_apf import save_chunk
+
+    buffers = out["buffers"]
+    n_snapshots = len(buffers["steps"])
+    if max_snapshots is not None and n_snapshots > int(max_snapshots):
+        keep = np.linspace(0, n_snapshots - 1, int(max_snapshots)).astype(int)
+        for key, values in buffers.items():
+            if not values:
+                continue
+            if len(values) != n_snapshots:
+                raise RuntimeError(
+                    f"Cannot retain metric snapshots: buffer {key!r} has "
+                    f"{len(values)} entries, expected {n_snapshots}."
+                )
+            buffers[key] = [values[int(idx)] for idx in keep]
+    extra = {
+        key: np.asarray(buffers[key])
+        for key in (
+            "resume_batch_rng_key",
+            "resume_batch_size",
+            "resume_batch_index",
+            "resume_selection0",
+            "resume_jit_microbatch",
+            "resume_snapshot_interval",
+            "resume_seed",
+            "resume_lagrangian_seed",
+            "state_t",
+            "state_mass_cycle_start",
+        )
+        if buffers.get(key)
+    }
+    compress = out["output_compress"]
+    if compress is None:
+        compress = _as_bool(_get(args, "compress", True), True)
+    out["file_idx"] = save_chunk(
+        str(out["apf_dir"]),
+        float(out["sim_fps"]),
+        buffers["steps"],
+        buffers["P"],
+        int(out["file_idx"]),
+        buffers["A"] if buffers.get("A") else None,
+        buffers["F"] if buffers.get("F") else None,
+        use_fp16=True,
+        snaps_lagrangian=(
+            buffers["lagrangian_xy"]
+            if buffers.get("lagrangian_xy")
+            else None
+        ),
+        snaps_lagrangian_c=(
+            buffers["lagrangian_c"]
+            if buffers.get("lagrangian_c")
+            else None
+        ),
+        compress=bool(compress),
+        extra_payload=extra,
+    )
+    for key in buffers:
+        buffers[key] = []
+
+
+def _make_batch_runtime(first: dict[str, Any]) -> dict[str, Any]:
     args = first["args"]
     substrate = _make_substrate(args)
-    _ = substrate.seed_state(jax.random.PRNGKey(0), jnp.asarray(first["params"], dtype=jnp.float32))
+    _ = substrate.seed_state(
+        jax.random.PRNGKey(0),
+        jnp.asarray(first["params"], dtype=jnp.float32),
+    )
+    rt = substrate.RT
+    lag_flow_channel = int(
+        _get(
+            args,
+            "lagrangian_flow_channel",
+            _get(args, "metric_lagrangian_flow_channel", -1),
+        )
+    )
+    lag_flow_reduce = str(
+        _get(
+            args,
+            "lagrangian_flow_reduce",
+            _get(args, "metric_lagrangian_flow_reduce", "mass_weighted"),
+        )
+    )
+    lag_channel_mode = str(
+        _get(
+            args,
+            "lagrangian_channel_mode",
+            _get(args, "metric_lagrangian_channel_mode", "resample"),
+        )
+    )
+    lag_noise_model = str(
+        _get(
+            args,
+            "lagrangian_noise_model",
+            _get(args, "metric_lagrangian_noise_model", "rt_box"),
+        )
+    )
+    lag_diffusion_scale = float(
+        _get(
+            args,
+            "lagrangian_diffusion_scale",
+            _get(args, "metric_lagrangian_diffusion_scale", 1.0),
+        )
+    )
+    stepper = _make_batched_stepper(
+        substrate=substrate,
+        rt=rt,
+        original_batch_size=int(first["original_batch_size"]),
+        lag_flow_channel=lag_flow_channel,
+        lag_flow_reduce=lag_flow_reduce,
+        lag_channel_mode=lag_channel_mode,
+        lag_noise_model=lag_noise_model,
+        lag_diffusion_scale=lag_diffusion_scale,
+    )
+    return {
+        "args": args,
+        "substrate": substrate,
+        "stepper": stepper,
+    }
+
+
+def _process_prepared_batch(
+    jobs: list[dict[str, Any]],
+    *,
+    runtime: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not jobs:
+        raise ValueError("Prepared batch must contain at least one job.")
+    first = jobs[0]
+    if runtime is None:
+        runtime = _make_batch_runtime(first)
+    args = runtime["args"]
+    substrate = runtime["substrate"]
     rt = substrate.RT
 
     states = []
@@ -376,21 +721,7 @@ def _process_prepared_batch(jobs: list[dict[str, Any]]) -> None:
     params_j = jnp.stack(params, axis=0)
     original_batch_index = jnp.asarray([job["original_batch_index"] for job in jobs], dtype=jnp.int32)
 
-    lag_flow_channel = int(_get(args, "lagrangian_flow_channel", _get(args, "metric_lagrangian_flow_channel", -1)))
-    lag_flow_reduce = str(_get(args, "lagrangian_flow_reduce", _get(args, "metric_lagrangian_flow_reduce", "mass_weighted")))
-    lag_channel_mode = str(_get(args, "lagrangian_channel_mode", _get(args, "metric_lagrangian_channel_mode", "resample")))
-    lag_noise_model = str(_get(args, "lagrangian_noise_model", _get(args, "metric_lagrangian_noise_model", "rt_box")))
-    lag_diffusion_scale = float(_get(args, "lagrangian_diffusion_scale", _get(args, "metric_lagrangian_diffusion_scale", 1.0)))
-    stepper = _make_batched_stepper(
-        substrate=substrate,
-        rt=rt,
-        original_batch_size=int(first["original_batch_size"]),
-        lag_flow_channel=lag_flow_channel,
-        lag_flow_reduce=lag_flow_reduce,
-        lag_channel_mode=lag_channel_mode,
-        lag_noise_model=lag_noise_model,
-        lag_diffusion_scale=lag_diffusion_scale,
-    )
+    stepper = runtime["stepper"]
 
     outs = [_new_out(job) for job in jobs]
     metas = [_resume_meta(job) for job in jobs]
@@ -402,14 +733,24 @@ def _process_prepared_batch(jobs: list[dict[str, Any]]) -> None:
     jit_microbatch = int(first["jit_microbatch"])
     snapshots_per_file = max(1, int(_get(args, "snapshots_per_file", 50)))
     rel_done = 0
+    capture_relative_steps = first["capture_relative_steps"]
     desc = f"batched resume B={len(jobs)} {horizon_steps} steps"
     pbar = tqdm(total=horizon_steps * len(jobs), desc=desc)
     try:
         _capture_apf_only(outs=outs, jobs=jobs, state=state, lag_xy=lag_xy, lag_ch=lag_ch, rng=rng, rel_step=rel_done, resume_meta=metas)
         while rel_done < horizon_steps:
             start0 = int(first["start_step"])
-            target_abs = min(start0 + horizon_steps, ((start0 + rel_done) // snapshot_interval + 1) * snapshot_interval)
-            target_rel = int(target_abs) - start0
+            if capture_relative_steps is None:
+                target_abs = min(
+                    start0 + horizon_steps,
+                    ((start0 + rel_done) // snapshot_interval + 1)
+                    * snapshot_interval,
+                )
+                target_rel = int(target_abs) - start0
+            else:
+                target_rel = next(
+                    step for step in capture_relative_steps if step > rel_done
+                )
             while rel_done < target_rel:
                 n = min(jit_microbatch, target_rel - rel_done)
                 split = jax.vmap(lambda key: jax.random.split(key, 2))(rng)
@@ -419,27 +760,58 @@ def _process_prepared_batch(jobs: list[dict[str, Any]]) -> None:
                 rel_done += int(n)
                 pbar.update(int(n) * len(jobs))
             _capture_apf_only(outs=outs, jobs=jobs, state=state, lag_xy=lag_xy, lag_ch=lag_ch, rng=rng, rel_step=rel_done, resume_meta=metas)
-            for out in outs:
+            for out, job in zip(outs, jobs, strict=True):
                 if len(out["buffers"]["steps"]) >= snapshots_per_file:
-                    _flush(out, args)
+                    _flush_metric_snapshots(
+                        out,
+                        args,
+                        job["output_max_snapshots_per_chunk"],
+                    )
     finally:
         pbar.close()
-        for out in outs:
-            _flush(out, args)
+        for out, job in zip(outs, jobs, strict=True):
+            _flush_metric_snapshots(
+                out,
+                args,
+                job["output_max_snapshots_per_chunk"],
+            )
+    return runtime
 
 
 def _process_jobs(raw_jobs: list[dict[str, Any]], *, batch_size: int, overwrite: bool) -> None:
     batch_size = max(1, int(batch_size))
     total = len(raw_jobs)
     done = 0
+    runtimes: dict[Any, dict[str, Any]] = {}
+    config_cache: dict[
+        Path,
+        tuple[Any, dict[str, Any], SimpleNamespace],
+    ] = {}
+    params_cache: dict[Path, np.ndarray] = {}
+    snapshot_cache: dict[
+        tuple[Path, int | None],
+        tuple[Path, int, int, dict[str, Any]],
+    ] = {}
     for start in range(0, total, batch_size):
         raw_chunk = raw_jobs[start : start + batch_size]
-        prepared = [_prepare_job(raw, overwrite=overwrite) for raw in raw_chunk]
+        prepared = [
+            _prepare_job(
+                raw,
+                overwrite=overwrite,
+                config_cache=config_cache,
+                params_cache=params_cache,
+                snapshot_cache=snapshot_cache,
+            )
+            for raw in raw_chunk
+        ]
         groups: dict[Any, list[dict[str, Any]]] = {}
         for job in prepared:
             groups.setdefault(job["group_key"], []).append(job)
-        for group_jobs in groups.values():
-            _process_prepared_batch(group_jobs)
+        for group_key, group_jobs in groups.items():
+            runtimes[group_key] = _process_prepared_batch(
+                group_jobs,
+                runtime=runtimes.get(group_key),
+            )
             done += len(group_jobs)
             print(f"[batched-resume] completed {done}/{total} jobs")
 

@@ -1,6 +1,6 @@
 meta:
   machine_idx: ${env:PAPER_MACHINE_IDX,0}   # 0-based
-  num_machines: ${env:PAPER_NUM_MACHINES,1}
+  num_machines: ${env:PAPER_NUM_MACHINES,2}
   wandb_project: asal
   wandb_mode: online
   output_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1

@@ -27,9 +27,9 @@ optimization:
       optimizer_algorithm: mirrored_openai_es
       selection_protocol: mean_loss
       openai_es_n_pairs: 4
-      openai_es_n_seeds: 8
+      openai_es_n_seeds: 4
       openai_es_sigma: 0.2
-      openai_es_lr: 0.03
+      openai_es_lr: 0.5
       openai_es_adam_beta1: 0.9
       openai_es_adam_beta2: 0.999
       openai_es_adam_eps: 1.0e-8
@@ -37,9 +37,9 @@ optimization:
 frustration_simulation:
   base_config: frustration_simulation/config.yaml
   save_root: ${meta.output_root}/frustration_simulation
-  resume: true
+  resume: false
   trial_batch_size: 4
-  checkpoint_every_steps: 5000
+  checkpoint_every_stepgit s: 5000
   full_embedding_sample_every_steps: 1000
   log_full_embeddings_for_b: false
   overrides: {}

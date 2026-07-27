@@ -231,6 +231,77 @@ def _select_robust_pioneer(
     return selected, iter_rows, candidate_rows
 
 
+def _select_argmax(
+    pop: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    params = np.asarray(pop.get("params"), dtype=np.float32)
+    if params.ndim != 3:
+        raise ValueError(f"Expected pop_traj['params'] shape (iters, pop_size, n_params), got {params.shape}.")
+    score, score_source = _score_matrix(pop)
+    if score.shape != params.shape[:2]:
+        raise ValueError(f"Score shape {score.shape} does not match params shape prefix {params.shape[:2]}.")
+    seed_score, seed_score_source = _score_by_seed(pop, score)
+    if seed_score.shape[:2] != params.shape[:2]:
+        raise ValueError(f"Seed score shape {seed_score.shape} does not match params shape prefix {params.shape[:2]}.")
+    if not np.any(np.isfinite(score)):
+        raise ValueError("No finite MSPD candidate scores found.")
+
+    i_iter, pop_idx = np.unravel_index(np.nanargmax(score), score.shape)
+    i_iter = int(i_iter)
+    pop_idx = int(pop_idx)
+    selected_seed_scores = np.asarray(seed_score[i_iter, pop_idx], dtype=np.float64).reshape(-1)
+    selected_score = float(score[i_iter, pop_idx])
+
+    iter_rows: list[dict[str, Any]] = []
+    candidate_rows: list[dict[str, Any]] = []
+    for i in range(score.shape[0]):
+        iter_rows.append(
+            {
+                "iter": int(i),
+                "mean_score_mspd": float(np.nanmean(score[i])),
+                "median_score_mspd": float(np.nanmedian(score[i])),
+                "max_score_mspd": float(np.nanmax(score[i])),
+                "std_score_mspd": float(np.nanstd(score[i])),
+            }
+        )
+        for j in range(score.shape[1]):
+            seed_values = np.asarray(seed_score[i, j], dtype=np.float64).reshape(-1)
+            row = {
+                "iter": int(i),
+                "pop_idx": int(j),
+                "score_mspd": float(score[i, j]),
+                "seed_mean_mspd": float(np.nanmean(seed_values)),
+                "seed_std_mspd": float(np.nanstd(seed_values, ddof=1)) if seed_values.size > 1 else 0.0,
+                "seed_min_mspd": float(np.nanmin(seed_values)),
+                "seed_max_mspd": float(np.nanmax(seed_values)),
+                "is_selected": int(i == i_iter and j == pop_idx),
+            }
+            for k, value in enumerate(seed_values):
+                row[f"seed_{k:02d}_mspd"] = float(value)
+            candidate_rows.append(row)
+
+    selected = {
+        "selection_rule": "argmax_observed_mspd",
+        "score_source": score_source,
+        "seed_score_source": seed_score_source,
+        "iter": i_iter,
+        "pop_idx": pop_idx,
+        "score_mspd": selected_score,
+        "loss": -selected_score,
+        "seed_mean_mspd": float(np.nanmean(selected_seed_scores)),
+        "seed_std_mspd": float(np.nanstd(selected_seed_scores, ddof=1)) if selected_seed_scores.size > 1 else 0.0,
+        "seed_min_mspd": float(np.nanmin(selected_seed_scores)),
+        "seed_max_mspd": float(np.nanmax(selected_seed_scores)),
+        "n_iters": int(params.shape[0]),
+        "pop_size": int(params.shape[1]),
+        "n_params": int(params.shape[2]),
+        "seed_scores_mspd": [float(x) for x in selected_seed_scores],
+        "tau": _selected_tau_payload(pop, i_iter, pop_idx),
+        "params": np.asarray(params[i_iter, pop_idx], dtype=np.float32),
+    }
+    return selected, iter_rows, candidate_rows
+
+
 def _existing_matches(path: Path, selected: dict[str, Any], run_dir: Path) -> bool:
     meta_path = path / "selected_candidate.json"
     best_path = path / "best.pkl"
@@ -240,13 +311,17 @@ def _existing_matches(path: Path, selected: dict[str, Any], run_dir: Path) -> bo
         meta = json.loads(meta_path.read_text())
     except Exception:
         return False
-    return (
+    matches = (
         str(meta.get("source_run_dir")) == str(run_dir)
         and int(meta.get("iter", -1)) == int(selected["iter"])
         and int(meta.get("pop_idx", -1)) == int(selected["pop_idx"])
         and str(meta.get("selection_rule")) == str(selected["selection_rule"])
-        and abs(float(meta.get("lcb_z", float("nan"))) - float(selected["lcb_z"])) < 1e-12
     )
+    if not matches:
+        return False
+    if selected["selection_rule"] == "robust_pioneer_lcb_in_top_trend":
+        return abs(float(meta.get("lcb_z", float("nan"))) - float(selected["lcb_z"])) < 1e-12
+    return True
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -257,14 +332,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     output_dir = Path(args.output_dir)
 
     pop = _load_pickle(pop_path)
-    selected, iter_rows, candidate_rows = _select_robust_pioneer(
-        pop,
-        lcb_z=float(args.lcb_z),
-        trend_quantile=float(args.trend_quantile),
-        ewma_beta=float(args.ewma_beta),
-        trim_frac=float(args.trim_frac),
-        min_iter=int(args.min_iter),
-    )
+    selection_rule = str(getattr(args, "selection_rule", "robust")).strip().lower()
+    if selection_rule in {"argmax", "max", "global_argmax", "observed_argmax"}:
+        selected, iter_rows, candidate_rows = _select_argmax(pop)
+    elif selection_rule in {"robust", "robust_pioneer", "lcb"}:
+        selected, iter_rows, candidate_rows = _select_robust_pioneer(
+            pop,
+            lcb_z=float(args.lcb_z),
+            trend_quantile=float(args.trend_quantile),
+            ewma_beta=float(args.ewma_beta),
+            trim_frac=float(args.trim_frac),
+            min_iter=int(args.min_iter),
+        )
+    else:
+        raise ValueError(f"Unsupported selection_rule={selection_rule!r}; use 'robust' or 'argmax'.")
     params = np.asarray(selected.pop("params"), dtype=np.float32)
 
     if output_dir.exists() and any(output_dir.iterdir()) and not args.force:
@@ -299,7 +380,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _write_json(
         output_dir / "best_selection.json",
         {
-            "best_params_source": "openai_es_robust_pioneer_lcb_in_top_trend",
+            "best_params_source": f"openai_es_{meta['selection_rule']}",
             "best_pkl_loss_kind": "negative_observed_seed_mean_mspd",
             **{k: v for k, v in meta.items() if k not in {"exported_params_npy"}},
         },
@@ -312,6 +393,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Export a robust OpenAI-ES pioneer candidate from pop_traj.pkl.")
     parser.add_argument("run_dir", help="Optimization run directory containing pop_traj.pkl.")
     parser.add_argument("--output-dir", required=True, help="Output checkpoint directory to write best.pkl into.")
+    parser.add_argument("--selection-rule", choices=("robust", "argmax"), default="robust")
     parser.add_argument("--lcb-z", type=float, default=2.0, help="Penalty multiplier for score mean - z * SEM.")
     parser.add_argument("--trend-quantile", type=float, default=90.0, help="Keep only iterations above this EWMA-trend percentile.")
     parser.add_argument("--ewma-beta", type=float, default=0.85, help="EWMA beta for robust population trend.")

@@ -18,7 +18,7 @@ log_dir="${PAPER_SUITE_LOG_DIR:-${result_root}/logs}"
 master_log="${PAPER_SUITE_MASTER_LOG:-${log_dir}/${run_id}_master.log}"
 
 force_prep_export="${FORCE_PREP_EXPORT:-0}"
-force_apf="${FORCE_APF:-0}"
+force_apf="${FORCE_APF:-1}"
 force_metrics="${FORCE_METRICS:-1}"
 force_visualization="${FORCE_VISUALIZATION:-1}"
 conda_no_capture_output="${CONDA_NO_CAPTURE_OUTPUT:-1}"
@@ -167,6 +167,7 @@ run_py scripts/prepare_flowlenia_completed_robust_c1.py \
   --trend-quantile 90 \
   --ewma-beta 0.85 \
   --trim-frac 0.125 \
+  --legacy-optimization-sigma-collision \
   ${prep_force_arg}
 
 echo

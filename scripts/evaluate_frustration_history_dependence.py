@@ -260,9 +260,17 @@ def _prepare_block_template_state(
         j = bi % split_n
         i0 = i * block_size
         j0 = j * block_size
-        A_blocks[bi, pad:pad + block_size, pad:pad + block_size] = A0[i0:i0 + block_size, j0:j0 + block_size]
-        P_blocks[bi, pad:pad + block_size, pad:pad + block_size] = P0[i0:i0 + block_size, j0:j0 + block_size]
-        Food_blocks[bi, pad:pad + block_size, pad:pad + block_size] = Food0[i0:i0 + block_size, j0:j0 + block_size]
+        height = max(0, min(block_size, int(A0.shape[0]) - i0))
+        width = max(0, min(block_size, int(A0.shape[1]) - j0))
+        if height == 0 or width == 0:
+            continue
+        core_y = slice(pad, pad + height)
+        core_x = slice(pad, pad + width)
+        src_y = slice(i0, i0 + height)
+        src_x = slice(j0, j0 + width)
+        A_blocks[bi, core_y, core_x] = A0[src_y, src_x]
+        P_blocks[bi, core_y, core_x] = P0[src_y, src_x]
+        Food_blocks[bi, core_y, core_x] = Food0[src_y, src_x]
 
     blocks_state = {}
     for key, value in block_template.items():
@@ -323,13 +331,15 @@ def _merge_blocks_into_global_state(initial_state, blocks_state, *, split_n: int
         pad=pad,
     )
     merged = dict(initial_state)
-    merged["A"] = A_full
-    merged["P"] = P_full
-    merged["Food"] = Food_full
+    target_y = int(initial_state["A"].shape[0])
+    target_x = int(initial_state["A"].shape[1])
+    merged["A"] = A_full[:target_y, :target_x]
+    merged["P"] = P_full[:target_y, :target_x]
+    merged["Food"] = Food_full[:target_y, :target_x]
     if "t" in blocks_state:
         merged["t"] = jnp.asarray(blocks_state["t"][0])
     if "mass_cycle_start" in initial_state or "mass_cycle_start" in blocks_state:
-        merged["mass_cycle_start"] = jnp.sum(A_full)
+        merged["mass_cycle_start"] = jnp.sum(merged["A"])
     return merged
 
 

@@ -1,0 +1,103 @@
+meta:
+  machine_idx: ${env:PAPER_MACHINE_IDX,0}
+  num_machines: ${env:PAPER_NUM_MACHINES,1}
+  wandb_project: asal
+  wandb_mode: disabled
+  output_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1_openai_es_fixed_init_10opt_c2_c5_paper
+
+paper_check:
+  num_optimizations: 10
+  num_random_baselines: 3
+  optimization_seed_base: 1003
+  random_param_seed_base: 200003
+  pair_seed_base: 400003
+  metric_seed_base: 800003
+
+optimization:
+  base_config: optimization/config_longrun_check_fix.yaml
+  save_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1_openai_es_fixed_init_9opt_c1_argmax_paper/optimization
+  resume: true
+  save_every: 1
+  overrides:
+    substrate:
+      grid_size: 128
+      sigma: 0.2
+      flow_sigma: 0.2
+      seed_n_patches: 4
+    optimization:
+      optimizer_algorithm: mirrored_openai_es
+      selection_protocol: mean_loss
+      eval_seed_mode: fixed
+      openai_es_n_pairs: 4
+      openai_es_n_seeds: 4
+      openai_es_sigma: 0.2
+      openai_es_lr: 0.2
+      openai_es_adam_beta1: 0.9
+      openai_es_adam_beta2: 0.999
+      openai_es_adam_eps: 1.0e-8
+
+frustration_simulation:
+  base_config: frustration_simulation/config_grid128.yaml
+  save_root: ${meta.output_root}/frustration_simulation
+  resume: true
+  trial_batch_size: 40
+  # Operational resume cadence only; it does not alter simulation or sampling.
+  checkpoint_every_steps: 100000
+  full_embedding_sample_every_steps: 1000
+  # Full embeddings are unused diagnostics; primary late CLIP samples remain every 25k.
+  continuation_full_embedding_sample_every_steps: 1200000
+  log_full_embeddings_for_b: false
+  random_checkpoint_root: experiments/paper_check_flow_lenia/checkpoints_lockheed_1/frustration_simulation/random_params
+  require_existing_random_checkpoints: true
+  training_reference_manifest: experiments/paper_check_flow_lenia/checkpoints_lockheed_1_openai_es_fixed_init_9opt_c1_argmax_paper/c1_lagrangian_apf_300k_train50_4seeds_exact_parallel_zip/manifest.json
+  training_reference_step: 300000
+  training_horizon_steps: 300000
+  require_training_reference_match: true
+  training_reference_only: false
+  run_seed_protocol: optimization_metric
+  bootstrap_cache_root: ${meta.output_root}/frustration_simulation
+  wall_video_enabled: true
+  wall_video_sample_every_steps: 5000
+  wall_video_img_size: 256
+  wall_video_fps: 24
+  wall_video_codec: libx264
+  wall_video_keep_frames: false
+  overrides:
+    substrate:
+      grid_size: 128
+      rollout_steps: 1200000
+      sigma: 0.2
+      flow_sigma: 0.2
+      seed_n_patches: 4
+    protocol:
+      grid_split: 3
+      warmup_steps: 500000
+      total_steps: 1200000
+      wall_pad: 5
+    evaluation:
+      enable_clip: true
+      enable_msc: true
+      time_sampling: 8
+      clip_sample_every_steps: 25000
+      late_window_start_steps: 1000000
+      late_window_end_steps: 1200000
+      distance_metric: cosine_mean
+    metric:
+      sample_every_steps: 50
+      metric_tau_mode: max_grid
+      metric_tau_grid_steps: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000]
+      metric_window_size_steps: 20000
+      metric_window_step_steps: 5000
+      metric_tau_steps: 3000
+      metric_range_start_steps: 0
+      metric_range_end_steps: null
+      metric_lagrangian_n_particles: 256
+      metric_lagrangian_init_mode: mass
+      metric_lagrangian_flow_channel: -1
+      metric_lagrangian_flow_reduce: mass_weighted
+      metric_lagrangian_channel_mode: resample
+      metric_lagrangian_noise_model: rt_box
+      metric_lagrangian_diffusion_scale: 1.0
+    logging:
+      wandb_mode: disabled
+      log_clip_evolution: false

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pickle
 import sys
 import warnings
 from pathlib import Path
@@ -27,7 +28,7 @@ from analysis.history_dependence.paper_check_metric_stats import (
     history_distance_base_names,
 )
 from clip_deltah_msc_metric import make_metric_loss_fn, resolve_metric_config
-from flowlenia_minibang_simulate import _load_lagrangian_series
+from flowlenia_minibang_simulate import _init_lagrangian_points_jax, _load_lagrangian_series, _make_substrate
 from paper_suite_common import (
     REPO_ROOT,
     as_list,
@@ -413,20 +414,85 @@ def _checkpoint_train_tau_steps(checkpoint_dir_raw: Any) -> int | None:
     path = Path(str(checkpoint_dir_raw))
     if not path.is_absolute():
         path = REPO_ROOT / path
-    tau_path = path / "best_tau.json"
-    if not tau_path.exists():
+
+    for tau_path in (path / "best_tau.json", path / "selected_candidate.json"):
+        if not tau_path.exists():
+            continue
+        try:
+            payload = json.loads(tau_path.read_text())
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        tau_payload = payload.get("tau", payload)
+        if not isinstance(tau_payload, dict):
+            tau_payload = payload
+        value = tau_payload.get("tau_steps")
+        if value is None:
+            continue
+        try:
+            out = int(value)
+        except Exception:
+            continue
+        if out > 0:
+            return out
+    return None
+
+
+def _item_train_tau_steps(item: dict[str, Any]) -> int | None:
+    for key in ("optimizer_native_tau_steps", "train_tau_steps"):
+        value = item.get(key, None)
+        if value in (None, ""):
+            continue
+        try:
+            out = int(value)
+        except Exception:
+            continue
+        if out > 0:
+            return out
+    return _checkpoint_train_tau_steps(item.get("source_checkpoint_dir", None))
+
+
+def _float32_ulp_distance(lhs: float, rhs: float) -> int | None:
+    if not (np.isfinite(lhs) and np.isfinite(rhs)):
         return None
-    try:
-        payload = json.loads(tau_path.read_text())
-    except Exception:
-        return None
-    value = payload.get("tau_steps")
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except Exception:
-        return None
+
+    def ordered(value: float) -> int:
+        bits = int(np.asarray(np.float32(value)).view(np.uint32).item())
+        if bits & 0x80000000:
+            return 0x80000000 - (bits & 0x7FFFFFFF)
+        return 0x80000000 + bits
+
+    return abs(ordered(lhs) - ordered(rhs))
+
+
+def _select_score_tau_idx(
+    *,
+    c1_cfg: Any,
+    metric_cfg_raw: Any,
+    sel_score_by_tau: np.ndarray,
+    train_tau_idx: int,
+    context: str,
+) -> int:
+    source = str(
+        cfg_get(
+            c1_cfg,
+            "score_tau_source",
+            cfg_get(metric_cfg_raw, "score_tau_source", "selection"),
+        )
+    ).strip().lower()
+    if source in {"selection", "selection_holdout", "max_selection", "max_grid"}:
+        return int(np.nanargmax(sel_score_by_tau))
+    if source in {"train", "train_tau", "optimizer_train_tau", "optimizer_native_tau"}:
+        if int(train_tau_idx) < 0:
+            raise ValueError(
+                f"{context}: score_tau_source={source!r} requires train tau metadata, "
+                "but no matching train_tau_idx was found."
+            )
+        return int(train_tau_idx)
+    raise ValueError(
+        f"{context}: unsupported score_tau_source={source!r}; use 'selection' or 'train_tau'."
+    )
 
 
 def _file_probe(path: Path) -> str:
@@ -529,7 +595,28 @@ def _iter_apf_metric_items(root: Path) -> list[dict[str, Any]]:
                     "candidate_label": str(row.get("candidate_label", candidate_kind)),
                     "traj_dir": traj_dir,
                     "apf_dir": apf_dir,
+                    "params_path": _manifest_path(root, row.get("params_path"), default=traj_dir / "params.npy"),
                     "metrics_path": metrics_path,
+                    **{
+                        key: row[key]
+                        for key in (
+                            "optimizer_native_source_pop_traj",
+                            "optimizer_native_source_run_dir",
+                            "optimizer_native_iter",
+                            "optimizer_native_pop_idx",
+                            "optimizer_native_tau_idx",
+                            "optimizer_native_tau_steps",
+                            "optimizer_native_tau_frames",
+                            "optimizer_native_tau_selector_raw",
+                            "optimizer_native_score_mspd",
+                            "optimizer_native_score_by_seed_mspd",
+                            "optimizer_native_legacy_sigma_collision",
+                            "optimizer_native_params_source",
+                            "optimizer_native_use_row_params",
+                            "theta_source_checkpoint",
+                        )
+                        if key in row
+                    },
                 }
             )
     if items:
@@ -602,6 +689,359 @@ def _slice_apf_lagrangian(
             f"available step span is {available_min}..{available_max}."
         )
     return out
+
+
+def _path_from_repo(raw: Any) -> Path:
+    path = Path(str(raw))
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    return path
+
+
+def _flat_optimization_config(path: Path, *, legacy_sigma_collision: bool = False) -> Any:
+    cfg = OmegaConf.load(path)
+    flat = OmegaConf.merge(
+        cfg.get("meta", {}),
+        cfg.get("substrate", {}),
+        cfg.get("evaluation", {}),
+        cfg.get("optimization", {}),
+        cfg.get("logging", {}),
+        cfg.get("metric", {}),
+    )
+    substrate_cfg = cfg.get("substrate", {})
+    if legacy_sigma_collision:
+        if flat.get("flow_sigma", None) is not None:
+            flat.flow_sigma = None
+    elif str(substrate_cfg.get("substrate", "")).strip().lower() == "lenia_flow":
+        flow_sigma = substrate_cfg.get("flow_sigma", substrate_cfg.get("sigma", None))
+        if flow_sigma is not None:
+            flat.flow_sigma = flow_sigma
+    return flat
+
+
+def _metric_roll_key_for_optimizer(args: Any, eval_key: Any) -> Any:
+    if bool(cfg_get(args, "log_clip_evolution", True)):
+        rng_roll, _rng_metric, _rng_clip = jax.random.split(eval_key, 3)
+    else:
+        rng_roll, _rng_metric = jax.random.split(eval_key, 2)
+    return rng_roll
+
+
+def _seed_idx_for_run_seed(seed_keys: np.ndarray, run_seed: int) -> int:
+    expected = np.asarray(jax.random.PRNGKey(int(run_seed)), dtype=np.uint32).reshape(2)
+    seed_keys = np.asarray(seed_keys, dtype=np.uint32)
+    matches = np.flatnonzero(np.all(seed_keys == expected[None, :], axis=1))
+    if matches.size != 1:
+        keys = [[int(x) for x in np.asarray(key).reshape(-1)] for key in seed_keys]
+        raise ValueError(f"run_seed={run_seed} does not match exactly one optimizer seed key; seed_keys={keys}")
+    return int(matches[0])
+
+
+def _optimizer_native_metadata(item: dict[str, Any]) -> dict[str, Any]:
+    if item.get("optimizer_native_source_pop_traj", None) not in (None, ""):
+        pop_path = _path_from_repo(item.get("optimizer_native_source_pop_traj"))
+        source_run_dir = _path_from_repo(item.get("optimizer_native_source_run_dir", pop_path.parent))
+        selected = {
+            "iter": int(item.get("optimizer_native_iter", -1)),
+            "pop_idx": int(item.get("optimizer_native_pop_idx", -1)),
+        }
+    else:
+        checkpoint_dir_raw = item.get("source_checkpoint_dir", "")
+        if not checkpoint_dir_raw:
+            raise ValueError(f"{item.get('traj_id')}: optimizer-native replay requires source_checkpoint_dir.")
+        checkpoint_dir = _path_from_repo(checkpoint_dir_raw)
+        selected_path = checkpoint_dir / "selected_candidate.json"
+        if not selected_path.exists():
+            raise FileNotFoundError(f"{item.get('traj_id')}: missing selected_candidate.json at {selected_path}")
+        selected = json.loads(selected_path.read_text())
+        pop_path = _path_from_repo(selected.get("source_pop_traj", ""))
+        source_run_dir = _path_from_repo(selected.get("source_run_dir", pop_path.parent))
+    if not pop_path.exists():
+        raise FileNotFoundError(f"{item.get('traj_id')}: source_pop_traj not found: {pop_path}")
+    opt_config_path = source_run_dir / "optimization_config.yaml"
+    if not opt_config_path.exists():
+        raise FileNotFoundError(f"{item.get('traj_id')}: optimization_config.yaml not found: {opt_config_path}")
+
+    with pop_path.open("rb") as f:
+        pop = pickle.load(f)
+    params = np.asarray(pop["params"], dtype=np.float32)
+    seed_keys = np.asarray(pop["seed_keys"], dtype=np.uint32)
+    i_iter = int(selected.get("iter", -1))
+    pop_idx = int(selected.get("pop_idx", -1))
+    if params.ndim != 3 or seed_keys.ndim != 3:
+        raise ValueError(f"{item.get('traj_id')}: invalid pop_traj shapes params={params.shape} seed_keys={seed_keys.shape}")
+    if i_iter < 0 or i_iter >= params.shape[0] or pop_idx < 0 or pop_idx >= params.shape[1]:
+        raise ValueError(f"{item.get('traj_id')}: selected iter/pop_idx out of range: iter={i_iter} pop_idx={pop_idx}")
+    init_params_batch = np.asarray(params[i_iter], dtype=np.float32)
+    params_batch = np.asarray(init_params_batch, dtype=np.float32)
+    use_row_params = str(item.get("optimizer_native_use_row_params", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    } or item.get("optimizer_native_use_row_params") is True
+    if use_row_params:
+        params_path = _path_from_repo(item.get("params_path", ""))
+        if not params_path.exists():
+            raise FileNotFoundError(f"{item.get('traj_id')}: row params override not found: {params_path}")
+        row_params = np.asarray(np.load(params_path), dtype=np.float32).reshape(-1)
+        expected = np.asarray(params_batch[pop_idx], dtype=np.float32).reshape(-1)
+        if row_params.shape != expected.shape:
+            raise ValueError(
+                f"{item.get('traj_id')}: row params shape {row_params.shape} "
+                f"does not match optimizer params shape {expected.shape}."
+            )
+        params_batch = np.array(params_batch, copy=True)
+        params_batch[pop_idx] = row_params
+    seed_idx = _seed_idx_for_run_seed(seed_keys[i_iter], int(item["run_seed"]))
+    return {
+        "optimization_config": opt_config_path,
+        "source_pop_traj": pop_path,
+        "iter": i_iter,
+        "pop_idx": pop_idx,
+        "seed_idx": seed_idx,
+        "params_batch": params_batch,
+        "init_params_batch": init_params_batch,
+        "seed_keys": np.asarray(seed_keys[i_iter], dtype=np.uint32),
+        "row_params_override": bool(use_row_params),
+        "params_source": str(item.get("optimizer_native_params_source", "pop_traj")),
+    }
+
+
+def _make_optimizer_native_selected_xy_fn(
+    *,
+    opt_config_path: Path,
+    rollout_steps: int,
+    sample_every_steps: int,
+    legacy_sigma_collision: bool = False,
+    use_init_params_override: bool = False,
+):
+    args = _flat_optimization_config(opt_config_path, legacy_sigma_collision=bool(legacy_sigma_collision))
+    args.rollout_steps = int(rollout_steps)
+    args.sample_every_steps = int(sample_every_steps)
+    substrate = _make_substrate(args)
+    substrate_param_dims = int(substrate.n_params)
+
+    # Force RT construction before jitted rollout helpers close over it, as in
+    # main_opt_msc and the preflight diagnostics.
+    probe_params = substrate.default_params(jax.random.PRNGKey(17))
+    _ = substrate.init_state(jax.random.PRNGKey(0), probe_params)
+    rt = substrate.RT
+
+    lag_n = int(cfg_get(args, "metric_lagrangian_n_particles", 8192))
+    lag_init_mode = str(cfg_get(args, "metric_lagrangian_init_mode", "mass"))
+    lag_flow_channel = int(cfg_get(args, "metric_lagrangian_flow_channel", -1))
+    lag_flow_reduce = str(cfg_get(args, "metric_lagrangian_flow_reduce", "mass_weighted"))
+    lag_channel_mode = str(cfg_get(args, "metric_lagrangian_channel_mode", "resample"))
+    lag_noise_model = str(cfg_get(args, "metric_lagrangian_noise_model", "rt_box"))
+    lag_diffusion_scale = float(cfg_get(args, "metric_lagrangian_diffusion_scale", 1.0))
+    n_chunks = int(rollout_steps) // int(sample_every_steps)
+    if int(rollout_steps) % int(sample_every_steps) != 0:
+        raise ValueError(
+            f"optimizer-native replay requires rollout_steps divisible by sample_every_steps; "
+            f"got {rollout_steps} and {sample_every_steps}."
+        )
+
+    def rollout_one(eval_key, params_full):
+        params = params_full[:substrate_param_dims]
+        rng_roll = _metric_roll_key_for_optimizer(args, eval_key)
+        k_state, k_pts, k_ch, k_scan = jax.random.split(rng_roll, 4)
+        s0 = substrate.init_state(k_state, params)
+        pts0 = _init_lagrangian_points_jax(
+            s0["A"],
+            n_particles=lag_n,
+            init_mode=lag_init_mode,
+            border=str(getattr(rt, "border", "wall")),
+            sigma=float(getattr(rt, "sigma", 0.0)),
+            key=k_pts,
+        )
+        if lag_channel_mode in ("fixed", "resample"):
+            ch0 = rt.sample_point_channels(pts0, s0["A"], k_ch)
+        else:
+            ch0 = jnp.zeros((lag_n,), dtype=jnp.int32)
+
+        def step_fn(state, key_step):
+            st, pts, ch = state
+            st = substrate.step_state(key_step, st, params)
+            lag_key = jax.random.fold_in(key_step, jnp.uint32(0x4C4147))
+            pts, ch = rt.advect_particles(
+                points=pts,
+                F=st["F"],
+                A=st["A"],
+                channel=lag_flow_channel,
+                reduce=lag_flow_reduce,
+                point_channels=ch,
+                channel_mode=lag_channel_mode,
+                key=lag_key,
+                noise_model=lag_noise_model,
+                diffusion_scale=lag_diffusion_scale,
+            )
+            return (st, pts, ch), None
+
+        def chunk_fn(state, key_chunk):
+            state_next, _ = jax.lax.scan(step_fn, state, jax.random.split(key_chunk, int(sample_every_steps)))
+            return state_next, state_next[1]
+
+        (_, _, _), xy_seq = jax.lax.scan(
+            chunk_fn,
+            (s0, pts0, ch0),
+            jax.random.split(k_scan, n_chunks),
+        )
+        return xy_seq
+
+    def rollout_one_with_opt_init(eval_key, params_full, init_params_full):
+        params = params_full[:substrate_param_dims]
+        init_params = init_params_full[:substrate_param_dims]
+        rng_roll = _metric_roll_key_for_optimizer(args, eval_key)
+        k_state, k_pts, k_ch, k_scan = jax.random.split(rng_roll, 4)
+        s0 = substrate.init_state(k_state, params)
+        init_s0 = substrate.init_state(k_state, init_params)
+        s0 = dict(s0)
+        for key in ("A", "P", "Food", "t", "F"):
+            if key in init_s0:
+                s0[key] = init_s0[key]
+        pts0 = _init_lagrangian_points_jax(
+            s0["A"],
+            n_particles=lag_n,
+            init_mode=lag_init_mode,
+            border=str(getattr(rt, "border", "wall")),
+            sigma=float(getattr(rt, "sigma", 0.0)),
+            key=k_pts,
+        )
+        if lag_channel_mode in ("fixed", "resample"):
+            ch0 = rt.sample_point_channels(pts0, s0["A"], k_ch)
+        else:
+            ch0 = jnp.zeros((lag_n,), dtype=jnp.int32)
+
+        def step_fn(state, key_step):
+            st, pts, ch = state
+            st = substrate.step_state(key_step, st, params)
+            lag_key = jax.random.fold_in(key_step, jnp.uint32(0x4C4147))
+            pts, ch = rt.advect_particles(
+                points=pts,
+                F=st["F"],
+                A=st["A"],
+                channel=lag_flow_channel,
+                reduce=lag_flow_reduce,
+                point_channels=ch,
+                channel_mode=lag_channel_mode,
+                key=lag_key,
+                noise_model=lag_noise_model,
+                diffusion_scale=lag_diffusion_scale,
+            )
+            return (st, pts, ch), None
+
+        def chunk_fn(state, key_chunk):
+            state_next, _ = jax.lax.scan(step_fn, state, jax.random.split(key_chunk, int(sample_every_steps)))
+            return state_next, state_next[1]
+
+        (_, _, _), xy_seq = jax.lax.scan(
+            chunk_fn,
+            (s0, pts0, ch0),
+            jax.random.split(k_scan, n_chunks),
+        )
+        return xy_seq
+
+    if bool(use_init_params_override):
+        def selected_xy(seed_keys_in, params_batch_in, init_params_batch_in, pop_idx_in, seed_idx_in):
+            # The caller needs one selected candidate/seed, so avoid replaying the full
+            # optimizer population and all evaluation seeds before indexing the result.
+            params = params_batch_in[pop_idx_in]
+            init_params = init_params_batch_in[pop_idx_in]
+            key = seed_keys_in[seed_idx_in]
+            return rollout_one_with_opt_init(key, params, init_params)
+    else:
+        def selected_xy(seed_keys_in, params_batch_in, init_params_batch_in, pop_idx_in, seed_idx_in):
+            params = params_batch_in[pop_idx_in]
+            key = seed_keys_in[seed_idx_in]
+            return rollout_one(key, params)
+
+    return jax.jit(selected_xy)
+
+
+def _optimizer_native_lagrangian_xy(
+    item: dict[str, Any],
+    *,
+    rollout_steps: int,
+    sample_every_steps: int,
+    fn_cache: dict[tuple[str, int, int, bool], Any],
+    legacy_sigma_collision: bool = False,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    meta = _optimizer_native_metadata(item)
+    legacy_sigma_collision = bool(legacy_sigma_collision)
+    row_params_override = bool(meta.get("row_params_override", False))
+    cache_key = (
+        str(meta["optimization_config"]),
+        int(rollout_steps),
+        int(sample_every_steps),
+        legacy_sigma_collision,
+        row_params_override,
+    )
+    if cache_key not in fn_cache:
+        fn_cache[cache_key] = _make_optimizer_native_selected_xy_fn(
+            opt_config_path=Path(meta["optimization_config"]),
+            rollout_steps=int(rollout_steps),
+            sample_every_steps=int(sample_every_steps),
+            legacy_sigma_collision=legacy_sigma_collision,
+            use_init_params_override=row_params_override,
+        )
+    fn = fn_cache[cache_key]
+    flat = _flat_optimization_config(
+        Path(meta["optimization_config"]),
+        legacy_sigma_collision=legacy_sigma_collision,
+    )
+    meta = dict(
+        meta,
+        legacy_sigma_collision=legacy_sigma_collision,
+        row_params_override=bool(meta.get("row_params_override", False)),
+        params_source=str(meta.get("params_source", "pop_traj")),
+        resolved_args_sigma=None if cfg_get(flat, "sigma", None) is None else float(cfg_get(flat, "sigma")),
+        resolved_args_flow_sigma=(
+            None if cfg_get(flat, "flow_sigma", None) is None else float(cfg_get(flat, "flow_sigma"))
+        ),
+    )
+    xy = fn(
+        jnp.asarray(meta["seed_keys"], dtype=jnp.uint32),
+        jnp.asarray(meta["params_batch"], dtype=jnp.float32),
+        jnp.asarray(meta.get("init_params_batch", meta["params_batch"]), dtype=jnp.float32),
+        jnp.asarray(int(meta["pop_idx"]), dtype=jnp.int32),
+        jnp.asarray(int(meta["seed_idx"]), dtype=jnp.int32),
+    )
+    return np.asarray(jax.device_get(xy), dtype=np.float32), meta
+
+
+def _item_optimizer_native_legacy_sigma_collision(item: dict[str, Any], default: bool) -> bool:
+    raw = item.get("optimizer_native_legacy_sigma_collision", None)
+    if raw in (None, ""):
+        return bool(default)
+    if isinstance(raw, str):
+        return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(raw)
+
+
+def _sample_every_for_c1_apf_split(root: Path, c1_cfg: Any, items: list[dict[str, Any]]) -> int:
+    for key in ("sample_every_steps", "snapshot_interval"):
+        raw = cfg_get(c1_cfg, key, None)
+        if raw is not None:
+            return int(raw)
+    manifest = root / "manifest.json"
+    if manifest.exists():
+        payload = json.loads(manifest.read_text())
+        sig = payload.get("expected_rollout_signature", {})
+        for key in ("sample_every_steps", "snapshot_interval"):
+            raw = sig.get(key, None)
+            if raw is not None:
+                return int(raw)
+    for item in items:
+        apf_dir = Path(item["apf_dir"])
+        if apf_dir.exists():
+            try:
+                steps, _lag = _load_lagrangian_series(apf_dir)
+                return _apf_sample_every(steps)
+            except Exception:
+                continue
+    raise ValueError(f"Could not infer C1 APF sample interval from config or APF root: {root}")
 
 
 def _absolute_window_steps(info: dict[str, np.ndarray], *, range_start_steps: int, window_size_steps: int) -> tuple[np.ndarray, np.ndarray]:
@@ -738,17 +1178,34 @@ def _compute_c1_from_apf_lagrangian_split(
         for stale in maps_dir.glob("*_c1_maps.npz"):
             stale.unlink()
 
-    first_steps, first_lag = _load_lagrangian_series(Path(items[0]["apf_dir"]))
-    sample_every = _apf_sample_every(first_steps)
+    sample_every = _sample_every_for_c1_apf_split(root, c1_cfg, items)
     full_len = range_end - range_start
     metric_cfg = _metric_config_from_timing(metric_cfg_raw, rollout_steps=full_len, sample_every=sample_every)
     metric_eval = jax.jit(make_metric_loss_fn(metric_cfg, include_maps=True))
     window_size_steps = int(metric_cfg["window_size_frames"]) * int(metric_cfg["sample_every_steps"])
+    optimized_replay_source = str(cfg_get(c1_cfg, "optimized_replay_source", "apf")).strip().lower()
+    use_optimizer_native_for_optimized = optimized_replay_source in {
+        "optimizer_native",
+        "optimization_native",
+        "optimizer_nested_jit",
+        "nested_jit",
+    }
+    if use_optimizer_native_for_optimized:
+        raise RuntimeError(
+            f"{dataset_name}: optimized_replay_source={optimized_replay_source!r} is disabled. "
+            "C1 posthoc must score the saved APF trajectories instead of launching a new replay."
+        )
+    optimized_replay_legacy_sigma_collision = bool(
+        cfg_get(c1_cfg, "optimized_replay_legacy_sigma_collision", False)
+    )
+    optimizer_native_fn_cache: dict[tuple[str, int, int, bool], Any] = {}
 
     score_rows: list[dict[str, Any]] = []
     log_event(
         f"{dataset_name}: C1 APF interleaved holdout start n_items={len(items)} root={root} "
-        f"range={range_start}..{range_end} selection_windows=2k eval_windows=2k+1",
+        f"range={range_start}..{range_end} selection_windows=2k eval_windows=2k+1 "
+        f"optimized_replay_source={optimized_replay_source} "
+        f"optimized_replay_legacy_sigma_collision={optimized_replay_legacy_sigma_collision}",
         component="posthoc",
     )
     for idx, item in enumerate(items, start=1):
@@ -758,22 +1215,63 @@ def _compute_c1_from_apf_lagrangian_split(
                 f"{dataset_name}: C1 APF interleaved scoring {idx}/{len(items)} traj={item['traj_id']} apf={apf_dir}",
                 component="posthoc",
             )
+        replay_source = "apf_lagrangian"
+        optimizer_native_meta: dict[str, Any] = {}
         try:
-            steps, lag = (first_steps, first_lag) if idx == 1 else _load_lagrangian_series(apf_dir)
-            sample_every_i = _apf_sample_every(steps)
-            if sample_every_i != sample_every:
-                raise ValueError(f"sample_every mismatch: got {sample_every_i}, expected {sample_every}")
-            xy_full = _slice_apf_lagrangian(
-                steps,
-                lag,
-                start_steps=range_start,
-                end_steps=range_end,
-                sample_every=sample_every,
-                context=f"{dataset_name}: {item['traj_id']} full_range",
-            )
+            has_optimizer_native_manifest = item.get("optimizer_native_source_pop_traj", None) not in (None, "")
+            if use_optimizer_native_for_optimized and (
+                str(item.get("candidate_kind", "")) == "optimized" or has_optimizer_native_manifest
+            ):
+                item_legacy_sigma_collision = _item_optimizer_native_legacy_sigma_collision(
+                    item,
+                    optimized_replay_legacy_sigma_collision,
+                )
+                native_xy, optimizer_native_meta = _optimizer_native_lagrangian_xy(
+                    item,
+                    rollout_steps=range_end,
+                    sample_every_steps=sample_every,
+                    fn_cache=optimizer_native_fn_cache,
+                    legacy_sigma_collision=item_legacy_sigma_collision,
+                )
+                native_steps = np.arange(sample_every, range_end + sample_every, sample_every, dtype=np.int64)
+                xy_full = _slice_apf_lagrangian(
+                    native_steps,
+                    native_xy,
+                    start_steps=range_start,
+                    end_steps=range_end,
+                    sample_every=sample_every,
+                    context=f"{dataset_name}: {item['traj_id']} optimizer_native_full_range",
+                )
+                replay_source = (
+                    (
+                        "optimizer_native_nested_jit_row_params_legacy_sigma_collision"
+                        if item_legacy_sigma_collision
+                        else "optimizer_native_nested_jit_row_params"
+                    )
+                    if optimizer_native_meta.get("row_params_override", False)
+                    else (
+                        "optimizer_native_nested_jit_legacy_sigma_collision"
+                        if item_legacy_sigma_collision
+                        else "optimizer_native_nested_jit"
+                    )
+                )
+            else:
+                steps, lag = _load_lagrangian_series(apf_dir)
+                sample_every_i = _apf_sample_every(steps)
+                if sample_every_i != sample_every:
+                    raise ValueError(f"sample_every mismatch: got {sample_every_i}, expected {sample_every}")
+                xy_full = _slice_apf_lagrangian(
+                    steps,
+                    lag,
+                    start_steps=range_start,
+                    end_steps=range_end,
+                    sample_every=sample_every,
+                    context=f"{dataset_name}: {item['traj_id']} full_range",
+                )
         except Exception as exc:
             raise ValueError(
-                f"{dataset_name}: invalid C1 APF lagrangian path={apf_dir} error={type(exc).__name__}: {exc}"
+                f"{dataset_name}: invalid C1 replay for traj={item['traj_id']} apf={apf_dir} "
+                f"replay_source={replay_source} error={type(exc).__name__}: {exc}"
             ) from exc
 
         metric_seed, metric_seed_label = _c1_metric_seed(c1_cfg, item, idx)
@@ -802,14 +1300,81 @@ def _compute_c1_from_apf_lagrangian_split(
                 full_mask,
             )
         full_selected_idx = int(np.nanargmax(full_score_by_tau))
-        train_tau_steps = _checkpoint_train_tau_steps(item.get("source_checkpoint_dir", None))
+        train_tau_steps = _item_train_tau_steps(item)
         train_tau_idx = -1
         if train_tau_steps is not None:
             matches = np.where(tau_steps == int(train_tau_steps))[0]
             if matches.size:
                 train_tau_idx = int(matches[0])
         train_tau_score = float(full_score_by_tau[train_tau_idx]) if train_tau_idx >= 0 else float("nan")
-        selected_idx = int(np.nanargmax(sel_score_by_tau))
+        reference_seed_score = float("nan")
+        reference_seed_scores_raw = item.get("optimizer_native_score_by_seed_mspd", None)
+        if reference_seed_scores_raw not in (None, ""):
+            reference_seed_scores = np.asarray(reference_seed_scores_raw, dtype=np.float32).reshape(-1)
+            rollout_seed_idx = int(item.get("rollout_seed_idx", 0))
+            if 0 <= rollout_seed_idx < reference_seed_scores.size:
+                reference_seed_score = float(reference_seed_scores[rollout_seed_idx])
+        train_mspd_abs_error = (
+            abs(float(np.float32(train_tau_score)) - float(np.float32(reference_seed_score)))
+            if np.isfinite(train_tau_score) and np.isfinite(reference_seed_score)
+            else float("nan")
+        )
+        train_mspd_ulp_distance = _float32_ulp_distance(train_tau_score, reference_seed_score)
+        train_mspd_exact_match = bool(
+            np.isfinite(train_tau_score)
+            and np.isfinite(reference_seed_score)
+            and np.asarray(np.float32(train_tau_score)).view(np.uint32).item()
+            == np.asarray(np.float32(reference_seed_score)).view(np.uint32).item()
+        )
+        cross_hardware_source_runs = {
+            int(value)
+            for value in as_list(
+                cfg_get(c1_cfg, "optimizer_reference_cross_hardware_source_run_indices", [])
+            )
+        }
+        cross_hardware_max_ulps = int(
+            cfg_get(c1_cfg, "optimizer_reference_cross_hardware_max_ulps", 0)
+        )
+        source_run_idx = int(item.get("source_optimized_run_idx", -1))
+        cross_hardware_exception_used = bool(
+            not train_mspd_exact_match
+            and source_run_idx in cross_hardware_source_runs
+            and train_mspd_ulp_distance is not None
+            and train_mspd_ulp_distance <= cross_hardware_max_ulps
+        )
+        train_mspd_validation_passed = bool(
+            train_mspd_exact_match or cross_hardware_exception_used
+        )
+        if train_mspd_exact_match:
+            train_mspd_validation = "bit_exact"
+        elif cross_hardware_exception_used:
+            train_mspd_validation = "known_cross_hardware_ulp"
+        elif train_mspd_ulp_distance is None:
+            train_mspd_validation = "not_available"
+        else:
+            train_mspd_validation = "failed"
+        if (
+            bool(cfg_get(c1_cfg, "require_exact_optimized_train_mspd", False))
+            and str(item.get("candidate_kind", "")) == "optimized"
+            and not train_mspd_validation_passed
+        ):
+            raise RuntimeError(
+                f"{dataset_name}: exact optimizer MSPD replay failed for {item['traj_id']}: "
+                f"APF full_score_train_tau={train_tau_score:.17g}, "
+                f"optimizer score_by_seed={reference_seed_score:.17g}, "
+                f"float32_abs_error={train_mspd_abs_error:.17g}, "
+                f"float32_ulp_distance={train_mspd_ulp_distance}, "
+                f"source_run_idx={source_run_idx}, "
+                f"allowed_cross_hardware_runs={sorted(cross_hardware_source_runs)}, "
+                f"cross_hardware_max_ulps={cross_hardware_max_ulps}."
+            )
+        selected_idx = _select_score_tau_idx(
+            c1_cfg=c1_cfg,
+            metric_cfg_raw=metric_cfg_raw,
+            sel_score_by_tau=sel_score_by_tau,
+            train_tau_idx=train_tau_idx,
+            context=f"{dataset_name}: {item['traj_id']}",
+        )
         eval_values = eval_map[selected_idx]
         full_window_start, full_window_end = _absolute_window_steps(
             info,
@@ -848,6 +1413,7 @@ def _compute_c1_from_apf_lagrangian_split(
             train_tau_idx=np.asarray(train_tau_idx, dtype=np.int32),
             train_tau_steps=np.asarray(-1 if train_tau_steps is None else int(train_tau_steps), dtype=np.int32),
             apf_dir=str(apf_dir),
+            c1_replay_source=np.asarray(replay_source),
         )
         score_rows.append(
             {
@@ -865,11 +1431,35 @@ def _compute_c1_from_apf_lagrangian_split(
                     cfg_get(c1_cfg, "metric_seed_protocol", "posthoc_index")
                 ),
                 "metric_seed": metric_seed_label,
+                "score_tau_source": str(
+                    cfg_get(
+                        c1_cfg,
+                        "score_tau_source",
+                        cfg_get(metric_cfg_raw, "score_tau_source", "selection"),
+                    )
+                ),
                 "rollout_seed_idx": int(item.get("rollout_seed_idx", 0)),
                 "rollout_seed_count": int(item.get("rollout_seed_count", 1)),
                 "candidate_kind": str(item.get("candidate_kind", "optimized")),
                 "candidate_idx": int(item.get("candidate_idx", 0)),
                 "candidate_label": str(item.get("candidate_label", item.get("candidate_kind", "optimized"))),
+                "c1_replay_source": replay_source,
+                "optimizer_native_iter": int(optimizer_native_meta.get("iter", -1)),
+                "optimizer_native_pop_idx": int(optimizer_native_meta.get("pop_idx", -1)),
+                "optimizer_native_seed_idx": int(optimizer_native_meta.get("seed_idx", -1)),
+                "optimizer_native_legacy_sigma_collision": bool(
+                    optimizer_native_meta.get("legacy_sigma_collision", False)
+                ),
+                "optimizer_native_params_source": str(optimizer_native_meta.get("params_source", "")),
+                "optimizer_native_row_params_override": bool(
+                    optimizer_native_meta.get("row_params_override", False)
+                ),
+                "optimizer_native_resolved_sigma": safe_float(
+                    optimizer_native_meta.get("resolved_args_sigma", np.nan)
+                ),
+                "optimizer_native_resolved_flow_sigma": safe_float(
+                    optimizer_native_meta.get("resolved_args_flow_sigma", np.nan)
+                ),
                 "selected_tau_idx": selected_idx,
                 "selected_tau_steps": int(tau_steps[selected_idx]),
                 "full_selected_tau_idx": full_selected_idx,
@@ -885,6 +1475,14 @@ def _compute_c1_from_apf_lagrangian_split(
                 "full_score_selected_mspd": float(full_score_by_tau[selected_idx]),
                 "full_score_max_mspd": float(full_score_by_tau[full_selected_idx]),
                 "full_score_train_tau_mspd": train_tau_score,
+                "optimizer_reference_seed_score_mspd": reference_seed_score,
+                "optimizer_reference_train_mspd_abs_error": train_mspd_abs_error,
+                "optimizer_reference_train_mspd_ulp_distance": train_mspd_ulp_distance,
+                "optimizer_reference_train_mspd_exact_match": train_mspd_exact_match,
+                "optimizer_reference_train_mspd_validation": train_mspd_validation,
+                "optimizer_reference_train_mspd_validation_passed": train_mspd_validation_passed,
+                "optimizer_reference_cross_hardware_exception_used": cross_hardware_exception_used,
+                "optimizer_reference_cross_hardware_max_ulps": cross_hardware_max_ulps,
                 "full_amp_max": float(full_amp_by_tau[full_selected_idx]) if full_amp_by_tau.size else np.nan,
                 "full_msc_max": float(full_msc_by_tau[full_selected_idx]) if full_msc_by_tau.size else np.nan,
                 "eval_score_max_mspd": float(np.nanmax(eval_score_by_tau)),

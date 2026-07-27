@@ -21,7 +21,7 @@ for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "scripts")):
 import numpy as np
 from omegaconf import OmegaConf
 
-from paper_suite_common import load_config, resolve_path, write_json
+from paper_suite_common import as_list, load_config, resolve_path, write_json
 
 
 DEFAULT_CONFIG = (
@@ -39,13 +39,23 @@ DEFAULT_SCORES_CSV = (
 )
 
 
-def _get(cfg: Any, key: str, default: Any = None) -> Any:
+_MISSING = object()
+
+
+def _get(cfg: Any, key: Any, default: Any = None) -> Any:
     if cfg is None:
         return default
+    if isinstance(key, (tuple, list)):
+        cur = cfg
+        for part in key:
+            cur = _get(cur, part, _MISSING)
+            if cur is _MISSING:
+                return default
+        return cur
     try:
         return cfg.get(key, default)
     except Exception:
-        return getattr(cfg, key, default)
+        return getattr(cfg, key, default) if isinstance(key, str) else default
 
 
 def _load_pickle(path: Path) -> Any:
@@ -126,7 +136,7 @@ def _selected_checkpoint_audit(run_dir: Path, params: np.ndarray) -> dict[str, A
     return out
 
 
-def _flat_optimization_config(path: Path) -> Any:
+def _flat_optimization_config(path: Path, *, legacy_sigma_collision: bool = False) -> Any:
     cfg = OmegaConf.load(path)
     flat = OmegaConf.merge(
         cfg.get("meta", {}),
@@ -137,7 +147,10 @@ def _flat_optimization_config(path: Path) -> Any:
         cfg.get("metric", {}),
     )
     substrate_cfg = cfg.get("substrate", {})
-    if str(substrate_cfg.get("substrate", "")).strip().lower() == "lenia_flow":
+    if legacy_sigma_collision:
+        if flat.get("flow_sigma", None) is not None:
+            flat.flow_sigma = None
+    elif str(substrate_cfg.get("substrate", "")).strip().lower() == "lenia_flow":
         flow_sigma = substrate_cfg.get("flow_sigma", substrate_cfg.get("sigma", None))
         if flow_sigma is not None:
             # main_opt_msc reconstructs this in memory so the optimizer search
@@ -770,6 +783,7 @@ def _split_protocol_config_diffs(
     *,
     rollout_flat: Any,
     opt_flat: Any,
+    legacy_sigma_collision: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     protocol_diffs: list[dict[str, Any]] = []
     ignored: list[dict[str, Any]] = []
@@ -778,15 +792,35 @@ def _split_protocol_config_diffs(
         if key == "sigma":
             rollout_flow_sigma = _get(rollout_flat, "flow_sigma", None)
             opt_flow_sigma = _get(opt_flat, "flow_sigma", None)
+            opt_effective_sigma = _get(opt_flat, "sigma", None) if legacy_sigma_collision else opt_flow_sigma
             if (
                 rollout_flow_sigma is not None
-                and opt_flow_sigma is not None
-                and _same_float(rollout_flow_sigma, opt_flow_sigma)
+                and opt_effective_sigma is not None
+                and _same_float(rollout_flow_sigma, opt_effective_sigma)
             ):
                 ignored_row = dict(row)
                 ignored_row["reason"] = (
+                    "Flow-Lenia physical sigma matches effective replay sigma; "
+                    "legacy optimizer checkpoints used optimization.sigma as physical sigma"
+                    if legacy_sigma_collision
+                    else
                     "benign Flow-Lenia namespace collision: optimization.sigma is optimizer radius; "
                     "physical substrate sigma is compared through flow_sigma"
+                )
+                ignored.append(ignored_row)
+                continue
+        if key == "flow_sigma" and legacy_sigma_collision:
+            rollout_flow_sigma = _get(rollout_flat, "flow_sigma", None)
+            opt_effective_sigma = _get(opt_flat, "sigma", None)
+            if (
+                rollout_flow_sigma is not None
+                and opt_effective_sigma is not None
+                and _same_float(rollout_flow_sigma, opt_effective_sigma)
+            ):
+                ignored_row = dict(row)
+                ignored_row["reason"] = (
+                    "legacy optimizer checkpoint had no flow_sigma key; replay flow_sigma "
+                    "is set to the historical effective physical sigma"
                 )
                 ignored.append(ignored_row)
                 continue
@@ -1330,6 +1364,16 @@ def _audit_generated_config(config_path: Path) -> dict[str, Any]:
     rollout_substrate = _get(rollout_overrides, "substrate", {})
     run_seed_protocol = str(_get(section, "run_seed_protocol", ""))
     metric_seed_protocol = str(_get(c1, "metric_seed_protocol", ""))
+    optimized_replay_source = str(_get(c1, "optimized_replay_source", "apf"))
+    optimized_replay_legacy_sigma_collision = bool(
+        _get(c1, "optimized_replay_legacy_sigma_collision", False)
+    )
+    legacy_mapping_raw = _get(c1, "optimizer_native_legacy_sigma_collision_by_source_run_idx", None)
+    legacy_mapping = (
+        OmegaConf.to_container(legacy_mapping_raw, resolve=True)
+        if OmegaConf.is_config(legacy_mapping_raw)
+        else (legacy_mapping_raw or {})
+    )
     metric_log_clip = _get(c1, "metric_log_clip_evolution", None)
     rollout_log_clip = _get(rollout_logging, "log_clip_evolution", None)
     rollout_sigma = _get(rollout_substrate, "sigma", None)
@@ -1338,6 +1382,9 @@ def _audit_generated_config(config_path: Path) -> dict[str, Any]:
         "config": str(config_path),
         "run_seed_protocol": run_seed_protocol,
         "metric_seed_protocol": metric_seed_protocol,
+        "optimized_replay_source": optimized_replay_source,
+        "optimized_replay_legacy_sigma_collision": bool(optimized_replay_legacy_sigma_collision),
+        "optimizer_native_legacy_sigma_collision_by_source_run_idx": legacy_mapping,
         "metric_log_clip_evolution": None if metric_log_clip is None else bool(metric_log_clip),
         "rollout_log_clip_evolution": None if rollout_log_clip is None else bool(rollout_log_clip),
         "rollout_sigma": None if rollout_sigma is None else float(rollout_sigma),
@@ -1354,6 +1401,15 @@ def _audit_generated_config(config_path: Path) -> dict[str, Any]:
         errors.append(f"run_seed_protocol={run_seed_protocol!r}, expected 'optimization_metric'")
     if metric_seed_protocol != "optimization_metric":
         errors.append(f"metric_seed_protocol={metric_seed_protocol!r}, expected 'optimization_metric'")
+    if optimized_replay_source not in {"optimizer_native", "apf"}:
+        errors.append(
+            f"optimized_replay_source={optimized_replay_source!r}, expected 'optimizer_native' or 'apf'"
+        )
+    if optimized_replay_source == "optimizer_native" and not optimized_replay_legacy_sigma_collision and not legacy_mapping:
+        errors.append(
+            "optimized_replay_legacy_sigma_collision is false; this archived fixed-init OpenAI-ES "
+            "campaign requires legacy sigma collision replay to match stored optimization scores"
+        )
     if metric_log_clip is None:
         errors.append("missing datasets.flow_lenia.c1.metric_log_clip_evolution")
     if rollout_log_clip is None:
@@ -1376,6 +1432,27 @@ def _audit_generated_config(config_path: Path) -> dict[str, Any]:
         errors.append(f"run_seed_rep_stride={out['run_seed_rep_stride']!r}, expected 1")
     out["errors"] = errors
     return out
+
+
+def _mapping_get_bool(raw: Any, key: int, default: bool) -> bool:
+    if raw in (None, ""):
+        return bool(default)
+    values = OmegaConf.to_container(raw, resolve=True) if OmegaConf.is_config(raw) else raw
+    if not isinstance(values, dict):
+        return bool(default)
+    keys = (key, str(key), f"run_{int(key):03d}", f"{int(key):03d}")
+    for candidate in keys:
+        if candidate in values:
+            return bool(values[candidate])
+    return bool(default)
+
+
+def _legacy_sigma_collision_for_run(config_audit: dict[str, Any], run_idx: int) -> bool:
+    return _mapping_get_bool(
+        config_audit.get("optimizer_native_legacy_sigma_collision_by_source_run_idx", None),
+        int(run_idx),
+        bool(config_audit.get("optimized_replay_legacy_sigma_collision", False)),
+    )
 
 
 def _apply_section_rollout_overrides_for_preflight(rollout_cfg: Any, rollout_flat: Any, section: Any) -> tuple[Any, Any]:
@@ -1423,13 +1500,23 @@ def _optimization_eval_seed_count(run_dir: Path) -> int | None:
     return None if raw is None else int(raw)
 
 
-def _audit_seed_count(config_audit: dict[str, Any], selected_root: Path) -> dict[str, Any]:
+def _configured_selected_run_dirs(config_path: Path, selected_root: Path) -> list[Path]:
+    cfg, _flat = load_config(config_path)
+    section = _resolve_section(cfg)
+    raw_dirs = _get(section, "optimized_checkpoint_dirs", None)
+    if raw_dirs not in (None, ""):
+        values = OmegaConf.to_container(raw_dirs, resolve=True) if OmegaConf.is_config(raw_dirs) else raw_dirs
+        dirs = [_as_repo_path(value) for value in values]
+    else:
+        dirs = sorted(Path(selected_root).glob("run_*"))
+    return sorted([Path(path) for path in dirs if Path(path).is_dir()])
+
+
+def _audit_seed_count(config_audit: dict[str, Any], run_dirs: list[Path]) -> dict[str, Any]:
     requested = int(config_audit.get("n_rollout_seeds_per_checkpoint", -1))
     rows = []
     errors = []
-    for run_dir in sorted(Path(selected_root).glob("run_*")):
-        if not run_dir.is_dir():
-            continue
+    for run_dir in sorted(run_dirs):
         expected = _optimization_eval_seed_count(run_dir)
         row = {"run": run_dir.name, "optimization_eval_seed_count": expected, "c1_rollout_seed_count": requested}
         rows.append(row)
@@ -1438,7 +1525,7 @@ def _audit_seed_count(config_audit: dict[str, Any], selected_root: Path) -> dict
         elif int(expected) != requested:
             errors.append(f"{run_dir.name}: optimization eval seed count={expected}, C1 rollout seed count={requested}")
     if not rows:
-        errors.append(f"no run_* directories found under {selected_root}")
+        errors.append("no selected run directories found in generated config")
     return {"status": "ok" if not errors else "failed", "rows": rows, "errors": errors}
 
 
@@ -1454,12 +1541,10 @@ def _load_best_params(run_dir: Path) -> np.ndarray:
     return np.asarray(params, dtype=np.float32).reshape(-1)
 
 
-def _audit_selected_candidates(selected_root: Path, source_optimization_root: Path | None = None) -> dict[str, Any]:
+def _audit_selected_candidates(run_dirs: list[Path], source_optimization_root: Path | None = None) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
-    for run_dir in sorted(Path(selected_root).glob("run_*")):
-        if not run_dir.is_dir():
-            continue
+    for run_dir in sorted(run_dirs):
         row: dict[str, Any] = {"run": run_dir.name, "run_dir": str(run_dir)}
         rows.append(row)
         for name in ("best.pkl", "params.npy", "optimization_config.yaml", "selected_candidate.json"):
@@ -1516,21 +1601,20 @@ def _audit_selected_candidates(selected_root: Path, source_optimization_root: Pa
         except Exception as exc:
             errors.append(f"{run_dir}: selected candidate audit failed: {exc!r}")
     if not rows:
-        errors.append(f"no run_* directories found under {selected_root}")
+        errors.append("no selected run directories found in generated config")
     return {"status": "ok" if not errors else "failed", "rows": rows, "errors": errors}
 
 
-def _audit_optimization_protocol(config_audit: dict[str, Any], selected_root: Path) -> dict[str, Any]:
+def _audit_optimization_protocol(config_audit: dict[str, Any], run_dirs: list[Path]) -> dict[str, Any]:
     requested_seeds = int(config_audit.get("n_rollout_seeds_per_checkpoint", -1))
     expected_seed_base = int(config_audit.get("run_seed_base", -1))
     run_seed_mode = str(config_audit.get("run_seed_mode", "")).strip().lower()
     expected_log_clip = config_audit.get("rollout_log_clip_evolution", None)
     expected_flow_sigma = config_audit.get("rollout_flow_sigma", None)
+    has_legacy_mapping = bool(config_audit.get("optimizer_native_legacy_sigma_collision_by_source_run_idx", None))
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
-    for suite_idx, run_dir in enumerate(sorted(Path(selected_root).glob("run_*"))):
-        if not run_dir.is_dir():
-            continue
+    for suite_idx, run_dir in enumerate(sorted(run_dirs)):
         try:
             run_idx = int(run_dir.name.split("_", 1)[1])
         except Exception:
@@ -1541,6 +1625,7 @@ def _audit_optimization_protocol(config_audit: dict[str, Any], selected_root: Pa
             expected_fixed_eval_seed_base = int(expected_seed_base + 2 * suite_idx)
         else:
             expected_fixed_eval_seed_base = int(expected_seed_base)
+        legacy_sigma_collision = _legacy_sigma_collision_for_run(config_audit, run_idx)
         cfg_path = run_dir / "optimization_config.yaml"
         row: dict[str, Any] = {"run": run_dir.name, "optimization_config": str(cfg_path)}
         rows.append(row)
@@ -1551,7 +1636,7 @@ def _audit_optimization_protocol(config_audit: dict[str, Any], selected_root: Pa
             cfg = OmegaConf.load(cfg_path)
             opt = cfg.get("optimization", {})
             substrate = cfg.get("substrate", {})
-            flat = _flat_optimization_config(cfg_path)
+            flat = _flat_optimization_config(cfg_path, legacy_sigma_collision=legacy_sigma_collision)
             algorithm = str(opt.get("optimizer_algorithm", opt.get("optimization_algorithm", ""))).strip().lower()
             eval_seed_mode = str(opt.get("eval_seed_mode", "")).strip().lower()
             openai_es_n_seeds = opt.get("openai_es_n_seeds", None)
@@ -1559,6 +1644,7 @@ def _audit_optimization_protocol(config_audit: dict[str, Any], selected_root: Pa
             log_clip = bool(_get(flat, "log_clip_evolution", True))
             substrate_sigma = substrate.get("sigma", None)
             flow_sigma = _get(flat, "flow_sigma", None)
+            effective_flow_sigma = _get(flat, "sigma", None) if legacy_sigma_collision else flow_sigma
             row.update(
                 {
                     "optimizer_algorithm": algorithm,
@@ -1569,6 +1655,8 @@ def _audit_optimization_protocol(config_audit: dict[str, Any], selected_root: Pa
                     "log_clip_evolution": log_clip,
                     "substrate_sigma": None if substrate_sigma is None else float(substrate_sigma),
                     "flat_flow_sigma": None if flow_sigma is None else float(flow_sigma),
+                    "effective_flow_sigma": None if effective_flow_sigma is None else float(effective_flow_sigma),
+                    "legacy_sigma_collision": bool(legacy_sigma_collision),
                 }
             )
             if algorithm not in {
@@ -1600,21 +1688,25 @@ def _audit_optimization_protocol(config_audit: dict[str, Any], selected_root: Pa
                     f"{run_dir.name}: optimization log_clip_evolution={log_clip}, "
                     f"generated rollout_log_clip_evolution={expected_log_clip}"
                 )
-            if expected_flow_sigma is None:
+            if has_legacy_mapping:
+                row["rollout_flow_sigma_global_not_used_for_optimizer_native_mixed_protocol"] = (
+                    None if expected_flow_sigma is None else float(expected_flow_sigma)
+                )
+            elif expected_flow_sigma is None:
                 errors.append(f"{run_dir.name}: generated config has no rollout_flow_sigma")
-            elif flow_sigma is None or float(flow_sigma) != float(expected_flow_sigma):
+            elif effective_flow_sigma is None or float(effective_flow_sigma) != float(expected_flow_sigma):
                 errors.append(
-                    f"{run_dir.name}: optimization flow_sigma={flow_sigma}, "
+                    f"{run_dir.name}: optimization effective_flow_sigma={effective_flow_sigma}, "
                     f"generated rollout_flow_sigma={expected_flow_sigma}"
                 )
         except Exception as exc:
             errors.append(f"{run_dir}: optimization protocol audit failed: {exc!r}")
     if not rows:
-        errors.append(f"no run_* directories found under {selected_root}")
+        errors.append("no selected run directories found in generated config")
     return {"status": "ok" if not errors else "failed", "rows": rows, "errors": errors}
 
 
-def _audit_random_checkpoints(config_path: Path, selected_root: Path) -> dict[str, Any]:
+def _audit_random_checkpoints(config_path: Path, run_dirs: list[Path]) -> dict[str, Any]:
     cfg, _flat = load_config(config_path)
     section = _resolve_section(cfg)
     mode = str(_get(section, "random_checkpoint_selection", "per_source_group")).strip().lower()
@@ -1625,15 +1717,74 @@ def _audit_random_checkpoints(config_path: Path, selected_root: Path) -> dict[st
     errors: list[str] = []
     if n_random <= 0:
         return {"status": "ok", "mode": mode, "n_random": n_random, "rows": rows, "errors": []}
-    if not random_root.exists():
-        errors.append(f"random checkpoint root does not exist: {random_root}")
-    if mode not in {"per_source_group", "all_groups_flat", "global_flat", "flat"}:
+    per_source_modes = {
+        "per_source_group",
+        "per_source_group_optimizer_context",
+        "per_source_group_optimizer_init",
+        "random_params_optimizer_context",
+        "random_params_optimizer_init",
+    }
+    if mode not in (per_source_modes | {"all_groups_flat", "global_flat", "flat", "optimization_iter0"}):
         errors.append(f"unknown random_checkpoint_selection={mode!r}")
 
-    if mode == "per_source_group":
-        for run_dir in sorted(Path(selected_root).glob("run_*")):
-            if not run_dir.is_dir():
+    if mode == "optimization_iter0":
+        raw_indices = _get(section, "random_optimizer_native_pop_indices", None)
+        if raw_indices not in (None, ""):
+            values = OmegaConf.to_container(raw_indices, resolve=True) if OmegaConf.is_config(raw_indices) else raw_indices
+            pop_indices = [int(x) for x in values]
+        else:
+            pop_indices = list(range(n_random))
+        if len(pop_indices) < n_random:
+            errors.append(f"need {n_random} optimizer iter0 pop indices, got {pop_indices}")
+        opt_iter = int(_get(section, "random_optimizer_native_iter", 0))
+        for run_dir in sorted(run_dirs):
+            selected_path = run_dir / "selected_candidate.json"
+            row = {
+                "run": run_dir.name,
+                "selected_candidate": str(selected_path),
+                "optimizer_iter": int(opt_iter),
+                "pop_indices": [int(x) for x in pop_indices[:n_random]],
+                "ok": False,
+            }
+            rows.append(row)
+            if not selected_path.exists():
+                errors.append(f"missing selected_candidate.json for optimization_iter0 random controls: {selected_path}")
                 continue
+            try:
+                selected = json.loads(selected_path.read_text())
+                pop_path = Path(str(selected.get("source_pop_traj", "")))
+                if not pop_path.is_absolute():
+                    pop_path = _REPO_ROOT / pop_path
+                row["source_pop_traj"] = str(pop_path)
+                if not pop_path.exists():
+                    errors.append(f"{run_dir.name}: source_pop_traj not found: {pop_path}")
+                    continue
+                with pop_path.open("rb") as f:
+                    pop = pickle.load(f)
+                params = np.asarray(pop.get("params"), dtype=np.float32)
+                tau_steps = np.asarray(pop.get("tau_steps")) if "tau_steps" in pop else None
+                row["params_shape"] = list(params.shape)
+                if params.ndim != 3:
+                    errors.append(f"{run_dir.name}: invalid pop_traj params shape {params.shape}")
+                    continue
+                if opt_iter < 0 or opt_iter >= params.shape[0]:
+                    errors.append(f"{run_dir.name}: random_optimizer_native_iter={opt_iter} out of range {params.shape}")
+                bad = [int(i) for i in pop_indices[:n_random] if int(i) < 0 or int(i) >= params.shape[1]]
+                if bad:
+                    errors.append(f"{run_dir.name}: random pop indices out of range for pop_size={params.shape[1]}: {bad}")
+                if tau_steps is None:
+                    errors.append(f"{run_dir.name}: pop_traj has no tau_steps for optimization_iter0 random controls")
+                else:
+                    row["tau_steps"] = [int(tau_steps[opt_iter, int(i)]) for i in pop_indices[:n_random] if 0 <= int(i) < params.shape[1]]
+                row["ok"] = not bad and tau_steps is not None
+            except Exception as exc:
+                errors.append(f"{run_dir.name}: optimization_iter0 random audit failed: {exc!r}")
+    else:
+        if not random_root.exists():
+            errors.append(f"random checkpoint root does not exist: {random_root}")
+
+    if mode in per_source_modes:
+        for run_dir in sorted(run_dirs):
             try:
                 run_idx = int(run_dir.name.split("_", 1)[1])
             except Exception:
@@ -1660,7 +1811,7 @@ def _audit_random_checkpoints(config_path: Path, selected_root: Path) -> dict[st
                 rows.append(row)
                 if not best_path.exists():
                     errors.append(f"missing random checkpoint: {best_path}")
-    else:
+    elif mode in {"all_groups_flat", "global_flat", "flat"}:
         found = sorted(random_root.glob("group_*/random_*/best.pkl"))
         rows.append({"mode": mode, "required": int(n_random), "found": int(len(found)), "random_root": str(random_root)})
         if len(found) < n_random:
@@ -1706,6 +1857,9 @@ def _run_replay_smoke(
 
     cfg, _flat = load_config(config_path)
     section = _resolve_section(cfg)
+    c1_cfg = _get(cfg, ("datasets", "flow_lenia", "c1"), {})
+    legacy_sigma_collision = bool(_get(c1_cfg, "optimized_replay_legacy_sigma_collision", False))
+    optimized_replay_source = str(_get(c1_cfg, "optimized_replay_source", "apf")).strip().lower()
     pair_seed_base = int(_get(section, "run_seed_base", 400003))
     run_idx, run_dir = _find_run(selected_root, run)
     run_seed = pair_seed_base + 2 * int(run_idx) + int(seed_idx)
@@ -1720,7 +1874,7 @@ def _run_replay_smoke(
     opt_cfg_path = run_dir / "optimization_config.yaml"
     if not opt_cfg_path.exists():
         raise FileNotFoundError(f"Missing copied optimization_config.yaml: {opt_cfg_path}")
-    opt_flat = _flat_optimization_config(opt_cfg_path)
+    opt_flat = _flat_optimization_config(opt_cfg_path, legacy_sigma_collision=legacy_sigma_collision)
 
     rollout_config = resolve_path(_get(section, "rollout_config", None))
     if rollout_config is None or not rollout_config.exists():
@@ -1836,9 +1990,10 @@ def _run_replay_smoke(
     batch_inputs = _optimizer_batch_reference_inputs(run_dir, int(seed_idx))
     flat_pair_vmap_xy: np.ndarray | None = None
     flat_pair_jit_xy: np.ndarray | None = None
+    nested_eager_xy: np.ndarray | None = None
     nested_jit_xy: np.ndarray | None = None
     if batch_inputs is not None:
-        reference_mode = "optimizer_original_pop_batch"
+        reference_mode = "optimizer_original_pop_batch_nested_jit"
         reference_details = {
             "iter": int(batch_inputs["iter"]),
             "pop_idx": int(batch_inputs["pop_idx"]),
@@ -1847,7 +2002,7 @@ def _run_replay_smoke(
             "seed_keys_shape": list(np.asarray(batch_inputs["seed_keys"]).shape),
             "selected_seed_key": batch_inputs["selected_seed_key"],
         }
-        opt_xy = _optimization_lagrangian_xy_from_optimizer_batch(
+        nested_eager_xy = _optimization_lagrangian_xy_from_optimizer_batch(
             opt_flat=opt_flat,
             params_batch=np.asarray(batch_inputs["params_batch"], dtype=np.float32),
             seed_keys=np.asarray(batch_inputs["seed_keys"], dtype=np.uint32),
@@ -1866,6 +2021,7 @@ def _run_replay_smoke(
             sample_every_steps=sample_every,
             jit_compile=True,
         )
+        opt_xy = nested_jit_xy
         opt_xy_with_initial = _optimization_lagrangian_xy_from_optimizer_batch(
             opt_flat=opt_flat,
             params_batch=np.asarray(batch_inputs["params_batch"], dtype=np.float32),
@@ -1875,6 +2031,7 @@ def _run_replay_smoke(
             rollout_steps=int(rollout_steps),
             sample_every_steps=sample_every,
             include_initial=True,
+            jit_compile=True,
         )
         flat_pair_vmap_xy = _optimization_lagrangian_xy_from_flat_pair_batch(
             opt_flat=opt_flat,
@@ -2043,7 +2200,7 @@ def _run_replay_smoke(
     jit_reference = None
     if nested_jit_xy is not None and flat_pair_jit_xy is not None:
         jit_reference = {
-            "nested_jit_vs_nested_eager": _xy_diff_summary(nested_jit_xy, opt_xy, atol=atol),
+            "nested_jit_vs_nested_eager": _xy_diff_summary(nested_jit_xy, nested_eager_xy, atol=atol),
             "nested_jit_vs_single_selected_apf": _xy_diff_summary(nested_jit_xy, apf_xy, atol=atol),
             "flat_jit_vs_flat_eager": _xy_diff_summary(flat_pair_jit_xy, flat_pair_vmap_xy, atol=atol),
             "flat_jit_vs_single_selected_apf": _xy_diff_summary(flat_pair_jit_xy, apf_xy, atol=atol),
@@ -2088,6 +2245,7 @@ def _run_replay_smoke(
         "single_selected_apf": apf_xy,
         "scalar_eager_reference": scalar_opt_xy,
         "active_reference": opt_xy,
+        "optimizer_nested_eager": nested_eager_xy,
         "optimizer_nested_jit": nested_jit_xy,
         "optimizer_flat_eager": flat_pair_vmap_xy,
         "optimizer_flat_jit": flat_pair_jit_xy,
@@ -2096,6 +2254,7 @@ def _run_replay_smoke(
         "single_selected_apf_first_chunk": apf_xy[:1],
         "scalar_eager_reference_first_chunk": scalar_opt_xy[:1],
         "active_reference_first_chunk": opt_xy[:1],
+        "optimizer_nested_eager_first_chunk": None if nested_eager_xy is None else nested_eager_xy[:1],
         "optimizer_nested_jit_first_chunk": None if nested_jit_xy is None else nested_jit_xy[:1],
         "optimizer_flat_eager_first_chunk": None if flat_pair_vmap_xy is None else flat_pair_vmap_xy[:1],
         "optimizer_flat_jit_first_chunk": None if flat_pair_jit_xy is None else flat_pair_jit_xy[:1],
@@ -2176,12 +2335,35 @@ def _run_replay_smoke(
         raw_config_diffs,
         rollout_flat=OmegaConf.create(flat_dict),
         opt_flat=opt_flat,
+        legacy_sigma_collision=legacy_sigma_collision,
+    )
+    def _one_step_component_ok(diff_name: str, component: str) -> bool:
+        diff_block = one_step.get(diff_name, {}) if isinstance(one_step, dict) else {}
+        value = diff_block.get(f"{component}_max_abs_diff", float("inf"))
+        try:
+            return bool(float(value) <= float(atol))
+        except Exception:
+            return False
+
+    one_step_ok = all(
+        _one_step_component_ok(diff_name, component)
+        for diff_name in ("initial_diff", "after_one_step_diff")
+        for component in ("A", "P", "F", "lagrangian_xy")
+    )
+    optimizer_native_apf_diagnostic_only = bool(
+        (not ok)
+        and optimized_replay_source == "optimizer_native"
+        and not protocol_config_diffs
+        and one_step_ok
     )
     known_execution_divergence = bool(
-        (not ok)
-        and initial_max_abs <= float(atol)
-        and not protocol_config_diffs
-        and first_failed_step is not None
+        (
+            (not ok)
+            and initial_max_abs <= float(atol)
+            and not protocol_config_diffs
+            and first_failed_step is not None
+        )
+        or optimizer_native_apf_diagnostic_only
     )
     smoke_status = "ok" if ok else ("known_execution_divergence" if known_execution_divergence else "failed")
     return {
@@ -2193,6 +2375,10 @@ def _run_replay_smoke(
         "apf_chunk_stepper_mode": apf_chunk_stepper_mode,
         "reference_mode": reference_mode,
         "reference_details": reference_details,
+        "legacy_sigma_collision": bool(legacy_sigma_collision),
+        "optimized_replay_source": optimized_replay_source,
+        "optimizer_native_apf_diagnostic_only": bool(optimizer_native_apf_diagnostic_only),
+        "one_step_ok": bool(one_step_ok),
         "flat_pair_vmap_reference": flat_pair_vmap_reference,
         "jit_reference": jit_reference,
         "apf_style_chunk_reference": apf_style_chunk_reference,
@@ -2234,7 +2420,7 @@ def _run_replay_smoke(
     }
 
 
-def _audit_existing_results(scores_csv: Path) -> dict[str, Any]:
+def _audit_existing_results(scores_csv: Path, config_path: Path) -> dict[str, Any]:
     if not scores_csv.exists():
         return {"scores_csv": str(scores_csv), "status": "missing", "errors": [f"missing {scores_csv}"]}
     import pandas as pd
@@ -2257,11 +2443,108 @@ def _audit_existing_results(scores_csv: Path) -> dict[str, Any]:
         missing_tau = int(opt["train_tau_steps"].isna().sum())
         if missing_tau:
             errors.append(f"{missing_tau} optimized rows have missing train_tau_steps")
+    if "c1_replay_source" not in df.columns:
+        errors.append("checkpoint_scores.csv has no c1_replay_source column; metrics are stale.")
+    else:
+        opt_sources = sorted(set(str(x) for x in opt["c1_replay_source"].dropna().unique()))
+        expected_opt_sources = [
+            "apf_lagrangian",
+            "optimizer_native_nested_jit",
+            "optimizer_native_nested_jit_legacy_sigma_collision",
+        ]
+        if not opt_sources or any(src not in expected_opt_sources for src in opt_sources):
+            errors.append(
+                "optimized c1_replay_source values are "
+                f"{opt_sources}, expected one of {expected_opt_sources}"
+            )
+        if "candidate_kind" in df.columns:
+            rand = df[df["candidate_kind"] == "random"]
+            if not rand.empty:
+                rand_sources = sorted(set(str(x) for x in rand["c1_replay_source"].dropna().unique()))
+                expected_rand_sources = [
+                    "apf_lagrangian",
+                    "optimizer_native_nested_jit_row_params",
+                    "optimizer_native_nested_jit_row_params_legacy_sigma_collision",
+                ]
+                if any(src not in expected_rand_sources for src in rand_sources):
+                    errors.append(
+                        "random c1_replay_source values are "
+                        f"{rand_sources}, expected subset of {expected_rand_sources}"
+                    )
+    cfg = OmegaConf.load(config_path)
+    c1_cfg = cfg.datasets.flow_lenia.c1
+    cross_hardware_runs = {
+        int(value)
+        for value in as_list(
+            _get(c1_cfg, "optimizer_reference_cross_hardware_source_run_indices", [])
+        )
+    }
+    cross_hardware_max_ulps = int(
+        _get(c1_cfg, "optimizer_reference_cross_hardware_max_ulps", 0)
+    )
+    exact_col = "optimizer_reference_train_mspd_exact_match"
+    validation_col = "optimizer_reference_train_mspd_validation_passed"
+    exception_col = "optimizer_reference_cross_hardware_exception_used"
+    ulp_col = "optimizer_reference_train_mspd_ulp_distance"
+    exact_count = 0
+    exception_count = 0
+    if validation_col not in opt.columns:
+        errors.append(f"checkpoint_scores.csv has no {validation_col} column; metrics are stale.")
+    else:
+        validation_values = opt[validation_col].astype(str).str.lower().isin({"true", "1"})
+        if not bool(validation_values.all()):
+            errors.append(
+                f"{int((~validation_values).sum())} optimized rows fail train-MSPD validation"
+            )
+    if exact_col in opt.columns:
+        exact_values = opt[exact_col].astype(str).str.lower().isin({"true", "1"})
+        exact_count = int(exact_values.sum())
+    else:
+        errors.append(f"checkpoint_scores.csv has no {exact_col} column; metrics are stale.")
+        exact_values = pd.Series(False, index=opt.index)
+    if exception_col in opt.columns:
+        exception_values = opt[exception_col].astype(str).str.lower().isin({"true", "1"})
+        exception_count = int(exception_values.sum())
+        if bool(exception_values.any()):
+            if "source_optimized_run_idx" not in opt.columns:
+                errors.append("cross-hardware exceptions exist but source_optimized_run_idx is missing")
+            else:
+                exception_runs = set(
+                    pd.to_numeric(
+                        opt.loc[exception_values, "source_optimized_run_idx"], errors="coerce"
+                    ).dropna().astype(int)
+                )
+                unexpected_runs = sorted(exception_runs - cross_hardware_runs)
+                if unexpected_runs:
+                    errors.append(
+                        f"cross-hardware MSPD exceptions used for unconfigured source runs {unexpected_runs}"
+                    )
+            if ulp_col not in opt.columns:
+                errors.append(f"cross-hardware exceptions exist but {ulp_col} is missing")
+            else:
+                exception_ulps = pd.to_numeric(opt.loc[exception_values, ulp_col], errors="coerce")
+                invalid_ulps = exception_ulps.isna() | (exception_ulps > cross_hardware_max_ulps)
+                if bool(invalid_ulps.any()):
+                    errors.append(
+                        f"{int(invalid_ulps.sum())} cross-hardware MSPD exceptions exceed "
+                        f"configured max {cross_hardware_max_ulps} ULP"
+                    )
+        unvalidated_nonexact = (~exact_values) & (~exception_values)
+        if bool(unvalidated_nonexact.any()):
+            errors.append(
+                f"{int(unvalidated_nonexact.sum())} optimized rows are neither exact nor a validated cross-hardware exception"
+            )
+    else:
+        errors.append(f"checkpoint_scores.csv has no {exception_col} column; metrics are stale.")
     return {
         "scores_csv": str(scores_csv),
         "status": "ok" if not errors else "failed",
         "n_rows": int(len(df)),
         "n_optimized_rows": int(len(opt)),
+        "n_optimizer_reference_bit_exact": exact_count,
+        "n_optimizer_reference_cross_hardware_ulp": exception_count,
+        "optimizer_reference_cross_hardware_source_runs": sorted(cross_hardware_runs),
+        "optimizer_reference_cross_hardware_max_ulps": cross_hardware_max_ulps,
         "errors": errors,
     }
 
@@ -2305,27 +2588,29 @@ def main() -> int:
     summary: dict[str, Any] = {
         "config_audit": _audit_generated_config(config_path),
     }
+    selected_run_dirs = _configured_selected_run_dirs(config_path, selected_root)
+    summary["selected_run_dirs"] = [str(path) for path in selected_run_dirs]
     if args.require_apf_root_contains:
         apf_root = str(summary["config_audit"].get("apf_root", ""))
         if str(args.require_apf_root_contains) not in apf_root:
             summary["config_audit"].setdefault("errors", []).append(
                 f"apf_root={apf_root!r} does not contain required substring {args.require_apf_root_contains!r}"
             )
-    summary["seed_count_audit"] = _audit_seed_count(summary["config_audit"], selected_root)
+    summary["seed_count_audit"] = _audit_seed_count(summary["config_audit"], selected_run_dirs)
     if not args.skip_selected_candidate_audit:
         summary["selected_candidate_audit"] = _audit_selected_candidates(
-            selected_root,
+            selected_run_dirs,
             source_optimization_root=source_optimization_root,
         )
     if not args.skip_optimization_protocol_audit:
         summary["optimization_protocol_audit"] = _audit_optimization_protocol(
             summary["config_audit"],
-            selected_root,
+            selected_run_dirs,
         )
     if not args.skip_random_checkpoint_audit:
-        summary["random_checkpoint_audit"] = _audit_random_checkpoints(config_path, selected_root)
+        summary["random_checkpoint_audit"] = _audit_random_checkpoints(config_path, selected_run_dirs)
     if not args.skip_existing_results:
-        summary["existing_results_audit"] = _audit_existing_results(scores_csv)
+        summary["existing_results_audit"] = _audit_existing_results(scores_csv, config_path)
     if not args.skip_smoke:
         summary["replay_smoke"] = _run_replay_smoke(
             config_path=config_path,

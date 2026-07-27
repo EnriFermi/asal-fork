@@ -112,7 +112,7 @@ def _plain_value(value: Any) -> Any:
     return value
 
 
-def _effective_optimization_flat(run_dir: Path) -> Any:
+def _effective_optimization_flat(run_dir: Path, *, legacy_sigma_collision: bool = False) -> Any:
     cfg_path = run_dir / "optimization_config.yaml"
     if not cfg_path.exists():
         raise FileNotFoundError(f"Missing optimization_config.yaml for replay substrate audit: {cfg_path}")
@@ -126,7 +126,10 @@ def _effective_optimization_flat(run_dir: Path) -> Any:
         cfg.get("metric", {}),
     )
     substrate_cfg = cfg.get("substrate", {})
-    if str(substrate_cfg.get("substrate", "")).strip().lower() == "lenia_flow":
+    if legacy_sigma_collision:
+        if flat.get("flow_sigma", None) is not None:
+            flat.flow_sigma = None
+    elif str(substrate_cfg.get("substrate", "")).strip().lower() == "lenia_flow":
         flow_sigma = substrate_cfg.get("flow_sigma", substrate_cfg.get("sigma", None))
         if flow_sigma is not None:
             # `optimization.sigma` and Flow-Lenia's physical `substrate.sigma`
@@ -137,12 +140,16 @@ def _effective_optimization_flat(run_dir: Path) -> Any:
     return flat
 
 
-def _flowlenia_replay_substrate_overrides(completed: list[dict[str, Any]]) -> dict[str, Any]:
+def _flowlenia_replay_substrate_overrides(
+    completed: list[dict[str, Any]],
+    *,
+    legacy_sigma_collision: bool = False,
+) -> dict[str, Any]:
     overrides: dict[str, Any] = {}
     reference_values: dict[str, Any] = {}
     for row in completed:
         run_dir = Path(row["run_dir"])
-        flat = _effective_optimization_flat(run_dir)
+        flat = _effective_optimization_flat(run_dir, legacy_sigma_collision=legacy_sigma_collision)
         if str(flat.get("substrate", "")).strip().lower() != "lenia_flow":
             continue
         for key in FLOWLENIA_REPLAY_SUBSTRATE_KEYS:
@@ -163,16 +170,22 @@ def _flowlenia_replay_substrate_overrides(completed: list[dict[str, Any]]) -> di
                     f"cannot use one APF rollout_config. key={key} first={reference_values[key]!r} "
                     f"run_{int(row['run_idx']):03d}={value!r}"
                 )
+    if legacy_sigma_collision and "sigma" in reference_values:
+        reference_values["flow_sigma"] = reference_values["sigma"]
     for key, value in reference_values.items():
         overrides[key] = value
     return overrides
 
 
-def _flowlenia_replay_logging_overrides(completed: list[dict[str, Any]]) -> dict[str, Any]:
+def _flowlenia_replay_logging_overrides(
+    completed: list[dict[str, Any]],
+    *,
+    legacy_sigma_collision: bool = False,
+) -> dict[str, Any]:
     reference: bool | None = None
     for row in completed:
         run_dir = Path(row["run_dir"])
-        flat = _effective_optimization_flat(run_dir)
+        flat = _effective_optimization_flat(run_dir, legacy_sigma_collision=legacy_sigma_collision)
         if str(flat.get("substrate", "")).strip().lower() != "lenia_flow":
             continue
         value = bool(flat.get("log_clip_evolution", True))
@@ -322,8 +335,18 @@ def _write_c1_config(
     pair_seed_base: int,
     rollout_substrate_overrides: dict[str, Any] | None = None,
     rollout_logging_overrides: dict[str, Any] | None = None,
+    legacy_sigma_collision: bool = False,
+    legacy_sigma_collision_by_run_idx: dict[int, bool] | None = None,
+    posthoc_replay_source: str = "optimizer_native",
+    require_exact_train_mspd: bool = False,
+    optimizer_reference_cross_hardware_source_runs: list[int] | None = None,
+    optimizer_reference_cross_hardware_max_ulps: int = 0,
 ) -> None:
     metric_log_clip_evolution = bool((rollout_logging_overrides or {}).get("log_clip_evolution", False))
+    legacy_by_run = {
+        int(k): bool(v)
+        for k, v in (legacy_sigma_collision_by_run_idx or {}).items()
+    }
     cfg = {
         "meta": {
             "output_root": result_root,
@@ -338,12 +361,25 @@ def _write_c1_config(
                     "source": "apf_lagrangian_split",
                     "apf_root": apf_root,
                     "require_random": True,
+                    "sample_every_steps": 50,
+                    "optimized_replay_source": str(posthoc_replay_source),
+                    "optimized_replay_legacy_sigma_collision": bool(legacy_sigma_collision),
+                    "optimizer_native_legacy_sigma_collision_by_source_run_idx": legacy_by_run,
                     "expected_window_start_steps": 50000,
                     "expected_window_end_steps": 300000,
                     "metric_seed_protocol": "optimization_metric",
                     "metric_log_clip_evolution": metric_log_clip_evolution,
+                    "score_tau_source": "train_tau",
+                    "require_exact_optimized_train_mspd": bool(require_exact_train_mspd),
+                    "optimizer_reference_cross_hardware_source_run_indices": sorted(
+                        {int(value) for value in (optimizer_reference_cross_hardware_source_runs or [])}
+                    ),
+                    "optimizer_reference_cross_hardware_max_ulps": int(
+                        optimizer_reference_cross_hardware_max_ulps
+                    ),
                     "metric": {
                         "metric_tau_mode": "max_grid",
+                        "score_tau_source": "train_tau",
                         "metric_tau_grid_steps": [
                             1000,
                             2000,
@@ -394,9 +430,14 @@ def _write_c1_config(
                 "num_random_baselines": int(num_random_baselines),
                 "random_checkpoint_root": random_checkpoint_root,
                 "random_checkpoint_selection": str(random_checkpoint_selection),
+                "random_optimizer_native_iter": 0,
+                "random_optimizer_native_pop_indices": list(range(int(num_random_baselines))),
                 "run_seed_base": int(pair_seed_base),
                 "run_seed_mode": "source_run_idx",
                 "run_seed_protocol": "optimization_metric",
+                "optimized_apf_source": "optimizer_native",
+                "optimized_native_legacy_sigma_collision": bool(legacy_sigma_collision),
+                "optimizer_native_legacy_sigma_collision_by_source_run_idx": legacy_by_run,
                 "batch_size": int(batch_size),
                 "optimized_checkpoint_dirs": selected_dirs,
                 "dedupe_by_run_idx": False,
@@ -428,7 +469,17 @@ def main() -> int:
     parser.add_argument(
         "--random-checkpoint-selection",
         default="all_groups_flat",
-        choices=["all_groups_flat", "global_flat", "flat", "per_source_group"],
+        choices=[
+            "all_groups_flat",
+            "global_flat",
+            "flat",
+            "per_source_group",
+            "per_source_group_optimizer_context",
+            "per_source_group_optimizer_init",
+            "random_params_optimizer_context",
+            "random_params_optimizer_init",
+            "optimization_iter0",
+        ],
         help="How to pick random checkpoints for each optimized run.",
     )
     parser.add_argument("--rollout-config", default="experiments/paper_suite/flowlenia_arun_apf_300k_train50_grid128.yaml")
@@ -441,8 +492,83 @@ def main() -> int:
     parser.add_argument("--ewma-beta", type=float, default=0.85)
     parser.add_argument("--trim-frac", type=float, default=0.125)
     parser.add_argument("--min-iter", type=int, default=0)
+    parser.add_argument(
+        "--candidate-selection-rule",
+        choices=("robust", "argmax"),
+        default="robust",
+        help="Select the exported optimization candidate by the legacy robust rule or global observed-MSPD argmax.",
+    )
+    parser.add_argument(
+        "--include-source-run",
+        type=int,
+        action="append",
+        default=[],
+        help="Only include these completed source run indices. Repeat for multiple runs.",
+    )
+    parser.add_argument(
+        "--posthoc-replay-source",
+        choices=("optimizer_native", "apf"),
+        default="optimizer_native",
+        help="C1 metric input. Use apf to guarantee metrics and downstream tasks consume saved trajectories.",
+    )
+    parser.add_argument("--require-exact-train-mspd", action="store_true")
+    parser.add_argument(
+        "--optimizer-reference-cross-hardware-source-run",
+        type=int,
+        action="append",
+        default=[],
+        help=(
+            "Source run whose historical optimizer scalar was produced on another GPU architecture. "
+            "Repeat for multiple runs; exact matching remains mandatory for every other run."
+        ),
+    )
+    parser.add_argument(
+        "--optimizer-reference-cross-hardware-max-ulps",
+        type=int,
+        default=0,
+        help="Maximum float32 ULP distance allowed only for explicitly listed cross-hardware source runs.",
+    )
+    parser.add_argument(
+        "--apf-uncompressed",
+        action="store_true",
+        help="Use np.savez instead of CPU-heavy ZIP compression for large APF chunks.",
+    )
+    parser.add_argument(
+        "--apf-flush-workers",
+        type=int,
+        default=1,
+        help="Number of independent APF NPZ chunks to serialize concurrently.",
+    )
+    parser.add_argument(
+        "--exclude-source-run",
+        type=int,
+        action="append",
+        default=[],
+        help="Completed source optimization run index to exclude from this C1 eval. Repeat for multiple runs.",
+    )
     parser.add_argument("--force-export", action="store_true")
+    parser.add_argument(
+        "--legacy-optimization-sigma-collision",
+        action="store_true",
+        help=(
+            "Replay archived Flow-Lenia optimization runs exactly as main_opt_msc.py did before "
+            "the flow_sigma namespace fix: optimization.sigma also became the physical Flow-Lenia sigma."
+        ),
+    )
+    parser.add_argument(
+        "--legacy-optimization-sigma-collision-except-run",
+        type=int,
+        action="append",
+        default=[],
+        help=(
+            "Source optimization run index that must use the post-fix flow_sigma namespace even when "
+            "--legacy-optimization-sigma-collision is set. Repeat for multiple runs."
+        ),
+    )
     args = parser.parse_args()
+
+    if int(args.optimizer_reference_cross_hardware_max_ulps) < 0:
+        raise ValueError("--optimizer-reference-cross-hardware-max-ulps must be >= 0")
 
     source_root = _resolve(args.source_optimization_root)
     selected_root = _resolve(args.selected_optimization_root)
@@ -458,12 +584,49 @@ def main() -> int:
     completed = _discover_completed_runs(source_root)
     if not completed:
         raise RuntimeError(f"No completed optimization runs found under {source_root}.")
+    included_run_indices = sorted({int(x) for x in args.include_source_run})
+    if included_run_indices:
+        completed = [row for row in completed if int(row["run_idx"]) in set(included_run_indices)]
+        missing_included = sorted(set(included_run_indices) - {int(row["run_idx"]) for row in completed})
+        if missing_included:
+            raise RuntimeError(f"Requested source runs are not complete or missing: {missing_included}")
+    excluded_run_indices = sorted({int(x) for x in args.exclude_source_run})
+    if excluded_run_indices:
+        completed = [
+            row for row in completed
+            if int(row["run_idx"]) not in set(excluded_run_indices)
+        ]
+        if not completed:
+            raise RuntimeError(
+                "All completed optimization runs were excluded; "
+                f"excluded_run_indices={excluded_run_indices}"
+            )
     _validate_rollout_seed_count(completed, int(args.n_rollout_seeds))
 
     selected_dirs: list[str] = []
     selected_rows: list[dict[str, Any]] = []
-    rollout_substrate_overrides = _flowlenia_replay_substrate_overrides(completed)
-    rollout_logging_overrides = _flowlenia_replay_logging_overrides(completed)
+    legacy_sigma_collision = bool(args.legacy_optimization_sigma_collision)
+    legacy_sigma_collision_by_run_idx = {
+        int(row["run_idx"]): bool(legacy_sigma_collision)
+        for row in completed
+    }
+    for run_idx in args.legacy_optimization_sigma_collision_except_run:
+        legacy_sigma_collision_by_run_idx[int(run_idx)] = False
+    rollout_substrate_overrides = _flowlenia_replay_substrate_overrides(
+        completed,
+        legacy_sigma_collision=legacy_sigma_collision,
+    )
+    rollout_logging_overrides = _flowlenia_replay_logging_overrides(
+        completed,
+        legacy_sigma_collision=legacy_sigma_collision,
+    )
+    if bool(args.apf_uncompressed):
+        rollout_logging_overrides = dict(rollout_logging_overrides)
+        rollout_logging_overrides["compress"] = False
+    if int(args.apf_flush_workers) < 1:
+        raise ValueError("--apf-flush-workers must be >= 1")
+    rollout_logging_overrides = dict(rollout_logging_overrides)
+    rollout_logging_overrides["apf_flush_workers"] = int(args.apf_flush_workers)
     for row in completed:
         run_idx = int(row["run_idx"])
         out_dir = selected_root / f"run_{run_idx:03d}"
@@ -475,6 +638,7 @@ def main() -> int:
             ewma_beta=float(args.ewma_beta),
             trim_frac=float(args.trim_frac),
             min_iter=int(args.min_iter),
+            selection_rule=str(args.candidate_selection_rule),
             force=bool(args.force_export),
         )
         meta = export_robust_pioneer(export_args)
@@ -490,6 +654,7 @@ def main() -> int:
                 "selected_pop_idx": meta.get("pop_idx"),
                 "selected_score_mspd": meta.get("score_mspd"),
                 "selected_lcb_mspd": meta.get("seed_lcb_mspd"),
+                "selection_rule": meta.get("selection_rule"),
                 "selected_tau_steps": (meta.get("tau") or {}).get("tau_steps"),
             }
         )
@@ -509,11 +674,26 @@ def main() -> int:
         pair_seed_base=int(args.pair_seed_base),
         rollout_substrate_overrides=rollout_substrate_overrides,
         rollout_logging_overrides=rollout_logging_overrides,
+        legacy_sigma_collision=legacy_sigma_collision,
+        legacy_sigma_collision_by_run_idx=legacy_sigma_collision_by_run_idx,
+        posthoc_replay_source=str(args.posthoc_replay_source),
+        require_exact_train_mspd=bool(args.require_exact_train_mspd),
+        optimizer_reference_cross_hardware_source_runs=[
+            int(value) for value in args.optimizer_reference_cross_hardware_source_run
+        ],
+        optimizer_reference_cross_hardware_max_ulps=int(
+            args.optimizer_reference_cross_hardware_max_ulps
+        ),
     )
 
     manifest_dir = output_config.parent / "generated_manifests" / output_config.stem
     _write_csv(manifest_dir / "completed_runs.csv", [{**row, "run_dir": _rel(Path(row["run_dir"]))} for row in completed])
-    _write_csv(manifest_dir / "selected_robust_candidates.csv", selected_rows)
+    selected_filename = (
+        "selected_argmax_candidates.csv"
+        if str(args.candidate_selection_rule) == "argmax"
+        else "selected_robust_candidates.csv"
+    )
+    _write_csv(manifest_dir / selected_filename, selected_rows)
     summary = {
         "source_optimization_root": _rel(source_root),
         "selected_optimization_root": _rel(selected_root),
@@ -524,20 +704,32 @@ def main() -> int:
         "random_checkpoint_selection": random_checkpoint_selection,
         "n_completed_runs": len(completed),
         "completed_run_indices": [int(row["run_idx"]) for row in completed],
+        "excluded_run_indices": excluded_run_indices,
+        "included_run_indices": included_run_indices,
         "n_rollout_seeds": int(args.n_rollout_seeds),
         "num_random_baselines": int(args.num_random_baselines),
-        "anti_noise_selection": {
-            "rule": "robust_pioneer_lcb_in_top_trend",
+        "candidate_selection": {
+            "rule": str(args.candidate_selection_rule),
             "lcb_z": float(args.lcb_z),
             "trend_quantile": float(args.trend_quantile),
             "ewma_beta": float(args.ewma_beta),
             "trim_frac": float(args.trim_frac),
             "min_iter": int(args.min_iter),
         },
-        "selected_candidates_csv": _rel(manifest_dir / "selected_robust_candidates.csv"),
+        "selected_candidates_csv": _rel(manifest_dir / selected_filename),
         "completed_runs_csv": _rel(manifest_dir / "completed_runs.csv"),
         "rollout_substrate_overrides": rollout_substrate_overrides,
         "rollout_logging_overrides": rollout_logging_overrides,
+        "legacy_optimization_sigma_collision": bool(legacy_sigma_collision),
+        "legacy_optimization_sigma_collision_by_run_idx": legacy_sigma_collision_by_run_idx,
+        "posthoc_replay_source": str(args.posthoc_replay_source),
+        "require_exact_train_mspd": bool(args.require_exact_train_mspd),
+        "optimizer_reference_cross_hardware_source_runs": sorted(
+            {int(value) for value in args.optimizer_reference_cross_hardware_source_run}
+        ),
+        "optimizer_reference_cross_hardware_max_ulps": int(
+            args.optimizer_reference_cross_hardware_max_ulps
+        ),
     }
     _write_json(manifest_dir / "summary.json", summary)
     print(json.dumps(summary, indent=2, sort_keys=True))

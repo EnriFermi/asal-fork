@@ -205,7 +205,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     trajectory_root = _trajectory_root(c2_cfg)
     if trajectory_root is None or not trajectory_root.exists():
         raise FileNotFoundError(f"Missing C2 trajectory root: {trajectory_root}")
-    items = _iter_metric_items(trajectory_root)
+    items = _iter_metric_items(trajectory_root, c2_cfg)
     if not items:
         raise ValueError(f"No optimized metrics.npz items found under {trajectory_root}.")
 
